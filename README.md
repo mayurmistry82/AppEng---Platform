@@ -8,5 +8,9 @@ Built as part of my Python learning journey toward Energy Market Analysis and AI
 - Takes number of days in billing period as input
 - Calculates total energy used and total bill amount
 
+## How to run
+- **Command line:** `python calculator.py`
+- **GUI app:** `python app.py` (uses Tkinter, included with Python)
+
 ## Author
 Mayur Mistry
