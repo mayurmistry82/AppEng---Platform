@@ -1,0 +1,5 @@
+*.env
+__pycache__/
+*.pyc
+test_bill.pdf
+test_bill.jpg
