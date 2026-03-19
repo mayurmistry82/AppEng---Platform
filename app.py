@@ -22,6 +22,7 @@ from financial_model import calculate_financials
 from report_generator import generate_report
 from sizing_engine import size_system
 from solar_irradiance import fetch_pvgis_profile
+from database import save_report
 
 
 NAVY = "#1a1a2e"
@@ -290,6 +291,38 @@ def _page_customer_input() -> None:
 
         if existing_solar and existing_solar_kw > 0:
             results["sizing_data"]["existing_solar_kw"] = float(existing_solar_kw)
+
+        # -----------------------------
+        # Save the generated report (best-effort)
+        # -----------------------------
+        try:
+            bill_data = results.get("bill_data") or {}
+            sizing_data = results.get("sizing_data") or {}
+            financial_data = results.get("financial_data") or {}
+
+            report_payload = {
+                "customer_address": address.strip(),
+                "bill_data": {
+                    "tariff_rate": bill_data.get("tariff_rate"),
+                    "annual_spend": bill_data.get("annual_spend"),
+                    "daily_avg_kwh": bill_data.get("daily_avg_kwh"),
+                },
+                "sizing_results": {
+                    "solar_kw": sizing_data.get("solar_kw"),
+                    "battery_kwh": sizing_data.get("battery_kwh"),
+                    "system_cost": sizing_data.get("system_cost"),
+                },
+                "financial_results": {
+                    "annual_savings": financial_data.get("annual_savings"),
+                    "payback_years": financial_data.get("payback_years"),
+                    "npv_25_year": financial_data.get("npv_25_year"),
+                },
+                # timestamp is added automatically in database.save_report()
+            }
+            st.session_state["report_id"] = save_report(report_payload)
+        except Exception as exc:
+            # Do not block the user flow if Firebase save fails.
+            st.error(f"FIREBASE ERROR: {type(exc).__name__}: {exc}")
 
         st.session_state["results"] = results
         st.session_state["stage"] = "teaser"
