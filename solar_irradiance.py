@@ -16,6 +16,10 @@ from typing import Any
 from urllib.parse import urlencode
 from urllib.request import urlopen
 
+from dotenv import load_dotenv
+
+load_dotenv()
+
 
 PVGIS_PVCALC_URL = "https://re.jrc.ec.europa.eu/api/v5_2/PVcalc"
 

@@ -23,6 +23,9 @@ from pathlib import Path
 from typing import Any
 
 import matplotlib.pyplot as plt
+from dotenv import load_dotenv
+
+load_dotenv()
 
 from reportlab.lib import colors
 from reportlab.lib.pagesizes import A4

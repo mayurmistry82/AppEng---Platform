@@ -12,6 +12,10 @@ from __future__ import annotations
 import json
 from typing import Any
 
+from dotenv import load_dotenv
+
+load_dotenv()
+
 from bill_parser import parse_bill
 from solar_irradiance import fetch_pvgis_profile
 

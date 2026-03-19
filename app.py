@@ -13,6 +13,9 @@ from typing import Any
 
 import plotly.graph_objects as go
 import streamlit as st
+from dotenv import load_dotenv
+
+load_dotenv()
 
 from bill_parser import parse_bill
 from financial_model import calculate_financials
