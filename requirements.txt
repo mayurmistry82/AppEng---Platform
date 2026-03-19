@@ -6,3 +6,5 @@ geopy
 reportlab
 matplotlib
 python-dotenv
+firebase-admin
+firebase-admin
