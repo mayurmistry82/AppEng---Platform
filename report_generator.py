@@ -535,6 +535,30 @@ def generate_pdf_report(
                 pass
 
 
+def generate_report(
+    *,
+    bill_data: dict[str, Any],
+    solar_data: dict[str, Any],
+    sizing_data: dict[str, Any],
+    financial_data: dict[str, Any],
+    customer_name: str,
+    property_address: str,
+) -> str:
+    """
+    Backwards-compatible alias for generate_pdf_report().
+
+    The Streamlit app uses this name for the download button.
+    """
+    return generate_pdf_report(
+        bill_data=bill_data,
+        solar_data=solar_data,
+        sizing_data=sizing_data,
+        financial_data=financial_data,
+        customer_name=customer_name,
+        property_address=property_address,
+    )
+
+
 # -----------------------------
 # End-to-end pipeline test
 # -----------------------------

@@ -252,6 +252,21 @@ def compute_financials(
     }
 
 
+def calculate_financials(
+    bill_data: dict[str, Any],
+    sizing_data: dict[str, Any],
+    solar_data: dict[str, Any],
+) -> dict[str, Any]:
+    """
+    Backwards-compatible alias for compute_financials().
+
+    The Streamlit app and report pipeline call this name.
+    """
+    return compute_financials(
+        bill_data=bill_data, sizing_data=sizing_data, solar_data=solar_data
+    )
+
+
 def _build_headline(*, annual_bill_reduction: float, payback_years: float | None) -> str:
     savings_txt = f"${annual_bill_reduction:,.0f}/year"
     if payback_years is None:
