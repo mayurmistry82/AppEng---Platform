@@ -45,14 +45,17 @@ def _get_db():
 
     project_root = Path(__file__).resolve().parent
     cred_path = project_root / "firebase-credentials.json"
-    if not cred_path.exists():
-        raise RuntimeError(
-            f"Missing Firebase service account file: {cred_path}"
-        )
 
-    # Initialize the default app if needed.
     if not firebase_admin._apps:
-        cred = credentials.Certificate(str(cred_path))
+        if cred_path.exists():
+            # Local development — use the JSON file
+            cred = credentials.Certificate(str(cred_path))
+        else:
+            # Streamlit Cloud — load from secrets
+            import json
+            import streamlit as st
+            cred_dict = json.loads(st.secrets["FIREBASE_CREDENTIALS"])
+            cred = credentials.Certificate(cred_dict)
         firebase_admin.initialize_app(cred)
 
     _DB = firestore.client()
