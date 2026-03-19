@@ -129,6 +129,56 @@ def _dispatch_strategy_text(occupancy: str, wants_battery: bool) -> str:
     )
 
 
+def _fmt_money0(value: Any) -> str:
+    """Format AUD amounts like $8,112."""
+    try:
+        if value is None:
+            return "N/A"
+        return f"${float(value):,.0f}"
+    except Exception:
+        return "N/A"
+
+
+def _fmt_money_per_year(value: Any) -> str:
+    v = _fmt_money0(value)
+    return f"{v}/yr" if v != "N/A" else "N/A"
+
+
+def _fmt_money_per_month(value: Any) -> str:
+    v = _fmt_money0(value)
+    return f"{v}/mo" if v != "N/A" else "N/A"
+
+
+def _fmt_years_1(value: Any) -> str:
+    """Format years like 4.1 yrs."""
+    try:
+        if value is None:
+            return "N/A"
+        return f"{float(value):.1f} yrs"
+    except Exception:
+        return "N/A"
+
+
+def _fmt_years_word(value: Any) -> str:
+    """Format years like 4.1 years (for table display)."""
+    try:
+        if value is None:
+            return "N/A"
+        return f"{float(value):.1f} years"
+    except Exception:
+        return "N/A"
+
+
+def _fmt_pct_1(value: Any) -> str:
+    """Format percent like 732.9%."""
+    try:
+        if value is None:
+            return "N/A"
+        return f"{float(value):.1f}%"
+    except Exception:
+        return "N/A"
+
+
 def _run_pipeline(
     *,
     uploaded_bytes: bytes,
@@ -254,40 +304,61 @@ def _page_teaser() -> None:
     sizing = results.get("sizing_data") or {}
     financial = results.get("financial_data") or {}
 
-    solar_kw = float(sizing.get("solar_kw") or 0.0)
-    battery_kwh = float(sizing.get("battery_kwh") or 0.0)
+    # Teaser intentionally does not reveal technical system size details.
+    annual_savings = financial.get("annual_savings")
     payback = financial.get("payback_years")
-    annual_savings = float(financial.get("annual_savings") or 0.0)
+    monthly_bill_reduction = financial.get("monthly_bill_reduction")
 
     c1, c2, c3 = st.columns(3)
     with c1:
-        st.metric("Recommended system", f"{solar_kw:.1f} kW + {battery_kwh:.1f} kWh")
+        st.metric("Annual savings", _fmt_money_per_year(annual_savings))
     with c2:
-        st.metric(
-            "Payback period",
-            f"{payback:.1f} yrs" if isinstance(payback, (int, float)) else "N/A",
-        )
+        st.metric("Payback period", _fmt_years_1(payback))
     with c3:
-        st.metric("Annual savings", f"${annual_savings:,.0f}/yr")
+        st.metric("Monthly bill reduction", _fmt_money_per_month(monthly_bill_reduction))
 
-    st.markdown("<div class='box'>", unsafe_allow_html=True)
-    unlock = st.button("Unlock Full Report — $99 AUD")
-    st.markdown("</div>", unsafe_allow_html=True)
+    # -----------------------------
+    # What you unlock (installer confidence)
+    # -----------------------------
+    npv_25_year = financial.get("npv_25_year")
+    npv_txt = _fmt_money0(npv_25_year)
 
-    st.markdown("#### What you’ll unlock")
     st.markdown(
-        """
-        <div class="teaser-blur">
-          <ul>
-            <li>Full financial breakdown</li>
-            <li>25-year projection</li>
-            <li>Dispatch strategy</li>
-            <li>Monthly generation chart</li>
+        f"""
+        <div style="
+          border: 2px solid {ORANGE};
+          background: #FFF3CD;
+          padding: 14px 16px;
+          border-radius: 12px;
+          margin: 10px 0 14px 0;
+        ">
+          <div style="font-size: 16px; font-weight: 800; color: #1a1a2e;">
+            What's included in the full report — $99 AUD
+          </div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+    st.markdown(
+        f"""
+        <div style="padding: 4px 6px;">
+          <ul style="list-style: none; padding-left: 0; margin-left: 0;">
+            <li style="margin: 8px 0;">✓ Recommended system size (solar kW + battery kWh)</li>
+            <li style="margin: 8px 0;">✓ Complete financial breakdown — upfront cost, payback, ROI</li>
+            <li style="margin: 8px 0;">✓ 25-year savings projection ({npv_txt} for this property)</li>
+            <li style="margin: 8px 0;">✓ Monthly solar generation chart</li>
+            <li style="margin: 8px 0;">✓ Occupancy-aware dispatch strategy</li>
+            <li style="margin: 8px 0;">✓ Feed-in tariff optimisation tips</li>
+            <li style="margin: 8px 0;">✓ Downloadable PDF report for your customer</li>
           </ul>
         </div>
         """,
         unsafe_allow_html=True,
     )
+
+    st.markdown("###")
+    unlock = st.button("Unlock Full Report — $99 AUD")
 
     cols = st.columns([1, 1])
     with cols[0]:
@@ -326,18 +397,18 @@ def _page_full_report() -> None:
     a, b, c = st.columns(3)
     a.metric("Solar", f"{solar_kw:.1f} kW")
     b.metric("Battery", f"{battery_kwh:.1f} kWh")
-    c.metric("Estimated cost", f"${system_cost:,.0f} AUD")
+    c.metric("Estimated cost", f"{_fmt_money0(system_cost)} AUD")
 
     st.markdown("### Financial summary")
     table = {
-        "Upfront system cost (AUD)": financial.get("system_capex"),
-        "Annual savings (AUD/yr)": financial.get("annual_savings"),
-        "Monthly bill reduction (AUD/mo)": financial.get("monthly_bill_reduction"),
-        "Payback (years)": financial.get("payback_years"),
-        "25-year NPV (AUD)": financial.get("npv_25_year"),
-        "ROI (%)": financial.get("roi_percent"),
-        "Current annual spend (AUD)": financial.get("current_annual_spend"),
-        "Projected annual spend (AUD)": financial.get("projected_annual_spend"),
+        "Upfront system cost": _fmt_money0(financial.get("system_capex")),
+        "Annual savings": _fmt_money_per_year(financial.get("annual_savings")),
+        "Monthly bill reduction": _fmt_money_per_month(financial.get("monthly_bill_reduction")),
+        "Payback period": _fmt_years_word(financial.get("payback_years")),
+        "25-year NPV": _fmt_money0(financial.get("npv_25_year")),
+        "ROI": _fmt_pct_1(financial.get("roi_percent")),
+        "Current annual spend": _fmt_money0(financial.get("current_annual_spend")),
+        "Projected annual spend": _fmt_money0(financial.get("projected_annual_spend")),
     }
     st.table({k: [v] for k, v in table.items()})
 

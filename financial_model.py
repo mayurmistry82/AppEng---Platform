@@ -272,6 +272,7 @@ def calculate_financials(
 
 
 def _build_headline(*, annual_bill_reduction: float, payback_years: float | None) -> str:
+    # Headline formatting is kept simple and display-friendly.
     savings_txt = f"${annual_bill_reduction:,.0f}/year"
     if payback_years is None:
         return f"Your system saves {savings_txt}."
