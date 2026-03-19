@@ -323,6 +323,7 @@ def _page_customer_input() -> None:
         except Exception as exc:
             # Do not block the user flow if Firebase save fails.
             st.error(f"FIREBASE ERROR: {type(exc).__name__}: {exc}")
+            import time; time.sleep(8)
 
         st.session_state["results"] = results
         st.session_state["stage"] = "teaser"
