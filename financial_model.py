@@ -146,7 +146,18 @@ def compute_financials(
     annual_savings = annual_bill_reduction + annual_export_revenue
 
     monthly_bill_reduction = annual_bill_reduction / 12.0
-    projected_annual_spend = max(0.0, current_annual_spend - annual_savings)
+    # Projected annual spend is the current annual spend minus annual savings.
+    # If it goes negative, the household is generating more value than they consume;
+    # we clamp to $0 but include a clear note for the report.
+    projected_annual_spend_raw = current_annual_spend - annual_savings
+    projected_annual_spend_note = None
+    if projected_annual_spend_raw < 0:
+        projected_annual_spend = 0.0
+        projected_annual_spend_note = (
+            "System generates more than current usage — potential export income"
+        )
+    else:
+        projected_annual_spend = projected_annual_spend_raw
 
     # -----------------------------
     # Payback (simple)
@@ -238,6 +249,7 @@ def compute_financials(
         "roi_percent": roi_percent,
         "current_annual_spend": current_annual_spend,
         "projected_annual_spend": projected_annual_spend,
+        "projected_annual_spend_note": projected_annual_spend_note,
         "headline_insight": headline_insight,
     }
 
