@@ -282,7 +282,8 @@ def generate_pdf_report(
     roi_percent = financial_data.get("roi_percent")
     current_annual_spend = _safe_float(financial_data.get("current_annual_spend"))
     projected_annual_spend = _safe_float(financial_data.get("projected_annual_spend"))
-    projected_annual_spend_note = financial_data.get("projected_annual_spend_note")
+    has_excess_generation = bool(financial_data.get("has_excess_generation"))
+    excess_export_kwh = _safe_float(financial_data.get("excess_export_kwh")) or 0.0
 
     base_kwp = 6.6  # must match solar_irradiance.py default used in the pipeline
 
@@ -489,11 +490,17 @@ def generate_pdf_report(
                     small_style,
                 )
             )
-            if projected_annual_spend_note:
+            if has_excess_generation:
                 story.append(
                     Paragraph(
-                        f"<font color='{ACCENT_COLOR}'>"
-                        f"<b>{projected_annual_spend_note}</b></font>",
+                        f"System generates {excess_export_kwh:,.0f} kWh more than current annual usage.",
+                        small_style,
+                    )
+                )
+                story.append(
+                    Paragraph(
+                        "Tip: Consider switching to a plan with a feed-in tariff to earn "
+                        "export income on excess generation.",
                         small_style,
                     )
                 )

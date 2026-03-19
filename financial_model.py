@@ -132,6 +132,8 @@ def compute_financials(
 
     annual_self_consumption_kwh = annual_solar_generation_kwh * self_consumption_ratio
     annual_export_kwh = max(0.0, annual_solar_generation_kwh - annual_self_consumption_kwh)
+    excess_export_kwh = annual_export_kwh
+    has_excess_generation = annual_solar_generation_kwh > annual_load_kwh
 
     # -----------------------------
     # Annual savings (Year 1, nominal)
@@ -147,15 +149,10 @@ def compute_financials(
 
     monthly_bill_reduction = annual_bill_reduction / 12.0
     # Projected annual spend is the current annual spend minus annual savings.
-    # If it goes negative, the household is generating more value than they consume;
-    # we clamp to $0 but include a clear note for the report.
+    # If it goes negative, clamp to $0 and allow the report to show an export tip.
     projected_annual_spend_raw = current_annual_spend - annual_savings
-    projected_annual_spend_note = None
     if projected_annual_spend_raw < 0:
         projected_annual_spend = 0.0
-        projected_annual_spend_note = (
-            "System generates more than current usage — potential export income"
-        )
     else:
         projected_annual_spend = projected_annual_spend_raw
 
@@ -241,6 +238,8 @@ def compute_financials(
         "annual_solar_generation_kwh": annual_solar_generation_kwh,
         "annual_self_consumption_kwh": annual_self_consumption_kwh,
         "annual_export_kwh": annual_export_kwh,
+        "excess_export_kwh": excess_export_kwh,
+        "has_excess_generation": has_excess_generation,
         "annual_savings": annual_savings,
         "annual_bill_reduction": annual_bill_reduction,
         "monthly_bill_reduction": monthly_bill_reduction,
@@ -249,7 +248,6 @@ def compute_financials(
         "roi_percent": roi_percent,
         "current_annual_spend": current_annual_spend,
         "projected_annual_spend": projected_annual_spend,
-        "projected_annual_spend_note": projected_annual_spend_note,
         "headline_insight": headline_insight,
     }
 
