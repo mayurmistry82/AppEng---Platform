@@ -51,10 +51,11 @@ def _get_db():
             # Local development — use the JSON file
             cred = credentials.Certificate(str(cred_path))
         else:
-            # Streamlit Cloud — load from secrets
-            import json
             import streamlit as st
-            cred_dict = json.loads(st.secrets["FIREBASE_CREDENTIALS"])
+            import json
+            raw = st.secrets["FIREBASE_CREDENTIALS"]
+            # Streamlit may return the value already parsed or as a string
+            cred_dict = raw if isinstance(raw, dict) else json.loads(raw)
             cred = credentials.Certificate(cred_dict)
         firebase_admin.initialize_app(cred)
 
