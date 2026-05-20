@@ -1,0 +1,15 @@
+fastapi
+uvicorn[standard]
+python-multipart
+sentry-sdk[fastapi]
+anthropic
+supabase
+python-dotenv
+geopy
+pandas
+pymupdf
+Pillow
+plotly
+pvlib
+requests
+pulp

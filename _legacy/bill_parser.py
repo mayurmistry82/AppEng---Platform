@@ -240,6 +240,8 @@ def parse_bill(file_path: str) -> dict[str, Any]:
       - historical_usage: list of previous billing periods in the bill:
             [{period_label, kwh, days}, ...]
       - has_solar: boolean (true if solar export data is present)
+      - nmi: National Metering Identifier (10-11 digit string) or None
+      - daily_supply_charge: daily supply charge in AUD per day, or None
     """
     # Load and validate the file path.
     path = Path(file_path)
@@ -308,6 +310,8 @@ def parse_bill(file_path: str) -> dict[str, Any]:
         "      kwh: number (kWh)\n"
         "      days: integer (days)\n"
         "  has_solar: boolean (true if solar export data is present, otherwise false)\n"
+        "  nmi: string (National Metering Identifier — 10 or 11 digit number, often labelled 'NMI' on the bill) or null if not present\n"
+        "  daily_supply_charge: number (AUD per day, e.g. 1.12) or null if not present. Look for 'daily supply charge', 'service to property', 'network charge', or similar. Convert to AUD/day if shown as a total for the period (divide total by billing_period_days).\n"
         "\n"
         "Rules:\n"
         "- If the bill shows cents per kWh, convert to AUD per kWh (e.g. 32 c/kWh -> 0.32).\n"
@@ -315,6 +319,8 @@ def parse_bill(file_path: str) -> dict[str, Any]:
         "- For annual_spend, if the bill only shows this period spend, extrapolate to annual using days in period.\n"
         "- historical_usage should include as many prior periods as the bill provides.\n"
         "- has_solar should be true if export (kWh) or feed-in credits/rates are present.\n"
+        "- For daily_supply_charge: if the bill shows a total supply charge for the period (e.g. \"$86.53 for 77 days\"), divide by days to get the daily rate. If shown as a per-day rate directly, use that.\n"
+        "- NMI is typically a 10-11 digit number near the top of the bill, labelled \"NMI\", \"National Metering Identifier\", or \"Meter ID\".\n"
         "- Be conservative: if uncertain, set fields to null (except feed_in_tariff=0 and has_solar=false).\n"
     )
 
@@ -353,6 +359,8 @@ def parse_bill(file_path: str) -> dict[str, Any]:
     plan_name = _coerce_str(raw.get("plan_name"))
     historical_usage = _coerce_historical_usage(raw.get("historical_usage"))
     has_solar = _coerce_bool(raw.get("has_solar"))
+    nmi = _coerce_str(raw.get("nmi"))
+    daily_supply_charge = _coerce_float(raw.get("daily_supply_charge"))
 
     # Requirement: feed_in_tariff should be 0 if not present.
     if feed_in_tariff is None:
@@ -377,6 +385,8 @@ def parse_bill(file_path: str) -> dict[str, Any]:
         "plan_name": plan_name,
         "historical_usage": historical_usage,
         "has_solar": has_solar,
+        "nmi": nmi,
+        "daily_supply_charge": daily_supply_charge,
     }
 
 

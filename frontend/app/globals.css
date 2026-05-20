@@ -1,0 +1,49 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@layer base {
+  :root {
+    /* EnrgEngine dark theme — HSL for shadcn compatibility */
+    --background: 222 53% 7%;          /* #090E1C */
+    --foreground: 220 100% 96%;        /* #F0F4FF */
+
+    --card: 222 36% 11%;               /* dark surface */
+    --card-foreground: 220 100% 96%;
+
+    --popover: 222 36% 11%;
+    --popover-foreground: 220 100% 96%;
+
+    --primary: 38 100% 58%;            /* #FFB428 */
+    --primary-foreground: 222 53% 7%;
+
+    --secondary: 222 36% 14%;
+    --secondary-foreground: 220 100% 96%;
+
+    --muted: 222 30% 18%;
+    --muted-foreground: 220 20% 65%;
+
+    --accent: 38 100% 58%;
+    --accent-foreground: 222 53% 7%;
+
+    --destructive: 0 84% 60%;
+    --destructive-foreground: 220 100% 96%;
+
+    --border: 220 20% 18%;
+    --input: 220 20% 18%;
+    --ring: 38 100% 58%;
+
+    --radius: 0.5rem;
+  }
+}
+
+@layer base {
+  * {
+    @apply border-border;
+  }
+  html,
+  body {
+    @apply bg-background text-foreground;
+    font-family: "DM Sans", system-ui, sans-serif;
+  }
+}

@@ -3,8 +3,7 @@ streamlit
 plotly
 pymupdf
 geopy
-reportlab
 matplotlib
 python-dotenv
-firebase-admin
-firebase-admin
+supabase
+pandas
