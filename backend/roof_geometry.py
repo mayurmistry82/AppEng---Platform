@@ -354,6 +354,24 @@ def _normalise(data: dict, panel: dict, usability: float) -> dict:
             }
         )
 
+    # Retained (not consumed) geometry — everything needed to redraw the panel layout over
+    # a satellite tile later without a second Google call. Purely additive: none of the
+    # values above are derived from or affected by any of this.
+    raw_panels = sp.get("solarPanels")
+    panels_raw = list(raw_panels) if isinstance(raw_panels, list) else []
+
+    segment_boxes: list[dict] = []
+    for i, seg in enumerate(segments):
+        if not isinstance(seg, dict):
+            continue
+        segment_boxes.append(
+            {
+                "segment_index": i,
+                "boundingBox": seg.get("boundingBox"),
+                "center": seg.get("center"),
+            }
+        )
+
     return {
         "planes": planes,
         "candidate_configs": configs,
@@ -362,6 +380,11 @@ def _normalise(data: dict, panel: dict, usability: float) -> dict:
         "google_max_array_panels_count": sp.get("maxArrayPanelsCount"),
         "roof_segment_count": len(segments),
         "flags": flags,
+        # Retained verbatim — see comment above.
+        "panels_raw": panels_raw,
+        "segment_bounding_boxes": segment_boxes,
+        "building_center": data.get("center"),
+        "building_bounding_box": data.get("boundingBox"),
     }
 
 
@@ -457,6 +480,12 @@ def _blank(found: bool = False) -> dict:
         "total_kwp": None,
         "max_panels": None,
         "google_max_array_panels_count": None,
+        # Retained Google geometry — empty/null on every no-find path (manual entry, 404,
+        # API error), never absent, so the contract is stable for the route and the UI.
+        "panels_raw": [],
+        "segment_bounding_boxes": [],
+        "building_center": None,
+        "building_bounding_box": None,
         "error": None,
     }
 
@@ -533,6 +562,10 @@ def fetch_roof_geometry(
             "total_kwp": norm["total_kwp"],
             "max_panels": norm["max_panels"],
             "google_max_array_panels_count": norm["google_max_array_panels_count"],
+            "panels_raw": norm["panels_raw"],
+            "segment_bounding_boxes": norm["segment_bounding_boxes"],
+            "building_center": norm["building_center"],
+            "building_bounding_box": norm["building_bounding_box"],
         }
     )
     flags = panel_flags + norm["flags"]

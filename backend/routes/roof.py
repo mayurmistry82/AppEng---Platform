@@ -74,6 +74,10 @@ def _persist(model: dict, job_id: Optional[str]) -> tuple[bool, Optional[str]]:
         "total_kwp": model.get("total_kwp"),
         "max_panels": model.get("max_panels"),
         "google_max_array_panels_count": model.get("google_max_array_panels_count"),
+        "panels_raw": model.get("panels_raw", []),
+        "segment_bounding_boxes": model.get("segment_bounding_boxes", []),
+        "building_center": model.get("building_center"),
+        "building_bounding_box": model.get("building_bounding_box"),
     }
     try:
         client.table("roof_geometry").insert(row).execute()

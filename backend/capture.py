@@ -57,9 +57,24 @@ _ALLOWED: dict[str, set[str]] = {
         # privacy_notice_given is the installer attestation gating the de-identified
         # flywheel (notice-based, on by default). training_consent is retained for
         # backward-compat with any old payloads but is no longer the training gate.
-        "job_id", "installer_id", "status", "privacy_notice_given", "training_consent",
+        "job_id", "installer_id", "company_id", "status", "privacy_notice_given", "training_consent",
         "site_postcode", "site_state", "site_dnsp", "site_lat_coarse", "site_lon_coarse",
         "accuracy_tier", "confidence_pct", "engine_versions",
+        # Job-tracker fields (installer dashboard).
+        "notes", "assigned_to", "scheduled_date", "event_type", "quoted_value_aud",
+        # Six-path routing inputs. `path` is deliberately absent: it is a Postgres
+        # GENERATED column, so writing to it raises — the database derives it from
+        # has_existing_solar + intent. See backend/job_paths.py.
+        "has_existing_solar", "existing_solar_kw", "existing_inverter_kw", "intent",
+        # Property / building facts — capture-completeness. These cannot be reconstructed
+        # after the fact. climate_zone is accepted but stays NULL until the NCC
+        # postcode-to-zone mapping exists.
+        "bedrooms", "floor_area_m2", "storeys", "dwelling_type", "year_built",
+        "roof_material", "electrical_phase", "climate_zone",
+        # Outcome labels — the supervised targets the flywheel eventually learns from.
+        "job_outcome", "quoted_solar_kw", "quoted_battery_kwh",
+        "installed_solar_kw", "installed_battery_kwh",
+        "quoted_panel_id", "quoted_inverter_id", "quoted_battery_id",
     },
     "bills": {
         "bill_id", "job_id", "raw_file_path", "parsed_json", "parser_version",
@@ -74,6 +89,9 @@ _ALLOWED: dict[str, set[str]] = {
     "surveys": {
         "survey_id", "job_id", "household_size", "occupancy_pattern", "hot_water_type",
         "has_ev", "has_pool", "solar_export", "occupancy_grid", "daytime_home_frac",
+        # Energy context — capture-completeness. ac_type / heating_type are free text
+        # until the load-survey rebuild settles the option lists.
+        "gas_connection", "ac_type", "num_evs", "ev_charger_kw", "heating_type",
     },
     "load_profiles": {
         "load_profile_id", "job_id", "archetype_used", "hourly_profile_weights",

@@ -1,29 +1,46 @@
 """
-Job persistence routes — ML data-flywheel capture (docs/2026-06-05-ml-data-flywheel-plan.md).
+Job persistence routes — ML data-flywheel capture (docs/2026-06-05-ml-data-flywheel-plan.md)
+plus the authenticated job CRUD API (2026-08-06).
 
+Legacy capture endpoints (no auth — the running frontend still calls them; retrofit is a
+separate pre-deployment task):
 POST /api/job/save        — persist one complete, de-identified, linked job record.
 POST /api/job/correction  — record an installer override as a before/after gold label.
 
-Best-effort by contract: these endpoints MUST NEVER block the installer. On any failure
-they log to Sentry and return HTTP 200 with a null id, so the UI proceeds and results
-still display. Non-PII tables are written via capture.py (anon-key friendly). The PII
-table (job_customers) is written directly here because capture.py has no PII writer —
-under the backend's anon key that write is denied by RLS and silently skipped (PII is
-simply not stored); configure SUPABASE_SERVICE_ROLE_KEY to enable it.
+Authenticated CRUD (identity ALWAYS from auth.Caller, never from the payload):
+POST  /api/job                  — create a job for the caller's company.
+GET   /api/jobs                 — list the caller's company's jobs + dashboard KPIs.
+GET   /api/job/{job_id}         — one job hydrated with every child table.
+PATCH /api/job/{job_id}/status  — manual status transition.
+
+SECURITY MODEL for the CRUD endpoints: they run on the SERVICE-ROLE client, which
+BYPASSES RLS — the company-scoped policies give them no protection. Every query is
+therefore filtered by caller.company_id in code, and another company's job is answered
+with 404 (never 403 — a 403 confirms the job exists, which leaks information).
+
+Best-effort contract of the legacy endpoints is unchanged: they never block the installer.
 """
 
 from __future__ import annotations
 
+import logging
 import os
+import re
 import uuid
-from typing import Any, Optional
+from datetime import datetime, timedelta, timezone
+from typing import Any, Literal, Optional
 
 import sentry_sdk
-from fastapi import APIRouter
+from fastapi import APIRouter, Depends, HTTPException, Query
 from fastapi.responses import JSONResponse
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 import capture
+import job_paths
+import nem_data
+from auth import Caller, require_company
+
+logger = logging.getLogger("enrgengine.job")
 
 router = APIRouter()
 
@@ -202,3 +219,504 @@ async def save_correction(req: CorrectionRequest):
     except Exception as exc:  # noqa: BLE001 - never block the installer
         sentry_sdk.capture_exception(exc)
         return JSONResponse(status_code=200, content={"correction_id": None})
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Authenticated job CRUD (2026-08-06). Identity comes from auth.Caller ONLY.
+# ═══════════════════════════════════════════════════════════════════════════════
+
+_VALID_STATUSES = ("draft", "sized", "sent", "won", "installed", "lost")
+_SORTS = {
+    "updated_desc": ("updated_at", True),
+    "updated_asc": ("updated_at", False),
+    "created_desc": ("created_at", True),
+    "created_asc": ("created_at", False),
+}
+# Child tables hydrated by GET /api/job/{id}. job_customers is exposed as "customer".
+_CHILD_TABLES: list[tuple[str, str]] = [
+    ("customer", "job_customers"),
+    ("bills", "bills"),
+    ("tariffs", "tariffs"),
+    ("surveys", "surveys"),
+    ("load_profiles", "load_profiles"),
+    ("solar_resources", "solar_resources"),
+    ("sizing_results", "sizing_results"),
+    ("financial_results", "financial_results"),
+    ("corrections", "corrections"),
+    ("interval_data", "interval_data"),
+    ("actuals", "actuals"),
+    ("roof_geometry", "roof_geometry"),
+]
+
+_NOT_FOUND = HTTPException(status_code=404, detail="Job not found")
+_UNAVAILABLE = HTTPException(status_code=503, detail="Database unavailable")
+
+_SVC: Any = None
+_SVC_READY = False
+
+
+def _svc() -> Any:
+    """Service-role client (bypasses RLS — which is exactly why every query below
+    filters by company_id in code). Service-role ONLY: no anon fallback, matching
+    auth.py — a quiet downgrade here would skew reads instead of failing loudly."""
+    global _SVC, _SVC_READY
+    if _SVC_READY:
+        return _SVC
+    _SVC_READY = True
+    url = os.getenv("SUPABASE_URL")
+    key = os.getenv("SUPABASE_SERVICE_ROLE_KEY")
+    if not url or not key:
+        logger.error("job CRUD: SUPABASE_SERVICE_ROLE_KEY missing — endpoints will 503.")
+        _SVC = None
+        return None
+    try:
+        from supabase import create_client
+
+        _SVC = create_client(url, key)
+    except Exception as exc:  # noqa: BLE001
+        sentry_sdk.capture_exception(exc)
+        _SVC = None
+    return _SVC
+
+
+def _require_svc() -> Any:
+    client = _svc()
+    if client is None:
+        raise _UNAVAILABLE
+    return client
+
+
+def _num(v: Any) -> Optional[float]:
+    try:
+        return float(v) if v is not None else None
+    except (TypeError, ValueError):
+        return None
+
+
+def _parse_ts(v: Any) -> Optional[datetime]:
+    if not isinstance(v, str):
+        return None
+    try:
+        return datetime.fromisoformat(v)
+    except ValueError:
+        return None
+
+
+# Postcode / state derivation ---------------------------------------------------
+# Replaces the old "last 4-digit group" extraction, which mistook a street number for a
+# postcode whenever the address had no postcode: "1234 Main North Rd, Adelaide" resolved
+# to 1234 -> NSW (1000-2599) on an SA property, silently corrupting export limit, FiT and
+# STC zone with entirely plausible-looking output.
+_STATE_ABBRS = frozenset({"SA", "NSW", "VIC", "QLD", "WA", "TAS", "NT", "ACT"})
+_COUNTRY_WORDS = frozenset({"AUSTRALIA", "AUS", "AU"})
+# Longest first so "New South Wales" is consumed before any shorter overlap.
+_FULL_STATE_NAMES: list[tuple[str, str]] = sorted(
+    [
+        ("Australian Capital Territory", "ACT"),
+        ("New South Wales", "NSW"),
+        ("Northern Territory", "NT"),
+        ("Western Australia", "WA"),
+        ("South Australia", "SA"),
+        ("Queensland", "QLD"),
+        ("Tasmania", "TAS"),
+        ("Victoria", "VIC"),
+    ],
+    key=lambda p: -len(p[0]),
+)
+
+
+def _as_postcode(token: str) -> Optional[str]:
+    """A digit token as a REAL postcode, or None. 3-digit tokens are zero-padded to
+    cover NT/ACT leading-zero postcodes written bare ("NT 800" -> "0800"); the padded
+    value must still map to a state, so 300-799 and other junk are rejected."""
+    if not token.isdigit():
+        return None
+    if len(token) == 4:
+        candidate = token
+    elif len(token) == 3:
+        candidate = "0" + token
+    else:
+        return None
+    return candidate if nem_data.postcode_to_state(candidate) else None
+
+
+def _derive_site(address: Any) -> tuple[Optional[str], Optional[str], list[str]]:
+    """
+    (postcode, state, flags) from a free-text address. Never raises, for any input.
+
+    A digit group only counts as a postcode when it sits in a POSTCODE POSITION —
+    immediately after the state token ("... SA 5000", the standard AU format) or in the
+    trailing tail of the address. A leading "1234 Main North Rd" is a street number and
+    is never eligible, which is the whole point of this function.
+
+    When a state token and the postcode-derived state disagree, THE TOKEN WINS and the
+    postcode is dropped: a wrong state silently corrupts the entire financial envelope
+    (export limit, FiT, STC zone), whereas a missing postcode only costs precision.
+    Prefer no postcode to a wrong state.
+
+    Never guesses. A city name is not a state token — "Adelaide" alone yields nothing.
+    """
+    try:
+        if not isinstance(address, str):
+            return None, None, []
+        raw = address.strip()
+        if not raw:
+            return None, None, []
+
+        # Full state names -> abbreviations so both forms take one code path.
+        normalised = raw
+        for full, abbr in _FULL_STATE_NAMES:
+            normalised = re.sub(rf"\b{re.escape(full)}\b", abbr, normalised, flags=re.IGNORECASE)
+
+        tokens = re.findall(r"[A-Za-z]+|\d+", normalised)
+        upper = [t.upper() for t in tokens]
+
+        # Whole-token match only, so "Waterloo" never reads as WA. Last occurrence wins,
+        # so a street named "Victoria" is overridden by the real trailing state token.
+        state_idx = None
+        for i, tok in enumerate(upper):
+            if tok in _STATE_ABBRS:
+                state_idx = i
+        token_state = upper[state_idx] if state_idx is not None else None
+
+        # Trailing tail, ignoring a trailing country word.
+        end = len(tokens)
+        while end > 0 and upper[end - 1] in _COUNTRY_WORDS:
+            end -= 1
+        tail_start = max(0, end - 2)
+
+        postcode: Optional[str] = None
+        saw_unmappable = False
+
+        # (a) Immediately after the state token — the strongest signal.
+        if state_idx is not None and state_idx + 1 < len(tokens):
+            tok = tokens[state_idx + 1]
+            if tok.isdigit():
+                found = _as_postcode(tok)
+                if found:
+                    postcode = found
+                else:
+                    saw_unmappable = True
+
+        # (b) Otherwise the last candidate in the tail that maps to a real state.
+        if postcode is None:
+            for i in range(end - 1, tail_start - 1, -1):
+                tok = tokens[i]
+                if not tok.isdigit():
+                    continue
+                found = _as_postcode(tok)
+                if found:
+                    postcode = found
+                    break
+                saw_unmappable = True
+
+        derived_state = nem_data.postcode_to_state(postcode) if postcode else None
+        flags: list[str] = []
+
+        if token_state:
+            if postcode and derived_state and derived_state != token_state:
+                # Trust the token; drop the postcode rather than ship a wrong state.
+                flags.append("postcode_state_mismatch")
+                return None, token_state, flags
+            if postcode:
+                return postcode, token_state, flags
+            flags.append("postcode_not_found_in_address")
+            if saw_unmappable:
+                flags.append("state_not_derivable")
+            flags.append("postcode_from_state_token")
+            return None, token_state, flags
+
+        if postcode:
+            return postcode, derived_state, flags
+        flags.append("postcode_not_found_in_address")
+        if saw_unmappable:
+            flags.append("state_not_derivable")
+        return None, None, flags
+    except Exception as exc:  # noqa: BLE001 — derivation must never block job creation
+        logger.warning("job CRUD: site derivation failed for %r: %s", address, exc)
+        return None, None, []
+
+
+def _get_company_job(client: Any, job_id: str, company_id: str) -> dict:
+    """Fetch one job IFF it belongs to this company. Any other outcome — bad uuid,
+    no such job, someone else's job — is the same 404, so existence never leaks."""
+    try:
+        res = client.table("jobs").select("*").eq("job_id", job_id).limit(1).execute()
+        rows = getattr(res, "data", None) or []
+    except Exception as exc:  # noqa: BLE001 — bad uuid etc. must read as not-found
+        logger.info("job CRUD: job fetch failed for %r: %s", job_id, exc)
+        raise _NOT_FOUND from None
+    if not rows or rows[0].get("company_id") != company_id:
+        raise _NOT_FOUND
+    return rows[0]
+
+
+class JobCreateRequest(BaseModel):
+    """Body for POST /api/job. Deliberately contains NO company_id / installer_id —
+    pydantic drops unknown keys, so a payload asserting either is ignored silently."""
+
+    address: str = Field(min_length=1)
+    customer_name: Optional[str] = None
+    has_existing_solar: Optional[bool] = None
+    existing_solar_kw: Optional[float] = None
+    existing_inverter_kw: Optional[float] = None
+    intent: Optional[Literal["solar", "battery", "both"]] = None
+
+
+class StatusPatchRequest(BaseModel):
+    status: Literal["draft", "sized", "sent", "won", "installed", "lost"]
+
+
+@router.post("/api/job")
+async def create_job(body: JobCreateRequest, caller: Caller = Depends(require_company)):
+    """Create a draft job for the caller's company. Identity from the token, only."""
+    client = _require_svc()
+
+    # Site derivation — never guess, never crash; a miss is a null plus a flag.
+    # An incomplete address is still a valid job: creation succeeds regardless and the
+    # accuracy meter reflects what could not be derived.
+    postcode, state, flags = _derive_site(body.address)
+    dnsp = (nem_data.get_dnsp(state, postcode) or None) if state else None
+    if state and dnsp is None:
+        flags.append("dnsp_not_derivable")
+
+    row = {
+        "job_id": str(uuid.uuid4()),
+        "company_id": caller.company_id,      # from the Caller — the body has no say
+        "installer_id": caller.user_id,       # from the Caller — the body has no say
+        "status": "draft",
+        "site_postcode": postcode,
+        "site_state": state,
+        "site_dnsp": dnsp,
+        "has_existing_solar": body.has_existing_solar,
+        "existing_solar_kw": body.existing_solar_kw,
+        "existing_inverter_kw": body.existing_inverter_kw,
+        "intent": body.intent,
+        # `path` is NEVER written — it is a GENERATED column; the DB derives it.
+    }
+    try:
+        client.table("jobs").insert(row).execute()
+        created = (
+            client.table("jobs").select("*").eq("job_id", row["job_id"]).limit(1).execute()
+        ).data[0]
+    except Exception as exc:  # noqa: BLE001
+        sentry_sdk.capture_exception(exc)
+        return JSONResponse(status_code=500, content={"detail": "job create failed"})
+
+    # PII (name + full address) goes to job_customers, never onto jobs.
+    try:
+        client.table("job_customers").upsert(
+            {
+                "job_id": created["job_id"],
+                "customer_name": body.customer_name,
+                "property_address_full": body.address,
+            },
+            on_conflict="job_id",
+        ).execute()
+    except Exception as exc:  # noqa: BLE001 — job exists; PII miss is flagged, not fatal
+        sentry_sdk.capture_exception(exc)
+        flags.append("customer_not_persisted")
+
+    path = created.get("path")  # read back from the DB — the single source of truth
+    return {
+        **created,
+        "path_label": job_paths.PATH_LABELS.get(path) if path else None,
+        "address": body.address,
+        "customer_name": body.customer_name,
+        "flags": flags,
+    }
+
+
+@router.get("/api/jobs")
+async def list_jobs(
+    caller: Caller = Depends(require_company),
+    status: Optional[list[str]] = Query(default=None),
+    q: Optional[str] = None,
+    sort: str = "updated_desc",
+    limit: int = Query(default=50, ge=1, le=200),
+    offset: int = Query(default=0, ge=0),
+):
+    """The caller's company's jobs — only ever theirs — plus the dashboard KPI strip."""
+    client = _require_svc()
+    if status:
+        bad = [s for s in status if s not in _VALID_STATUSES]
+        if bad:
+            raise HTTPException(status_code=422, detail=f"invalid status filter: {bad}")
+    if sort not in _SORTS:
+        raise HTTPException(status_code=422, detail=f"invalid sort: {sort!r}")
+    order_col, order_desc = _SORTS[sort]
+
+    try:
+        # Every query in this endpoint starts from .eq("company_id", caller.company_id).
+        # There is intentionally no code path that omits it.
+        query = (
+            client.table("jobs").select("*").eq("company_id", caller.company_id)
+        )
+        if status:
+            query = query.in_("status", status)
+        jobs = (query.order(order_col, desc=order_desc).execute()).data or []
+
+        job_ids = [j["job_id"] for j in jobs]
+        customers: dict[str, dict] = {}
+        sizing: dict[str, dict] = {}
+        financial: dict[str, dict] = {}
+        if job_ids:
+            for r in (
+                client.table("job_customers")
+                .select("job_id, customer_name, property_address_full")
+                .in_("job_id", job_ids)
+                .execute()
+            ).data or []:
+                customers[r["job_id"]] = r
+            for r in (
+                client.table("sizing_results")
+                .select("job_id, solar_kw, battery_kwh, created_at")
+                .in_("job_id", job_ids)
+                .order("created_at", desc=True)
+                .execute()
+            ).data or []:
+                sizing.setdefault(r["job_id"], r)  # newest first — keep the latest
+            for r in (
+                client.table("financial_results")
+                .select("job_id, payback_years, created_at")
+                .in_("job_id", job_ids)
+                .order("created_at", desc=True)
+                .execute()
+            ).data or []:
+                financial.setdefault(r["job_id"], r)
+    except Exception as exc:  # noqa: BLE001
+        sentry_sdk.capture_exception(exc)
+        return JSONResponse(status_code=500, content={"detail": "job list failed"})
+
+    rows = []
+    for j in jobs:
+        cust = customers.get(j["job_id"]) or {}
+        siz = sizing.get(j["job_id"]) or {}
+        fin = financial.get(j["job_id"]) or {}
+        path = j.get("path")
+        rows.append(
+            {
+                "job_id": j["job_id"],
+                "customer_name": cust.get("customer_name"),
+                "address": cust.get("property_address_full"),
+                "status": j.get("status"),
+                "path": path,
+                "path_label": job_paths.PATH_LABELS.get(path) if path else None,
+                # Null headline figures when un-sized — the row itself is never omitted.
+                "headline": {
+                    "solar_kw": _num(siz.get("solar_kw")),
+                    "battery_kwh": _num(siz.get("battery_kwh")),
+                    "payback_years": _num(fin.get("payback_years")),
+                },
+                "accuracy_tier": j.get("accuracy_tier"),
+                "assigned_to": j.get("assigned_to"),
+                "notes": j.get("notes"),
+                "scheduled_date": j.get("scheduled_date"),
+                "event_type": j.get("event_type"),
+                "updated_at": j.get("updated_at"),
+            }
+        )
+
+    if q:
+        needle = q.strip().lower()
+        rows = [
+            r
+            for r in rows
+            if needle in (r["address"] or "").lower()
+            or needle in (r["customer_name"] or "").lower()
+        ]
+
+    total = len(rows)
+    rows = rows[offset : offset + limit]
+
+    # KPIs — over ALL of this company's jobs, ignoring the list filters above.
+    try:
+        all_jobs = (
+            client.table("jobs")
+            .select("job_id, status, quoted_value_aud, updated_at")
+            .eq("company_id", caller.company_id)
+            .execute()
+        ).data or []
+    except Exception as exc:  # noqa: BLE001
+        sentry_sdk.capture_exception(exc)
+        all_jobs = []
+
+    now = datetime.now(timezone.utc)
+    win_from = now - timedelta(days=90)
+    pipeline = sum(
+        _num(j.get("quoted_value_aud")) or 0.0
+        for j in all_jobs
+        if j.get("status") in ("sized", "sent")
+    )
+    won_90 = lost_90 = 0
+    won_month_count = 0
+    won_month_value = 0.0
+    for j in all_jobs:
+        ts = _parse_ts(j.get("updated_at"))
+        if j.get("status") == "won":
+            if ts and ts >= win_from:
+                won_90 += 1
+            if ts and ts.year == now.year and ts.month == now.month:
+                won_month_count += 1
+                won_month_value += _num(j.get("quoted_value_aud")) or 0.0
+        elif j.get("status") == "lost" and ts and ts >= win_from:
+            lost_90 += 1
+    denom = won_90 + lost_90
+    kpis = {
+        "pipeline_value": round(pipeline, 2),
+        "win_rate": round(won_90 / denom, 4) if denom else None,  # null, not 0, when empty
+        "in_progress": sum(1 for j in all_jobs if j.get("status") in ("draft", "sized", "sent")),
+        "won_this_month": {"count": won_month_count, "value": round(won_month_value, 2)},
+    }
+
+    return {"jobs": rows, "total": total, "limit": limit, "offset": offset, "kpis": kpis}
+
+
+@router.get("/api/job/{job_id}")
+async def get_job(job_id: str, caller: Caller = Depends(require_company)):
+    """One job + a faithful dump of every child table. 404 when absent OR not yours."""
+    client = _require_svc()
+    job = _get_company_job(client, job_id, caller.company_id)
+
+    children: dict[str, list] = {}
+    for key, table in _CHILD_TABLES:
+        # A missing/unreadable child table yields an empty list for its key, never a 500.
+        try:
+            res = client.table(table).select("*").eq("job_id", job_id).execute()
+            children[key] = getattr(res, "data", None) or []
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("job CRUD: hydration of %s failed for %s: %s", table, job_id, exc)
+            children[key] = []
+
+    path = job.get("path")
+    return {
+        **job,
+        "path_label": job_paths.PATH_LABELS.get(path) if path else None,
+        **children,
+    }
+
+
+@router.patch("/api/job/{job_id}/status")
+async def patch_job_status(
+    job_id: str, body: StatusPatchRequest, caller: Caller = Depends(require_company)
+):
+    """Manual status transition. Automatic advancing on result-save is a later task."""
+    client = _require_svc()
+    _get_company_job(client, job_id, caller.company_id)  # 404 when absent or not yours
+
+    try:
+        client.table("jobs").update(
+            {"status": body.status, "updated_at": datetime.now(timezone.utc).isoformat()}
+        ).eq("job_id", job_id).eq("company_id", caller.company_id).execute()
+        updated = (
+            client.table("jobs").select("*").eq("job_id", job_id).limit(1).execute()
+        ).data[0]
+    except Exception as exc:  # noqa: BLE001
+        sentry_sdk.capture_exception(exc)
+        return JSONResponse(status_code=500, content={"detail": "status update failed"})
+
+    path = updated.get("path")
+    return {
+        **updated,
+        "path_label": job_paths.PATH_LABELS.get(path) if path else None,
+    }

@@ -380,6 +380,35 @@ BORDER = "rgba(255, 255, 255, 0.08)" # Subtle borders
 
 ---
 
+## Stage 1 additions (2026-08-06) — modules and tables that did not exist before
+
+**New backend modules**
+- `backend/auth.py` — **the security boundary.** `Caller` / `require_caller` / `require_company` / `require_owner`.
+  Validates the Supabase JWT REMOTELY (`auth.get_user`); never decode or verify a JWT by hand anywhere in this repo.
+  Fail-closed: Supabase unreachable → 503, never a Caller. Identity comes ONLY from the validated token plus the
+  server-side `company_members` lookup — NEVER from the request body. 60s token cache.
+- `backend/job_paths.py` — `derive_path(has_existing_solar, intent)` + `PATH_LABELS`. Pure, never raises.
+  **`jobs.path` is a Postgres GENERATED column and is the source of truth** — never write to it; this helper only
+  derives the value before insert / for display.
+
+**WHERE MIGRATIONS LIVE:** Supabase migration `.sql` files are NOT in this repository. They are at
+`../supabase/migrations/` — one level up, in the `enrgengine` workspace repo (which also holds `docs/`). This repo
+holds application code only. When you write a migration, the file belongs there; commit it in that repo.
+
+**New tables:** `companies`, `company_members` (owner|installer).
+**New endpoints (all require auth):** `POST /api/job`, `GET /api/jobs`, `GET /api/job/{id}`, `PATCH /api/job/{id}/status`, `GET /api/auth/me`.
+
+**RULES THAT NOW APPLY TO EVERY NEW ENDPOINT**
+1. **The service-role key bypasses RLS.** Company-scoped policies give backend endpoints NO protection — every query
+   must filter by `caller.company_id` in application code.
+2. **Cross-company access returns 404, never 403.** A 403 confirms the record exists, which leaks information.
+3. **Never trust identity from a payload.** `installer_id` / `company_id` in a request body are assertions; use the
+   `Caller`.
+4. **capture.py has a per-table column allowlist.** A new column not added to `_ALLOWED` is SILENTLY DROPPED on write.
+5. **`origin`/`verified`/`owner_company_id` on equipment** — `source` means datasheet provenance, do not confuse them.
+
+---
+
 ## Conventions Claude Code must not re-derive
 
 - **`accuracy_tier` is stored as an INTEGER** (`1` / `2` / `3`), not the string `"tier_3"`. This was a deliberate
@@ -391,6 +420,14 @@ BORDER = "rgba(255, 255, 255, 0.08)" # Subtle borders
   worked examples from different retailers is still outstanding (OPEN_ITEMS "Bill parser — Claude Vision retained").
 - **Cost model is bottom-up** (catalogue hardware + soft costs - STC - rebate). `pricing_benchmarks.json` and the
   flat $/kW approach are superseded — do not reintroduce them.
+- **Landing-page signup MUST keep `Prefer: return=minimal`.** As of 2026-08-05 `anon` holds INSERT only on
+  `registrations` / `questionnaire_responses` (SELECT/UPDATE/DELETE revoked). Switching to `return=representation`
+  makes PostgREST read the row back, which `anon` cannot do — live signups would 401. Fix the header, never re-grant
+  SELECT to anon on those tables.
+- **`TRUNCATE` and `MAINTAIN` are NOT subject to RLS.** Enabling RLS does not protect against them; only revoking the
+  privilege does. TRUNCATE was revoked 2026-08-05; MAINTAIN is still outstanding (see OPEN_ITEMS).
+- **`rls_auto_enable()` / the `ensure_rls` event trigger are deliberate and correct** — they auto-enable RLS on every
+  new table in `public`. EXECUTE is granted only to `postgres` and `search_path` is pinned. Do not remove them.
 - **Current build sequence** = `docs/2026-08-05-master-build-checklist.md`. `BUILD_SEQUENCE.md`'s Wave 1/Wave 2
   frontend order predates the 2026-08-04 six-path + load-insight decisions.
 
