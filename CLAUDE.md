@@ -3,14 +3,22 @@
 > Read this file at the start of every session. It contains everything you need to
 > understand the project, avoid breaking things, and build features correctly.
 
-> ⚠️ MIGRATION IN PROGRESS — May 2026
+> ✅ MIGRATION COMPLETE — June 2026
 >
-> The platform is migrating from Streamlit to FastAPI + Next.js + Tailwind CSS + shadcn/ui.
-> `app.py` is legacy code — do not add new features to it.
-> Python modules (bill_parser.py, sizing_engine.py, financial_model.py, solar_irradiance.py,
-> database.py, nem_data.py) are being retained as FastAPI endpoints — do not modify their
-> function signatures or data contracts without explicit instruction.
-> See docs/BUILD_SEQUENCE.md Phase 0 for the migration build order.
+> The platform has migrated from Streamlit to **FastAPI + Next.js 15 (App Router) +
+> Tailwind CSS + shadcn/ui**. Phase 0 scaffolding is done; the dashboard is built as
+> Next.js panels backed by FastAPI routes.
+> `app.py` and `report_generator.py` are **legacy Streamlit-era code** — do not read them
+> for current behaviour and do not add features to them. The live code is under `backend/`
+> and `frontend/`.
+> The retained Python modules (`bill_parser.py`, `sizing_engine.py`, `financial_model.py`,
+> `solar_irradiance.py`, `database.py`, `capture.py`, `nem_data.py` when built) live under
+> `backend/` and are wired as FastAPI routes — do not modify their function signatures or
+> data contracts without explicit instruction.
+>
+> **Authoritative build status / roadmap:** `docs/PROGRESS.md` (what's built),
+> `docs/features.md` (feature list + status), `docs/BUILD_SEQUENCE.md` (ordered prompts).
+> This file is the stable project guide; those three are the live state.
 
 ---
 
@@ -23,47 +31,47 @@ mathematically optimal system size for their situation.
 
 **Positioning in one line:** "Accurate Solar + BESS sizing reports your customers can trust."
 
-**The workflow:**
+**The workflow:** *(address-anchored — full design in `docs/2026-06-12-workflow-IA-design.md`)*
 ```
 Customer inquiry
       ↓
-Installer uploads bill + enters site details
+Installer enters the property address (→ roof geometry + PVGIS irradiance resolve)
       ↓
-EnrgEngine: bill parse → PVGIS irradiance → MILP sizing → financial model
+Adds usage (bill upload / interval CSV / load survey) + tariff + objective
       ↓
-Interactive dashboard shows all results — installer verifies numbers live
+EnrgEngine: roof + per-plane generation → solar optimiser → battery LP → bottom-up cost
       ↓
-"Generate Report" → white-label PDF downloaded
+Living-worksheet dashboard — installer verifies live + tunes inputs (A/B what-if)
+      ↓
+Save job  ·  "Generate Report" → white-label PDF
 ```
 
-**Build philosophy:** Dashboard-first. Every feature is built as a live display panel
-on the Streamlit dashboard first. The installer (and developer) can see and verify all
-data immediately. The PDF report is built last — it just renders data that is already
-verified on the dashboard.
+**Build philosophy:** API-first, then dashboard. Each feature is built as a FastAPI endpoint
+returning a verified JSON response, then surfaced as a Next.js panel where the installer (and
+developer) can see and verify all data immediately. The PDF report renders data already proven
+correct on the dashboard.
 
 ---
 
 ## How to Run Locally
 
-The platform is migrating to FastAPI + Next.js. Until migration is complete, the legacy
-Streamlit app can be run for reference only — do not build new features here.
-
 ```bash
-# Legacy Streamlit (reference only)
-pip install -r requirements.txt
-streamlit run app.py  # runs at http://localhost:8501
+# Backend (FastAPI)
+cd backend && uvicorn main:app --reload      # http://localhost:8000
+
+# Frontend (Next.js 15)
+cd frontend && npm run dev                   # http://localhost:3000
 ```
 
-New platform run instructions will replace this section once Phase 0 scaffolding is complete:
-- FastAPI backend: `uvicorn main:app --reload` (target: http://localhost:8000)
-- Next.js frontend: `npm run dev` (target: http://localhost:3000)
+Legacy Streamlit (`app.py`) is retired — reference only, do not run for current behaviour.
 
 ---
 
 ## Environment Variables
 
-All secrets live in `.env` (FastAPI backend, local dev). Never use `st.secrets` — the
-Streamlit layer is being removed. **Never hardcode API keys. Never commit .env to git.**
+Backend secrets live in `backend/.env` (local dev) and in the Railway dashboard (deploy).
+Frontend secrets live in `frontend/.env.local`. **Never hardcode API keys. Never commit
+`.env`. Never expose the Supabase service-role key to the client.**
 
 FastAPI backend access pattern:
 ```python
@@ -73,24 +81,25 @@ load_dotenv()
 api_key = os.getenv("ANTHROPIC_API_KEY")
 ```
 
-Next.js frontend secrets live in `.env.local` (prefixed `NEXT_PUBLIC_` for client-side,
-unprefixed for server-side only). Never expose Supabase service keys to the client.
-
 Required variables (backend `.env`):
 ```
-ANTHROPIC_API_KEY=...          # Claude Vision for bill parsing — stay on Claude Vision, do NOT use Mistral
-SUPABASE_URL=...               # Supabase project URL
-SUPABASE_ANON_KEY=...          # Supabase anon/public key
-GOOGLE_SOLAR_API_KEY=...       # Google Solar API — Phase 2
-SOLCAST_API_KEY=...            # Solcast irradiance — Phase 2
-SENTRY_DSN=...                 # Sentry error tracking — set up at migration start
+ANTHROPIC_API_KEY=...           # Claude Vision for bill parsing — stay on Claude Vision, do NOT use Mistral
+SUPABASE_URL=...                # Supabase project URL
+SUPABASE_ANON_KEY=...           # Supabase anon/public key
+SUPABASE_SERVICE_ROLE_KEY=...   # Server-side only — PII writes + capture-table access (added D4). NEVER expose to client.
+GOOGLE_SOLAR_API_KEY=...        # Google Solar API — roof geometry (Solar Sizing Rebuild)
+SOLCAST_API_KEY=...             # Solcast irradiance — Phase 2 upgrade
+SENTRY_DSN=...                  # Sentry error tracking
 ```
 
-Supabase connection:
+Frontend (`frontend/.env.local`): `NEXT_PUBLIC_SUPABASE_URL`, `NEXT_PUBLIC_SUPABASE_ANON_KEY`
+(client-side, prefixed). Server-side-only secrets stay unprefixed.
+
+Supabase connection (backend; prefers the service-role key where available):
 ```python
 from supabase import create_client
 url = os.getenv("SUPABASE_URL")
-key = os.getenv("SUPABASE_ANON_KEY")
+key = os.getenv("SUPABASE_SERVICE_ROLE_KEY") or os.getenv("SUPABASE_ANON_KEY")
 supabase = create_client(url, key)
 ```
 
@@ -99,24 +108,41 @@ supabase = create_client(url, key)
 ## File Structure
 
 ```
-app.py                  # Streamlit UI — dashboard-first, single-page layout
-bill_parser.py          # Claude Vision bill parsing → structured dict
-sizing_engine.py        # Solar + battery sizing (heuristic Phase 1, MILP Phase 2)
-financial_model.py      # Financial KPIs — payback, NPV, ROI, savings
-solar_irradiance.py     # PVGIS API integration for solar production data
-nem_data.py             # NEM-specific: DNSP limits, tariff library, STC, VPP (to build)
-database.py             # Supabase persistence (replaces old Firebase version)
-requirements.txt        # Python dependencies
-.env                    # Local secrets (gitignored)
+backend/
+  main.py               # FastAPI app — CORS, route registration, health check
+  routes/               # API endpoints (bill, solar, sizing, financial, load, job, report, nem)
+  bill_parser.py        # Claude Vision bill parsing → structured dict (+ structured tariff, D2)
+  sizing_engine.py      # Solar + battery sizing — MILP/optimiser (Phase 1 accuracy core; heuristic being replaced). See PROGRESS.md "Solar Sizing Rebuild"
+  financial_model.py    # Financial KPIs — payback, NPV, ROI, savings
+  solar_irradiance.py   # PVGIS API integration for solar production data
+  nem_data.py           # NEM-specific: DNSP lookup + export limits + FiT defaults (built); STC / tariff library / VPP to come
+  database.py           # Supabase persistence (reports, installer profiles)
+  capture.py            # ML data-flywheel write layer (D1–D5) — best-effort, never raises
+  requirements.txt      # Python dependencies
+  .env                  # Local backend secrets (gitignored)
+
+frontend/
+  app/dashboard/        # inputs / outputs / report / workflow pages (App Router)
+  components/panels/    # one component per dashboard panel
+  components/           # NavTabs, RunAnalysisButton, JobAutoSave, etc.
+  lib/store.ts          # Zustand in-session state (billData, customerInputs, solarData, sizingData, ...)
+  lib/api.ts            # typed fetch client for all backend endpoints
+  lib/plotly-theme.ts   # ENRG Plotly layout/config (amber/dark brand)
+  .env.local            # Frontend secrets (gitignored)
 ```
 
-**Do not use or modify:**
-- `report_generator.py` — PDF generation is Phase 3. Ignore this file entirely for now.
-- `calculator.py` — Dead code. Delete from repo.
+**Legacy — do not use or modify:**
+- `app.py` — legacy Streamlit UI. Superseded by `frontend/`. Reference only.
+- `report_generator.py` — legacy. The live PDF is `backend/routes/report.py` (ReportLab).
+- `calculator.py` — dead code, not connected.
 
 ---
 
 ## Data Contracts — What Each Module Returns
+
+The retained Python modules keep their contracts. The pipeline is
+`bill_parser` → `sizing_engine` → `financial_model` → report. Do not break a contract
+without updating every caller.
 
 ### `bill_parser.parse_bill(file_path: str) → dict`
 ```python
@@ -126,19 +152,25 @@ requirements.txt        # Python dependencies
     "billing_period_end": str | None,     # ISO date YYYY-MM-DD
     "total_kwh": float | None,
     "daily_avg_kwh": float | None,
-    "tariff_rate": float | None,          # AUD per kWh (e.g. 0.32)
+    "tariff_rate": float | None,          # AUD per kWh (e.g. 0.32) — scalar, retained
     "feed_in_tariff": float,              # AUD per kWh, defaults to 0.0
     "annual_spend": float | None,         # AUD, extrapolated
     "retailer": str | None,
     "plan_name": str | None,
     "historical_usage": list[dict],       # [{period_label, kwh, days}, ...]
     "has_solar": bool,                    # defaults to False
-    "nmi": str | None,                   # National Metering Identifier (10-11 digits)
-    "daily_supply_charge": float | None, # AUD per day (e.g. 1.12)
+    "nmi": str | None,                    # National Metering Identifier (10-11 digits)
+    "daily_supply_charge": float | None,  # AUD per day (e.g. 1.12)
+    # --- added in D2 (structured-tariff extension) ---
+    "tariff_structured": dict,            # {tariff_type, supply_charge, tou_windows[], demand_charges[], controlled_load[], block_tiers[], fit_tiers[]} — never None
+    "parse_confidence": dict,             # {field: 0.0-1.0}
+    "field_provenance": dict,             # {field: "extracted" | "default"}
+    "parser_version": str,                # e.g. "2026-06-10-structured-tariff-v2"
 }
 ```
-**Note:** `tariff_rate` is in AUD/kWh (NOT cents). If the bill shows cents, the parser
-converts automatically. Always check for None before using.
+**Note:** `tariff_rate` is in AUD/kWh (NOT cents) and is retained unchanged for downstream
+callers; `tariff_structured` is the richer object (TOU windows etc.). The bill upload route
+also returns `raw_file_path` (private `bills` Storage bucket). Always check for None.
 
 ### `solar_irradiance.fetch_pvgis_profile(address, peakpower_kwp=6.6) → dict`
 ```python
@@ -150,16 +182,15 @@ converts automatically. Always check for None before using.
     "monthly_profile": list[float],       # 12 values, kWh/month for peakpower_kwp system
 }
 ```
-**Note:** `monthly_profile` is for a `peakpower_kwp`-sized system (default 6.6kW).
-To scale to a different system size: `value * (solar_kw / 6.6)`. See `app.py →
-_scaled_monthly_generation()`.
+**Note:** `monthly_profile` is for a `peakpower_kwp`-sized system (default 6.6kW). To scale to
+a different system size, multiply by `(solar_kw / 6.6)` (done in the Solar panel on the frontend).
 
 ### `sizing_engine.size_system(bill_data, solar_data, budget, wants_battery, occupancy) → dict`
 ```python
 {
     "solar_kw": float,
     "battery_kwh": float,
-    "self_consumption_ratio": float,        # effective ratio (0..1)
+    "self_consumption_ratio": float,         # effective ratio (0..1)
     "assumed_self_consumption_ratio": float, # occupancy-based input assumption
     "occupancy": str,                        # "home_all_day" | "mixed" | "away_during_day"
     "system_cost": float,                    # AUD
@@ -167,9 +198,10 @@ _scaled_monthly_generation()`.
     "within_budget": bool,
 }
 ```
-**Current state:** Simple heuristic model (not true MILP yet). `solar_kw` is stepped
-in 0.1kW increments to maximise annual kWh served within budget. Battery is sized from
-daily surplus. This is the primary module to upgrade — replace heuristic with MILP.
+**Current state:** Being rebuilt from the legacy heuristic to the accurate MILP/optimiser
+pipeline as the **Phase 1 accuracy core** (see `docs/PROGRESS.md` "Solar Sizing Rebuild" and
+`docs/2026-06-04-solar-sizing-build-plan.md`). **MILP is Phase 1, not Phase 2.** Do not treat
+the heuristic as the target — the MILP pipeline is. Solar sized first, battery second.
 
 ### `financial_model.calculate_financials(bill_data, sizing_data, solar_data) → dict`
 ```python
@@ -192,65 +224,51 @@ daily surplus. This is the primary module to upgrade — replace heuristic with 
 }
 ```
 **Known issue:** `projected_annual_spend` shows $0 when savings exceed current spend.
-This is mathematically correct but misleading in the UI. Fix: show "Bill eliminated +
-$X export income" instead of "$0 projected spend."
-
-### `report_generator.generate_report(...) → str`
-Returns the file path to the generated PDF. Alias for `generate_pdf_report()`.
-Takes: `bill_data`, `solar_data`, `sizing_data`, `financial_data`, `customer_name`,
-`property_address`.
+Mathematically correct but misleading in the UI. Fix: show "Bill eliminated + $X export
+income" instead of "$0 projected spend."
 
 ### `database.save_report(report_data: dict) → str`
-Saves to Supabase `reports` table. Returns the record ID. Adds `created_at`
-automatically. If Supabase is unavailable, raises an exception — caller must catch.
+Saves to Supabase `reports` table. Returns the record ID, adds `created_at`. If Supabase is
+unavailable it raises — the caller must catch.
+
+### `capture.py` (ML data-flywheel write layer — D1–D5)
+`save_job`, `save_bill`, `save_tariff`, `save_survey`, `save_load_profile`,
+`save_solar_resource`, `save_sizing_result`, `save_financial_result`, `save_correction`.
+Each takes a dict, writes one row, returns a pk or `None`. **Best-effort: never raises** —
+a failed capture never blocks the user flow. Strategy: `docs/2026-06-05-ml-data-flywheel-plan.md`.
 
 ---
 
-## Current App Flow (app.py)
+## Current Architecture
 
-Single-page dashboard. No stages, no paywall, no sidebar.
+Next.js dashboard backed by FastAPI routes; in-session state in a Zustand store; persisted
+data in Supabase. Plotly.js for all charts. **Panel-by-panel detail (what each panel does,
+which route it calls, known fixes) is maintained in `docs/PROGRESS.md` — read it for current
+state.** High level:
 
-**Tab layout:**
-- Tab 1 "Installer Inputs" — all user inputs: installer profile (collapsible
-  expander at top), customer name, property address, bill upload, occupancy,
-  budget, wants_battery. Run Analysis button at the bottom.
-- Tab 2 "Bill Data & Usage" — outputs only: bill data panel + usage history
-  chart. Shown after analysis runs.
-- Future tabs: all additional output panels added here as Phase 1 continues.
+- `frontend/app/dashboard/` — `inputs` (all input panels + Run Analysis), `outputs` (result
+  panels), `report` (Report Builder), `workflow` (informational flowchart).
+- `frontend/components/panels/` — one component per panel (Installer Profile, Bill, Customer &
+  Site, Solar, Sizing, Load Profile/Survey, Financial, Network, Incentives).
+- `frontend/lib/store.ts` — Zustand: `billData`, `customerInputs`, `solarData`, `sizingData`,
+  load/survey results, `jobId`, `trainingConsent`, `pendingCorrections`, `assembleJobPayload()`.
+- `backend/routes/` — one module per endpoint; each catches exceptions and returns a safe JSON
+  error, never a traceback.
 
-**Key functions:**
-- `_set_global_styles()` — Google Fonts (Syne + DM Sans), brand CSS, Streamlit
-  tab overrides, fixed nav bar HTML with base64 WebP logo extracted from
-  `../ENRG-ENGINE-landing/index.html`
-- `_merge_bill_data(bill_data_list)` — returns (primary_bill_data,
-  combined_usage_periods, combined_stats). Uses each bill's own
-  billing_period_start / end / total_kwh only — NOT historical_usage from bill
-  visual charts (those are imprecise estimates, not meter reads)
-- `_panel_bill_data(primary_bill_data, combined_stats)` — combined stats for
-  usage fields; primary bill for tariff / retailer / NMI; annual spend breakdown
-  showing energy component + supply component separately
-- `_panel_usage_history_from_bill(combined_usage_periods)` — vertical Plotly
-  bar chart, one bar per uploaded bill, amber bars, dark background
-- `_input_form()` — Tab 1 layout: installer profile expander at top, then
-  customer + bill inputs below
-- `_render_results()` — Tab 2 layout
-- `main()` — st.tabs(["Installer Inputs", "Bill Data & Usage"])
-
-**Annual spend formula:**
+**Annual spend formula (business logic — unchanged):**
 ```
 energy_component  = daily_avg_kwh × tariff_rate × 365
 supply_component  = daily_supply_charge × 365
 annual_spend      = energy_component + supply_component
 ```
-Both components stored separately in combined_stats as `annual_energy_component`
-and `annual_supply_component` for display in the bill data panel.
+Energy and supply components are stored/displayed separately in the bill data panel.
 
 ---
 
 ## Brand & Design System
 
-Apply these everywhere — Streamlit UI, matplotlib charts, reportlab PDF.
-No exceptions. No matplotlib defaults visible in any output.
+Apply everywhere — Next.js UI, Plotly charts, ReportLab PDF. No exceptions. No Plotly/matplotlib
+defaults visible in any output.
 
 ```python
 AMBER  = "#FFB428"   # Primary accent — solar, positive outcomes, highlights
@@ -267,7 +285,7 @@ BORDER = "rgba(255, 255, 255, 0.08)" # Subtle borders
 **Typography:**
 - Headings / logo: Syne ExtraBold (Syne-ExtraBold.ttf)
 - Body: DM Sans Regular / Medium
-- In matplotlib/reportlab: embed font files or use closest available
+- In ReportLab PDF: embed font files or use the closest available
 
 **PDF report rules:**
 - Installer logo top-left on every page (white-label)
@@ -277,115 +295,81 @@ BORDER = "rgba(255, 255, 255, 0.08)" # Subtle borders
 - White background for PDF (light theme) — not dark mode
 - Brand colours on all charts, section headers, accent elements
 
----
-
-## What's Already Branding Wrong (Fix These)
-
-The existing code has OLD branding. When touching these files, fix:
-
-| File | Old value | Replace with |
-|------|-----------|--------------|
-| `app.py` | `"AppEng.ai"` in header | `"EnrgEngine"` |
-| `app.py` | `NAVY = "#1a1a2e"`, `ORANGE = "#FF6B35"` only | Full brand palette above |
-| `report_generator.py` | `"AppEng.ai"` in footer | Remove — PDF is white-label, no engine branding |
-| `report_generator.py` | `ACCENT_COLOR = "#FF6B35"`, `NAVY_COLOR = "#1a1a2e"` | Full palette above |
-| `report_generator.py` | `ax.bar(..., color="#2E86AB")` | Use `AMBER` |
-| `report_generator.py` | `support@appeng.ai` in footer | `info@enrgengine.com` |
+> Branding is implemented in the live stack (`frontend/` + `backend/routes/report.py`). The old
+> `app.py` / `report_generator.py` "AppEng.ai" branding is legacy and not used — ignore it
+> unless explicitly asked to touch a legacy file (you shouldn't need to).
 
 ---
 
 ## Rules Claude Code Must Always Follow
 
-1. **Never hardcode API keys.** Use `os.getenv("KEY_NAME")` with `load_dotenv()` for
-   local, and `st.secrets["KEY_NAME"]` for Streamlit Cloud paths.
+1. **Never hardcode API keys.** Use `os.getenv("KEY_NAME")` with `load_dotenv()` (backend) and
+   `process.env` (Next.js). Never expose the Supabase service-role key to the client.
 
-2. **Never modify `calculator.py`.** It's a legacy file and is not used by the app.
+2. **Never modify legacy files** (`app.py`, `report_generator.py`, `calculator.py`) — they are
+   not part of the live stack.
 
-3. **Never break the data contracts.** If you change what a function returns, update
-   every caller. The pipeline is: `bill_parser` → `sizing_engine` → `financial_model`
-   → `report_generator`. Each consumes the previous module's output dict directly.
+3. **Never break the data contracts.** If you change what a function returns, update every
+   caller. Pipeline: `bill_parser` → `sizing_engine` → `financial_model` → report.
 
-4. **Always use Plotly for dashboard charts.** Matplotlib is for PDF only. Dashboard
-   charts use `st.plotly_chart()` with brand colours. Never add matplotlib charts to
-   the Streamlit UI.
+4. **Always use Plotly for dashboard charts**, with brand colours via `lib/plotly-theme.ts`
+   (`react-plotly.js`, SSR disabled). ReportLab is for the PDF only.
 
-5. **Never add a paywall or payment gate.** The old `"teaser"` stage simulated this.
-   It is being removed. The new architecture gives installers full access immediately.
+5. **Never add a paywall or payment gate.** Installers get full access immediately. (Premium
+   gating is a separate, later subscription concern — see OPEN_ITEMS.md.)
 
-6. **Dashboard-first.** Every new feature must display its output on the dashboard
-   before any PDF work begins. The PDF is built after the dashboard data is verified.
+6. **API-first, dashboard-first.** Build the endpoint with a verified JSON response, surface it
+   as a panel, verify on screen — before any PDF work.
 
-7. **Fail gracefully.** Supabase errors must not block the user flow — catch and warn,
-   never crash. PVGIS timeouts must surface a user-friendly message, not a stack trace.
+7. **Fail gracefully.** Supabase errors must not block the user flow — catch and warn, never
+   crash. External API timeouts (PVGIS, Google Solar, Energy Made Easy) must surface a
+   user-friendly message, not a stack trace. Capture writes are best-effort and never block.
 
-8. **All new Streamlit inputs → `st.session_state`.** Never store user inputs in local
-   variables only — they won't survive a rerun.
+8. **All frontend in-session state → the Zustand store (`lib/store.ts`).** Never keep user
+   inputs in component-local state only where they need to survive navigation.
 
-9. **Do not touch `sizing_engine.py` unless the prompt explicitly says to.** It is the
-   most complex module and changes cascade. Treat it as read-only unless scoped.
+9. **Do not touch `sizing_engine.py` unless the prompt explicitly says to.** It is the most
+   complex module and changes cascade. Treat it as read-only unless scoped.
 
-10. **When in doubt about scope, do less and flag it.** Add a `# TODO:` comment and
-    tell Mayur what you skipped rather than guessing and introducing bugs.
+10. **When in doubt about scope, do less and flag it.** Add a `# TODO:` comment and tell Mayur
+    what you skipped rather than guessing and introducing bugs.
 
 ---
 
 ## Feature Roadmap (Build Order)
 
-Build in this order. Do not skip ahead. Each step depends on the previous.
+> **Authoritative, live status is in `docs/PROGRESS.md`, `docs/features.md`, and
+> `docs/BUILD_SEQUENCE.md`.** The summary below is orientation only — do not treat its phase
+> labels or file columns as current (many features are now built as `backend/routes/*` +
+> `frontend/components/panels/*`, not in `app.py`).
 
-### Phase 1 — Foundation (current priority)
-| # | Feature | Files | Status |
-|---|---------|-------|--------|
-| 1 | Rebrand app.py to EnrgEngine | `app.py` | DONE |
-| 2 | Bill parser dashboard panel | `app.py` | DONE |
-| 3 | Installer profile inputs (UI + session state) | `app.py` | IN PROGRESS |
-| 3b | Installer profile Supabase persistence | `app.py`, `database.py` | TODO |
-| 4 | Customer + site inputs | `app.py` | TODO |
-| 5 | PVGIS + solar irradiance panel | `app.py` | TODO |
-| 6 | Sizing results panel | `app.py` | TODO |
-| 7 | Financial model panel | `app.py` | TODO |
-| 8 | DNSP export limit lookup | new `nem_data.py` | TODO |
-| 9 | SA tariff library | new `nem_data.py` | TODO |
-| 10 | STC calculation | new `nem_data.py` | TODO |
-
-### Phase 2 — Accuracy upgrades
-| # | Feature | Files |
-|---|---------|-------|
-| 11 | True MILP sizing (replace heuristic) | `sizing_engine.py` |
-| 12 | Split solar / battery ROI | `financial_model.py` |
-| 13 | TOU tariff dispatch modelling | `sizing_engine.py`, `nem_data.py` |
-| 14 | Interval data upload | `app.py`, new `interval_data.py` |
-| 15 | Google Solar API roof data | new `roof_data.py` |
-
-### Phase 3 — Report
-| # | Feature | Files |
-|---|---------|-------|
-| 16 | Rebrand PDF to EnrgEngine white-label | `report_generator.py` |
-| 17 | Apply brand colours to all PDF charts | `report_generator.py` |
-| 18 | Add installer branding to PDF | `report_generator.py` |
-| 19 | Add VPP/REPS eligibility section to PDF | `report_generator.py`, `nem_data.py` |
-| 20 | 25-year cash flow chart in PDF | `report_generator.py` |
-
-### Phase 4 — Polish
-| # | Feature |
-|---|---------|
-| 21 | Interactive Plotly sliders (system size sensitivity) |
-| 22 | Month-by-month dispatch chart |
-| 23 | Tariff comparison ("switch to X, save Y") |
-| 24 | Equipment recommendation section |
+- **Phase 0 — Migration (DONE):** FastAPI + Next.js + Supabase Auth scaffold.
+- **Phase 1 — Foundation & accuracy core (current):** dashboard panels (installer profile,
+  bill, customer/site, solar, sizing, load, financial, network, incentives), `nem_data` (DNSP
+  limits / tariff library / STC), the **Solar Sizing Rebuild** (heuristic → **MILP/optimiser —
+  MILP is Phase 1**), and the ML data-capture layer (D1–D5, built). Pre-beta: PII hardening +
+  consent (see OPEN_ITEMS.md).
+- **Phase 2 — Accuracy upgrades:** split solar/battery ROI, TOU dispatch modelling, interval
+  data upload, Solcast irradiance, Google Solar roof data.
+- **Phase 3 — Report:** white-label PDF polish, brand charts, installer branding, VPP/REPS
+  section, 25-year cash-flow chart.
+- **Phase 4 — Polish:** interactive sliders, dispatch chart, tariff comparison, equipment
+  section. Plus the AI-agents accuracy layer (built at end of Phase 1 after MILP — see
+  `docs/2026-06-10-ai-agents-plan.md`).
 
 ---
 
 ## Testing Checklist (Run After Any Change)
 
-- [ ] `streamlit run app.py` — app loads without errors
-- [ ] Upload a test bill PDF → parsed data appears correctly
+- [ ] Backend starts: `cd backend && uvicorn main:app --reload` — no errors; `GET /api/health` OK
+- [ ] Frontend starts: `cd frontend && npm run dev` — dashboard loads
+- [ ] Upload a test bill PDF → parsed data appears correctly in the Bill panel
 - [ ] Address lookup works → PVGIS data returns
 - [ ] Sizing runs and displays sensible kW / kWh values
 - [ ] Financial panel shows non-zero, non-negative values
-- [ ] No "AppEng" or "AppEng.ai" text visible anywhere in UI
-- [ ] No matplotlib default blue (#1f77b4) visible in any chart
-- [ ] Supabase save succeeds (or warning shown gracefully on failure)
+- [ ] No "AppEng" or "AppEng.ai" text visible anywhere in the UI
+- [ ] No Plotly/matplotlib default colours visible in any chart
+- [ ] Supabase save succeeds (or warning shown gracefully on failure); capture never blocks
 
 **Test addresses:**
 - `53 Bishops Place, Kensington SA 5068` — existing test address, constrained DNSP zone
@@ -396,35 +380,42 @@ Build in this order. Do not skip ahead. Each step depends on the previous.
 
 ---
 
+## Conventions Claude Code must not re-derive
+
+- **`accuracy_tier` is stored as an INTEGER** (`1` / `2` / `3`), not the string `"tier_3"`. This was a deliberate
+  E1 deviation to match the existing `load_profiles.accuracy_tier` integer column. Any UI reading the tier (the
+  worksheet accuracy meter, the dashboard accuracy column, the tier-fallback flow) must read the integer.
+- **Charts:** recharts is the standard; Plotly is reserved for heavy technical charts only (8,760-hour series,
+  7x24 heatmap). Decided 2026-06-23 (PROGRESS decision #25).
+- **Bill parser prompt** has an explicit JSON schema + unit rules but **no few-shot examples** — adding two
+  worked examples from different retailers is still outstanding (OPEN_ITEMS "Bill parser — Claude Vision retained").
+- **Cost model is bottom-up** (catalogue hardware + soft costs - STC - rebate). `pricing_benchmarks.json` and the
+  flat $/kW approach are superseded — do not reintroduce them.
+- **Current build sequence** = `docs/2026-08-05-master-build-checklist.md`. `BUILD_SEQUENCE.md`'s Wave 1/Wave 2
+  frontend order predates the 2026-08-04 six-path + load-insight decisions.
+
+---
+
 ## Known Issues / Tech Debt
 
 | Issue | File | Priority |
 |-------|------|----------|
-| `sizing_engine.py` uses heuristic, not true MILP | `sizing_engine.py` | Phase 2 |
-| `projected_annual_spend` shows $0 misleadingly | `financial_model.py`, `app.py` | Phase 1 |
-| PDF chart uses default matplotlib blue | `report_generator.py` | Phase 3 |
-| Installer profile session-state only — no Supabase persistence yet | `database.py` | Phase 1 (Prompt 3b) |
-| `calculator.py` is dead code, not connected | `calculator.py` | Ignore |
-| Financial model blends solar+battery ROI | `financial_model.py` | Phase 2 |
+| **Heuristic still live + still the only path the frontend calls** — `sizing_engine.py` is imported by `routes/sizing.py`, `POST /api/sizing/size` is registered in `main.py`, and `frontend/lib/api.ts` calls ONLY that endpoint (never `/api/sizing/optimise` or `/api/sizing/battery`). The accurate engine is API-only today. Verified in code 2026-08-05. Retirement = master checklist 3.16 | `sizing_engine.py`, `routes/sizing.py`, `frontend/lib/api.ts` | **Phase 1 — blocking** |
+| `projected_annual_spend` shows $0 misleadingly | `financial_model.py`, Financial panel | Phase 1 |
+| Financial model blends solar+battery ROI (needs split) | `financial_model.py` | Phase 2 |
+| Pre-beta: signed URLs for raw-bill reads (bucket already private) | `routes/bill.py` | Pre-beta polish |
+| Legacy `app.py` / `report_generator.py` / `calculator.py` not used | (legacy) | Ignore |
 
 ---
 
 ## Deployment
 
-**Platform frontend:** Next.js on Vercel — migration target
-- `git push` to `main` → Vercel auto-deploys
-- Environment variables set in Vercel project dashboard
+**Frontend:** Next.js on Vercel — `git push` to `main` auto-deploys; env vars in Vercel dashboard.
 
-**Platform backend:** FastAPI on Railway — migration target
-- Deployed as a Python service
-- Environment variables set in Railway project dashboard
-- Do not push `.env` or any credentials file
+**Backend:** FastAPI on Railway — deployed as a Python service; env vars in Railway dashboard.
+Do not push `.env` or any credentials file.
 
-**Landing page:** HTML/CSS/JS on Netlify — live, unchanged
-- Repo: separate `ENRG-ENGINE-landing` git repo
-- Auto-deploys from `main` on push
+**Landing page:** HTML/CSS/JS on Netlify — separate `ENRG-ENGINE-landing` repo, auto-deploys on push.
 
-**Legacy (reference only):**
-- Streamlit Cloud repo: `mayurmistry82/AppEng---Platform`
-- URL: `appeng-platform.streamlit.app`
-- Do not push new features to this deployment — it is being retired
+**Legacy (retired):** Streamlit Cloud `mayurmistry82/AppEng---Platform` (`appeng-platform.streamlit.app`).
+Do not push to it.

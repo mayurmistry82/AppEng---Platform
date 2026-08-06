@@ -13,3 +13,4 @@ plotly
 pvlib
 requests
 pulp
+reportlab

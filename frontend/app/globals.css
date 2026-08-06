@@ -33,7 +33,7 @@
     --input: 220 20% 18%;
     --ring: 38 100% 58%;
 
-    --radius: 0.5rem;
+    --radius: 0.75rem;
   }
 }
 
@@ -45,5 +45,14 @@
   body {
     @apply bg-background text-foreground;
     font-family: "DM Sans", system-ui, sans-serif;
+  }
+}
+
+@layer utilities {
+  .text-gradient {
+    background: linear-gradient(135deg, #FFB428, #FF6B35);
+    -webkit-background-clip: text;
+    -webkit-text-fill-color: transparent;
+    background-clip: text;
   }
 }

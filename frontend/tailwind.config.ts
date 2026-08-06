@@ -63,6 +63,13 @@ const config: Config = {
         syne: ["Syne", "sans-serif"],
         sans: ["DM Sans", "sans-serif"],
       },
+      backgroundImage: {
+        "enrg-gradient": "linear-gradient(135deg, #FFB428 0%, #FF6B35 100%)",
+      },
+      boxShadow: {
+        "enrg-glow":
+          "0 0 0 1px rgba(255,180,40,0.6), 0 0 40px 0 rgba(255,180,40,0.15)",
+      },
     },
   },
   plugins: [require("tailwindcss-animate")],

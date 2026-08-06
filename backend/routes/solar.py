@@ -14,11 +14,31 @@ class IrradianceRequest(BaseModel):
     system_kw: float
 
 
+class DailyIrradianceRequest(BaseModel):
+    lat: float
+    lon: float
+    system_kw: float
+
+
 @router.post("/api/solar/irradiance")
 async def get_irradiance(body: IrradianceRequest):
     try:
         result = solar_irradiance.fetch_pvgis_profile(
             body.address, peakpower_kwp=body.system_kw
+        )
+        return result
+    except Exception as e:
+        sentry_sdk.capture_exception(e)
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.post("/api/solar/irradiance/daily")
+async def get_daily_irradiance(body: DailyIrradianceRequest):
+    try:
+        result = solar_irradiance.fetch_pvgis_daily(
+            body.lat,
+            body.lon,
+            peakpower_kwp=body.system_kw,
         )
         return result
     except Exception as e:

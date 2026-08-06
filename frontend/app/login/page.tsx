@@ -61,7 +61,7 @@ export default function LoginPage() {
               required
               value={email}
               onChange={(e) => setEmail(e.target.value)}
-              className="w-full rounded-md border border-white/10 bg-white/5 px-3 py-2 text-foreground placeholder:text-muted-foreground focus:border-enrg-amber focus:outline-none"
+              className="w-full rounded-md border border-white/10 bg-white/5 px-3 py-2 text-foreground placeholder:text-muted-foreground focus:border-enrg-amber/50 focus:outline-none"
               placeholder="you@example.com"
             />
           </div>
@@ -80,7 +80,7 @@ export default function LoginPage() {
               required
               value={password}
               onChange={(e) => setPassword(e.target.value)}
-              className="w-full rounded-md border border-white/10 bg-white/5 px-3 py-2 text-foreground placeholder:text-muted-foreground focus:border-enrg-amber focus:outline-none"
+              className="w-full rounded-md border border-white/10 bg-white/5 px-3 py-2 text-foreground placeholder:text-muted-foreground focus:border-enrg-amber/50 focus:outline-none"
             />
           </div>
 
@@ -96,7 +96,7 @@ export default function LoginPage() {
           <button
             type="submit"
             disabled={submitting}
-            className="w-full rounded-md bg-enrg-amber px-4 py-2.5 font-syne text-sm font-extrabold uppercase tracking-wider text-enrg-dark transition hover:bg-enrg-orange disabled:cursor-not-allowed disabled:opacity-60"
+            className="w-full rounded-md bg-enrg-gradient px-4 py-2.5 font-syne text-sm font-extrabold uppercase tracking-wider text-enrg-dark transition-all hover:opacity-90 hover:-translate-y-px active:translate-y-0 disabled:cursor-not-allowed disabled:opacity-60"
           >
             {submitting ? "Signing in..." : "Sign in"}
           </button>

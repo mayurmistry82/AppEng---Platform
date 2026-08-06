@@ -27,6 +27,14 @@ from routes.bill import router as bill_router
 from routes.solar import router as solar_router
 from routes.sizing import router as sizing_router
 from routes.financial import router as financial_router
+from routes.load import router as load_router
+from routes.report import router as report_router
+from routes.job import router as job_router
+from routes.nem import router as nem_router
+from routes.cost import router as cost_router
+from routes.interval import router as interval_router
+from routes.roof import router as roof_router
+from routes.generation import router as generation_router
 
 app = FastAPI(title="EnrgEngine API", version="0.1.0")
 
@@ -41,6 +49,14 @@ app.include_router(bill_router)
 app.include_router(solar_router)
 app.include_router(sizing_router)
 app.include_router(financial_router)
+app.include_router(load_router)
+app.include_router(report_router)
+app.include_router(job_router)
+app.include_router(nem_router)
+app.include_router(cost_router)
+app.include_router(interval_router)
+app.include_router(roof_router)
+app.include_router(generation_router)
 
 
 @app.get("/api/health")

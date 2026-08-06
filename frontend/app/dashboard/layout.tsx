@@ -1,4 +1,6 @@
 import { redirect } from "next/navigation";
+import Sidebar from "@/components/Sidebar";
+import SidebarToggle from "@/components/SidebarToggle";
 import { createClient } from "@/lib/supabase/server";
 
 async function signOutAction() {
@@ -23,26 +25,17 @@ export default async function DashboardLayout({
   }
 
   return (
-    <div className="min-h-screen bg-enrg-dark">
-      <header className="border-b border-white/10">
-        <div className="mx-auto flex max-w-7xl items-center justify-between px-6 py-4">
-          <div className="bg-gradient-to-r from-enrg-amber to-enrg-orange bg-clip-text font-syne text-xl font-extrabold tracking-tight text-transparent">
-            EnrgEngine
-          </div>
-          <div className="flex items-center gap-4">
-            <span className="text-sm text-muted-foreground">{user.email}</span>
-            <form action={signOutAction}>
-              <button
-                type="submit"
-                className="rounded-md border border-white/10 bg-white/5 px-3 py-1.5 font-syne text-xs font-bold uppercase tracking-wider text-foreground transition hover:border-enrg-amber hover:text-enrg-amber"
-              >
-                Sign Out
-              </button>
-            </form>
-          </div>
+    <div className="flex h-screen overflow-hidden bg-enrg-dark">
+      <Sidebar
+        userEmail={user.email ?? ""}
+        signOutAction={signOutAction}
+      />
+      <div className="flex flex-1 flex-col overflow-hidden">
+        <div className="flex h-11 flex-shrink-0 items-center border-b border-white/10 px-4">
+          <SidebarToggle />
         </div>
-      </header>
-      <main className="mx-auto max-w-7xl px-6 py-8">{children}</main>
+        <main className="flex-1 overflow-y-auto px-8 py-8">{children}</main>
+      </div>
     </div>
   );
 }
