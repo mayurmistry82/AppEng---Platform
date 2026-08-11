@@ -21,9 +21,11 @@ export function getChartLayout(mode: ChartMode): Partial<Layout> {
         color: dark ? "rgba(240,244,255,0.5)" : "rgba(9,14,28,0.45)",
         size: 11,
       },
-      titlefont: {
-        color: dark ? "rgba(240,244,255,0.7)" : "rgba(9,14,28,0.6)",
-        size: 12,
+      title: {
+        font: {
+          color: dark ? "rgba(240,244,255,0.7)" : "rgba(9,14,28,0.6)",
+          size: 12,
+        },
       },
       automargin: true,
     },
@@ -36,9 +38,11 @@ export function getChartLayout(mode: ChartMode): Partial<Layout> {
         color: dark ? "rgba(240,244,255,0.5)" : "rgba(9,14,28,0.45)",
         size: 11,
       },
-      titlefont: {
-        color: dark ? "rgba(240,244,255,0.7)" : "rgba(9,14,28,0.6)",
-        size: 12,
+      title: {
+        font: {
+          color: dark ? "rgba(240,244,255,0.7)" : "rgba(9,14,28,0.6)",
+          size: 12,
+        },
       },
       tickformat: ",d",
       automargin: true,

@@ -1,4 +1,7 @@
-import { createServerClient } from "@supabase/ssr";
+import {
+  createServerClient,
+  type CookieMethodsServer,
+} from "@supabase/ssr";
 import { NextResponse, type NextRequest } from "next/server";
 
 export async function updateSession(request: NextRequest) {
@@ -12,22 +15,26 @@ export async function updateSession(request: NextRequest) {
     );
   }
 
-  const supabase = createServerClient(url, key, {
-    cookies: {
-      getAll() {
-        return request.cookies.getAll();
-      },
-      setAll(cookiesToSet) {
-        cookiesToSet.forEach(({ name, value }) =>
-          request.cookies.set(name, value),
-        );
-        supabaseResponse = NextResponse.next({ request });
-        cookiesToSet.forEach(({ name, value, options }) =>
-          supabaseResponse.cookies.set(name, value, options),
-        );
-      },
+  // Explicit CookieMethodsServer annotation collapses the CookieMethodsServer |
+  // CookieMethodsServerDeprecated union createServerClient's `cookies` option accepts —
+  // TypeScript won't contextually type a method param inside an object literal against a
+  // union, so without this `cookiesToSet` falls back to implicit `any` under strict.
+  const cookieMethods: CookieMethodsServer = {
+    getAll() {
+      return request.cookies.getAll();
     },
-  });
+    setAll(cookiesToSet) {
+      cookiesToSet.forEach(({ name, value }) =>
+        request.cookies.set(name, value),
+      );
+      supabaseResponse = NextResponse.next({ request });
+      cookiesToSet.forEach(({ name, value, options }) =>
+        supabaseResponse.cookies.set(name, value, options),
+      );
+    },
+  };
+
+  const supabase = createServerClient(url, key, { cookies: cookieMethods });
 
   const {
     data: { user },

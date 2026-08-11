@@ -267,24 +267,36 @@ Energy and supply components are stored/displayed separately in the bill data pa
 
 ## Brand & Design System
 
-Apply everywhere — Next.js UI, Plotly charts, ReportLab PDF. No exceptions. No Plotly/matplotlib
+Apply everywhere — Next.js UI, charts, ReportLab PDF. No exceptions. No Plotly/matplotlib
 defaults visible in any output.
 
+**`docs/DESIGN.md` is the source of truth for every design token.** The block below is a mirror
+for Python code (ReportLab) that cannot read CSS variables. Do not edit it here — change
+DESIGN.md, then mirror. Frontend code binds to semantic CSS tokens, never to these hexes.
+
 ```python
-AMBER  = "#FFB428"   # Primary accent — solar, positive outcomes, highlights
-ORANGE = "#FF6B35"   # Secondary accent — CTAs, export, secondary data series
-BLUE   = "#378ADD"   # Tertiary — battery, grid, neutral data series
+BLUE   = "#378ADD"   # PRIMARY action colour — buttons, links, focus ring, "sized" status
+AMBER  = "#FFB428"   # Brand HIGHLIGHT only — active nav, accuracy meter, selected. Used sparingly.
+ORANGE = "#FF6B35"   # WARNING colour + export / secondary data series
+GREEN  = "#2EBD85"   # Success
+RED    = "#E5484D"   # Error / destructive
 DARK   = "#090E1C"   # Page background
-DARK2  = "#0F1628"   # Card / panel background
-DARK3  = "#161E33"   # Nested card background
-TEXT   = "#F0F4FF"   # Primary text
-MUTED  = "rgba(240, 244, 255, 0.5)"  # Secondary text
-BORDER = "rgba(255, 255, 255, 0.08)" # Subtle borders
+DARK2  = "#111A2E"   # Card / panel surface
+DARK3  = "#16203A"   # Popover / nested surface
+TEXT   = "#EEF2F9"   # Primary text
+MUTED  = "#6F7F9F"   # Secondary text, captions, chart axes
+BORDER = "#283450"   # Card / input borders
 ```
 
+Amber is NEVER the warning colour and NEVER the primary action colour — orange is the warning,
+blue is the action. Light + dark modes both ship; the values above are the dark mode, see
+DESIGN.md for light. The four-stop brand gradient is for brand moments only — never on buttons,
+cards, or panels.
+
 **Typography:**
-- Headings / logo: Syne ExtraBold (Syne-ExtraBold.ttf)
-- Body: DM Sans Regular / Medium
+- Brand display only (`hero-xl` / `hero` / `hero-sub`): Syne ExtraBold 800 (Syne-ExtraBold.ttf)
+- Everything else — `display`, H1–H3, body, UI, labels, numbers: Inter (400/500/600/700/900)
+- All numbers use tabular figures + slashed zero
 - In ReportLab PDF: embed font files or use the closest available
 
 **PDF report rules:**
@@ -312,8 +324,10 @@ BORDER = "rgba(255, 255, 255, 0.08)" # Subtle borders
 3. **Never break the data contracts.** If you change what a function returns, update every
    caller. Pipeline: `bill_parser` → `sizing_engine` → `financial_model` → report.
 
-4. **Always use Plotly for dashboard charts**, with brand colours via `lib/plotly-theme.ts`
-   (`react-plotly.js`, SSR disabled). ReportLab is for the PDF only.
+4. **recharts is the chart standard** (PROGRESS decision #25, 2026-06-23). **Plotly is reserved
+   for heavy technical charts only** — the 8,760-hour series and the 7×24 heatmap — with brand
+   colours via `lib/plotly-theme.ts` (`react-plotly.js`, SSR disabled). ReportLab is for the
+   PDF only.
 
 5. **Never add a paywall or payment gate.** Installers get full access immediately. (Premium
    gating is a separate, later subscription concern — see OPEN_ITEMS.md.)

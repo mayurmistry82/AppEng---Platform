@@ -2,38 +2,199 @@
 @tailwind components;
 @tailwind utilities;
 
+/*
+ * EnrgEngine design tokens — generated from docs/DESIGN.md (single source of truth).
+ * Stage 2.1: every variable below is a space-separated HSL triplet (shadcn convention,
+ * consumed as hsl(var(--x) / <alpha-value>) in tailwind.config.ts). The trailing hex
+ * comment on each line is the DESIGN.md source value — that is what makes this file
+ * auditable; verify with `node scripts/verify-tokens.mjs`.
+ *
+ * :root = LIGHT mode. .dark = DARK mode. The app currently renders dark because
+ * app/layout.tsx pins class="dark" on <html> (checklist 2.2 replaces that with a
+ * theme provider). Removing the class must yield a fully usable light theme.
+ */
+
 @layer base {
   :root {
-    /* EnrgEngine dark theme — HSL for shadcn compatibility */
-    --background: 222 53% 7%;          /* #090E1C */
-    --foreground: 220 100% 96%;        /* #F0F4FF */
+    /* ── Colour tokens (LIGHT) — 77 tokens from DESIGN.md colors: ── */
+    --brand-amber: 39.1 100% 57.8%;           /* #FFB428 */
+    --brand-orange: 16 100% 60.4%;            /* #FF6B35 */
+    --brand-blue: 210 70.9% 54.1%;            /* #378ADD */
+    --brand-blue-dark: 214.7 68.7% 32.5%;     /* #1A4A8C */
+    --bg-subtle: 216 38% 95%;                 /* #EDF1F7 */
+    --background: 216 45.5% 97.8%;            /* #F7F9FC */
+    --card: 0 0% 100%;                        /* #FFFFFF */
+    --popover: 0 0% 100%;                     /* #FFFFFF */
+    --sidebar: 0 0% 100%;                     /* #FFFFFF */
+    --foreground: 220 49.1% 10.8%;            /* #0E1729 */
+    --card-foreground: 220 49.1% 10.8%;       /* #0E1729 */
+    --popover-foreground: 220 49.1% 10.8%;    /* #0E1729 */
+    --text-secondary: 219.5 21.6% 34.5%;      /* #45526B */
+    --muted-foreground: 218.9 14.7% 49.2%;    /* #6B7890 */
+    --text-disabled: 218.6 18.2% 69.8%;       /* #A4AEC0 */
+    --sidebar-foreground: 220 49.1% 10.8%;    /* #0E1729 */
+    --primary: 210.4 62.8% 47.5%;             /* #2D78C5 */
+    --primary-hover: 210.8 65.5% 53.3%;       /* #3A86D6 */
+    --primary-active: 211 63% 38%;            /* #245F9E */
+    --primary-foreground: 0 0% 100%;          /* #FFFFFF */
+    --secondary: 216 38% 95%;                 /* #EDF1F7 */
+    --secondary-foreground: 220 49.1% 10.8%;  /* #0E1729 */
+    --muted: 216 38% 95%;                     /* #EDF1F7 */
+    --accent: 217.5 44.4% 96.5%;              /* #F2F5FA */
+    --accent-foreground: 220 49.1% 10.8%;     /* #0E1729 */
+    --ring: 210.4 62.8% 47.5%;                /* #2D78C5 */
+    --brand-amber-hover: 39.3 92% 51.2%;      /* #F5A610 */
+    --brand-amber-active: 40 100% 43%;        /* #DB9200 */
+    --brand-orange-hover: 16 100% 60.4%;      /* #FF6B35 */
+    --brand-orange-active: 17 86% 42%;        /* #C7430F */
+    --border-subtle: 218 31% 93%;             /* #E8ECF3 */
+    --border: 219 28% 88%;                    /* #D8DEE9 */
+    --input: 219 28% 88%;                     /* #D8DEE9 */
+    --border-strong: 217.5 21.1% 77.6%;       /* #BAC3D2 */
+    --sidebar-border: 218 31% 93%;            /* #E8ECF3 */
+    --sidebar-ring: 210.4 62.8% 47.5%;        /* #2D78C5 */
+    --destructive: 358.1 65.5% 53.3%;         /* #D63A3F */
+    --destructive-foreground: 0 0% 100%;      /* #FFFFFF */
+    --destructive-subtle: 0 82.6% 95.5%;      /* #FDEAEA */
+    --success: 156.2 67% 36.9%;               /* #1F9D6B */
+    --success-foreground: 0 0% 100%;          /* #FFFFFF */
+    --success-subtle: 151.6 48.7% 92.4%;      /* #E2F5EC */
+    --warning: 15.6 81.3% 51.8%;              /* #E85420 */
+    --warning-foreground: 0 0% 100%;          /* #FFFFFF */
+    --warning-subtle: 18.6 82.9% 93.1%;       /* #FCE8DF */
+    --info: 210.4 62.8% 47.5%;                /* #2D78C5 */
+    --info-foreground: 0 0% 100%;             /* #FFFFFF */
+    --info-subtle: 211.6 70.4% 94.7%;         /* #E8F1FB */
+    --sidebar-primary: 210.4 62.8% 47.5%;     /* #2D78C5 */
+    --sidebar-primary-foreground: 0 0% 100%;  /* #FFFFFF */
+    --sidebar-accent: 217.5 44.4% 96.5%;      /* #F2F5FA */
+    --sidebar-accent-foreground: 220 49.1% 10.8%;/* #0E1729 */
+    --status-draft: 218 18% 61%;              /* #8A97AD */
+    --status-draft-bg: 216 38% 95%;           /* #EDF1F7 */
+    --status-draft-foreground: 216 14.3% 41.2%;/* #5A6678 */
+    --status-sized: 210 70.9% 54.1%;          /* #378ADD */
+    --status-sized-bg: 211.6 70.4% 94.7%;     /* #E8F1FB */
+    --status-sized-foreground: 211.3 68.4% 38.4%;/* #1F5FA5 */
+    --status-sent: 39.3 85.6% 49%;            /* #E89E12 */
+    --status-sent-bg: 40 100% 93.5%;          /* #FFF4DE */
+    --status-sent-foreground: 39 100% 27%;    /* #8A5A00 */
+    --status-won: 156.2 67% 36.9%;            /* #1F9D6B */
+    --status-won-bg: 151.6 48.7% 92.4%;       /* #E2F5EC */
+    --status-won-foreground: 154.9 67.2% 25.1%;/* #156B47 */
+    --status-lost: 358.1 65.5% 53.3%;         /* #D63A3F */
+    --status-lost-bg: 0 82.6% 95.5%;          /* #FDEAEA */
+    --status-lost-foreground: 358 60.6% 39.8%;/* #A3282C */
+    --chart-1: 40 100% 43%;                   /* #DB9200 */
+    --chart-2: 210 70.9% 54.1%;               /* #378ADD */
+    --chart-3: 15.6 81.3% 51.8%;              /* #E85420 */
+    --chart-4: 156.2 67% 36.9%;               /* #1F9D6B */
+    --chart-5: 358.1 65.5% 53.3%;             /* #D63A3F */
+    --chart-grid: 218 31% 93%;                /* #E8ECF3 */
+    --chart-axis: 218.9 14.7% 49.2%;          /* #6B7890 */
+    --chart-baseline: 218.9 14.7% 49.2%;      /* #6B7890 */
+    --delta-positive: 156.2 67% 36.9%;        /* #1F9D6B */
+    --delta-negative: 358.1 65.5% 53.3%;      /* #D63A3F */
 
-    --card: 222 36% 11%;               /* dark surface */
-    --card-foreground: 220 100% 96%;
+    /* Brand gradient — identical in both modes (DESIGN.md: 4 stops, brand moments only,
+       never UI chrome). */
+    --brand-gradient: linear-gradient(135deg, #FFB428 0%, #FF6B35 30%, #378ADD 60%, #1A4A8C 100%);
 
-    --popover: 222 36% 11%;
-    --popover-foreground: 220 100% 96%;
+    /* Radius — shadcn components that read --radius directly land on md/8px. */
+    --radius: 0.5rem;
 
-    --primary: 38 100% 58%;            /* #FFB428 */
-    --primary-foreground: 222 53% 7%;
+    /* Elevation (LIGHT: soft shadows) — DESIGN.md elevation: lightShadow values. */
+    --shadow-elev-1: 0 1px 2px rgba(16, 24, 40, 0.05);
+    --shadow-elev-2: 0 4px 12px rgba(16, 24, 40, 0.1);
+    --shadow-elev-3: 0 12px 32px rgba(16, 24, 40, 0.16);
+    --shadow-focus-ring: 0 0 0 2px hsl(var(--background)), 0 0 0 4px hsl(var(--ring));
+  }
 
-    --secondary: 222 36% 14%;
-    --secondary-foreground: 220 100% 96%;
+  .dark {
+    /* ── Colour tokens (DARK) — 77 tokens from DESIGN.md colors: ── */
+    --brand-amber: 39.1 100% 57.8%;           /* #FFB428 */
+    --brand-orange: 16 100% 60.4%;            /* #FF6B35 */
+    --brand-blue: 210 70.9% 54.1%;            /* #378ADD */
+    --brand-blue-dark: 214.7 68.7% 32.5%;     /* #1A4A8C */
+    --bg-subtle: 221.5 48.1% 5.3%;            /* #070B14 */
+    --background: 224.2 51.4% 7.3%;           /* #090E1C */
+    --card: 221.4 46% 12.4%;                  /* #111A2E */
+    --popover: 223.3 45% 15.7%;               /* #16203A */
+    --sidebar: 221.4 46% 12.4%;               /* #111A2E */
+    --foreground: 218.2 47.8% 95.5%;          /* #EEF2F9 */
+    --card-foreground: 218.2 47.8% 95.5%;     /* #EEF2F9 */
+    --popover-foreground: 218.2 47.8% 95.5%;  /* #EEF2F9 */
+    --text-secondary: 220 30% 74%;            /* #A9B6D1 */
+    --muted-foreground: 220 20% 53%;          /* #6F7F9F */
+    --text-disabled: 221.4 23.3% 35.3%;       /* #45526F */
+    --sidebar-foreground: 218.2 47.8% 95.5%;  /* #EEF2F9 */
+    --primary: 210 70.9% 54.1%;               /* #378ADD */
+    --primary-hover: 210.2 74.4% 60.2%;       /* #4E99E5 */
+    --primary-active: 210.8 63% 46.7%;        /* #2C75C2 */
+    --primary-foreground: 0 0% 100%;          /* #FFFFFF */
+    --secondary: 223.3 45% 15.7%;             /* #16203A */
+    --secondary-foreground: 218.2 47.8% 95.5%;/* #EEF2F9 */
+    --muted: 223.3 45% 15.7%;                 /* #16203A */
+    --accent: 222 39% 18%;                    /* #1C2740 */
+    --accent-foreground: 218.2 47.8% 95.5%;   /* #EEF2F9 */
+    --ring: 210 70.9% 54.1%;                  /* #378ADD */
+    --brand-amber-hover: 39.2 100% 65.5%;     /* #FFC24F */
+    --brand-amber-active: 39.3 85.6% 49%;     /* #E89E12 */
+    --brand-orange-hover: 16.4 100% 66.3%;    /* #FF8253 */
+    --brand-orange-active: 15.6 81.3% 51.8%;  /* #E85420 */
+    --border-subtle: 222 39% 18%;             /* #1C2740 */
+    --border: 222 33.3% 23.5%;                /* #283450 */
+    --input: 222 33.3% 23.5%;                 /* #283450 */
+    --border-strong: 220.4 29.7% 32.4%;       /* #3A4A6B */
+    --sidebar-border: 222 39% 18%;            /* #1C2740 */
+    --sidebar-ring: 210 70.9% 54.1%;          /* #378ADD */
+    --destructive: 358 75% 59%;               /* #E5484D */
+    --destructive-foreground: 0 0% 100%;      /* #FFFFFF */
+    --destructive-subtle: 354.8 35.4% 12.7%;  /* #2C1517 */
+    --success: 156.5 60.9% 46.1%;             /* #2EBD85 */
+    --success-foreground: 164 78.9% 7.5%;     /* #04221A */
+    --success-subtle: 156 50% 11%;            /* #0E2A1F */
+    --warning: 16 100% 60.4%;                 /* #FF6B35 */
+    --warning-foreground: 16 73% 6%;          /* #1A0A04 */
+    --warning-subtle: 12.9 46.7% 11.8%;       /* #2C1610 */
+    --info: 210 70.9% 54.1%;                  /* #378ADD */
+    --info-foreground: 0 0% 100%;             /* #FFFFFF */
+    --info-subtle: 211.2 60% 15.7%;           /* #102740 */
+    --sidebar-primary: 210 70.9% 54.1%;       /* #378ADD */
+    --sidebar-primary-foreground: 0 0% 100%;  /* #FFFFFF */
+    --sidebar-accent: 222 39% 18%;            /* #1C2740 */
+    --sidebar-accent-foreground: 218.2 47.8% 95.5%;/* #EEF2F9 */
+    --status-draft: 220 20% 53%;              /* #6F7F9F */
+    --status-draft-bg: 222 39% 18%;           /* #1C2740 */
+    --status-draft-foreground: 220 30% 74%;   /* #A9B6D1 */
+    --status-sized: 210 70.9% 54.1%;          /* #378ADD */
+    --status-sized-bg: 211.2 60% 15.7%;       /* #102740 */
+    --status-sized-foreground: 210.3 76.6% 71.6%;/* #7FB6EE */
+    --status-sent: 39.1 100% 57.8%;           /* #FFB428 */
+    --status-sent-bg: 42.4 68% 9.8%;          /* #2A2008 */
+    --status-sent-foreground: 39.2 100% 65.5%;/* #FFC24F */
+    --status-won: 156.5 60.9% 46.1%;          /* #2EBD85 */
+    --status-won-bg: 156 50% 11%;             /* #0E2A1F */
+    --status-won-foreground: 156.7 56.9% 60%; /* #5FD3A6 */
+    --status-lost: 358 75% 59%;               /* #E5484D */
+    --status-lost-bg: 354.8 35.4% 12.7%;      /* #2C1517 */
+    --status-lost-foreground: 358 77% 74%;    /* #F08A8D */
+    --chart-1: 39.1 100% 57.8%;               /* #FFB428 */
+    --chart-2: 210 70.9% 54.1%;               /* #378ADD */
+    --chart-3: 16 100% 60.4%;                 /* #FF6B35 */
+    --chart-4: 156.5 60.9% 46.1%;             /* #2EBD85 */
+    --chart-5: 358 75% 59%;                   /* #E5484D */
+    --chart-grid: 222 39% 18%;                /* #1C2740 */
+    --chart-axis: 220 20% 53%;                /* #6F7F9F */
+    --chart-baseline: 220 20% 53%;            /* #6F7F9F */
+    --delta-positive: 156.5 60.9% 46.1%;      /* #2EBD85 */
+    --delta-negative: 358 75% 59%;            /* #E5484D */
 
-    --muted: 222 30% 18%;
-    --muted-foreground: 220 20% 65%;
-
-    --accent: 38 100% 58%;
-    --accent-foreground: 222 53% 7%;
-
-    --destructive: 0 84% 60%;
-    --destructive-foreground: 220 100% 96%;
-
-    --border: 220 20% 18%;
-    --input: 220 20% 18%;
-    --ring: 38 100% 58%;
-
-    --radius: 0.75rem;
+    /* Elevation (DARK: flat — depth comes from surface lightening + hairline borders,
+       never a drop shadow on cards; elev-1 darkShadow is `none` by design). */
+    --shadow-elev-1: none;
+    --shadow-elev-2: 0 4px 12px rgba(0, 0, 0, 0.45);
+    --shadow-elev-3: 0 8px 28px rgba(0, 0, 0, 0.55);
+    --shadow-focus-ring: 0 0 0 2px hsl(var(--background)), 0 0 0 4px hsl(var(--ring));
   }
 }
 
@@ -43,16 +204,27 @@
   }
   html,
   body {
-    @apply bg-background text-foreground;
-    font-family: "DM Sans", system-ui, sans-serif;
+    @apply bg-background font-sans text-foreground;
   }
 }
 
 @layer utilities {
+  /* Brand-moment text gradient — the 4-stop DESIGN.md gradient, never on UI chrome. */
   .text-gradient {
-    background: linear-gradient(135deg, #FFB428, #FF6B35);
+    background: var(--brand-gradient);
     -webkit-background-clip: text;
     -webkit-text-fill-color: transparent;
     background-clip: text;
+  }
+
+  /* Metric type roles — fontVariantNumeric cannot live in a Tailwind fontSize entry,
+     so these pair the role with tabular figures + slashed zero (DESIGN.md typography). */
+  .metric-lg {
+    @apply text-metric-lg;
+    font-variant-numeric: tabular-nums slashed-zero;
+  }
+  .metric-sm {
+    @apply text-metric-sm;
+    font-variant-numeric: tabular-nums slashed-zero;
   }
 }
