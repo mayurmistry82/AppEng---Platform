@@ -16,7 +16,7 @@
 
 @layer base {
   :root {
-    /* ── Colour tokens (LIGHT) — 77 tokens from DESIGN.md colors: ── */
+    /* ── Colour tokens (LIGHT) — 80 tokens from DESIGN.md colors: ── */
     --brand-amber: 39.1 100% 57.8%;           /* #FFB428 */
     --brand-orange: 16 100% 60.4%;            /* #FF6B35 */
     --brand-blue: 210 70.9% 54.1%;            /* #378ADD */
@@ -37,6 +37,11 @@
     --primary-hover: 210.8 65.5% 53.3%;       /* #3A86D6 */
     --primary-active: 211 63% 38%;            /* #245F9E */
     --primary-foreground: 0 0% 100%;          /* #FFFFFF */
+    /* Filled-surface ramp (F45) — for a bg that carries a WHITE label, NOT for text/
+       links/rings/borders. `primary` keeps that role unchanged; see button.tsx. */
+    --primary-solid: 210.4 62.8% 47.5%;       /* #2D78C5 */
+    --primary-solid-hover: 211 63% 38%;       /* #245F9E */
+    --primary-solid-active: 210.3 65.7% 35.5%;/* #1F5A96 */
     --secondary: 216 38% 95%;                 /* #EDF1F7 */
     --secondary-foreground: 220 49.1% 10.8%;  /* #0E1729 */
     --muted: 216 38% 95%;                     /* #EDF1F7 */
@@ -110,7 +115,7 @@
   }
 
   .dark {
-    /* ── Colour tokens (DARK) — 77 tokens from DESIGN.md colors: ── */
+    /* ── Colour tokens (DARK) — 80 tokens from DESIGN.md colors: ── */
     --brand-amber: 39.1 100% 57.8%;           /* #FFB428 */
     --brand-orange: 16 100% 60.4%;            /* #FF6B35 */
     --brand-blue: 210 70.9% 54.1%;            /* #378ADD */
@@ -131,6 +136,11 @@
     --primary-hover: 210.2 74.4% 60.2%;       /* #4E99E5 */
     --primary-active: 210.8 63% 46.7%;        /* #2C75C2 */
     --primary-foreground: 0 0% 100%;          /* #FFFFFF */
+    /* Filled-surface ramp (F45) — for a bg that carries a WHITE label, NOT for text/
+       links/rings/borders. `primary` keeps that role unchanged; see button.tsx. */
+    --primary-solid: 210.8 63% 46.7%;         /* #2C75C2 */
+    --primary-solid-hover: 210.2 65.3% 41.8%; /* #256AB0 */
+    --primary-solid-active: 210.3 65.7% 35.5%;/* #1F5A96 */
     --secondary: 223.3 45% 15.7%;             /* #16203A */
     --secondary-foreground: 218.2 47.8% 95.5%;/* #EEF2F9 */
     --muted: 223.3 45% 15.7%;                 /* #16203A */

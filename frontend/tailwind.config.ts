@@ -47,6 +47,13 @@ const config: Config = {
           hover: "hsl(var(--primary-hover) / <alpha-value>)",
           active: "hsl(var(--primary-active) / <alpha-value>)",
           foreground: "hsl(var(--primary-foreground) / <alpha-value>)",
+          // Filled-surface ramp (F45) — bg for a white label, e.g. the primary button.
+          // `primary` above stays the text/link/ring/border role; do not conflate them.
+          solid: {
+            DEFAULT: "hsl(var(--primary-solid) / <alpha-value>)",
+            hover: "hsl(var(--primary-solid-hover) / <alpha-value>)",
+            active: "hsl(var(--primary-solid-active) / <alpha-value>)",
+          },
         },
         secondary: {
           DEFAULT: "hsl(var(--secondary) / <alpha-value>)",
