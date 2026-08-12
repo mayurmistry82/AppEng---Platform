@@ -29,6 +29,30 @@ import {
   TableRow,
 } from "@/components/ui/table";
 import { HoverHelp } from "@/components/ui/tooltip";
+import { WorksheetSection } from "@/components/ui/worksheet-section";
+import {
+  OverrideDrawer,
+  OverrideDrawerPins,
+  OverrideDrawerRow,
+  PinChip,
+} from "@/components/ui/override-drawer";
+import { KpiStrip, KpiTile } from "@/components/ui/kpi-tile";
+import { AccuracyMeter } from "@/components/ui/accuracy-meter";
+import { PhaseRailWithLabels } from "@/components/ui/phase-rail";
+import {
+  CartesianGrid,
+  Legend,
+  Line,
+  LineChart,
+  ReferenceLine,
+  Tooltip,
+  XAxis,
+  YAxis,
+} from "recharts";
+import {
+  ChartContainer,
+  useChartDefaults,
+} from "@/components/charts/chart-container";
 
 /**
  * Style guide (Stage 2.3a) — every component, variant and state on one page so
@@ -247,6 +271,119 @@ export default function StyleGuidePage() {
           </HoverHelp>
         </div>
       </Section>
+
+      {/* ── Platform components (2.3b) ──────────────────────────────────── */}
+
+      <Section
+        title="Worksheet section"
+        note="Locked (opacity, not expandable) · active (amber border + tick, drawer open below) · complete (neutral filled tick — never amber, so done and current never read alike)."
+      >
+        <div className="space-y-3">
+          <WorksheetSection title="Address & roof" state="locked">
+            <p>Unreachable while locked.</p>
+          </WorksheetSection>
+
+          <WorksheetSection title="Energy data" state="active" defaultOpen>
+            <p className="text-body text-foreground">
+              14 Frome St, Adelaide SA 5000 — interval data uploaded (NEM12).
+            </p>
+            <OverrideDrawer defaultOpen>
+              <OverrideDrawerPins>
+                <PinChip>8 panels pinned</PinChip>
+                <PinChip>Export limit 5 kW</PinChip>
+                <PinChip>Reserve SoC 20%</PinChip>
+              </OverrideDrawerPins>
+              <OverrideDrawerRow label="Panel count" value="8 (unconstrained: 24)" />
+              <OverrideDrawerRow label="Export limit" value="5 kW (unconstrained: 10 kW)" />
+              <OverrideDrawerRow
+                label="Reserve SoC"
+                value="20% (unconstrained: 0%)"
+                isLast
+              />
+            </OverrideDrawer>
+          </WorksheetSection>
+
+          <WorksheetSection title="Sizing & objective" state="complete">
+            <p>10.56 kW · 24 panels across 2 planes.</p>
+          </WorksheetSection>
+        </div>
+      </Section>
+
+      <Section title="KPI tile" note="4-column strip — one positive delta, one negative.">
+        <KpiStrip>
+          <KpiTile label="Pipeline value" value="$142,800" delta="+$18,200 this month" deltaSign="positive" />
+          <KpiTile label="Win rate (90d)" value="62%" delta="+4 pts" deltaSign="positive" />
+          <KpiTile label="In progress" value="14" delta="No change" />
+          <KpiTile label="Avg payback" value="5.2 yrs" delta="+0.3 yrs" deltaSign="negative" />
+        </KpiStrip>
+      </Section>
+
+      <Section
+        title="Accuracy meter"
+        note="Tier 1 (33.3%), Tier 2 (66.6%), Tier 3 (100%) side by side. An invalid tier renders an empty track — try it via the fourth example."
+      >
+        <div className="grid grid-cols-[repeat(auto-fit,minmax(160px,190px))] items-start gap-6">
+          <AccuracyMeter tier={1} />
+          <AccuracyMeter tier={2} />
+          <AccuracyMeter tier={3} />
+          <AccuracyMeter tier={undefined} />
+        </div>
+      </Section>
+
+      <Section
+        title="Phase rail"
+        note="Nodes show their letter (S D O R); a done node shows a tick instead, so this reads ✓ D O R and a finished job reads ✓ ✓ ✓ ✓ — done is neutral, current is amber, and the connector below a done node fills to carry progress down to Demand."
+      >
+        <PhaseRailWithLabels states={["done", "current", "pending", "pending"]} />
+      </Section>
+
+      <Section
+        title="Charts"
+        note="recharts is the standard for every new chart — colours come from the CSS chart tokens, so flipping the theme recolours them with no reload. Plotly is reserved for exactly two heavy technical charts (the 8,760-hour series and the 7×24 heatmap) and is lazily loaded, so it is deliberately not shown here."
+      >
+        <ChartSample />
+      </Section>
     </div>
   );
 }
+
+/** Sample recharts chart: three series, grid, axes, tooltip, dashed A/B baseline. */
+function ChartSample() {
+  const d = useChartDefaults();
+
+  return (
+    <div className="rounded-lg border border-border bg-card p-4">
+      <ChartContainer height={280}>
+        <LineChart data={CHART_SAMPLE_DATA} margin={{ top: 8, right: 8, bottom: 0, left: 0 }}>
+          <CartesianGrid {...d.grid} />
+          <XAxis dataKey="month" {...d.axis} />
+          <YAxis {...d.axis} width={44} />
+          <Tooltip {...d.tooltip} />
+          <Legend
+            wrapperStyle={{ fontSize: 12, color: d.tokens["chart-axis"] }}
+            iconType="plainline"
+          />
+          {/* Dashed baseline — the A/B comparison overlay, the one sanctioned dashed line. */}
+          <ReferenceLine y={520} {...d.baseline} label={{
+            value: "Baseline",
+            position: "insideTopRight",
+            fill: d.tokens["chart-axis"],
+            fontSize: 11,
+          }} />
+          <Line name="Solar generation" dataKey="generation" stroke={d.byRole.solarGeneration} {...d.line} />
+          <Line name="Grid import" dataKey="gridImport" stroke={d.byRole.gridImport} {...d.line} />
+          <Line name="Export" dataKey="exported" stroke={d.byRole.export} {...d.line} />
+        </LineChart>
+      </ChartContainer>
+    </div>
+  );
+}
+
+const CHART_SAMPLE_DATA = [
+  { month: "Jul", generation: 410, gridImport: 620, exported: 150 },
+  { month: "Aug", generation: 480, gridImport: 560, exported: 190 },
+  { month: "Sep", generation: 640, gridImport: 430, exported: 280 },
+  { month: "Oct", generation: 780, gridImport: 340, exported: 390 },
+  { month: "Nov", generation: 880, gridImport: 300, exported: 470 },
+  { month: "Dec", generation: 920, gridImport: 290, exported: 510 },
+];
