@@ -81,16 +81,30 @@ load_dotenv()
 api_key = os.getenv("ANTHROPIC_API_KEY")
 ```
 
-Required variables (backend `.env`):
+**`backend/.env` is the only env file the backend reads.** `load_dotenv()` resolves from the
+calling module's own directory, and every loader lives in `backend/`, so it always lands there
+regardless of where uvicorn is launched from. Verified 2026-08-11 (**F40**). Do not add a second
+`.env` higher up the tree — only the retired `_legacy/` scripts would ever resolve to one.
+
+Required — the backend does not work without these five:
 ```
 ANTHROPIC_API_KEY=...           # Claude Vision for bill parsing — stay on Claude Vision, do NOT use Mistral
 SUPABASE_URL=...                # Supabase project URL
 SUPABASE_ANON_KEY=...           # Supabase anon/public key
 SUPABASE_SERVICE_ROLE_KEY=...   # Server-side only — PII writes + capture-table access (added D4). NEVER expose to client.
-GOOGLE_SOLAR_API_KEY=...        # Google Solar API — roof geometry (Solar Sizing Rebuild)
-SOLCAST_API_KEY=...             # Solcast irradiance — Phase 2 upgrade
-SENTRY_DSN=...                  # Sentry error tracking
+GOOGLE_MAPS_API_KEY=...         # Google Solar API — roof geometry. THIS name, not GOOGLE_SOLAR_API_KEY (roof_geometry.py reads GOOGLE_MAPS_API_KEY)
 ```
+
+Optional — absent is fine, the code degrades deliberately:
+```
+SENTRY_DSN=...                  # Sentry error tracking; init is skipped silently when unset
+SOLCAST_API_KEY=...             # NOT YET USED — Solcast irradiance is checklist 10.6, a Phase 2 upgrade
+```
+
+**Missing `SUPABASE_SERVICE_ROLE_KEY` fails loudly by design.** `auth.py` refuses to fall back to
+the anon key — company lookups would silently return nothing and 403 everyone with no obvious
+cause — so it logs an error and every identity-dependent request returns **503** until the key is
+set. A 503 storm on a fresh machine means this key, not a broken endpoint.
 
 Frontend (`frontend/.env.local`): `NEXT_PUBLIC_SUPABASE_URL`, `NEXT_PUBLIC_SUPABASE_ANON_KEY`
 (client-side, prefixed). Server-side-only secrets stay unprefixed.

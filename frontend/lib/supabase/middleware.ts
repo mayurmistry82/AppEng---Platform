@@ -42,24 +42,34 @@ export async function updateSession(request: NextRequest) {
 
   const pathname = request.nextUrl.pathname;
 
-  // Protect /dashboard — redirect to /login when unauthenticated.
-  if (!user && pathname.startsWith("/dashboard")) {
+  // DENY BY DEFAULT (2026-08-11). Every route requires a session unless it is
+  // explicitly listed here. The previous guard protected an allowlist of paths
+  // (`pathname.startsWith("/dashboard")`), which meant every route added later
+  // shipped publicly reachable by default — that is exactly how the /jobs tree
+  // would have gone out unprotected. With deny-by-default, a future /settings
+  // cannot silently ship open: forgetting this file leaves it locked, not exposed.
+  // (Static assets never reach here — the matcher in middleware.ts excludes them.)
+  const PUBLIC_PATHS = new Set<string>(["/login"]);
+
+  if (!user && !PUBLIC_PATHS.has(pathname)) {
     const redirectUrl = request.nextUrl.clone();
     redirectUrl.pathname = "/login";
     return NextResponse.redirect(redirectUrl);
   }
 
-  // Root: redirect to /dashboard (authenticated) or /login (anonymous).
-  if (pathname === "/") {
+  // Authenticated home is /jobs, NOT /dashboard — deliberate change, 2026-08-11.
+  // The old /dashboard tree stays reachable by direct URL (and via the rail's
+  // Legacy item) until 3.16 retires it.
+  if (user && pathname === "/") {
     const redirectUrl = request.nextUrl.clone();
-    redirectUrl.pathname = user ? "/dashboard" : "/login";
+    redirectUrl.pathname = "/jobs";
     return NextResponse.redirect(redirectUrl);
   }
 
-  // Authenticated user landing on /login → push to /dashboard.
+  // Authenticated user landing on /login → push to /jobs.
   if (user && pathname === "/login") {
     const redirectUrl = request.nextUrl.clone();
-    redirectUrl.pathname = "/dashboard";
+    redirectUrl.pathname = "/jobs";
     return NextResponse.redirect(redirectUrl);
   }
 

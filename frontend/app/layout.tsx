@@ -1,5 +1,6 @@
 import type { Metadata } from "next";
 import { Inter, Syne } from "next/font/google";
+import { ThemeProvider } from "@/components/ThemeProvider";
 import "./globals.css";
 
 // Self-hosted via next/font — no request-time Google Fonts fetch, no FOUT.
@@ -30,17 +31,16 @@ export default function RootLayout({
   children: React.ReactNode;
 }) {
   return (
-    // className="dark" is HARDCODED so the app keeps rendering dark exactly as
-    // before this token layer landed (:root is now light, .dark is dark).
-    // Checklist 2.2 replaces this class with a theme provider — do not build a
-    // toggle here. suppressHydrationWarning exists for that same provider.
+    // Theme is managed by ThemeProvider (next-themes, attribute="class") — 2.2
+    // replaced 2.1's hardcoded dark class. suppressHydrationWarning stays: the
+    // provider mutates <html> class before hydration.
     <html
       lang="en"
-      className={`${inter.variable} ${syne.variable} dark`}
+      className={`${inter.variable} ${syne.variable}`}
       suppressHydrationWarning
     >
       <body className="min-h-screen bg-background text-foreground antialiased">
-        {children}
+        <ThemeProvider>{children}</ThemeProvider>
       </body>
     </html>
   );
