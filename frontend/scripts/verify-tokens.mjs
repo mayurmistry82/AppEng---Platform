@@ -1,15 +1,35 @@
 #!/usr/bin/env node
 /**
- * verify-tokens.mjs — proves app/globals.css matches docs/DESIGN.md exactly.
+ * verify-tokens.mjs — proves the token layer is correct end to end:
+ * docs/DESIGN.md -> app/globals.css -> tailwind.config.ts.
  *
- * Extracts every { light, dark } colour token from the DESIGN.md `colors:` block with a
- * line regex (deliberately NOT a YAML parser: the front matter has six `key:{` lines
- * missing a space after the colon and will not parse as YAML — and DESIGN.md must never
- * be edited). Then reads the `--var: H S% L%;` declarations from the `:root` and `.dark`
- * blocks of app/globals.css, converts each HSL triplet BACK to hex, and diffs.
+ * WHICH BYTES EACH CHECK CONSUMES (F61: a negative test once targeted a hex audit
+ * comment that the parser strips, and so could never have gone red — state the
+ * consumed bytes explicitly so a negative test can be aimed correctly):
  *
- * Exit non-zero on any mismatch, or if any token found in DESIGN.md is missing from
- * either mode.
+ *   CHECK 1 — expected tokens. Reads docs/DESIGN.md line by line and keeps only lines
+ *     matching `name: { light: "#RRGGBB", dark: "#RRGGBB" }`. A reformatted or
+ *     multi-line entry is SILENTLY NOT SEEN. (Deliberately not a YAML parser: the front
+ *     matter has six `key:{` lines missing a space after the colon and will not parse.)
+ *
+ *   CHECK 2 — emitted values. Reads app/globals.css, slices the `:root {` and `.dark {`
+ *     blocks, STRIPS ALL /* ... *​/ BLOCK COMMENTS, then matches
+ *     `--name: <H> <S>% <L>%;` declarations. It therefore consumes the HSL TRIPLET ONLY —
+ *     the trailing `/* #RRGGBB *​/` audit comment is stripped before matching and is NOT
+ *     verified. To make this check fail you must change a NUMBER in the triplet, never
+ *     the hex comment. Each triplet is converted back to hex and compared to CHECK 1.
+ *
+ *   CHECK 3 — tailwind reachability (F62). Reads tailwind.config.ts as raw TEXT and, for
+ *     every token CHECK 2 found in `:root`, asserts the literal substring `var(--name)`
+ *     appears somewhere in that text. It consumes the whole file as one string — it does
+ *     not parse the config, so it is indifferent to nesting, key names and formatting;
+ *     it only proves the CSS variable is referenced. Without this, a token could be
+ *     defined in DESIGN.md, correctly emitted into both modes, pass 83/83, and STILL be
+ *     unreachable from a className — which is exactly what happened to
+ *     `--destructive-subtle` between F35 and 3.1.
+ *
+ * Exit non-zero on any mismatch, if any token found in DESIGN.md is missing from either
+ * mode, or if any emitted colour token is unmapped in tailwind.
  * Run: node scripts/verify-tokens.mjs   (intentionally not a package.json script)
  */
 import { readFileSync } from "node:fs";
@@ -19,6 +39,7 @@ import { fileURLToPath } from "node:url";
 const here = dirname(fileURLToPath(import.meta.url));
 const DESIGN_MD = join(here, "..", "..", "..", "docs", "DESIGN.md");
 const GLOBALS = join(here, "..", "app", "globals.css");
+const TAILWIND = join(here, "..", "tailwind.config.ts");
 
 // Sanity floor: catches a gutted or unreadable DESIGN.md (e.g. the regex silently
 // matching nothing). NOT the pass/fail gate — that demands every token found, below.
@@ -95,11 +116,27 @@ for (const [name, lightHex, darkHex] of expected) {
   }
 }
 
+// ── 5. Tailwind reachability (F62) ────────────────────────────────────────────
+// Raw text, not a parse: a token is "mapped" iff the literal `var(--name)` appears
+// anywhere in tailwind.config.ts. Every colour token emitted in :root must be
+// reachable from a className.
+const tailwindText = readFileSync(TAILWIND, "utf8");
+const emittedNames = Object.keys(emitted.light);
+const unmapped = emittedNames.filter(
+  (name) => !tailwindText.includes(`var(--${name})`)
+);
+
 console.log("-".repeat(64));
 console.log(`DESIGN.md tokens found : ${expected.length}`);
 console.log(`emitted in :root       : ${counts.light}/${expected.length}`);
 console.log(`emitted in .dark       : ${counts.dark}/${expected.length}`);
 console.log(`mismatches             : ${failures}`);
+console.log(
+  `mapped in tailwind     : ${emittedNames.length - unmapped.length}/${emittedNames.length}`
+);
+for (const name of unmapped) {
+  console.log(`UNMAPPED: ${name} — no "var(--${name})" in tailwind.config.ts`);
+}
 
 if (expected.length < MIN_EXPECTED_TOKENS) {
   console.error(
@@ -111,6 +148,13 @@ if (counts.light < expected.length || counts.dark < expected.length || failures 
   console.error("FAIL: token layer does not match DESIGN.md");
   process.exit(1);
 }
+if (unmapped.length > 0) {
+  console.error(
+    `FAIL: ${unmapped.length} emitted token(s) unmapped in tailwind.config.ts: ${unmapped.join(", ")}`
+  );
+  process.exit(1);
+}
 console.log(
   `OK: ${counts.light}/${expected.length} PASS in light, ${counts.dark}/${expected.length} PASS in dark`
 );
+console.log(`OK: ${emittedNames.length}/${emittedNames.length} reachable in tailwind.config.ts`);

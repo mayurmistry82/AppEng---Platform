@@ -2,7 +2,7 @@ import * as React from "react";
 import { cn } from "@/lib/utils";
 
 /**
- * StatusPill — the five job statuses (DESIGN.md `components: status-pill`).
+ * StatusPill — the six job statuses (DESIGN.md `components: status-pill`).
  * Composition: dot in `status-X` + background `status-X-bg` + label in
  * `status-X-foreground`, fully rounded, `caption` type role.
  *
@@ -16,7 +16,7 @@ import { cn } from "@/lib/utils";
  * scans source statically, so `bg-status-${x}-bg` would never be generated.
  */
 
-export type JobStatus = "draft" | "sized" | "sent" | "won" | "lost";
+export type JobStatus = "draft" | "sized" | "sent" | "won" | "installed" | "lost";
 
 const STATUS_STYLES: Record<
   JobStatus,
@@ -42,6 +42,11 @@ const STATUS_STYLES: Record<
     pill: "bg-status-won-bg",
     label: "text-status-won-foreground",
   },
+  installed: {
+    dot: "bg-status-installed",
+    pill: "bg-status-installed-bg",
+    label: "text-status-installed-foreground",
+  },
   lost: {
     dot: "bg-status-lost",
     pill: "bg-status-lost-bg",
@@ -54,6 +59,7 @@ const LABELS: Record<JobStatus, string> = {
   sized: "Sized",
   sent: "Sent",
   won: "Won",
+  installed: "Installed",
   lost: "Lost",
 };
 

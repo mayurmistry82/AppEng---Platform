@@ -89,6 +89,9 @@
     --status-lost: 358.1 65.5% 53.3%;         /* #D63A3F */
     --status-lost-bg: 0 82.6% 95.5%;          /* #FDEAEA */
     --status-lost-foreground: 358 60.6% 39.8%;/* #A3282C */
+    --status-installed: 187 77.44% 31.5%;     /* #12808F */
+    --status-installed-bg: 185.25 52.18% 91.63%; /* #DFF3F5 */
+    --status-installed-foreground: 187.22 77.19% 22.47%; /* #0D5B66 */
     --chart-1: 40 100% 43%;                   /* #DB9200 */
     --chart-2: 210 70.9% 54.1%;               /* #378ADD */
     --chart-3: 15.6 81.3% 51.8%;              /* #E85420 */
@@ -188,6 +191,9 @@
     --status-lost: 358 75% 59%;               /* #E5484D */
     --status-lost-bg: 354.8 35.4% 12.7%;      /* #2C1517 */
     --status-lost-foreground: 358 77% 74%;    /* #F08A8D */
+    --status-installed: 185.76 61.43% 47.98%; /* #2FB7C6 */
+    --status-installed-bg: 187.54 56.16% 10.68%; /* #0C272B */
+    --status-installed-foreground: 186.31 64.62% 60.82%; /* #5BCEDC */
     --chart-1: 39.1 100% 57.8%;               /* #FFB428 */
     --chart-2: 210 70.9% 54.1%;               /* #378ADD */
     --chart-3: 16 100% 60.4%;                 /* #FF6B35 */

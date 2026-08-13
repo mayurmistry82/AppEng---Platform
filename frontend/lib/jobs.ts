@@ -1,0 +1,374 @@
+/**
+ * Job-tracker domain logic (checklist 3.1) — PURE. No React, no fetch, no
+ * next/*, no DOM. This file is exercised by scripts/verify-jobs-logic.ts under
+ * `node --experimental-strip-types`, so it must stay strip-safe: no `enum`, no
+ * namespaces, no parameter properties, no decorators. Types, interfaces,
+ * `as const` and plain functions only.
+ *
+ * Every formatter accepts null/undefined/NaN and returns a display string —
+ * none throw. A bad field renders a placeholder, never breaks a row.
+ */
+
+// ── Statuses / API contract ──────────────────────────────────────────────────
+
+/** The six values allowed by jobs_status_check and backend _VALID_STATUSES. */
+export const JOB_STATUSES = [
+  "draft",
+  "sized",
+  "sent",
+  "won",
+  "installed",
+  "lost",
+] as const;
+
+export type JobStatus = (typeof JOB_STATUSES)[number];
+
+export interface JobHeadline {
+  solar_kw: number | null;
+  battery_kwh: number | null;
+  payback_years: number | null;
+}
+
+export interface JobListItem {
+  job_id: string;
+  customer_name: string | null;
+  address: string | null;
+  status: string; // one of the six; the pill guards unknown values
+  path: string | null;
+  path_label: string | null;
+  headline: JobHeadline;
+  accuracy_tier: number | null; // INTEGER 1|2|3 — never the string "tier_3"
+  assigned_to: string | null; // uuid — no name available until the 7.2 join
+  notes: string | null;
+  scheduled_date: string | null; // rendered by 7.3, not 3.1
+  event_type: string | null; // rendered by 7.3, not 3.1
+  updated_at: string | null; // ISO8601
+}
+
+export interface JobKpis {
+  pipeline_value: number;
+  win_rate: number | null; // 0..1 fraction; null when no won/lost in 90 days
+  in_progress: number;
+  won_this_month: { count: number; value: number };
+}
+
+export interface JobsResponse {
+  jobs: JobListItem[];
+  total: number;
+  limit: number;
+  offset: number;
+  kpis: JobKpis;
+}
+
+/** Minimal structural check — a 200 body missing `jobs` is an ERROR, not empty. */
+export function isJobsResponse(value: unknown): value is JobsResponse {
+  return (
+    typeof value === "object" &&
+    value !== null &&
+    Array.isArray((value as { jobs?: unknown }).jobs)
+  );
+}
+
+// ── Filters / sorts ──────────────────────────────────────────────────────────
+
+export interface JobFilter {
+  id: string;
+  label: string;
+  /** Statuses sent as repeated ?status= params; empty = no status param. */
+  statuses: readonly JobStatus[];
+}
+
+/**
+ * The four wireframe tabs. A job with status `installed` appears only under
+ * All — that is the four-tab design, deliberate for 3.1 (no fifth tab, and
+ * installed is NOT folded into Won).
+ */
+export const FILTERS = [
+  { id: "all", label: "All", statuses: [] },
+  { id: "in-progress", label: "In progress", statuses: ["draft", "sized", "sent"] },
+  { id: "won", label: "Won", statuses: ["won"] },
+  { id: "lost", label: "Lost", statuses: ["lost"] },
+] as const satisfies readonly JobFilter[];
+
+export type JobFilterId = (typeof FILTERS)[number]["id"];
+
+export const DEFAULT_FILTER_ID: JobFilterId = "all";
+
+/** The four sorts GET /api/jobs accepts — anything else 422s. */
+export const SORTS = [
+  { id: "updated_desc", label: "Recently updated" },
+  { id: "updated_asc", label: "Least recently updated" },
+  { id: "created_desc", label: "Newest" },
+  { id: "created_asc", label: "Oldest" },
+] as const;
+
+export type JobSortId = (typeof SORTS)[number]["id"];
+
+export const DEFAULT_SORT_ID: JobSortId = "updated_desc";
+
+/** Unknown/absent filter ids silently fall back to All (never a 422). */
+export function resolveFilter(id: string | null | undefined): JobFilter {
+  return FILTERS.find((f) => f.id === id) ?? FILTERS[0];
+}
+
+/** Unknown/absent sort ids silently fall back to updated_desc (never a 422). */
+export function resolveSort(id: string | null | undefined): JobSortId {
+  return SORTS.some((s) => s.id === id) ? (id as JobSortId) : DEFAULT_SORT_ID;
+}
+
+export interface JobsQueryInput {
+  filter?: string | null;
+  q?: string | null;
+  sort?: string | null;
+  limit?: number;
+  offset?: number;
+}
+
+/**
+ * Build the /api/jobs query string. Only values the backend accepts are ever
+ * emitted: unknown filter → no status param, unknown sort → updated_desc.
+ */
+export function buildJobsQuery(input: JobsQueryInput): URLSearchParams {
+  const params = new URLSearchParams();
+  for (const status of resolveFilter(input.filter).statuses) {
+    params.append("status", status);
+  }
+  const q = typeof input.q === "string" ? input.q.trim() : "";
+  if (q) params.set("q", q);
+  params.set("sort", resolveSort(input.sort));
+  if (typeof input.limit === "number" && Number.isFinite(input.limit)) {
+    params.set("limit", String(Math.trunc(input.limit)));
+  }
+  if (typeof input.offset === "number" && Number.isFinite(input.offset) && input.offset > 0) {
+    params.set("offset", String(Math.trunc(input.offset)));
+  }
+  return params;
+}
+
+// ── Formatters ───────────────────────────────────────────────────────────────
+
+function isNum(v: unknown): v is number {
+  return typeof v === "number" && Number.isFinite(v);
+}
+
+/** One decimal, with a trailing ".0" dropped: 9.2 → "9.2", 10 → "10". */
+function fmt1(n: number): string {
+  return n.toFixed(1).replace(/\.0$/, "");
+}
+
+export const NOT_YET_SIZED = "— not yet sized";
+
+/**
+ * Headline → "9.2 kW + 10 kWh · 6.4 yr" (see the column spec for the shapes).
+ * Sizes but no payback → the size part alone; nothing at all → NOT_YET_SIZED.
+ */
+export function formatResult(headline: JobHeadline | null | undefined): string {
+  const solar = isNum(headline?.solar_kw) ? headline.solar_kw : null;
+  const battery = isNum(headline?.battery_kwh) ? headline.battery_kwh : null;
+  const payback = isNum(headline?.payback_years) ? headline.payback_years : null;
+
+  const sizes: string[] = [];
+  if (solar !== null) sizes.push(`${fmt1(solar)} kW`);
+  if (battery !== null) sizes.push(`${fmt1(battery)} kWh`);
+  const sizePart = sizes.join(" + ");
+
+  if (!sizePart) return payback !== null ? `${fmt1(payback)} yr` : NOT_YET_SIZED;
+  if (payback === null) return sizePart;
+  return `${sizePart} · ${fmt1(payback)} yr`;
+}
+
+/** Integer accuracy tier → label; tier 1 is flagged low (worth improving). */
+export function formatTier(
+  tier: number | null | undefined,
+): { label: string; low: boolean } {
+  if (tier === 1 || tier === 2 || tier === 3) {
+    return { label: `Tier ${tier}`, low: tier === 1 };
+  }
+  return { label: "—", low: false };
+}
+
+/**
+ * ISO timestamp → "2 Aug" in Australia/Adelaide — never the server's local
+ * zone. Unparseable/absent → "—".
+ */
+export function formatUpdated(iso: string | null | undefined): string {
+  if (typeof iso !== "string" || !iso) return "—";
+  const date = new Date(iso);
+  if (Number.isNaN(date.getTime())) return "—";
+  return new Intl.DateTimeFormat("en-AU", {
+    day: "numeric",
+    month: "short",
+    timeZone: "Australia/Adelaide",
+  }).format(date);
+}
+
+/** Compact AUD: 84200 → "$84.2k", 610 → "$610", 1250000 → "$1.3m", null → "—". */
+export function formatCompactAud(n: number | null | undefined): string {
+  if (!isNum(n)) return "—";
+  const sign = n < 0 ? "-" : "";
+  const abs = Math.abs(n);
+  if (abs >= 1_000_000) return `${sign}$${fmt1(abs / 1_000_000)}m`;
+  if (abs >= 1_000) return `${sign}$${fmt1(abs / 1_000)}k`;
+  return `${sign}$${Math.round(abs)}`;
+}
+
+/** 0..1 fraction → "61%"; null (no won/lost in 90 days) → "—", never "0%". */
+export function formatWinRate(r: number | null | undefined): string {
+  if (!isNum(r)) return "—";
+  return `${Math.round(r * 100)}%`;
+}
+
+// ── Error-panel copy ─────────────────────────────────────────────────────────
+
+/**
+ * Why a request failed, as a cause rather than a status code (F55).
+ *
+ * Defined HERE, in the pure module, rather than in lib/api-server.ts, so the
+ * copy below can be unit-tested under --experimental-strip-types without
+ * loading that server-only module. api-server.ts imports and re-exports it.
+ *
+ * config  — the Supabase client could not be constructed (missing env vars)
+ * auth    — the client worked; there is no signed-in session
+ * network — fetch() threw; the request never reached the server
+ * http    — the backend answered with a non-2xx
+ * parse   — the response body could not be read as the expected JSON
+ */
+export type ApiErrorKind = "config" | "auth" | "network" | "http" | "parse";
+
+export interface ErrorPanelCopy {
+  heading: string;
+  body: string;
+}
+
+/**
+ * Every word the /jobs error panel renders. page.tsx holds no copy of its own,
+ * so all of it is testable without a browser.
+ *
+ * F55 is the whole point of the `config` branch: it must never mention a
+ * session, signing in, or expiry — an unset env var is a deployment fault, and
+ * sending the installer to the login screen hides it. An unrecognised kind
+ * (impossible via the type, reachable via bad data) falls back to `http` rather
+ * than rendering an empty panel.
+ *
+ * Env var NAMES only — never a value, and never the access token.
+ */
+export function errorPanelCopy(
+  kind: ApiErrorKind,
+  status: number,
+  endpoint: string,
+): ErrorPanelCopy {
+  switch (kind) {
+    case "config":
+      return {
+        heading: "Jobs can't load — the app is misconfigured",
+        body: `NEXT_PUBLIC_SUPABASE_URL / NEXT_PUBLIC_SUPABASE_ANON_KEY is not set. Set both in the deployment environment and redeploy.`,
+      };
+    case "auth":
+      return {
+        heading: "Couldn't load jobs — you may be signed out",
+        body: `${endpoint} responded with HTTP ${status}. Your session may have expired — sign in again.`,
+      };
+    case "network":
+      return {
+        heading: "Couldn't load jobs — the backend is unreachable",
+        body: `The request to ${endpoint} never reached the server. Check the backend is running on port 8000.`,
+      };
+    case "parse":
+      return {
+        heading: "Couldn't load jobs — the response was unreadable",
+        body: `${endpoint} returned a response the app could not read. Try reloading, and check the backend logs if it persists.`,
+      };
+    case "http":
+    default:
+      return {
+        heading: "Couldn't load jobs",
+        body: `${endpoint} responded with HTTP ${status}. The backend hit an error — try reloading, and check the backend logs if it persists.`,
+      };
+  }
+}
+
+// ── View models for the strip + table ────────────────────────────────────────
+
+export interface KpiTileView {
+  label: string;
+  value: string;
+  delta: string;
+}
+
+export interface JobRowView {
+  jobId: string;
+  customerName: string; // "Unnamed customer" when null — never "null"/empty
+  address: string; // "No address yet" when null
+  status: string;
+  result: string;
+  resultMuted: boolean;
+  tierLabel: string;
+  tierLow: boolean;
+  notes: string | null;
+  updated: string;
+  href: string;
+}
+
+export interface JobsSummary {
+  tiles: [KpiTileView, KpiTileView, KpiTileView, KpiTileView];
+  rows: JobRowView[];
+}
+
+/**
+ * Everything the KPI strip and the table render, precomputed. A null/absent
+ * KPI object yields four "—" tiles; a null field in any job yields that
+ * column's placeholder — one bad row never removes the row.
+ *
+ * F25: the two dollar captions read jobs.quoted_value_aud, which holds the
+ * engine's MODELLED net cost until an installer enters real pricing at 4.12 —
+ * so they say "modelled estimate" / "modelled value", never "installed value".
+ */
+export function summariseJobs(
+  jobs: readonly JobListItem[] | null | undefined,
+  kpis: JobKpis | null | undefined,
+): JobsSummary {
+  const tiles: JobsSummary["tiles"] = [
+    {
+      label: "Pipeline value",
+      value: formatCompactAud(kpis?.pipeline_value),
+      delta: "sized + sent · modelled estimate",
+    },
+    {
+      label: "Win rate",
+      value: formatWinRate(kpis?.win_rate),
+      delta: "last 90 days",
+    },
+    {
+      label: "Jobs in progress",
+      value: isNum(kpis?.in_progress) ? String(kpis.in_progress) : "—",
+      delta: "draft + sized + sent",
+    },
+    {
+      label: "Won this month",
+      value: isNum(kpis?.won_this_month?.count)
+        ? String(kpis.won_this_month.count)
+        : "—",
+      delta: `${formatCompactAud(kpis?.won_this_month?.value)} modelled value`,
+    },
+  ];
+
+  const rows: JobRowView[] = (jobs ?? []).map((job) => {
+    const result = formatResult(job.headline);
+    const tier = formatTier(job.accuracy_tier);
+    return {
+      jobId: job.job_id,
+      customerName: job.customer_name ?? "Unnamed customer",
+      address: job.address ?? "No address yet",
+      status: job.status,
+      result,
+      resultMuted: result === NOT_YET_SIZED,
+      tierLabel: tier.label,
+      tierLow: tier.low,
+      notes: job.notes && job.notes.trim() ? job.notes : null,
+      updated: formatUpdated(job.updated_at),
+      href: `/jobs/${job.job_id}/worksheet`,
+    };
+  });
+
+  return { tiles, rows };
+}

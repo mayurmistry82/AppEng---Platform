@@ -99,6 +99,7 @@ const config: Config = {
           // Legacy alias, not in DESIGN.md's 75 — app/login/page.tsx still uses
           // text-destructive-foreground. Dies with that call site at 3.16.
           foreground: "hsl(var(--destructive-foreground) / <alpha-value>)",
+          subtle: "hsl(var(--destructive-subtle) / <alpha-value>)",
         },
         success: {
           DEFAULT: "hsl(var(--success) / <alpha-value>)",
@@ -132,7 +133,7 @@ const config: Config = {
           },
         },
 
-        // ── Job-status pills (dot / bg / fg × 5) ────────────────────────────
+        // ── Job-status pills (dot / bg / fg × 6) ────────────────────────────
         status: {
           draft: {
             DEFAULT: "hsl(var(--status-draft) / <alpha-value>)",
@@ -153,6 +154,11 @@ const config: Config = {
             DEFAULT: "hsl(var(--status-won) / <alpha-value>)",
             bg: "hsl(var(--status-won-bg) / <alpha-value>)",
             foreground: "hsl(var(--status-won-foreground) / <alpha-value>)",
+          },
+          installed: {
+            DEFAULT: "hsl(var(--status-installed) / <alpha-value>)",
+            bg: "hsl(var(--status-installed-bg) / <alpha-value>)",
+            foreground: "hsl(var(--status-installed-foreground) / <alpha-value>)",
           },
           lost: {
             DEFAULT: "hsl(var(--status-lost) / <alpha-value>)",
