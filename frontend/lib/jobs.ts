@@ -218,6 +218,86 @@ export function formatWinRate(r: number | null | undefined): string {
   return `${Math.round(r * 100)}%`;
 }
 
+// ── Six-path derivation (checklist 3.2) ──────────────────────────────────────
+
+export type JobIntent = "solar" | "battery" | "both";
+export type PathLetter = "A" | "B" | "C" | "D" | "E" | "F";
+
+/**
+ * (has_existing_solar, intent) → path letter. Mirrors backend/job_paths.py
+ * BYTE-FOR-BYTE — the Postgres GENERATED column `jobs.path` is the source of
+ * truth and this value is NEVER sent to the API; it only labels the UI.
+ * Null on any incomplete or invalid input. Never throws.
+ */
+export function derivePath(
+  hasExistingSolar: boolean | null | undefined,
+  intent: JobIntent | null | undefined,
+): PathLetter | null {
+  if (typeof hasExistingSolar !== "boolean") return null;
+  switch (intent) {
+    case "solar":
+      return hasExistingSolar ? "F" : "A";
+    case "both":
+      return hasExistingSolar ? "D" : "B";
+    case "battery":
+      return hasExistingSolar ? "C" : "E";
+    default:
+      return null;
+  }
+}
+
+/** Human labels for each path — mirrors backend/job_paths.py PATH_LABELS. */
+export const PATH_LABELS: Record<PathLetter, string> = {
+  A: "Solar only",
+  B: "Solar + battery",
+  C: "Battery only (has solar)",
+  D: "Add solar + battery",
+  E: "Battery only (no solar)",
+  F: "Expand solar only",
+};
+
+export interface SizingOption {
+  intent: JobIntent;
+  path: PathLetter;
+  label: string;
+  enabled: boolean;
+}
+
+/**
+ * The exact sentence rendered under the disabled C/D pair (decision D1).
+ * Do not reword it — the reason is specific and true.
+ */
+export const DISABLED_PATH_REASON =
+  "Battery sizing on a home that already has solar needs true consumption, which the meter cannot see. That calculation is being built (4.1).";
+
+/**
+ * Which sizing options the modal shows, and which are selectable — the SINGLE
+ * source of truth; the component must not re-derive any of this.
+ *
+ * null  → []                       (the section is hidden until step 3 answers)
+ * false → A, B, E — all enabled
+ * true  → C, D disabled (D1 — battery sizing behind an existing array needs
+ *         true consumption; built at 4.1), F enabled. Exactly one selectable
+ *         option is INTENDED until 4.1 — do not "fix" it.
+ */
+export function sizingOptions(
+  hasExistingSolar: boolean | null | undefined,
+): SizingOption[] {
+  if (typeof hasExistingSolar !== "boolean") return [];
+  if (!hasExistingSolar) {
+    return [
+      { intent: "solar", path: "A", label: PATH_LABELS.A, enabled: true },
+      { intent: "both", path: "B", label: PATH_LABELS.B, enabled: true },
+      { intent: "battery", path: "E", label: PATH_LABELS.E, enabled: true },
+    ];
+  }
+  return [
+    { intent: "battery", path: "C", label: PATH_LABELS.C, enabled: false },
+    { intent: "both", path: "D", label: PATH_LABELS.D, enabled: false },
+    { intent: "solar", path: "F", label: PATH_LABELS.F, enabled: true },
+  ];
+}
+
 // ── Error-panel copy ─────────────────────────────────────────────────────────
 
 /**

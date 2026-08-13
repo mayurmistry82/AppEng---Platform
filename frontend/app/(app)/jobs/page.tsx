@@ -1,8 +1,10 @@
+import Link from "next/link";
 import { AlertTriangle } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { JobFilterBar, JobSearchInput } from "@/components/jobs/job-filter-bar";
 import { JobKpiStrip } from "@/components/jobs/job-kpi-strip";
 import { JobTable } from "@/components/jobs/job-table";
+import { NewJobDialog } from "@/components/jobs/new-job-dialog";
 import { apiGet, type ApiResult } from "@/lib/api-server";
 import {
   buildJobsQuery,
@@ -101,10 +103,10 @@ export default async function Page({
         <div className="flex flex-1 justify-center">
           <JobSearchInput />
         </div>
-        {/* The creation modal is checklist 3.2 — until then this button
-            deliberately does nothing (same as AppRail's New job control).
-            Not linked anywhere, not disabled. */}
-        <Button>＋ New job</Button>
+        {/* Opens the 3.2 creation modal — same NewJobDialog as AppRail. */}
+        <NewJobDialog>
+          <Button>＋ New job</Button>
+        </NewJobDialog>
       </div>
 
       {view.ok ? (
@@ -116,7 +118,37 @@ export default async function Page({
             <JobFilterBar total={view.total} />
           </div>
           <div className="mt-4">
-            <JobTable rows={view.summary.rows} filtersActive={filtersActive} />
+            {view.summary.rows.length > 0 ? (
+              <JobTable rows={view.summary.rows} />
+            ) : (
+              /* Empty state rendered HERE rather than by JobTable: its ＋ New
+                 job button must open the 3.2 modal, and job-table.tsx is
+                 frozen at 3.2 — so the page owns the zero-rows branch and
+                 JobTable now only ever renders populated tables. Same copy,
+                 same two variants, same reachability rule: this branch needs
+                 a SUCCESSFUL response with zero jobs; failures render the
+                 error panel below, never this. */
+              <div className="flex flex-col items-center gap-3 rounded-lg border border-border bg-card px-6 py-16 text-center">
+                <h2 className="text-h3 text-foreground">
+                  {filtersActive ? "No jobs match these filters" : "No jobs yet"}
+                </h2>
+                <p className="text-body text-muted-foreground">
+                  {filtersActive
+                    ? "Try a different filter or clear your search."
+                    : "Create your first job to get started."}
+                </p>
+                <div className="mt-2 flex items-center gap-3">
+                  {filtersActive ? (
+                    <Button variant="secondary" asChild>
+                      <Link href="/jobs">Clear filters</Link>
+                    </Button>
+                  ) : null}
+                  <NewJobDialog>
+                    <Button>＋ New job</Button>
+                  </NewJobDialog>
+                </div>
+              </div>
+            )}
           </div>
         </>
       ) : (

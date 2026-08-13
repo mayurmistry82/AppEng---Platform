@@ -1,6 +1,5 @@
 import Link from "next/link";
 import { AlertTriangle, FileText, Plus } from "lucide-react";
-import { Button } from "@/components/ui/button";
 import { StatusPill } from "@/components/ui/status-pill";
 import {
   Table,
@@ -17,43 +16,15 @@ import type { JobRowView } from "@/lib/jobs";
  * height, hover and dividers come from TableRow (h-9, hover:bg-accent,
  * `border` dividers per F33) and are not restyled here.
  *
- * Empty state: only reachable when the request SUCCEEDED with zero jobs — a
- * failed request renders the page-level error panel instead, never this. The
- * two states are produced from different branches and can never be confused.
+ * Rows only (F75): the zero-rows empty state is owned by app/(app)/jobs/
+ * page.tsx, which renders this component solely when rows exist — its ＋ New
+ * job button had to open the 3.2 modal, so the page took the branch and the
+ * copy lives there. Empty-vs-error reachability is unchanged: a successful
+ * response with zero jobs renders the page's empty state, every failure
+ * renders the page's error panel.
  */
 
-export function JobTable({
-  rows,
-  filtersActive,
-}: {
-  rows: readonly JobRowView[];
-  filtersActive: boolean;
-}) {
-  if (rows.length === 0) {
-    return (
-      <div className="flex flex-col items-center gap-3 rounded-lg border border-border bg-card px-6 py-16 text-center">
-        <h2 className="text-h3 text-foreground">
-          {filtersActive ? "No jobs match these filters" : "No jobs yet"}
-        </h2>
-        <p className="text-body text-muted-foreground">
-          {filtersActive
-            ? "Try a different filter or clear your search."
-            : "Create your first job to get started."}
-        </p>
-        <div className="mt-2 flex items-center gap-3">
-          {filtersActive ? (
-            <Button variant="secondary" asChild>
-              <Link href="/jobs">Clear filters</Link>
-            </Button>
-          ) : null}
-          {/* The creation modal is checklist 3.2 — until then this button
-              deliberately does nothing, same as AppRail's New job control. */}
-          <Button>＋ New job</Button>
-        </div>
-      </div>
-    );
-  }
-
+export function JobTable({ rows }: { rows: readonly JobRowView[] }) {
   return (
     <Table>
       <TableHeader>

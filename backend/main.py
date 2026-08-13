@@ -35,6 +35,7 @@ from routes.cost import router as cost_router
 from routes.interval import router as interval_router
 from routes.roof import router as roof_router
 from routes.generation import router as generation_router
+from routes.address import router as address_router
 from auth import router as auth_router
 
 app = FastAPI(title="EnrgEngine API", version="0.1.0")
@@ -58,6 +59,7 @@ app.include_router(cost_router)
 app.include_router(interval_router)
 app.include_router(roof_router)
 app.include_router(generation_router)
+app.include_router(address_router)
 app.include_router(auth_router)  # GET /api/auth/me — no existing endpoint gains a dependency
 
 

@@ -12,18 +12,22 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 
 import {
+  DISABLED_PATH_REASON,
   FILTERS,
   JOB_STATUSES,
   NOT_YET_SIZED,
   buildJobsQuery,
+  derivePath,
   errorPanelCopy,
   formatCompactAud,
   formatResult,
   formatTier,
   formatUpdated,
   formatWinRate,
+  sizingOptions,
   summariseJobs,
   type ApiErrorKind,
+  type JobIntent,
   type JobKpis,
   type JobListItem,
 } from "../lib/jobs.ts";
@@ -341,6 +345,70 @@ test("errorPanelCopy: an unrecognised kind falls back to the http copy", () => {
   const bogus = errorPanelCopy(unsafe<ApiErrorKind>("banana"), 500, ENDPOINT);
   assert.deepEqual(bogus, errorPanelCopy("http", 500, ENDPOINT));
   assert.ok(bogus.heading.trim().length > 0);
+});
+
+// ── derivePath / sizingOptions (checklist 3.2) ───────────────────────────────
+
+// a. All six valid combinations, each asserted explicitly — no table loop.
+test("derivePath: all six combinations map exactly as backend/job_paths.py", () => {
+  assert.equal(derivePath(false, "solar"), "A");
+  assert.equal(derivePath(false, "both"), "B");
+  assert.equal(derivePath(true, "battery"), "C");
+  assert.equal(derivePath(true, "both"), "D");
+  assert.equal(derivePath(false, "battery"), "E");
+  assert.equal(derivePath(true, "solar"), "F");
+});
+
+// b. Null for incomplete or invalid input — and it never throws.
+test("derivePath: null for null intent, null solar flag, invalid intent", () => {
+  assert.equal(derivePath(false, null), null);
+  assert.equal(derivePath(true, null), null);
+  assert.equal(derivePath(null, "solar"), null);
+  assert.equal(derivePath(null, null), null);
+  assert.equal(derivePath(undefined, "both"), null);
+  assert.equal(derivePath(false, unsafe<JobIntent>("heat-pump")), null);
+  assert.doesNotThrow(() => derivePath(unsafe<boolean>("yes"), unsafe<JobIntent>(42)));
+});
+
+// c. Section hidden until step 3 is answered.
+test("sizingOptions: null returns []", () => {
+  assert.deepEqual(sizingOptions(null), []);
+  assert.deepEqual(sizingOptions(undefined), []);
+});
+
+// d. No existing solar → A, B, E, all enabled.
+test("sizingOptions(false): exactly A, B, E — all enabled", () => {
+  const options = sizingOptions(false);
+  assert.equal(options.length, 3);
+  assert.deepEqual(options.map((o) => o.path), ["A", "B", "E"]);
+  for (const o of options) assert.equal(o.enabled, true, `${o.path} should be enabled`);
+});
+
+// e. Has solar → C, D disabled (D1), F enabled. ONE selectable option is intended.
+test("sizingOptions(true): C and D disabled, F enabled", () => {
+  const options = sizingOptions(true);
+  assert.equal(options.length, 3);
+  assert.deepEqual(options.map((o) => o.path), ["C", "D", "F"]);
+  const byPath = new Map(options.map((o) => [o.path, o]));
+  assert.equal(byPath.get("C")?.enabled, false, "C must be disabled until 4.1");
+  assert.equal(byPath.get("D")?.enabled, false, "D must be disabled until 4.1");
+  assert.equal(byPath.get("F")?.enabled, true, "F must be enabled");
+  assert.equal(options.filter((o) => o.enabled).length, 1);
+});
+
+// f. The disabled reason is real and names 4.1.
+test("DISABLED_PATH_REASON: non-empty and mentions 4.1", () => {
+  assert.ok(DISABLED_PATH_REASON.trim().length > 0);
+  assert.ok(DISABLED_PATH_REASON.includes("4.1"));
+});
+
+// The option list's intents and the path derivation must agree with each other.
+test("sizingOptions and derivePath are mutually consistent", () => {
+  for (const has of [false, true]) {
+    for (const option of sizingOptions(has)) {
+      assert.equal(derivePath(has, option.intent), option.path);
+    }
+  }
 });
 
 // The four tabs stay exactly the wireframe's four — installed gets no fifth tab

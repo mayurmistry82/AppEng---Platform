@@ -11,6 +11,7 @@ import {
   Plus,
 } from "lucide-react";
 import ThemeToggle from "@/components/ThemeToggle";
+import { NewJobDialog } from "@/components/jobs/new-job-dialog";
 
 /**
  * Left icon rail (Stage 2.2) — layout from docs/2026-08-04-dashboard-newjob-wireframe.html.
@@ -82,15 +83,17 @@ export default function AppRail({ userEmail, signOutAction }: AppRailProps) {
         );
       })}
 
-      {/* New job — PRIMARY action, so blue, never amber. The creation modal is
-          checklist 3.2; until then this button deliberately does nothing. */}
-      <button
-        type="button"
-        className="flex w-full flex-col items-center gap-1 rounded-md bg-primary py-2 text-primary-foreground transition hover:bg-primary-hover active:bg-primary-active"
-      >
-        <Plus className="h-5 w-5" />
-        <span className="text-caption">New job</span>
-      </button>
+      {/* New job — PRIMARY action, so blue, never amber. Opens the 3.2
+          creation modal (same NewJobDialog as the /jobs header + empty state). */}
+      <NewJobDialog>
+        <button
+          type="button"
+          className="flex w-full flex-col items-center gap-1 rounded-md bg-primary py-2 text-primary-foreground transition hover:bg-primary-hover active:bg-primary-active"
+        >
+          <Plus className="h-5 w-5" />
+          <span className="text-caption">New job</span>
+        </button>
+      </NewJobDialog>
 
       {/* Equipment */}
       {NAV_ITEMS.slice(1).map((item) => {
