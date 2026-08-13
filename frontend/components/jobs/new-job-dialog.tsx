@@ -218,7 +218,7 @@ export function NewJobDialog({ children }: { children: React.ReactNode }) {
                     step="0.1"
                     value={solarKw}
                     onChange={(e) => setSolarKw(e.target.value)}
-                    placeholder="6.6"
+                    placeholder="e.g. 6.6"
                   />
                 </div>
                 <div>
@@ -234,7 +234,7 @@ export function NewJobDialog({ children }: { children: React.ReactNode }) {
                     step="0.1"
                     value={inverterKw}
                     onChange={(e) => setInverterKw(e.target.value)}
-                    placeholder="5.0"
+                    placeholder="e.g. 5.0"
                   />
                 </div>
               </div>
