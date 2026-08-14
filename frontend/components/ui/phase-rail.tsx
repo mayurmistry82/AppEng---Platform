@@ -77,6 +77,35 @@ function Connector({ done }: { done: boolean }) {
   );
 }
 
+/**
+ * ADDITIVE (3.3a fix 5) — the pieces, for callers that lay the four phases out
+ * themselves instead of as one compact column. The worksheet body needs each
+ * node beside its own group heading, with the connector running down past that
+ * group's sections; PhaseRail and PhaseRailWithLabels below are unchanged and
+ * still render the compact column on /style-guide.
+ *
+ * These wrap the SAME Node and Connector the rails use — the markup has one
+ * definition and is never duplicated by a caller.
+ */
+export const PHASE_META = PHASES;
+
+/** One rail node, addressed by its index in PHASE_META (0=Site … 3=Resolve). */
+export function PhaseNode({
+  index,
+  state,
+}: {
+  index: number;
+  state: PhaseNodeState;
+}) {
+  const phase = PHASES[index] ?? PHASES[0];
+  return <Node letter={phase.letter} label={phase.label} state={state} />;
+}
+
+/** The vertical run beneath a node; fills a flex-column parent. */
+export function PhaseConnector({ done }: { done: boolean }) {
+  return <Connector done={done} />;
+}
+
 export interface PhaseRailProps {
   /** States for [Site, Demand, Optimise, Resolve], in that order. */
   states: readonly [PhaseNodeState, PhaseNodeState, PhaseNodeState, PhaseNodeState];

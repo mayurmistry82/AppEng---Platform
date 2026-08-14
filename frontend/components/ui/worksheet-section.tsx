@@ -59,6 +59,14 @@ export interface WorksheetSectionProps {
   className?: string;
   /** Expanded by default when state is "active" or "complete" — set explicitly to override. */
   defaultOpen?: boolean;
+  /**
+   * Controlled disclosure (3.3): supply `open` to drive expansion from the
+   * parent; `onOpenChange` reports user toggles upward. When `open` is
+   * undefined the original uncontrolled `defaultOpen` behaviour applies
+   * unchanged (/style-guide renders it that way).
+   */
+  open?: boolean;
+  onOpenChange?: (open: boolean) => void;
 }
 
 export function WorksheetSection({
@@ -67,12 +75,14 @@ export function WorksheetSection({
   children,
   className,
   defaultOpen,
+  open: openProp,
+  onOpenChange,
 }: WorksheetSectionProps) {
   const resolved: WorksheetSectionState = isSectionState(state)
     ? state
     : "locked";
   const locked = resolved === "locked";
-  const open = defaultOpen ?? resolved !== "locked";
+  const open = openProp ?? defaultOpen ?? resolved !== "locked";
 
   if (locked) {
     // Not expandable by mouse OR keyboard: a plain <div>, no <summary>/tabindex.
@@ -95,6 +105,16 @@ export function WorksheetSection({
   return (
     <details
       open={open}
+      onToggle={
+        onOpenChange
+          ? (e: React.SyntheticEvent<HTMLDetailsElement>) => {
+              // Only this element's own toggle — never a nested <details>.
+              if (e.target === e.currentTarget) {
+                onOpenChange(e.currentTarget.open);
+              }
+            }
+          : undefined
+      }
       className={cn(
         "rounded-lg border bg-card",
         resolved === "active" ? "border-[1.5px] border-brand-amber" : "border-border",
