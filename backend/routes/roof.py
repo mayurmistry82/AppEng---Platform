@@ -33,8 +33,10 @@ from __future__ import annotations
 import os
 from typing import Any, Literal, Optional
 
+import requests
 import sentry_sdk
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Response
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 
 import roof_geometry
@@ -45,7 +47,7 @@ router = APIRouter()
 # Identical for absent and foreign jobs — existence never leaks.
 _404_JOB = HTTPException(status_code=404, detail="Job not found")
 # Ownership UNKNOWABLE (DB unreachable) is not "not yours" — same logic as auth.py's
-# membership 503 (F94): fail closed and honestly, and never cache or guess.
+# membership 503 (F88): fail closed and honestly, and never cache or guess.
 _503_JOBS = HTTPException(status_code=503, detail="Job lookup temporarily unavailable")
 
 
@@ -123,7 +125,7 @@ def _latest_roof_row(client: Any, job_id: str) -> Optional[dict]:
     try:
         res = (
             client.table("roof_geometry")
-            .select("lat, lng, geocoded_postcode, geocoded_state, geocoded_formatted_address")
+            .select("address, lat, lng, geocoded_postcode, geocoded_state, geocoded_formatted_address")
             .eq("job_id", job_id)
             .order("created_at", desc=True)
             .limit(1)
@@ -295,6 +297,11 @@ async def roof_manual_endpoint(
         )
         if panel_flags:
             model.setdefault("flags", []).extend(panel_flags)
+        # 3.4-B correction (b): a manual row otherwise stores address NULL. Inherit it
+        # from the newest existing row; with no previous row it stays NULL — never
+        # invented, and job_customers is never queried for it.
+        if previous and previous.get("address"):
+            model["address"] = previous["address"]
         _apply_site_cross_check(model, job)
         return _finish(model, body.job_id, body.persist)
     except HTTPException:
@@ -309,3 +316,63 @@ async def roof_manual_endpoint(
             "persisted": False,
             "flags": ["internal_error"],
         }
+
+
+# ── Static satellite tile (3.4-B) ────────────────────────────────────────────
+STATIC_MAPS_URL = "https://maps.googleapis.com/maps/api/staticmap"
+# Australia's rough bounding box — this proxy serves OUR property tiles, not the
+# world. Anything outside is 422; the endpoint must not become a general-purpose
+# image proxy for arbitrary coordinates (every call is billable).
+_AU_LAT = (-44.0, -9.0)
+_AU_LNG = (112.0, 154.0)
+
+
+@router.get("/api/roof/tile")
+async def roof_tile_endpoint(
+    lat: float, lng: float, zoom: int = 19, caller: Caller = Depends(require_company)
+):
+    """
+    Proxy ONE Maps Static satellite tile (D8 Option B). The key lives only in
+    backend/.env (F40) and never reaches the browser: the bytes are proxied,
+    never redirected, and failures carry a FIXED detail — a requests exception
+    message embeds the full URL including the key, so it is never echoed and
+    never sent to Sentry from here.
+    Size is fixed at 640x360 (not client-controlled). Billable per call
+    (Maps Static Essentials: 10,000/month free, then $2.00/1,000 — 2026-08-14).
+    """
+    # Bounds are checked HERE, in the handler body, so auth has already run —
+    # a stranger never learns which coordinates this endpoint considers valid.
+    if not (_AU_LAT[0] <= lat <= _AU_LAT[1]) or not (_AU_LNG[0] <= lng <= _AU_LNG[1]):
+        raise HTTPException(
+            status_code=422, detail="lat/lng outside supported bounds (Australia)"
+        )
+    zoom = max(17, min(21, zoom))
+
+    key = roof_geometry._api_key()
+    if not key:
+        return JSONResponse(status_code=502, content={"detail": "map tile unavailable"})
+    try:
+        upstream = requests.get(
+            STATIC_MAPS_URL,
+            params={
+                "center": f"{lat},{lng}",
+                "zoom": zoom,
+                "size": "640x360",
+                "maptype": "satellite",
+                "key": key,
+            },
+            timeout=15,
+        )
+    except Exception:  # noqa: BLE001 — exc text can embed the keyed URL; fixed detail only
+        return JSONResponse(status_code=502, content={"detail": "map tile unavailable"})
+
+    content_type = upstream.headers.get("Content-Type", "")
+    if upstream.status_code != 200 or not content_type.startswith("image/"):
+        # Includes Static Maps not being enabled on the key — same fixed detail,
+        # no upstream body (Google error text can also reference the request).
+        return JSONResponse(status_code=502, content={"detail": "map tile unavailable"})
+    return Response(
+        content=upstream.content,
+        media_type=content_type,
+        headers={"Cache-Control": "private, max-age=86400"},
+    )

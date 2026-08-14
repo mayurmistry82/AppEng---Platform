@@ -37,6 +37,7 @@ import {
   PinChip,
 } from "@/components/ui/override-drawer";
 import { KpiStrip, KpiTile } from "@/components/ui/kpi-tile";
+import { Notice } from "@/components/ui/notice";
 import { AccuracyMeter } from "@/components/ui/accuracy-meter";
 import { PhaseRailWithLabels } from "@/components/ui/phase-rail";
 import {
@@ -259,6 +260,26 @@ export default function StyleGuidePage() {
             <StatusPill key={s} status={s} />
           ))}
           <StatusPill status="not-a-real-status">Unknown → draft</StatusPill>
+        </div>
+      </Section>
+
+      <Section title="Notice" note="All four tones (DESIGN.md notice, added 2026-08-14 for 3.4-B). role=note, never alert. Caution is ORANGE (warning), never amber. An unrecognised tone falls back to info.">
+        <div className="flex max-w-xl flex-col gap-2">
+          <Notice tone="info" title="No aerial photo out here">
+            The imagery does not cover this area — entering the roof from plans is the accurate way anyway.
+          </Notice>
+          <Notice tone="success" title="Roof found">
+            Google&apos;s aerial imagery found this roof automatically.
+          </Notice>
+          <Notice tone="caution" title="The photo is 7 years old">
+            Anything built or planted since then will not appear.
+          </Notice>
+          <Notice tone="problem" title="That didn&apos;t work">
+            The lookup hit an error — try again in a moment.
+          </Notice>
+          <Notice tone="not-a-real-tone" title="Unknown tone → info">
+            Falls back to info rather than throwing.
+          </Notice>
         </div>
       </Section>
 

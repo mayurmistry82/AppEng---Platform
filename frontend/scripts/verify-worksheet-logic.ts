@@ -24,7 +24,11 @@ import {
   phaseStates,
   resultsBarDefaultCollapsed,
   resultsBarMaxHeight,
+  addressRoofView,
+  azimuthLabel,
+  latestRoofGeometry,
   resultsBarView,
+  roofEntryState,
   sectionStates,
   sectionsForPath,
   worksheetErrorCopy,
@@ -132,7 +136,7 @@ test("fresh job: section 1 active, rest locked, S current", () => {
 
 // e. roof_geometry populated -> 1 complete, 2 active
 test("roof done: section 1 complete, section 2 active", () => {
-  const job = emptyJob({ roof_geometry: [{ roof_id: "r1" }] });
+  const job = emptyJob({ roof_geometry: [{ created_at: "2026-08-01T00:00:00Z", found: true, planes: [{ panel_count: 12 }] }] });
   const states = sectionStates(job);
   assert.equal(states[0].state, "complete");
   assert.equal(states[1].state, "active");
@@ -163,7 +167,7 @@ test("all predicates true: 11 complete, phases all done", () => {
     roof_material: "tile",
     dwelling_type: "house",
     electrical_phase: "single",
-    roof_geometry: [{ roof_id: "r1" }],
+    roof_geometry: [{ created_at: "2026-08-01T00:00:00Z", found: true, planes: [{ panel_count: 12 }] }],
     bills: [{ bill_id: "b1" }],
     tariffs: [{ tariff_id: "t1" }],
     sizing_results: [{ solar_kw: 6.6, battery_kwh: 12.8 }],
@@ -510,7 +514,7 @@ test("phaseStates: path E Optimise holds 3 sections, none of them solar-sizing",
 
   const job = emptyJob({
     path: "E",
-    roof_geometry: [{ roof_id: "r1" }],
+    roof_geometry: [{ created_at: "2026-08-01T00:00:00Z", found: true, planes: [{ panel_count: 12 }] }],
     storeys: 1,
     roof_material: "tile",
     dwelling_type: "house",
@@ -620,4 +624,176 @@ test("worksheetErrorCopy: every other branch is unchanged by the 503 addition", 
     worksheetErrorCopy("network", 503, endpoint).heading,
     worksheetErrorCopy("network", 0, endpoint).heading,
   );
+});
+
+// ── Address & roof (3.4-B) ───────────────────────────────────────────────────
+
+const roofRow = (over: Record<string, unknown> = {}): Record<string, unknown> => ({
+  created_at: "2026-08-14T01:00:00Z",
+  found: true,
+  source: "google_solar",
+  manual_entry_required: false,
+  low_confidence: false,
+  needs_manual_confirmation: false,
+  planes: [{ azimuth: 0, pitch: 22, area_m2: 50, usable_area_m2: 35, panel_count: 17, kwp: 7.48 }],
+  ...over,
+});
+
+// (a) latestRoofGeometry — newest wins; unknown timestamps never win.
+test("latestRoofGeometry: junk-safe, newest wins, dateless sorts oldest", () => {
+  assert.equal(latestRoofGeometry(emptyJob()), null); // rows: []
+  assert.equal(latestRoofGeometry({}), null); // key absent
+  assert.equal(latestRoofGeometry(emptyJob({ roof_geometry: "junk" })), null);
+  assert.equal(
+    latestRoofGeometry(emptyJob({ roof_geometry: [1, "x", null] })),
+    null,
+  ); // rows that are not objects are dropped by arr()
+
+  const a = roofRow({ created_at: "2026-08-01T00:00:00Z", tag: "a" });
+  const b = roofRow({ created_at: "2026-08-14T00:00:00Z", tag: "b" });
+  const c = roofRow({ created_at: "2026-08-07T00:00:00Z", tag: "c" });
+  assert.equal(latestRoofGeometry(emptyJob({ roof_geometry: [a, b, c] }))?.tag, "b");
+  assert.equal(latestRoofGeometry(emptyJob({ roof_geometry: [b, a, c] }))?.tag, "b");
+
+  // A row with no created_at, or an unparseable one, must never beat a dated row —
+  // even when it appears LATER in the array.
+  const dateless = roofRow({ created_at: undefined, tag: "dateless" });
+  delete dateless.created_at;
+  const garbled = roofRow({ created_at: "not-a-date", tag: "garbled" });
+  assert.equal(
+    latestRoofGeometry(emptyJob({ roof_geometry: [a, dateless] }))?.tag,
+    "a",
+  );
+  assert.equal(
+    latestRoofGeometry(emptyJob({ roof_geometry: [a, garbled] }))?.tag,
+    "a",
+  );
+  // Exactly one row — returned even if dateless (something must supersede nothing).
+  assert.equal(
+    latestRoofGeometry(emptyJob({ roof_geometry: [dateless] }))?.tag,
+    "dateless",
+  );
+});
+
+// (b) roofEntryState — all five, with manual beating low_confidence.
+test("roofEntryState: five states, manual wins precedence", () => {
+  assert.equal(roofEntryState(null), "none");
+  assert.equal(roofEntryState("junk"), "none");
+  assert.equal(roofEntryState(roofRow()), "found");
+  assert.equal(roofEntryState(roofRow({ found: false })), "not_found");
+  assert.equal(roofEntryState(roofRow({ manual_entry_required: true })), "not_found");
+  assert.equal(roofEntryState(roofRow({ low_confidence: true })), "low_confidence");
+  assert.equal(
+    roofEntryState(roofRow({ needs_manual_confirmation: true })),
+    "low_confidence",
+  );
+  assert.equal(roofEntryState(roofRow({ source: "manual_plans" })), "manual");
+  // Precedence: a manual row that ALSO carries low_confidence resolves manual.
+  assert.equal(
+    roofEntryState(roofRow({ source: "manual_estimate", low_confidence: true })),
+    "manual",
+  );
+});
+
+// (c) azimuthLabel — the 16-point compass, normalised.
+test("azimuthLabel: compass points, normalisation, junk", () => {
+  assert.equal(azimuthLabel(0), "N");
+  assert.equal(azimuthLabel(90), "E");
+  assert.equal(azimuthLabel(180), "S");
+  assert.equal(azimuthLabel(270), "W");
+  assert.equal(azimuthLabel(45), "NE");
+  assert.equal(azimuthLabel(337.5), "NNW");
+  assert.equal(azimuthLabel(360), "N");
+  assert.equal(azimuthLabel(-90), "W");
+  assert.equal(azimuthLabel(720), "N");
+  assert.equal(azimuthLabel(null), null);
+  assert.equal(azimuthLabel(unsafe<number>("north")), null);
+  assert.equal(azimuthLabel(NaN), null);
+});
+
+// (d) THE CHANGED PREDICATE — a persisted row alone no longer completes the section.
+test("address-roof predicate: only a usable roof completes it", () => {
+  const spec = SECTIONS.find((s) => s.id === "address-roof");
+  assert.ok(spec);
+  const complete = (rows: unknown) =>
+    spec.complete(emptyJob({ roof_geometry: rows }));
+
+  // A not-found row persisted by the backend (the Mount Gambier case).
+  assert.equal(
+    complete([roofRow({ found: false, manual_entry_required: true, planes: [] })]),
+    false,
+    "a regional NOT_FOUND row must not complete the section",
+  );
+  assert.equal(complete([roofRow({ planes: [] })]), false, "empty planes");
+  assert.equal(
+    complete([roofRow({ planes: [{ panel_count: 0 }, { panel_count: 0 }] })]),
+    false,
+    "all-zero panels",
+  );
+  assert.equal(
+    complete([roofRow({ planes: [{ panel_count: 12 }] })]),
+    true,
+    "one plane with panels completes",
+  );
+  // An auto row WITH planes followed by a NEWER manual row with none: the newest
+  // row is the record, so the section is NOT complete.
+  const auto = roofRow({ created_at: "2026-08-10T00:00:00Z" });
+  const manualEmpty = roofRow({
+    created_at: "2026-08-14T02:00:00Z",
+    source: "manual_estimate",
+    planes: [],
+  });
+  assert.equal(complete([auto, manualEmpty]), false, "newer empty manual supersedes");
+  assert.equal(complete([manualEmpty, auto]), false, "order in array is irrelevant");
+});
+
+// (e) The regression the old predicate would have caused.
+test("not-found row: Address & roof stays ACTIVE, Site current, next locked", () => {
+  const job = emptyJob({
+    roof_geometry: [roofRow({ found: false, manual_entry_required: true, planes: [] })],
+  });
+  const states = sectionStates(job);
+  assert.equal(states[0].id, "address-roof");
+  assert.equal(states[0].state, "active", "must stay the active section");
+  assert.equal(states[1].id, "site-details");
+  assert.equal(states[1].state, "locked", "Site details must stay locked");
+  assert.deepEqual(phaseStates(job), ["current", "pending", "pending", "pending"]);
+});
+
+// (f) addressRoofView never throws.
+test("addressRoofView: junk-safe, serialisable, correct states", () => {
+  assert.doesNotThrow(() => addressRoofView(null));
+  assert.doesNotThrow(() => addressRoofView("garbage"));
+  assert.doesNotThrow(() => addressRoofView({}));
+  assert.equal(addressRoofView(null).state, "none");
+  assert.equal(addressRoofView({}).state, "none");
+  const junkPlanes = addressRoofView(
+    emptyJob({ roof_geometry: [roofRow({ planes: "not-a-list" })] }),
+  );
+  assert.equal(junkPlanes.state, "found");
+  assert.deepEqual(junkPlanes.planes, []);
+  assert.deepEqual(junkPlanes.totals, { panels: 0, kwp: 0 });
+
+  const found = addressRoofView(emptyJob({ path: "A", roof_geometry: [roofRow()] }));
+  assert.equal(found.state, "found");
+  assert.equal(found.notice?.tone, "success");
+  assert.equal(found.planes[0].azimuthLabel, "N");
+  assert.equal(found.totals.panels, 17);
+  assert.equal(found.solarMode, "optimise"); // 3.3b PATH_RULES, first consumer
+  const nf = addressRoofView(
+    emptyJob({ roof_geometry: [roofRow({ found: false, planes: [] })] }),
+  );
+  assert.equal(nf.notice?.tone, "info");
+  const manual = addressRoofView(
+    emptyJob({
+      roof_geometry: [
+        roofRow({ source: "manual_plans", reason: "Manual entry: from builder plans" }),
+      ],
+    }),
+  );
+  assert.equal(manual.state, "manual");
+  assert.equal(manual.note, "from builder plans");
+  assert.equal(manual.notice?.title, "Entered from plans");
+  // No function values anywhere — the view crosses the server/client boundary.
+  assert.doesNotThrow(() => JSON.stringify(found));
 });

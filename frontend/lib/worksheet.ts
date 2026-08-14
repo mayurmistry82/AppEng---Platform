@@ -86,7 +86,19 @@ export const SECTIONS: readonly WorksheetSectionSpec[] = [
     title: "Address & roof",
     phase: "site",
     builtAt: "3.4",
-    complete: (job) => arr(job.roof_geometry).length > 0,
+    // 3.4-B: the backend persists a row on EVERY outcome, including a regional
+    // NOT_FOUND with zero planes — so `length > 0` would tick this section
+    // complete for a Mount Gambier address with no roof at all, advance the
+    // phase rail and unlock Site details. Complete means: the NEWEST row (rows
+    // are append-only; newest supersedes) actually carries a usable roof.
+    complete: (job) => {
+      const row = latestRoofGeometry(job);
+      if (!row) return false;
+      return arr(row.planes).some((p) => {
+        const count = p.panel_count;
+        return typeof count === "number" && Number.isFinite(count) && count > 0;
+      });
+    },
   },
   {
     id: "site-details",
@@ -463,6 +475,306 @@ export function resultsBarView(job: unknown): ResultsBarView {
     paybackYears: num(latestFin?.payback_years),
     npv: num(latestFin?.npv_25_year),
   };
+}
+
+// ── Address & roof (3.4-B) ───────────────────────────────────────────────────
+
+/**
+ * The NEWEST roof_geometry row by created_at, or null. Rows are APPEND-ONLY and
+ * the newest supersedes (3.4-A's module docstring) — that is what lets a manual
+ * entry override an auto lookup while both survive for the ML flywheel.
+ *
+ * A row with no usable created_at sorts OLDEST and can never win a tie (strict
+ * `>` against dated rows; the earliest of the dateless wins only when every row
+ * is dateless). Tolerates the key absent, non-arrays and junk rows. Never throws.
+ */
+export function latestRoofGeometry(job: unknown): Record<string, unknown> | null {
+  const rows = arr(asObject(job).roof_geometry);
+  if (rows.length === 0) return null;
+  let best = rows[0];
+  let bestTime = roofRowTime(rows[0]);
+  for (let i = 1; i < rows.length; i++) {
+    const time = roofRowTime(rows[i]);
+    if (time > bestTime) {
+      best = rows[i];
+      bestTime = time;
+    }
+  }
+  return best;
+}
+
+function roofRowTime(row: Record<string, unknown>): number {
+  const raw = row.created_at;
+  if (typeof raw !== "string" || !raw) return -Infinity;
+  const time = new Date(raw).getTime();
+  return Number.isFinite(time) ? time : -Infinity;
+}
+
+export type RoofEntryState =
+  | "none"
+  | "found"
+  | "not_found"
+  | "low_confidence"
+  | "manual";
+
+/**
+ * Precedence, deliberately: manual beats everything (an installer's entry is
+ * the record even if the row also carries a low-confidence marker), then
+ * not-found, then low-confidence, then found.
+ */
+export function roofEntryState(row: unknown): RoofEntryState {
+  if (typeof row !== "object" || row === null) return "none";
+  const r = row as Record<string, unknown>;
+  if (typeof r.source === "string" && r.source.startsWith("manual_")) return "manual";
+  if (r.manual_entry_required === true || r.found !== true) return "not_found";
+  if (r.low_confidence === true || r.needs_manual_confirmation === true) {
+    return "low_confidence";
+  }
+  return "found";
+}
+
+const COMPASS_16 = [
+  "N", "NNE", "NE", "ENE", "E", "ESE", "SE", "SSE",
+  "S", "SSW", "SW", "WSW", "W", "WNW", "NW", "NNW",
+] as const;
+
+/** Degrees → 16-point compass label. Normalises negatives and >360; null in, null out. */
+export function azimuthLabel(deg: unknown): string | null {
+  if (typeof deg !== "number" || !Number.isFinite(deg)) return null;
+  const normalised = ((deg % 360) + 360) % 360;
+  return COMPASS_16[Math.round(normalised / 22.5) % 16];
+}
+
+export interface RoofPlaneView {
+  index: number;
+  label: string | null;
+  azimuth: number | null;
+  azimuthLabel: string | null;
+  pitch: number | null;
+  areaM2: number | null;
+  usableAreaM2: number | null;
+  panelCount: number | null;
+  kwp: number | null;
+}
+
+export interface RoofNoticeView {
+  tone: "info" | "success" | "caution" | "problem";
+  title: string;
+  body: string;
+}
+
+export interface AddressRoofView {
+  state: RoofEntryState;
+  address: string;
+  planes: RoofPlaneView[];
+  totals: { panels: number; kwp: number };
+  imageryDate: string | null;
+  imageryQualityLabel: string | null;
+  imageryStale: boolean;
+  imageryAgeYears: number | null;
+  sourceLabel: string | null;
+  lat: number | null;
+  lng: number | null;
+  panelLabel: string | null;
+  usabilityFactor: number | null;
+  note: string | null;
+  crossCheck: {
+    jobState: string | null;
+    jobPostcode: string | null;
+    geocodedState: string | null;
+    geocodedPostcode: string | null;
+    mismatch: boolean;
+  } | null;
+  notice: RoofNoticeView | null;
+  staleNotice: RoofNoticeView | null;
+  /** From PATH_RULES via pathRule() — 3.3b's fields, first consumer. */
+  solarMode: PathRule["solarMode"] | null;
+  showsExistingArray: boolean;
+}
+
+function roofNum(v: unknown): number | null {
+  return typeof v === "number" && Number.isFinite(v) ? v : null;
+}
+
+const SOURCE_LABELS: Record<string, string> = {
+  google_solar: "Google Solar",
+  manual_plans: "Entered from plans",
+  manual_site_measure: "Entered from a site measure",
+  manual_estimate: "Estimated",
+};
+
+const QUALITY_LABELS: Record<string, string> = {
+  HIGH: "High-quality imagery",
+  MEDIUM: "Medium-quality imagery",
+  LOW: "Low-quality imagery",
+};
+
+function roofStateNotice(
+  state: RoofEntryState,
+  source: string | null,
+): RoofNoticeView | null {
+  switch (state) {
+    case "found":
+      return {
+        tone: "success",
+        title: "Roof found",
+        body: "Google's aerial imagery found this roof automatically.",
+      };
+    case "not_found":
+      return {
+        tone: "info",
+        title: "No aerial photo out here",
+        body: "The aerial imagery doesn't cover this area — that's normal for about one address in five. Entering the roof from plans is the accurate way to do it anyway.",
+      };
+    case "low_confidence":
+      return {
+        tone: "caution",
+        title: "This looks like a newer build than the photo",
+        body: "The aerial photo seems to predate the house, so the roof it found is probably not the real one. Check it against the plans.",
+      };
+    case "manual":
+      if (source === "manual_plans") {
+        return {
+          tone: "success",
+          title: "Entered from plans",
+          body: "Plans are the most accurate roof source we can get.",
+        };
+      }
+      if (source === "manual_site_measure") {
+        return {
+          tone: "success",
+          title: "Entered from a site measure",
+          body: "Measured on site by the installer.",
+        };
+      }
+      return {
+        tone: "success",
+        title: "Estimated",
+        body: "A best estimate — refine it from plans when you can.",
+      };
+    default:
+      return null;
+  }
+}
+
+/**
+ * The serialisable view the Address & roof section renders — plain data only,
+ * no functions, because it crosses the server/client boundary. Every field
+ * degrades: a malformed row yields state "none" and a usable view, never a
+ * throw. solarMode / showsExistingArray are READ from PATH_RULES (3.3b built
+ * them for exactly this; behaviour is never re-derived from the path letter).
+ */
+export function addressRoofView(job: unknown): AddressRoofView {
+  const detail = asObject(job);
+  const rule = pathRule(detail.path);
+  const view: AddressRoofView = {
+    state: "none",
+    address: jobBarView(job).address,
+    planes: [],
+    totals: { panels: 0, kwp: 0 },
+    imageryDate: null,
+    imageryQualityLabel: null,
+    imageryStale: false,
+    imageryAgeYears: null,
+    sourceLabel: null,
+    lat: null,
+    lng: null,
+    panelLabel: null,
+    usabilityFactor: null,
+    note: null,
+    crossCheck: null,
+    notice: null,
+    staleNotice: null,
+    solarMode: rule ? rule.solarMode : null,
+    showsExistingArray: rule ? rule.showsExistingArray : false,
+  };
+
+  const row = latestRoofGeometry(job);
+  if (!row) return view;
+  view.state = roofEntryState(row);
+  if (view.state === "none") return view;
+
+  const source = typeof row.source === "string" ? row.source : null;
+  view.sourceLabel = source ? SOURCE_LABELS[source] ?? source : null;
+  view.lat = roofNum(row.lat);
+  view.lng = roofNum(row.lng);
+  view.usabilityFactor = roofNum(row.usability_factor);
+
+  let panels = 0;
+  let kwp = 0;
+  for (const [index, plane] of arr(row.planes).entries()) {
+    const azimuth = roofNum(plane.azimuth);
+    const planeView: RoofPlaneView = {
+      index,
+      label: typeof plane.label === "string" && plane.label ? plane.label : null,
+      azimuth,
+      azimuthLabel: azimuthLabel(azimuth),
+      pitch: roofNum(plane.pitch),
+      areaM2: roofNum(plane.area_m2),
+      usableAreaM2: roofNum(plane.usable_area_m2),
+      panelCount: roofNum(plane.panel_count),
+      kwp: roofNum(plane.kwp),
+    };
+    panels += planeView.panelCount ?? 0;
+    kwp += planeView.kwp ?? 0;
+    view.planes.push(planeView);
+  }
+  view.totals = { panels, kwp: Math.round(kwp * 1000) / 1000 };
+
+  const imageryDate = typeof row.imagery_date === "string" ? row.imagery_date : null;
+  view.imageryDate = imageryDate;
+  view.imageryStale = row.imagery_stale === true;
+  if (imageryDate) {
+    const time = new Date(imageryDate).getTime();
+    if (Number.isFinite(time)) {
+      view.imageryAgeYears = Math.max(
+        0,
+        Math.floor((Date.now() - time) / (365.25 * 24 * 3600 * 1000)),
+      );
+    }
+  }
+  const quality = typeof row.imagery_quality === "string" ? row.imagery_quality : null;
+  view.imageryQualityLabel = quality ? QUALITY_LABELS[quality] ?? quality : null;
+
+  const panel = row.selected_panel;
+  if (typeof panel === "object" && panel !== null) {
+    const p = panel as Record<string, unknown>;
+    const bits = [p.brand, p.model].filter((b) => typeof b === "string" && b);
+    const watts = roofNum(p.watts);
+    view.panelLabel =
+      bits.length || watts !== null
+        ? `${bits.join(" ")}${watts !== null ? ` ${watts} W` : ""}`.trim()
+        : null;
+  }
+
+  const reason = typeof row.reason === "string" ? row.reason : null;
+  view.note = reason?.startsWith("Manual entry: ")
+    ? reason.slice("Manual entry: ".length)
+    : null;
+
+  const cc = row.site_cross_check;
+  if (typeof cc === "object" && cc !== null) {
+    const c = cc as Record<string, unknown>;
+    view.crossCheck = {
+      jobState: typeof c.job_state === "string" ? c.job_state : null,
+      jobPostcode: typeof c.job_postcode === "string" ? c.job_postcode : null,
+      geocodedState: typeof c.geocoded_state === "string" ? c.geocoded_state : null,
+      geocodedPostcode:
+        typeof c.geocoded_postcode === "string" ? c.geocoded_postcode : null,
+      mismatch: c.mismatch === true,
+    };
+  }
+
+  view.notice = roofStateNotice(view.state, source);
+  if (view.imageryStale && view.state !== "manual") {
+    const years = view.imageryAgeYears;
+    view.staleNotice = {
+      tone: "caution",
+      title: years !== null ? `The photo is ${years} years old` : "The photo is old",
+      body: "Anything built or planted since then will not appear. Worth a check against the plans.",
+    };
+  }
+  return view;
 }
 
 // ── Results-bar geometry + preference (3.3a) ─────────────────────────────────

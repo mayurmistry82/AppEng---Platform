@@ -360,6 +360,16 @@ export function errorPanelCopy(
       };
     case "http":
     default:
+      if (kind === "http" && status === 503) {
+        // F88 residual: a 503 means the server could not reach its database, so
+        // it could not check anything about you. Deliberately says nothing about
+        // permissions or the session — pointing at authorisation is exactly the
+        // mistake the F88 auth fix removed.
+        return {
+          heading: "Couldn't load jobs — the server is briefly unavailable",
+          body: "The server could not reach its database for a moment. This is usually temporary — wait a few seconds and reload.",
+        };
+      }
       return {
         heading: "Couldn't load jobs",
         body: `${endpoint} responded with HTTP ${status}. The backend hit an error — try reloading, and check the backend logs if it persists.`,

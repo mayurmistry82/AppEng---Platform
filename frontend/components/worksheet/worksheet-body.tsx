@@ -8,8 +8,10 @@ import {
   type PhaseNodeState,
 } from "@/components/ui/phase-rail";
 import { WorksheetSection } from "@/components/ui/worksheet-section";
+import { AddressRoofSection } from "@/components/worksheet/address-roof-section";
 import {
   groupSectionsByPhase,
+  type AddressRoofView,
   type WorksheetSectionUnlockState,
 } from "@/lib/worksheet";
 
@@ -59,9 +61,15 @@ export interface WorksheetBodySection {
 export function WorksheetBody({
   sections,
   phases,
+  addressRoof,
+  jobId,
 }: {
   sections: readonly WorksheetBodySection[];
   phases: readonly [PhaseNodeState, PhaseNodeState, PhaseNodeState, PhaseNodeState];
+  /** 3.4-B: the serialisable Address & roof view; with it, that ONE section
+      renders the real body instead of its placeholder. */
+  addressRoof?: AddressRoofView;
+  jobId?: string;
 }) {
   const [openIds, setOpenIds] = React.useState<Record<string, boolean>>(() => {
     const active = sections.find((s) => s.state === "active");
@@ -89,11 +97,21 @@ export function WorksheetBody({
     "rounded-md border border-border px-2.5 py-1 text-caption text-foreground transition hover:bg-accent hover:text-accent-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-background";
 
   function renderSection(section: WorksheetBodySection) {
-    const body = (
-      <p className="text-caption text-muted-foreground">
-        Built at {section.builtAt}
-      </p>
-    );
+    const body =
+      section.id === "address-roof" && addressRoof && jobId ? (
+        // isOpen gates the billable tile <img>: a closed <details> keeps its
+        // children in the DOM, so the image must not exist until the section
+        // is actually open.
+        <AddressRoofSection
+          view={addressRoof}
+          jobId={jobId}
+          isOpen={!!openIds[section.id]}
+        />
+      ) : (
+        <p className="text-caption text-muted-foreground">
+          Built at {section.builtAt}
+        </p>
+      );
     if (section.state === "unlocked") {
       // Jumped-pass case — see the header comment.
       return (

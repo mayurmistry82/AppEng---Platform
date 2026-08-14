@@ -334,8 +334,10 @@ test("errorPanelCopy: no kind returns an empty heading or body", () => {
 test("errorPanelCopy: network and http surface the endpoint and status", () => {
   assert.ok(errorPanelCopy("network", 0, ENDPOINT).body.includes(ENDPOINT));
   assert.ok(errorPanelCopy("network", 0, ENDPOINT).body.includes("port 8000"));
-  const http = errorPanelCopy("http", 503, ENDPOINT).body;
-  assert.ok(http.includes(ENDPOINT) && http.includes("503"), http);
+  // 500, not 503 — 503 gained its own database-unavailable branch at 3.4-B, so it
+  // is no longer a valid example of the GENERIC http copy this test pins.
+  const http = errorPanelCopy("http", 500, ENDPOINT).body;
+  assert.ok(http.includes(ENDPOINT) && http.includes("500"), http);
   assert.ok(errorPanelCopy("parse", 200, ENDPOINT).body.includes("could not read"));
 });
 
@@ -426,4 +428,45 @@ test("FILTERS: exactly four tabs, installed only reachable under All", () => {
       "installed must not be folded into any tab",
     );
   }
+});
+
+// ── errorPanelCopy 503 branch (3.4-B — the F88 residual) ─────────────────────
+
+test("errorPanelCopy: 503 says database-unavailable, never authorisation", () => {
+  const copy = errorPanelCopy("http", 503, ENDPOINT);
+  const text = `${copy.heading} ${copy.body}`.toLowerCase();
+  for (const banned of ["sign", "session", "permission", "expired"]) {
+    assert.ok(!text.includes(banned), `503 copy must not contain ${JSON.stringify(banned)}: ${text}`);
+  }
+  assert.ok(copy.heading !== errorPanelCopy("http", 500, ENDPOINT).heading);
+  assert.ok(text.includes("temporar"), text);
+});
+
+test("errorPanelCopy: the other branches are byte-identical to pre-3.4-B", () => {
+  // Asserted, not eyeballed: the exact pre-change objects.
+  assert.deepEqual(errorPanelCopy("config", 500, ENDPOINT), {
+    heading: "Jobs can't load — the app is misconfigured",
+    body: "NEXT_PUBLIC_SUPABASE_URL / NEXT_PUBLIC_SUPABASE_ANON_KEY is not set. Set both in the deployment environment and redeploy.",
+  });
+  assert.deepEqual(errorPanelCopy("auth", 401, ENDPOINT), {
+    heading: "Couldn't load jobs — you may be signed out",
+    body: `${ENDPOINT} responded with HTTP 401. Your session may have expired — sign in again.`,
+  });
+  assert.deepEqual(errorPanelCopy("network", 0, ENDPOINT), {
+    heading: "Couldn't load jobs — the backend is unreachable",
+    body: `The request to ${ENDPOINT} never reached the server. Check the backend is running on port 8000.`,
+  });
+  assert.deepEqual(errorPanelCopy("parse", 200, ENDPOINT), {
+    heading: "Couldn't load jobs — the response was unreadable",
+    body: `${ENDPOINT} returned a response the app could not read. Try reloading, and check the backend logs if it persists.`,
+  });
+  assert.deepEqual(errorPanelCopy("http", 500, ENDPOINT), {
+    heading: "Couldn't load jobs",
+    body: `${ENDPOINT} responded with HTTP 500. The backend hit an error — try reloading, and check the backend logs if it persists.`,
+  });
+  // A 503 under a NON-http kind still takes that kind's own branch.
+  assert.equal(
+    errorPanelCopy("network", 503, ENDPOINT).heading,
+    "Couldn't load jobs — the backend is unreachable",
+  );
 });

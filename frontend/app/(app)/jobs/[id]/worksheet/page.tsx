@@ -4,6 +4,7 @@ import { ResultsBar } from "@/components/worksheet/results-bar";
 import { WorksheetBody } from "@/components/worksheet/worksheet-body";
 import { getJob } from "@/lib/job-server";
 import {
+  addressRoofView,
   phaseStates,
   resultsBarView,
   sectionStates,
@@ -76,7 +77,12 @@ export default async function Page({
   return (
     <div className="w-full px-6 pb-8">
       <ResultsBar view={resultsBarView(job)} />
-      <WorksheetBody sections={sections} phases={phaseStates(job)} />
+      <WorksheetBody
+        sections={sections}
+        phases={phaseStates(job)}
+        addressRoof={addressRoofView(job)}
+        jobId={id}
+      />
     </div>
   );
 }
