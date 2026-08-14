@@ -208,6 +208,14 @@ def _persist(model: dict, job_id: Optional[str]) -> tuple[bool, Optional[str]]:
         "geocoded_postcode": model.get("geocoded_postcode"),
         "geocoded_state": model.get("geocoded_state"),
         "geocoded_formatted_address": model.get("geocoded_formatted_address"),
+        # 3.5 (F106) — Google's own panel dimensions, from the model. The MANUAL
+        # model carries None for all three by construction (_blank), and unlike
+        # lat/lng they are NEVER inherited from a previous row: attaching
+        # Google's panel size to an installer's own measurement is the
+        # laundering manual_prefilled_from_lookup exists to prevent.
+        "google_panel_width_m": model.get("google_panel_width_m"),
+        "google_panel_height_m": model.get("google_panel_height_m"),
+        "google_panel_capacity_w": model.get("google_panel_capacity_w"),
         # 3.5b (§20.2) — start the 30-day Solar Data clock on GOOGLE rows only.
         # A manual row carries no Google content and is never stamped. Read from
         # the MODEL's source, never the request body.

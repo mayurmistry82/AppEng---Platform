@@ -371,6 +371,35 @@ def _normalise(data: dict, panel: dict, usability: float) -> dict:
     if not have_layout:
         flags.append("google_panel_layout_absent")
 
+    # 3.5 (F106): the panel dimensions Google laid panels_raw out at — width,
+    # height, capacity. Without them a centre + orientation cannot make a
+    # rectangle, and substituting OUR catalogue panel's size would present a
+    # guess as a measurement. §20.2: these are Google Solar Data and are in the
+    # 30-day retention set (solar_retention.GOOGLE_SOLAR_FIELDS).
+    #
+    # Never raises: absent / null / non-numeric / nested degrade to None with a
+    # flag naming the absence, and zero or negative is not a usable dimension.
+    # These values influence NO existing number — counts, kWp and configs are
+    # computed from OUR catalogue panel above, untouched.
+    def _google_dim(key: str, flag_name: str) -> Optional[float]:
+        value = _num(sp.get(key))
+        if value is None:
+            return None
+        if value <= 0:
+            flags.append(f"google_panel_{flag_name}_invalid")
+            return None
+        return value
+
+    google_panel_width_m = _google_dim("panelWidthMeters", "width")
+    google_panel_height_m = _google_dim("panelHeightMeters", "height")
+    google_panel_capacity_w = _google_dim("panelCapacityWatts", "capacity")
+    if (
+        google_panel_width_m is None
+        and google_panel_height_m is None
+        and google_panel_capacity_w is None
+    ):
+        flags.append("google_panel_dimensions_absent")
+
     planes: list[dict] = []
     max_flagged_pitch: Optional[float] = None
     for i, seg in enumerate(segments):
@@ -493,6 +522,9 @@ def _normalise(data: dict, panel: dict, usability: float) -> dict:
         # re-deriving them in the caller is how the original guard drifted.
         "have_google_layout": have_layout,
         "max_flagged_pitch": max_flagged_pitch,
+        "google_panel_width_m": google_panel_width_m,
+        "google_panel_height_m": google_panel_height_m,
+        "google_panel_capacity_w": google_panel_capacity_w,
         "flags": flags,
         # Retained verbatim — see comment above.
         "panels_raw": panels_raw,
@@ -600,6 +632,11 @@ def _blank(found: bool = False) -> dict:
         "segment_bounding_boxes": [],
         "building_center": None,
         "building_bounding_box": None,
+        # 3.5 (F106) — Google's own panel dimensions; None on every no-find and
+        # manual path (a manual roof has no Google panel, ever).
+        "google_panel_width_m": None,
+        "google_panel_height_m": None,
+        "google_panel_capacity_w": None,
         # F22 — the authoritative geocode. Present on EVERY path (404, API error,
         # manual) so the contract is stable; populated the moment a geocode succeeds.
         "geocoded_postcode": None,
@@ -692,6 +729,9 @@ def fetch_roof_geometry(
             "segment_bounding_boxes": norm["segment_bounding_boxes"],
             "building_center": norm["building_center"],
             "building_bounding_box": norm["building_bounding_box"],
+            "google_panel_width_m": norm["google_panel_width_m"],
+            "google_panel_height_m": norm["google_panel_height_m"],
+            "google_panel_capacity_w": norm["google_panel_capacity_w"],
         }
     )
     flags = panel_flags + norm["flags"]

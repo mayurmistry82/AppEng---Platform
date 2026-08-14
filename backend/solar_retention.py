@@ -40,6 +40,12 @@ GOOGLE_SOLAR_FIELDS: tuple[str, ...] = (
     "google_max_array_panels_count",
     "imagery_date",
     "imagery_quality",
+    # 3.5 (F106): the panel dimensions are Google Solar Data too — adding the
+    # columns WITHOUT adding them here would silently re-open the hole 3.5b
+    # closed.
+    "google_panel_width_m",
+    "google_panel_height_m",
+    "google_panel_capacity_w",
 )
 
 

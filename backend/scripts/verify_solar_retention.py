@@ -30,7 +30,7 @@ import solar_retention as sr  # noqa: E402
 # platform repo root -> workspace root (owns supabase/migrations)
 PLATFORM_DIR = os.path.dirname(BACKEND_DIR)
 WORKSPACE_DIR = os.path.dirname(PLATFORM_DIR)
-MIGRATIONS_GLOB = os.path.join(WORKSPACE_DIR, "supabase", "migrations", "*_solar_data_retention.sql")
+MIGRATIONS_GLOB = os.path.join(WORKSPACE_DIR, "supabase", "migrations", "*.sql")
 FRONTEND_WORKSHEET = os.path.join(PLATFORM_DIR, "frontend", "lib", "worksheet.ts")
 
 FAILURES: list[str] = []
@@ -67,6 +67,9 @@ def google_row(**over):
         "google_max_array_panels_count": 28,
         "imagery_date": "2018-11-17",
         "imagery_quality": "MEDIUM",
+        "google_panel_width_m": 1.045,
+        "google_panel_height_m": 1.879,
+        "google_panel_capacity_w": 400.0,
         "planes": [{"panel_count": 17}],
         "total_kwp": 7.48,
     }
@@ -139,12 +142,20 @@ def t_expiry() -> None:
 
 def t_anti_drift() -> None:
     print("\n3. ANTI-DRIFT — migration SQL == backend module == frontend mirror")
-    matches = glob.glob(MIGRATIONS_GLOB)
-    check("exactly one *_solar_data_retention.sql migration", len(matches) == 1,
-          str(matches))
-    if len(matches) != 1:
+    # The NEWEST migration defining expire_google_solar_data is the live
+    # definition (CREATE OR REPLACE) — 3.5b created it and 3.5 replaced it, so
+    # asserting against the older file would check superseded SQL.
+    defining = sorted(
+        f for f in glob.glob(MIGRATIONS_GLOB)
+        if "expire_google_solar_data" in open(f).read()
+    )
+    check("at least one migration defines expire_google_solar_data",
+          len(defining) >= 1, str(defining))
+    if not defining:
         return
-    sql = open(matches[0]).read()
+    newest = defining[-1]
+    print(f"        (parsing {os.path.basename(newest)})")
+    sql = open(newest).read()
 
     # The columns the SQL function nulls: `<column> = null` assignments.
     sql_nulled = set(re.findall(r"(\w+)\s*=\s*null\b", sql, flags=re.IGNORECASE))

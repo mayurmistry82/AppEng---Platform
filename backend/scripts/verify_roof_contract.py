@@ -542,6 +542,87 @@ def t_confidence() -> None:
           roof_geometry._blank().get("low_confidence_causes") == [])
 
 
+
+def t_panel_dimensions() -> None:
+    """3.5 prompt 1: Google's panel dimensions are captured, degrade safely, and
+    never touch a computed number."""
+    print("\nT-3.5. google panel dimensions")
+
+    with_dims = {"solarPotential": {
+        "roofSegmentStats": [
+            {"pitchDegrees": 20.0, "stats": {"areaMeters2": 40.0}}],
+        "solarPanels": [{"segmentIndex": 0}] * 10,
+        "maxArrayPanelsCount": 40,
+        "panelWidthMeters": 1.045,
+        "panelHeightMeters": 1.879,
+        "panelCapacityWatts": 400,
+    }}
+    n = roof_geometry._normalise(with_dims, dict(PANEL), 0.7)
+    check("found path: width captured", n["google_panel_width_m"] == 1.045,
+          str(n["google_panel_width_m"]))
+    check("found path: height captured", n["google_panel_height_m"] == 1.879)
+    check("found path: capacity captured (int coerced to float)",
+          n["google_panel_capacity_w"] == 400.0)
+    check("no absence flag when present",
+          "google_panel_dimensions_absent" not in n["flags"], str(n["flags"]))
+
+    # THE NUMBERS DO NOT MOVE: identical input without the dimension keys must
+    # yield identical counts/kwp/configs — the dimensions influence nothing.
+    without_dims = {"solarPotential": {
+        "roofSegmentStats": [
+            {"pitchDegrees": 20.0, "stats": {"areaMeters2": 40.0}}],
+        "solarPanels": [{"segmentIndex": 0}] * 10,
+        "maxArrayPanelsCount": 40,
+    }}
+    m = roof_geometry._normalise(without_dims, dict(PANEL), 0.7)
+    check("computed numbers identical with and without dimensions",
+          n["planes"] == m["planes"] and n["candidate_configs"] == m["candidate_configs"]
+          and n["total_kwp"] == m["total_kwp"] and n["max_panels"] == m["max_panels"],
+          f"{n['total_kwp']}/{n['max_panels']} vs {m['total_kwp']}/{m['max_panels']}")
+    check("absent dimensions -> all three None + absence flag",
+          m["google_panel_width_m"] is None and m["google_panel_height_m"] is None
+          and m["google_panel_capacity_w"] is None
+          and "google_panel_dimensions_absent" in m["flags"], str(m["flags"]))
+
+    # Junk shapes degrade to None without raising (the F17 contract).
+    junk = {"solarPotential": {
+        "roofSegmentStats": [{"pitchDegrees": 20.0, "stats": {"areaMeters2": 40.0}}],
+        "panelWidthMeters": "wide", "panelHeightMeters": {"m": 2},
+        "panelCapacityWatts": [400],
+    }}
+    try:
+        j = roof_geometry._normalise(junk, dict(PANEL), 0.7)
+        check("junk dimension shapes -> None, no raise",
+              j["google_panel_width_m"] is None and j["google_panel_height_m"] is None
+              and j["google_panel_capacity_w"] is None)
+    except Exception as exc:  # noqa: BLE001
+        check("junk dimension shapes -> None, no raise", False, str(exc))
+
+    # Zero / negative are not usable dimensions: None plus a flag naming it.
+    zeroneg = {"solarPotential": {
+        "roofSegmentStats": [{"pitchDegrees": 20.0, "stats": {"areaMeters2": 40.0}}],
+        "panelWidthMeters": 0, "panelHeightMeters": -1.8, "panelCapacityWatts": 400,
+    }}
+    z = roof_geometry._normalise(zeroneg, dict(PANEL), 0.7)
+    check("zero width -> None + flag", z["google_panel_width_m"] is None
+          and "google_panel_width_invalid" in z["flags"], str(z["flags"]))
+    check("negative height -> None + flag", z["google_panel_height_m"] is None
+          and "google_panel_height_invalid" in z["flags"], str(z["flags"]))
+    check("valid capacity beside invalid siblings still captured",
+          z["google_panel_capacity_w"] == 400.0)
+
+    # Not-found path and manual model both carry the keys as None.
+    blank = roof_geometry._blank()
+    check("not-found/_blank path: keys present, all None",
+          all(blank[k] is None for k in
+              ("google_panel_width_m", "google_panel_height_m", "google_panel_capacity_w")))
+    manual = roof_geometry.build_manual_roof_model(
+        "plans", [{"azimuth": 0, "pitch": 20, "area_m2": 50.0}], dict(PANEL), 0.7)
+    check("manual model: all three None — never inherited, never invented",
+          all(manual.get(k) is None for k in
+              ("google_panel_width_m", "google_panel_height_m", "google_panel_capacity_w")))
+
+
 def t_prefill_provenance() -> None:
     """3.4-D: pre-filling must never launder a lookup into a trusted source."""
     print("\nT-3.4D. manual pre-fill provenance")
@@ -661,6 +742,7 @@ def main() -> int:
     t4()
     t_confidence()
     t_prefill_provenance()
+    t_panel_dimensions()
     if live:
         t5_live()
 
