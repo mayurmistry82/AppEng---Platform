@@ -29,6 +29,15 @@ import {
  * there is no real chart until 3.12. The chart area is a bg-muted placeholder
  * that GROWS with the bar rather than sitting in a fixed box.
  *
+ * STACKED LAYOUT (2026-08-14, deliberate departure from wireframe Variant A):
+ * one vertical column — tiles, chips, then the chart placeholder full width —
+ * rather than the wireframe's side-by-side metrics/chart split. Dragged tall,
+ * the two-column version left a large empty area under the metrics while the
+ * chart stayed squeezed into 40% of the width; the wireframe's bar was a short
+ * fixed strip and never contemplated a full-height drag. The chart is the only
+ * element that takes the leftover height (flex-1 + min-h-0) — the tiles, chips
+ * and Metric row keep their natural heights.
+ *
  * DECISION D3, fixes 1 and 2:
  *   - first-ever render of an UNSIZED job is numbers-only (the chart is empty
  *     during first-pass entry, and the bar is frozen so its height is spent on
@@ -209,13 +218,13 @@ export function ResultsBar({ view }: { view: ResultsBarView }) {
       </button>
 
       <div
-        className={
-          collapsed ? "" : "grid grid-cols-[minmax(0,5fr)_minmax(0,4fr)] gap-4"
-        }
+        className={collapsed ? "" : "flex min-h-0 flex-col gap-2"}
         style={collapsed ? undefined : { height }}
       >
-        {/* LEFT — metrics. Keeps its own scrollbar when taller than the bar. */}
-        <div className="flex min-h-0 flex-col gap-2 overflow-y-auto">
+        {/* Metrics — full width. Keeps its own scrollbar only if it genuinely
+            overflows at the minimum height; it never takes the leftover space
+            (no flex-1 here — the chart below gets that). */}
+        <div className="flex shrink-0 flex-col gap-2 overflow-y-auto">
           <div className="grid grid-cols-5 gap-2">
             <KpiTile
               className="col-span-1"
@@ -246,11 +255,11 @@ export function ResultsBar({ view }: { view: ResultsBarView }) {
           </div>
         </div>
 
-        {/* RIGHT — chart column, absent when collapsed to numbers only. */}
+        {/* Chart — full width, absent when collapsed to numbers only. */}
         {collapsed ? null : (
-          <div className="flex min-h-0 flex-col gap-1">
-            {/* flex-1 + min-h-0: the placeholder fills whatever height the
-                drag gives the bar rather than staying a fixed box. */}
+          <div className="flex min-h-0 flex-1 flex-col gap-1">
+            {/* flex-1 + min-h-0: the ONLY element that absorbs the leftover
+                height, so the bar never has empty space at any drag height. */}
             <div className="flex min-h-0 flex-1 items-center justify-center rounded-lg border border-border bg-muted">
               <span className="px-4 text-center text-caption text-muted-foreground">
                 {view.sized
@@ -258,7 +267,7 @@ export function ResultsBar({ view }: { view: ResultsBarView }) {
                   : "Results appear after the first sizing run (3.11-3.12)"}
               </span>
             </div>
-            <div className="flex items-center justify-between">
+            <div className="flex shrink-0 items-center justify-between">
               <button
                 type="button"
                 disabled

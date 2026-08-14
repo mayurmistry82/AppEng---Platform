@@ -363,7 +363,7 @@ export const RESULTS_BAR_MIN_HEIGHT = 96;
 export const RESULTS_BAR_STRIP = 120;
 
 /** Height of an expanded bar before the user has ever dragged it. */
-export const RESULTS_BAR_DEFAULT_HEIGHT = 220;
+export const RESULTS_BAR_DEFAULT_HEIGHT = 320;
 
 /** Preference key — versioned so a future shape change cannot mis-parse this one. */
 export const RESULTS_BAR_STORAGE_KEY = "enrgengine.worksheet.results-bar.v1";
