@@ -14,16 +14,19 @@ import {
   RESULTS_BAR_DEFAULT_HEIGHT,
   RESULTS_BAR_MIN_HEIGHT,
   RESULTS_BAR_STRIP,
+  PATH_RULES,
   SECTIONS,
   clampResultsBarHeight,
   groupSectionsByPhase,
   jobBarView,
   parseResultsBarPreference,
+  pathRule,
   phaseStates,
   resultsBarDefaultCollapsed,
   resultsBarMaxHeight,
   resultsBarView,
   sectionStates,
+  sectionsForPath,
   worksheetErrorCopy,
   type JobDetailLike,
 } from "../lib/worksheet.ts";
@@ -48,9 +51,19 @@ const CHILD_KEYS = [
   "roof_geometry",
 ] as const;
 
-/** All children empty — exactly what the four real draft jobs return. */
+/**
+ * All children empty — exactly what the four real draft jobs return.
+ *
+ * PATH-LESS BY DEFAULT (3.3b): the path-filtering tests below pass an explicit
+ * `path`, and every other test is about the unlock rule or the views, not about
+ * paths — so the default takes the all-eleven branch and those assertions keep
+ * the exact meaning they had before section filtering existed. Before 3.3b this
+ * defaulted to `path: "A"`, which was inert; once "A" started hiding
+ * battery-sizing it silently shortened the list under tests that index by
+ * catalogue position.
+ */
 function emptyJob(overrides: Partial<JobDetailLike> = {}): JobDetailLike {
-  const job: JobDetailLike = { status: "draft", path: "A", path_label: "Solar only" };
+  const job: JobDetailLike = { status: "draft", path: null, path_label: null };
   for (const key of CHILD_KEYS) {
     (job as Record<string, unknown>)[key] = [];
   }
@@ -354,4 +367,205 @@ test("groupSectionsByPhase: 2/2/4/3, order kept, unknown phase kept", () => {
   assert.deepEqual(odd[0].sections.map((s) => s.id), ["a", "b"]);
   assert.deepEqual(odd[3].sections.map((s) => s.id), ["c"]);
   assert.doesNotThrow(() => groupSectionsByPhase([]));
+});
+
+// ── Per-path section rules (checklist 3.3b) ──────────────────────────────────
+
+const ALL_ELEVEN = [
+  "address-roof",
+  "site-details",
+  "energy-data",
+  "tariff-network",
+  "objective-budget",
+  "equipment-specs",
+  "solar-sizing",
+  "battery-sizing",
+  "results",
+  "incentives",
+  "summary-finish",
+];
+
+const ids = (sections: readonly { id: string }[]) => sections.map((s) => s.id);
+
+// a. Each path's EXACT id list, by name and in order — length alone cannot
+//    catch a wrong id being hidden.
+test("sectionsForPath: path A hides battery-sizing only", () => {
+  assert.deepEqual(
+    ids(sectionsForPath("A")),
+    ALL_ELEVEN.filter((id) => id !== "battery-sizing"),
+  );
+});
+
+test("sectionsForPath: path B hides nothing", () => {
+  assert.deepEqual(ids(sectionsForPath("B")), ALL_ELEVEN);
+});
+
+test("sectionsForPath: path C hides nothing — it KEEPS solar-sizing", () => {
+  assert.deepEqual(ids(sectionsForPath("C")), ALL_ELEVEN);
+});
+
+test("sectionsForPath: path D hides nothing", () => {
+  assert.deepEqual(ids(sectionsForPath("D")), ALL_ELEVEN);
+});
+
+test("sectionsForPath: path E hides solar-sizing only", () => {
+  assert.deepEqual(
+    ids(sectionsForPath("E")),
+    ALL_ELEVEN.filter((id) => id !== "solar-sizing"),
+  );
+});
+
+test("sectionsForPath: path F hides battery-sizing only", () => {
+  assert.deepEqual(
+    ids(sectionsForPath("F")),
+    ALL_ELEVEN.filter((id) => id !== "battery-sizing"),
+  );
+});
+
+// b. A typo in a `hidden` array would silently hide nothing — catch it.
+test("PATH_RULES: every hidden id is a real section id", () => {
+  const known = new Set(SECTIONS.map((s) => s.id));
+  for (const [letter, rule] of Object.entries(PATH_RULES)) {
+    for (const id of rule.hidden) {
+      assert.ok(known.has(id), `path ${letter} hides unknown id ${JSON.stringify(id)}`);
+    }
+  }
+});
+
+// c. Exactly six paths, A-F, nothing else.
+test("PATH_RULES: exactly six keys, A-F", () => {
+  assert.deepEqual(Object.keys(PATH_RULES).sort(), ["A", "B", "C", "D", "E", "F"]);
+});
+
+// d. Junk paths show all eleven — never hide on an undetermined path.
+test("sectionsForPath: junk paths return all eleven", () => {
+  const junk = [null, undefined, "", "a", "G", "AB", 3, {}, [], true, "c"];
+  for (const value of junk) {
+    assert.deepEqual(
+      ids(sectionsForPath(value)),
+      ALL_ELEVEN,
+      `junk path ${JSON.stringify(value)} filtered something`,
+    );
+    assert.equal(pathRule(value), null, `pathRule accepted ${JSON.stringify(value)}`);
+  }
+  assert.doesNotThrow(() => sectionsForPath(Symbol("x")));
+});
+
+// e. Path E: solar-sizing never appears, and the first step is still active.
+test("sectionStates: path E omits solar-sizing, address-roof still active", () => {
+  const states = sectionStates(emptyJob({ path: "E" }));
+  assert.equal(states.length, 10);
+  assert.ok(!states.some((s) => s.id === "solar-sizing"));
+  assert.equal(states[0].id, "address-roof");
+  assert.equal(states[0].state, "active");
+});
+
+// f. Paths A and F drop battery-sizing.
+test("sectionStates: paths A and F omit battery-sizing", () => {
+  for (const path of ["A", "F"]) {
+    const states = sectionStates(emptyJob({ path }));
+    assert.equal(states.length, 10, `path ${path}`);
+    assert.ok(!states.some((s) => s.id === "battery-sizing"), `path ${path}`);
+    assert.ok(states.some((s) => s.id === "solar-sizing"), `path ${path}`);
+  }
+});
+
+// g. Path C keeps solar-sizing, pinned to the existing array.
+test("sectionStates: path C KEEPS solar-sizing and pins it", () => {
+  const states = sectionStates(emptyJob({ path: "C" }));
+  assert.equal(states.length, 11);
+  assert.ok(
+    states.some((s) => s.id === "solar-sizing"),
+    "path C must keep solar-sizing — it shows the array the battery is sized around",
+  );
+  assert.equal(PATH_RULES.C.solarMode, "pinned");
+  assert.equal(PATH_RULES.C.batteryMode, "size");
+  assert.equal(PATH_RULES.C.showsExistingArray, true);
+});
+
+// h. A phase must not wait on a hidden section.
+//
+// LIMITATION, MEASURED NOT ASSUMED (reported with 3.3b): the prompt asked for a
+// fixture where all three of path E's Optimise sections are complete, so that
+// Optimise reads "done". That fixture CANNOT be built today — Optimise contains
+// `objective-budget` and `equipment-specs`, both hardcoded `() => false` until
+// 3.9/3.10, on every one of the six paths. Optimise therefore cannot read "done"
+// for any job, and swapping phaseStates to count the full catalogue instead of
+// the visible list produces IDENTICAL verdicts on every path (verified by
+// experiment — the suite stayed green under that mutation). The visible-list
+// dependency inside phaseStates is therefore not observable through its public
+// behaviour yet; it becomes a real regression test the moment 3.9 lands and
+// objective-budget becomes satisfiable.
+//
+// What IS asserted here, and does break: path E's Optimise composition (a wrong
+// PATH_RULES entry fails it), that the done-rule works on the phases that CAN
+// complete, and that the active section is the first incomplete VISIBLE one.
+test("phaseStates: path E Optimise holds 3 sections, none of them solar-sizing", () => {
+  const optimise = sectionsForPath("E").filter((s) => s.phase === "optimise");
+  assert.deepEqual(optimise.map((s) => s.id), [
+    "objective-budget",
+    "equipment-specs",
+    "battery-sizing",
+  ]);
+
+  const job = emptyJob({
+    path: "E",
+    roof_geometry: [{ roof_id: "r1" }],
+    storeys: 1,
+    roof_material: "tile",
+    dwelling_type: "house",
+    electrical_phase: "single",
+    bills: [{ bill_id: "b1" }],
+    tariffs: [{ tariff_id: "t1" }],
+  });
+  const phases = phaseStates(job);
+  // Site and Demand CAN complete, and do — the done-rule works.
+  assert.deepEqual(phases.slice(0, 2), ["done", "done"]);
+  // Optimise holds the active section, so it is current, never stuck pending.
+  assert.equal(phases[2], "current");
+  assert.equal(phases[3], "pending");
+
+  // The active section is the first incomplete VISIBLE one — on path E that is
+  // objective-budget, and solar-sizing takes no part in the ordering at all.
+  const states = sectionStates(job);
+  const active = states.filter((s) => s.state === "active");
+  assert.equal(active.length, 1);
+  assert.equal(active[0].id, "objective-budget");
+  assert.ok(!states.some((s) => s.id === "solar-sizing"));
+});
+
+// The empty-phase guard: `[].every()` is true, so without it a phase holding
+// nothing would render a tick. Unreachable under the six rules, so this pins the
+// precondition rather than the branch.
+test("phaseStates: no path empties a phase, and none throws", () => {
+  for (const path of ["A", "B", "C", "D", "E", "F", null]) {
+    const counts = PHASE_ORDER.map(
+      (phase) => sectionsForPath(path).filter((s) => s.phase === phase).length,
+    );
+    assert.ok(counts.every((n) => n > 0), `path ${String(path)} has an empty phase`);
+    assert.doesNotThrow(() => phaseStates(emptyJob({ path })));
+  }
+});
+
+// i. No path leaves a phase empty.
+test("no path produces an empty phase", () => {
+  for (const path of ["A", "B", "C", "D", "E", "F", null]) {
+    for (const phase of PHASE_ORDER) {
+      const count = sectionsForPath(path).filter((s) => s.phase === phase).length;
+      assert.ok(count > 0, `path ${String(path)} leaves phase ${phase} empty`);
+    }
+    assert.ok(sectionsForPath(path).length > 0);
+  }
+});
+
+// 6b. "Switching job type re-renders correctly" — the live half is DEFERRED TO
+// 3.3c (nothing in the product can change a job's type until the editor
+// exists). The pure half is asserted here: two paths yield two different lists.
+test("two different paths yield two different section lists", () => {
+  assert.notDeepEqual(ids(sectionsForPath("A")), ids(sectionsForPath("E")));
+  assert.notDeepEqual(ids(sectionsForPath("A")), ids(sectionsForPath("B")));
+  assert.notDeepEqual(
+    ids(sectionStates(emptyJob({ path: "A" }))),
+    ids(sectionStates(emptyJob({ path: "E" }))),
+  );
 });

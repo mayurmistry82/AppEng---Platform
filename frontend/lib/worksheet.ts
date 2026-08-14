@@ -1,4 +1,4 @@
-import type { ApiErrorKind } from "@/lib/jobs";
+import type { ApiErrorKind, PathLetter } from "@/lib/jobs";
 
 /**
  * Worksheet shell logic (checklist 3.3) — PURE. No React, no JSX, no fetch,
@@ -172,6 +172,110 @@ export const SECTIONS: readonly WorksheetSectionSpec[] = [
   },
 ];
 
+// ── Per-path section rules (checklist 3.3b) ──────────────────────────────────
+
+/**
+ * What a given six-path job does, beyond which sections it shows.
+ *
+ * `solarMode`, `batteryMode` and `showsExistingArray` HAVE NO CONSUMER YET AND
+ * MUST NOT BE DELETED AS UNUSED. The sections they describe are built at 3.11
+ * (solar sizing), 3.12 (battery sizing), 3.4 (address & roof) and 4.9. Without
+ * them each of those rows would re-derive its behaviour from the path letter
+ * and the six-path logic would end up reimplemented in eight places, drifting
+ * apart silently. Later rows read these fields instead.
+ */
+export interface PathRule {
+  /** Section ids removed from the catalogue for this path. */
+  hidden: readonly string[];
+  solarMode: "optimise" | "pinned" | "none";
+  batteryMode: "size" | "none";
+  showsExistingArray: boolean;
+}
+
+/**
+ * The six paths, confirmed by Mayur 2026-08-14 against GAP-4 and the
+ * flowchart's six engine nodes.
+ *
+ * PATH C IS THE ONE TO GET RIGHT — the hero path. It KEEPS solar-sizing even
+ * though no solar is being sized: the section shows the array already on the
+ * roof, because the battery sizing depends on it, and the flowchart node reads
+ * "Solar kept or re-optimised". Hiding it would remove the only place an
+ * installer can see the array the battery is sized around. Hence
+ * solarMode "pinned" rather than "none".
+ */
+export const PATH_RULES: Record<PathLetter, PathRule> = {
+  // A — Solar only, no existing solar
+  A: {
+    hidden: ["battery-sizing"],
+    solarMode: "optimise",
+    batteryMode: "none",
+    showsExistingArray: false,
+  },
+  // B — Solar + battery, no existing solar
+  B: {
+    hidden: [],
+    solarMode: "optimise",
+    batteryMode: "size",
+    showsExistingArray: false,
+  },
+  // C — Battery only, HAS solar. Keeps solar-sizing, pinned to what exists.
+  C: {
+    hidden: [],
+    solarMode: "pinned",
+    batteryMode: "size",
+    showsExistingArray: true,
+  },
+  // D — Add solar + battery, HAS solar
+  D: {
+    hidden: [],
+    solarMode: "optimise",
+    batteryMode: "size",
+    showsExistingArray: true,
+  },
+  // E — Battery only, no solar
+  E: {
+    hidden: ["solar-sizing"],
+    solarMode: "none",
+    batteryMode: "size",
+    showsExistingArray: false,
+  },
+  // F — Expand solar only, HAS solar
+  F: {
+    hidden: ["battery-sizing"],
+    solarMode: "optimise",
+    batteryMode: "none",
+    showsExistingArray: true,
+  },
+};
+
+/**
+ * The rule for a valid single-letter path, else null. Never throws.
+ *
+ * `jobs.path` is a Postgres GENERATED column and is the single source of
+ * truth — this module reads it and never re-derives it. `derivePath` in
+ * lib/jobs.ts exists to label the New Job modal BEFORE a job is created;
+ * calling it here would create a second source of truth.
+ */
+export function pathRule(path: unknown): PathRule | null {
+  if (typeof path !== "string") return null;
+  if (!Object.prototype.hasOwnProperty.call(PATH_RULES, path)) return null;
+  return PATH_RULES[path as PathLetter];
+}
+
+/**
+ * The section catalogue minus the ids this path hides, order preserved.
+ *
+ * A NULL, MISSING OR UNRECOGNISED PATH SHOWS ALL ELEVEN. Never hide a section
+ * because the path could not be determined: a missing step is invisible to the
+ * installer, whereas an extra one is obvious. A job created before path
+ * derivation existed is valid, not a fault.
+ */
+export function sectionsForPath(path: unknown): readonly WorksheetSectionSpec[] {
+  const rule = pathRule(path);
+  if (!rule || rule.hidden.length === 0) return SECTIONS;
+  return SECTIONS.filter((section) => !rule.hidden.includes(section.id));
+}
+
 // ── Progressive unlock ───────────────────────────────────────────────────────
 
 /**
@@ -199,10 +303,16 @@ export interface WorksheetSectionView extends WorksheetSectionSpec {
  *     firstIncomplete is complete; if any later section IS complete, the first
  *     pass has demonstrably been gone past, so nothing locks and the remaining
  *     incomplete sections are "unlocked" (expandable, not active).
+ *
+ * 3.3b: the rule runs over the sections VISIBLE for this job's path, resolved
+ * first. A hidden section takes no part in the ordering at all — so the active
+ * section is the first incomplete VISIBLE one, and the returned array contains
+ * only visible sections.
  */
 export function sectionStates(job: unknown): WorksheetSectionView[] {
   const detail = asObject(job);
-  const done = SECTIONS.map((section) => {
+  const visible = sectionsForPath(detail.path);
+  const done = visible.map((section) => {
     try {
       return section.complete(detail) === true;
     } catch {
@@ -213,7 +323,7 @@ export function sectionStates(job: unknown): WorksheetSectionView[] {
   const anyLaterComplete =
     firstIncomplete !== -1 && done.slice(firstIncomplete + 1).some(Boolean);
 
-  return SECTIONS.map((section, i) => {
+  return visible.map((section, i) => {
     let state: WorksheetSectionUnlockState;
     if (done[i]) {
       state = "complete";
@@ -257,9 +367,17 @@ export function groupSectionsByPhase<T extends { phase: string }>(
 }
 
 /**
- * done  — every section in the phase is complete
+ * done  — every VISIBLE section in the phase is complete
  * current — the phase contains the active section
  * pending — otherwise
+ *
+ * 3.3b: counted over the visible list only, so a phase is never stuck pending
+ * waiting on a section that is not on screen. On Path E, Optimise holds three
+ * sections rather than four and completes when those three are done.
+ *
+ * An EMPTY phase reports pending, not done: `[].every(...)` is true, so without
+ * this guard a phase with nothing in it would render a tick. Unreachable under
+ * the six rules (asserted in the suite), guarded anyway.
  */
 export function phaseStates(
   job: unknown,
@@ -267,6 +385,7 @@ export function phaseStates(
   const views = sectionStates(job);
   const states = PHASE_ORDER.map((phase) => {
     const sections = views.filter((v) => v.phase === phase);
+    if (sections.length === 0) return "pending";
     if (sections.every((v) => v.state === "complete")) return "done";
     if (sections.some((v) => v.state === "active")) return "current";
     return "pending";
