@@ -377,6 +377,61 @@ export function errorPanelCopy(
   }
 }
 
+/**
+ * Copy for a FAILED BUTTON PRESS, not a failed page load (3.4-E).
+ *
+ * errorPanelCopy and worksheetErrorCopy are both worded for a page that could not
+ * load — "try reloading" is the right advice there and the wrong advice here: the
+ * installer has a half-filled form open and reloading would destroy it. These
+ * branches are deliberately separate, and the suite asserts the auth wording of
+ * the two differs so a later tidy-up cannot silently unify them.
+ *
+ * Never mentions a token, a cookie, or an env var VALUE — an installer can act on
+ * none of those, and the config branch names the variables only because a
+ * deployer needs them.
+ */
+export function clientActionErrorCopy(
+  kind: ApiErrorKind,
+  status: number,
+): ErrorPanelCopy {
+  switch (kind) {
+    case "auth":
+      return {
+        heading: "Your session has expired",
+        body: "Sign in again and your work on this page will still be here.",
+      };
+    case "network":
+      return {
+        heading: "Couldn't reach the server",
+        body: "Check the backend is running on port 8000, then try again. Nothing you have entered has been lost.",
+      };
+    case "config":
+      return {
+        heading: "The app is misconfigured",
+        body: "NEXT_PUBLIC_SUPABASE_URL / NEXT_PUBLIC_SUPABASE_ANON_KEY is not set. This needs fixing in the deployment, not on this page.",
+      };
+    case "parse":
+      return {
+        heading: "The server sent something unreadable",
+        body: `The response to this request could not be read${
+          status ? ` (HTTP ${status})` : ""
+        }. Try again, and check the backend logs if it persists.`,
+      };
+    case "http":
+    default:
+      if (kind === "http" && (status === 409 || status === 422)) {
+        return {
+          heading: "The server rejected these values",
+          body: "Something in what was sent is not valid. Check the fields and try again.",
+        };
+      }
+      return {
+        heading: "That didn't work",
+        body: `The server responded with HTTP ${status}. Try again, and check the backend logs if it persists.`,
+      };
+  }
+}
+
 // ── View models for the strip + table ────────────────────────────────────────
 
 export interface KpiTileView {

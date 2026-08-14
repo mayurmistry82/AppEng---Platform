@@ -49,9 +49,19 @@ export async function updateSession(request: NextRequest) {
   // would have gone out unprotected. With deny-by-default, a future /settings
   // cannot silently ship open: forgetting this file leaves it locked, not exposed.
   // (Static assets never reach here — the matcher in middleware.ts excludes them.)
+  // API PATHS ANSWER 401, NOT A REDIRECT (F97, fixed 3.4-E). An API path is still
+  // denied without a session — nothing here becomes reachable, and PUBLIC_PATHS is
+  // unchanged. Only the SHAPE of the refusal differs: a 307 to an HTML login page
+  // is unreadable to a fetch, and worse, a client cannot tell it apart from
+  // success — `res.ok` is true after the redirect is followed, so the caller
+  // parses HTML as JSON, throws, and the button appears to do nothing at all.
+  // Route handlers already return a correct 401; they were simply never reached.
   const PUBLIC_PATHS = new Set<string>(["/login"]);
 
   if (!user && !PUBLIC_PATHS.has(pathname)) {
+    if (pathname.startsWith("/api/")) {
+      return NextResponse.json({ detail: "No active session" }, { status: 401 });
+    }
     const redirectUrl = request.nextUrl.clone();
     redirectUrl.pathname = "/login";
     return NextResponse.redirect(redirectUrl);

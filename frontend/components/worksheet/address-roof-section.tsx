@@ -1,6 +1,7 @@
 "use client";
 
 import * as React from "react";
+import Link from "next/link";
 import { useRouter } from "next/navigation";
 import { Minus } from "lucide-react";
 import { Button } from "@/components/ui/button";
@@ -22,12 +23,15 @@ import {
   TableHeader,
   TableRow,
 } from "@/components/ui/table";
+import { postJson } from "@/lib/client-api";
+import { clientActionErrorCopy } from "@/lib/jobs";
 import {
   EMPTY_PLANE_FORM_ROW,
   planeFormRowsFromView,
   type AddressRoofView,
   type PlaneFormRow,
 } from "@/lib/worksheet";
+import type { ApiErrorKind } from "@/lib/jobs";
 
 /**
  * Address & roof (checklist 3.4-B) — the worksheet's first real section body.
@@ -92,7 +96,12 @@ export function AddressRoofSection({
 }) {
   const router = useRouter();
   const [busy, setBusy] = React.useState<"lookup" | "save" | null>(null);
-  const [actionError, setActionError] = React.useState<string | null>(null);
+  // The copy plus whether it was an auth failure — the expired-session case adds a
+  // /login link, and the installer chooses when to follow it. We NEVER navigate
+  // away mid-action: losing a half-filled roof form is worse than the bug fixed.
+  const [actionError, setActionError] = React.useState<
+    { heading: string; body: string; isAuth: boolean } | null
+  >(null);
   const [unsaved, setUnsaved] = React.useState(false);
   const [liveMismatch, setLiveMismatch] = React.useState<
     { jobState: string; geocodedState: string } | null
@@ -119,15 +128,8 @@ export function AddressRoofSection({
   const [rowErrors, setRowErrors] = React.useState<PlaneRowError[]>([]);
   const [basisError, setBasisError] = React.useState<string | null>(null);
 
-  function statusMessage(status: number): string {
-    if (status === 401 || status === 403) {
-      return "Your session may have expired — sign in again, then retry.";
-    }
-    if (status === 404) return "This job could not be found.";
-    if (status === 503) {
-      return "The server is briefly unavailable — wait a few seconds and retry.";
-    }
-    return "The lookup hit an error — try again, and check the backend if it persists.";
+  function failed(kind: ApiErrorKind, status: number) {
+    setActionError({ ...clientActionErrorCopy(kind, status), isAuth: kind === "auth" });
   }
 
   async function lookup() {
@@ -136,17 +138,16 @@ export function AddressRoofSection({
     setActionError(null);
     setUnsaved(false);
     setLiveMismatch(null);
+    const result = await postJson<Record<string, unknown>>("/api/roof/geometry", {
+      address: view.address,
+      job_id: jobId,
+    });
     try {
-      const res = await fetch("/api/roof/geometry", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ address: view.address, job_id: jobId }),
-      });
-      const data = (await res.json().catch(() => ({}))) as Record<string, unknown>;
-      if (!res.ok) {
-        setActionError(statusMessage(res.status));
+      if (!result.ok) {
+        failed(result.kind, result.status);
         return;
       }
+      const data = result.data ?? {};
       if (data.persisted === false) setUnsaved(true);
       const cc = data.site_cross_check;
       if (typeof cc === "object" && cc !== null) {
@@ -159,8 +160,6 @@ export function AddressRoofSection({
         }
       }
       router.refresh();
-    } catch {
-      setActionError("Could not reach the server — check the backend is running.");
     } finally {
       setBusy(null);
     }
@@ -205,11 +204,8 @@ export function AddressRoofSection({
     setUnsaved(false);
     try {
       const usabilityNum = Number(usability);
-      const res = await fetch("/api/roof/manual", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          job_id: jobId,
+      const result = await postJson<Record<string, unknown>>("/api/roof/manual", {
+        job_id: jobId,
           basis,
           planes: rows.map((row) => ({
             azimuth: planeAzimuth(row),
@@ -218,21 +214,18 @@ export function AddressRoofSection({
             label: row.label.trim() || null,
           })),
           prefilled_from_lookup: prefilledFromLookup,
-          usability_factor:
-            Number.isFinite(usabilityNum) && usabilityNum > 0 ? usabilityNum : null,
-          note: note.trim() || null,
-        }),
+        usability_factor:
+          Number.isFinite(usabilityNum) && usabilityNum > 0 ? usabilityNum : null,
+        note: note.trim() || null,
       });
-      const data = (await res.json().catch(() => ({}))) as Record<string, unknown>;
-      if (!res.ok) {
-        setActionError(statusMessage(res.status));
+      if (!result.ok) {
+        failed(result.kind, result.status);
         return; // the form stays open, values intact
       }
+      const data = result.data ?? {};
       if (data.persisted === false) setUnsaved(true);
       closeForm();
       router.refresh();
-    } catch {
-      setActionError("Could not reach the server — check the backend is running.");
     } finally {
       setBusy(null);
     }
@@ -642,8 +635,16 @@ export function AddressRoofSection({
         </Notice>
       ) : null}
       {actionError ? (
-        <Notice tone="problem" title="That didn't work">
-          {actionError}
+        <Notice tone="problem" title={actionError.heading}>
+          {actionError.body}
+          {actionError.isAuth ? (
+            <>
+              {" "}
+              <Link href="/login" className="text-primary underline">
+                Go to sign in
+              </Link>
+            </>
+          ) : null}
         </Notice>
       ) : null}
 

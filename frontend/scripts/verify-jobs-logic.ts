@@ -17,6 +17,7 @@ import {
   JOB_STATUSES,
   NOT_YET_SIZED,
   buildJobsQuery,
+  clientActionErrorCopy,
   derivePath,
   errorPanelCopy,
   formatCompactAud,
@@ -469,4 +470,105 @@ test("errorPanelCopy: the other branches are byte-identical to pre-3.4-B", () =>
     errorPanelCopy("network", 503, ENDPOINT).heading,
     "Couldn't load jobs — the backend is unreachable",
   );
+});
+
+// ── clientActionErrorCopy (3.4-E) ────────────────────────────────────────────
+// Worded for a FAILED BUTTON PRESS, not a failed page load. Kept separate from
+// errorPanelCopy on purpose: "try reloading" is right for a page that would not
+// load and wrong for an installer with a half-filled form open.
+
+test("clientActionErrorCopy: every branch has non-empty, distinct copy", () => {
+  const kinds: ApiErrorKind[] = ["config", "auth", "network", "http", "parse"];
+  const headings = kinds.map((k) => clientActionErrorCopy(k, 500).heading);
+  assert.equal(new Set(headings).size, kinds.length, headings.join(" | "));
+  for (const kind of kinds) {
+    const copy = clientActionErrorCopy(kind, 500);
+    assert.ok(copy.heading.trim().length > 0, `${kind} heading empty`);
+    assert.ok(copy.body.trim().length > 0, `${kind} body empty`);
+  }
+});
+
+test("clientActionErrorCopy: the auth branch is the expired-session wording", () => {
+  const copy = clientActionErrorCopy("auth", 401);
+  assert.equal(copy.heading, "Your session has expired");
+  assert.equal(
+    copy.body,
+    "Sign in again and your work on this page will still be here.",
+  );
+});
+
+test("clientActionErrorCopy: auth copy never mentions a token, cookie or env var", () => {
+  const copy = clientActionErrorCopy("auth", 401);
+  const text = `${copy.heading} ${copy.body}`.toLowerCase();
+  for (const banned of ["token", "cookie", "jwt", "bearer", "env", "supabase"]) {
+    assert.ok(!text.includes(banned), `auth copy must not contain ${banned}: ${text}`);
+  }
+});
+
+test("clientActionErrorCopy: auth copy DIFFERS from errorPanelCopy's auth copy", () => {
+  // They serve different situations — a dead page vs a dead button press — and a
+  // later tidy-up must not silently unify them.
+  const action = clientActionErrorCopy("auth", 401);
+  const panel = errorPanelCopy("auth", 401, ENDPOINT);
+  assert.notEqual(action.heading, panel.heading);
+  assert.notEqual(action.body, panel.body);
+  // The page copy tells you to reload; the action copy must NOT.
+  assert.ok(!`${action.heading} ${action.body}`.toLowerCase().includes("reload"));
+});
+
+test("clientActionErrorCopy: 409 and 422 say the server rejected the values", () => {
+  for (const status of [409, 422]) {
+    const copy = clientActionErrorCopy("http", status);
+    assert.equal(copy.heading, "The server rejected these values");
+    assert.ok(copy.body.toLowerCase().includes("not valid"), copy.body);
+  }
+  // A plain 500 keeps the generic wording, not the rejection wording.
+  assert.notEqual(
+    clientActionErrorCopy("http", 500).heading,
+    "The server rejected these values",
+  );
+  assert.ok(clientActionErrorCopy("http", 500).body.includes("500"));
+});
+
+test("clientActionErrorCopy: parse carries the real status; network reassures", () => {
+  assert.ok(clientActionErrorCopy("parse", 502).body.includes("502"));
+  assert.ok(
+    clientActionErrorCopy("network", 0).body.toLowerCase().includes("port 8000"),
+  );
+  // Nothing entered is lost — say so, on both.
+  assert.ok(clientActionErrorCopy("network", 0).body.toLowerCase().includes("lost"));
+});
+
+test("clientActionErrorCopy: an unrecognised kind falls back, never empty", () => {
+  const bogus = clientActionErrorCopy(unsafe<ApiErrorKind>("banana"), 500);
+  assert.deepEqual(bogus, clientActionErrorCopy("http", 500));
+  assert.ok(bogus.heading.trim().length > 0);
+});
+
+test("errorPanelCopy: all six branches BYTE-IDENTICAL after 3.4-E", () => {
+  // Asserted, not eyeballed — adding a sibling function must not disturb it.
+  assert.deepEqual(errorPanelCopy("config", 500, ENDPOINT), {
+    heading: "Jobs can't load — the app is misconfigured",
+    body: "NEXT_PUBLIC_SUPABASE_URL / NEXT_PUBLIC_SUPABASE_ANON_KEY is not set. Set both in the deployment environment and redeploy.",
+  });
+  assert.deepEqual(errorPanelCopy("auth", 401, ENDPOINT), {
+    heading: "Couldn't load jobs — you may be signed out",
+    body: `${ENDPOINT} responded with HTTP 401. Your session may have expired — sign in again.`,
+  });
+  assert.deepEqual(errorPanelCopy("network", 0, ENDPOINT), {
+    heading: "Couldn't load jobs — the backend is unreachable",
+    body: `The request to ${ENDPOINT} never reached the server. Check the backend is running on port 8000.`,
+  });
+  assert.deepEqual(errorPanelCopy("parse", 200, ENDPOINT), {
+    heading: "Couldn't load jobs — the response was unreadable",
+    body: `${ENDPOINT} returned a response the app could not read. Try reloading, and check the backend logs if it persists.`,
+  });
+  assert.deepEqual(errorPanelCopy("http", 503, ENDPOINT), {
+    heading: "Couldn't load jobs — the server is briefly unavailable",
+    body: "The server could not reach its database for a moment. This is usually temporary — wait a few seconds and reload.",
+  });
+  assert.deepEqual(errorPanelCopy("http", 500, ENDPOINT), {
+    heading: "Couldn't load jobs",
+    body: `${ENDPOINT} responded with HTTP 500. The backend hit an error — try reloading, and check the backend logs if it persists.`,
+  });
 });

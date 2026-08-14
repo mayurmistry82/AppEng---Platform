@@ -1,6 +1,7 @@
 "use client";
 
 import * as React from "react";
+import Link from "next/link";
 import { useRouter } from "next/navigation";
 import { Button } from "@/components/ui/button";
 import {
@@ -14,8 +15,10 @@ import {
 } from "@/components/ui/dialog";
 import { Input } from "@/components/ui/input";
 import { AddressAutocomplete } from "@/components/jobs/address-autocomplete";
+import { postJson } from "@/lib/client-api";
 import {
   DISABLED_PATH_REASON,
+  clientActionErrorCopy,
   sizingOptions,
   type JobIntent,
 } from "@/lib/jobs";
@@ -62,7 +65,9 @@ export function NewJobDialog({ children }: { children: React.ReactNode }) {
   const [inverterKw, setInverterKw] = React.useState("");
   const [intent, setIntent] = React.useState<JobIntent | null>(null);
   const [submitting, setSubmitting] = React.useState(false);
-  const [error, setError] = React.useState<string | null>(null);
+  const [error, setError] = React.useState<
+    { heading: string; body: string; isAuth: boolean } | null
+  >(null);
 
   const options = sizingOptions(hasSolar);
   const canSubmit = address.trim().length > 0 && intent !== null && !submitting;
@@ -81,30 +86,31 @@ export function NewJobDialog({ children }: { children: React.ReactNode }) {
     setSubmitting(true); // double-submit guard — one job per click
     setError(null);
     try {
-      const res = await fetch("/api/job/create", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        // NEVER path / company_id / installer_id — path is a GENERATED column
-        // and identity comes from the token.
-        body: JSON.stringify({
-          address: address.trim(),
-          customer_name: customerName.trim() || null,
-          has_existing_solar: hasSolar,
-          existing_solar_kw: hasSolar ? parseKw(solarKw) : null,
-          existing_inverter_kw: hasSolar ? parseKw(inverterKw) : null,
-          intent,
-        }),
+      // NEVER path / company_id / installer_id — path is a GENERATED column
+      // and identity comes from the token.
+      const result = await postJson<CreateResponse>("/api/job/create", {
+        address: address.trim(),
+        customer_name: customerName.trim() || null,
+        has_existing_solar: hasSolar,
+        existing_solar_kw: hasSolar ? parseKw(solarKw) : null,
+        existing_inverter_kw: hasSolar ? parseKw(inverterKw) : null,
+        intent,
       });
-      const data = (await res.json().catch(() => ({}))) as CreateResponse;
 
-      if (res.status === 401 || res.status === 403) {
-        setError("Your session may have expired — sign in again.");
+      if (!result.ok) {
+        // Same vocabulary as the worksheet (3.4-E): an expired session says so
+        // plainly and the dialog STAYS OPEN with every value intact.
+        const copy = clientActionErrorCopy(result.kind, result.status);
+        setError({ ...copy, isAuth: result.kind === "auth" });
         return;
       }
-      if (!res.ok || !data.job_id) {
-        setError(
-          "The job could not be created — the backend reported an error. Your entries are kept; try again.",
-        );
+      const data = result.data ?? {};
+      if (!data.job_id) {
+        setError({
+          heading: "The job could not be created",
+          body: "The server accepted the request but returned no job. Your entries are kept — try again.",
+          isAuth: false,
+        });
         return;
       }
 
@@ -123,10 +129,6 @@ export function NewJobDialog({ children }: { children: React.ReactNode }) {
       setIntent(null);
       setOpen(false);
       router.push(`/jobs/${data.job_id}/worksheet`);
-    } catch {
-      setError(
-        "Could not reach the server — check the backend is running on port 8000. Your entries are kept.",
-      );
     } finally {
       setSubmitting(false);
     }
@@ -283,9 +285,20 @@ export function NewJobDialog({ children }: { children: React.ReactNode }) {
           ) : null}
 
           {error ? (
-            <p role="alert" className="text-body text-destructive">
-              {error}
-            </p>
+            <div role="alert" className="text-body text-destructive">
+              <p className="font-semibold">{error.heading}</p>
+              <p className="text-caption">
+                {error.body}
+                {error.isAuth ? (
+                  <>
+                    {" "}
+                    <Link href="/login" className="text-primary underline">
+                      Go to sign in
+                    </Link>
+                  </>
+                ) : null}
+              </p>
+            </div>
           ) : null}
         </div>
 
