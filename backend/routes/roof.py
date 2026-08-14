@@ -31,6 +31,7 @@ persisted=false — never blocks the workflow. persist=false skips the write ent
 from __future__ import annotations
 
 import os
+from datetime import datetime, timezone
 from typing import Any, Literal, Optional
 
 import requests
@@ -207,6 +208,14 @@ def _persist(model: dict, job_id: Optional[str]) -> tuple[bool, Optional[str]]:
         "geocoded_postcode": model.get("geocoded_postcode"),
         "geocoded_state": model.get("geocoded_state"),
         "geocoded_formatted_address": model.get("geocoded_formatted_address"),
+        # 3.5b (§20.2) — start the 30-day Solar Data clock on GOOGLE rows only.
+        # A manual row carries no Google content and is never stamped. Read from
+        # the MODEL's source, never the request body.
+        "solar_data_captured_at": (
+            datetime.now(timezone.utc).isoformat()
+            if model.get("source") == "google_solar"
+            else None
+        ),
     }
     try:
         client.table("roof_geometry").insert(row).execute()

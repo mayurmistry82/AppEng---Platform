@@ -28,6 +28,7 @@ import { clientActionErrorCopy } from "@/lib/jobs";
 import {
   EMPTY_PLANE_FORM_ROW,
   planeFormRowsFromView,
+  showsGoogleSolarAttribution,
   type AddressRoofView,
   type PlaneFormRow,
 } from "@/lib/worksheet";
@@ -377,8 +378,12 @@ export function AddressRoofSection({
           ]
             .filter(Boolean)
             .join(" · ")}
-          {view.imageryDate || view.imageryQualityLabel ? " · " : null}
-          Includes solar data from Google
+          {showsGoogleSolarAttribution(view) ? (
+            <>
+              {view.imageryDate || view.imageryQualityLabel ? " · " : null}
+              Includes solar data from Google
+            </>
+          ) : null}
         </figcaption>
       </figure>
     );
@@ -620,6 +625,11 @@ export function AddressRoofSection({
           {notice.body}
         </Notice>
       ))}
+      {view.solarExpiredNotice ? (
+        <Notice tone={view.solarExpiredNotice.tone} title={view.solarExpiredNotice.title}>
+          {view.solarExpiredNotice.body}
+        </Notice>
+      ) : null}
       {showsMultiDwellingCaution ? (
         <Notice tone="caution" title="The roof lookup may not be this dwelling">
           Google returns the one building nearest the address. On a
@@ -681,8 +691,16 @@ export function AddressRoofSection({
             ) : null}
             {view.state === "found" ? (
               <>
-                <Button variant="secondary" onClick={lookup} disabled={busy !== null}>
-                  {lookupBusy ? "Looking up…" : "Look up again"}
+                <Button
+                  variant={view.solarDataExpired ? "primary" : "secondary"}
+                  onClick={lookup}
+                  disabled={busy !== null}
+                >
+                  {lookupBusy
+                    ? "Looking up…"
+                    : view.solarDataExpired
+                      ? "Refresh roof data from Google"
+                      : "Look up again"}
                 </Button>
                 <Button variant="secondary" onClick={openForm} disabled={busy !== null}>
                   {manualTriggerLabel}
@@ -695,9 +713,20 @@ export function AddressRoofSection({
                   {manualTriggerLabel}
                 </Button>
                 {/* Restored at 3.4-D: a low-confidence roof is exactly where you
-                    might re-run after checking, and the retry had vanished. */}
-                <Button variant="secondary" onClick={lookup} disabled={busy !== null}>
-                  {lookupBusy ? "Looking up…" : "Look up again"}
+                    might re-run after checking, and the retry had vanished.
+                    3.5b: when the Solar Data has expired the same handler is the
+                    refresh — one Google call, appended as a new row, restarting
+                    the 30-day clock. */}
+                <Button
+                  variant={view.solarDataExpired ? "primary" : "secondary"}
+                  onClick={lookup}
+                  disabled={busy !== null}
+                >
+                  {lookupBusy
+                    ? "Looking up…"
+                    : view.solarDataExpired
+                      ? "Refresh roof data from Google"
+                      : "Look up again"}
                 </Button>
               </>
             ) : null}

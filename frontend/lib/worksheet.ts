@@ -539,6 +539,9 @@ export function roofEntryState(row: unknown): RoofEntryState {
 /** Mirrors backend/roof_geometry.py IMPLAUSIBLE_PITCH_DEGREES — keep the two equal. */
 const IMPLAUSIBLE_PITCH_DEGREES = 45;
 
+/* Mirrors backend/solar_retention.py SOLAR_DATA_RETENTION_DAYS — keep equal. */
+export const SOLAR_DATA_RETENTION_DAYS = 30;
+
 const COMPASS_16 = [
   "N", "NNE", "NE", "ENE", "E", "ESE", "SE", "SSE",
   "S", "SSW", "SW", "WSW", "W", "WNW", "NW", "NNW",
@@ -593,6 +596,17 @@ export interface AddressRoofView {
   } | null;
   notice: RoofNoticeView | null;
   staleNotice: RoofNoticeView | null;
+  /**
+   * §20.2 (3.5b): the newest row's Google Solar Data is past its 30-day
+   * retention. Deliberately an OR of three signals — the backend's redaction
+   * flag, the sweep's tombstone, and a client-side age check — so the expired
+   * state shows even if neither server mechanism has run. Never true for a
+   * manual_* source. false, never null.
+   */
+  solarDataExpired: boolean;
+  solarDataCapturedAt: string | null;
+  /** The §20.2 caution, rendered in the same slot as the 3.4-C cautions. */
+  solarExpiredNotice: RoofNoticeView | null;
   /** One caution per low-confidence cause (3.4-C). Empty array, never null. */
   confidenceNotices: RoofNoticeView[];
   /** From PATH_RULES via pathRule() — 3.3b's fields, first consumer. */
@@ -777,6 +791,9 @@ export function addressRoofView(job: unknown): AddressRoofView {
     crossCheck: null,
     notice: null,
     staleNotice: null,
+    solarDataExpired: false,
+    solarDataCapturedAt: null,
+    solarExpiredNotice: null,
     confidenceNotices: [],
     solarMode: rule ? rule.solarMode : null,
     showsExistingArray: rule ? rule.showsExistingArray : false,
@@ -855,6 +872,34 @@ export function addressRoofView(job: unknown): AddressRoofView {
       geocodedPostcode:
         typeof c.geocoded_postcode === "string" ? c.geocoded_postcode : null,
       mismatch: c.mismatch === true,
+    };
+  }
+
+  // ── §20.2 retention (3.5b) ─────────────────────────────────────────────
+  view.solarDataCapturedAt =
+    typeof row.solar_data_captured_at === "string" ? row.solar_data_captured_at : null;
+  if (source === "google_solar") {
+    const backendSaidSo = row.solar_data_expired === true;
+    const tombstoned = isParseableDate(row.solar_data_expired_at);
+    const referenceRaw = view.solarDataCapturedAt ?? row.created_at;
+    const reference =
+      typeof referenceRaw === "string" ? new Date(referenceRaw).getTime() : NaN;
+    const tooOld =
+      Number.isFinite(reference) &&
+      Date.now() - reference > SOLAR_DATA_RETENTION_DAYS * 24 * 3600 * 1000;
+    view.solarDataExpired = backendSaidSo || tombstoned || tooOld;
+  }
+  if (view.solarDataExpired) {
+    // The Google content is deleted (or due for deletion): the imagery
+    // metadata goes; OUR numbers — planes, totals, panel, usability — stay
+    // exactly as computed above. imageryStale, the confidence notices and the
+    // cross-check are deliberately untouched.
+    view.imageryDate = null;
+    view.imageryQualityLabel = null;
+    view.solarExpiredNotice = {
+      tone: "caution",
+      title: "Google's roof data for this job has been deleted",
+      body: "Google only lets us keep the aerial roof data for 30 days. The roof sizes below are ours and are unchanged. Refresh to bring back the aerial view and the panel layout.",
     };
   }
 
@@ -1015,6 +1060,30 @@ export function planeFormRowsFromView(planes: unknown): PlaneFormRow[] {
     });
   }
   return rows;
+}
+
+function isParseableDate(value: unknown): boolean {
+  return (
+    typeof value === "string" &&
+    value !== "" &&
+    Number.isFinite(new Date(value).getTime())
+  );
+}
+
+/**
+ * §20.2 attribution (3.5b, F79): "Includes solar data from Google" renders ONLY
+ * when the roof on screen actually contains Google Solar data. A roof entered
+ * from plans is the installer's own measurement and must not be credited to
+ * Google.
+ *
+ * "found"/"low_confidence" ⇔ source === "google_solar": those two states arise
+ * only from a found google_solar row, a manual row always resolves "manual",
+ * and a google lookup that found nothing stores source NULL (roof_geometry.py
+ * _blank) so it resolves "not_found" — correctly uncredited, since it holds no
+ * Solar data.
+ */
+export function showsGoogleSolarAttribution(view: AddressRoofView): boolean {
+  return view.state === "found" || view.state === "low_confidence";
 }
 
 // ── Results-bar geometry + preference (3.3a) ─────────────────────────────────

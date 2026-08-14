@@ -38,6 +38,7 @@ from pydantic import BaseModel, Field
 
 import capture
 import job_paths
+import solar_retention
 import nem_data
 from auth import Caller, require_company
 
@@ -722,7 +723,13 @@ async def get_job(job_id: str, caller: Caller = Depends(require_company)):
         # A missing/unreadable child table yields an empty list for its key, never a 500.
         try:
             res = client.table(table).select("*").eq("job_id", job_id).execute()
-            children[key] = getattr(res, "data", None) or []
+            rows = getattr(res, "data", None) or []
+            if key == "roof_geometry":
+                # 3.5b (§20.2) defence in depth: even if the nightly sweep has not
+                # run, expired Google Solar Data never leaves the server. Only this
+                # child table — nothing else holds Solar Data.
+                rows = [solar_retention.redact_expired_solar_data(r) for r in rows]
+            children[key] = rows
         except Exception as exc:  # noqa: BLE001
             logger.warning("job CRUD: hydration of %s failed for %s: %s", table, job_id, exc)
             children[key] = []

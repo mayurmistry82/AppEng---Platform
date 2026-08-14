@@ -35,6 +35,7 @@ import {
   roofEntryState,
   sectionStates,
   sectionsForPath,
+  showsGoogleSolarAttribution,
   siteDetailsView,
   worksheetErrorCopy,
   type JobDetailLike,
@@ -1191,4 +1192,133 @@ test("resultsBarMaxHeight and clampResultsBarHeight are UNCHANGED by 3.3a-fix2",
   assert.equal(clampResultsBarHeight(5000, 900, 140), 640);
   assert.equal(clampResultsBarHeight(10, 900, 140), RESULTS_BAR_MIN_HEIGHT);
   assert.equal(clampResultsBarHeight(NaN, 900, 140), RESULTS_BAR_DEFAULT_HEIGHT);
+});
+
+// ── §20.2 Solar Data retention (3.5b) ────────────────────────────────────────
+// Expiry begins strictly AFTER 30 days; day 30 itself is not yet expired
+// (matching backend/solar_retention.py's `> timedelta(days=30)`).
+
+const daysAgo = (days: number) =>
+  new Date(Date.now() - days * 24 * 3600 * 1000).toISOString();
+
+const googleRoof = (over: Record<string, unknown> = {}) =>
+  roofRow({
+    source: "google_solar",
+    imagery_date: "2018-11-17",
+    imagery_quality: "MEDIUM",
+    imagery_stale: true,
+    ...over,
+  });
+
+test("solar retention: a 31-day-old google row is expired and redacted in the view", () => {
+  const view = addressRoofView(
+    emptyJob({ roof_geometry: [googleRoof({ solar_data_captured_at: daysAgo(31) })] }),
+  );
+  assert.equal(view.solarDataExpired, true);
+  assert.equal(view.imageryDate, null, "imagery date is deleted data");
+  assert.equal(view.imageryQualityLabel, null, "imagery quality is deleted data");
+  assert.equal(
+    view.solarExpiredNotice?.title,
+    "Google's roof data for this job has been deleted",
+  );
+  assert.equal(view.solarExpiredNotice?.tone, "caution");
+  // OUR numbers survive untouched (roofRow's single-plane fixture: 17 / 7.48).
+  assert.equal(view.planes.length, 1);
+  assert.equal(view.totals.panels, 17);
+  assert.equal(view.totals.kwp, 7.48);
+  // imageryStale is deliberately untouched (the flag is ours).
+  assert.equal(view.imageryStale, true);
+});
+
+test("solar retention: a 29-day-old google row is NOT expired", () => {
+  const view = addressRoofView(
+    emptyJob({ roof_geometry: [googleRoof({ solar_data_captured_at: daysAgo(29) })] }),
+  );
+  assert.equal(view.solarDataExpired, false);
+  assert.equal(view.solarExpiredNotice, null);
+  assert.equal(view.imageryDate, "2018-11-17");
+});
+
+test("solar retention: the 30-day boundary is NOT yet expired (backend's choice)", () => {
+  // A hair under 30 full days — unambiguously inside the window.
+  const view = addressRoofView(
+    emptyJob({
+      roof_geometry: [
+        googleRoof({ solar_data_captured_at: daysAgo(30) }),
+      ],
+    }),
+  );
+  // daysAgo(30) is exactly 30*24h ago; expiry requires STRICTLY more.
+  assert.equal(view.solarDataExpired, false, "30 days is not yet expired");
+});
+
+test("solar retention: a manual row aged 400 days is never expired", () => {
+  const view = addressRoofView(
+    emptyJob({
+      roof_geometry: [
+        roofRow({
+          source: "manual_plans",
+          created_at: daysAgo(400),
+          solar_data_captured_at: null,
+        }),
+      ],
+    }),
+  );
+  assert.equal(view.solarDataExpired, false);
+  assert.equal(view.solarExpiredNotice, null);
+});
+
+test("solar retention: backend's solar_data_expired flag honoured even when recent", () => {
+  const view = addressRoofView(
+    emptyJob({
+      roof_geometry: [
+        googleRoof({ solar_data_captured_at: daysAgo(1), solar_data_expired: true }),
+      ],
+    }),
+  );
+  assert.equal(view.solarDataExpired, true);
+  assert.equal(view.imageryDate, null);
+});
+
+test("solar retention: the tombstone date alone expires the view", () => {
+  const view = addressRoofView(
+    emptyJob({
+      roof_geometry: [
+        googleRoof({
+          solar_data_captured_at: daysAgo(2),
+          solar_data_expired_at: daysAgo(1),
+        }),
+      ],
+    }),
+  );
+  assert.equal(view.solarDataExpired, true);
+});
+
+test("solar retention: captured_at NULL falls back to created_at", () => {
+  const view = addressRoofView(
+    emptyJob({
+      roof_geometry: [googleRoof({ created_at: daysAgo(31), solar_data_captured_at: null })],
+    }),
+  );
+  assert.equal(view.solarDataExpired, true, "a NULL capture date never means immortal");
+  assert.equal(view.solarDataCapturedAt, null);
+});
+
+test("showsGoogleSolarAttribution: google yes, manual no, not-found no", () => {
+  const google = addressRoofView(emptyJob({ roof_geometry: [googleRoof()] }));
+  assert.equal(showsGoogleSolarAttribution(google), true);
+  const lowConf = addressRoofView(
+    emptyJob({ roof_geometry: [googleRoof({ low_confidence: true })] }),
+  );
+  assert.equal(showsGoogleSolarAttribution(lowConf), true);
+  const manual = addressRoofView(
+    emptyJob({ roof_geometry: [roofRow({ source: "manual_plans" })] }),
+  );
+  assert.equal(showsGoogleSolarAttribution(manual), false,
+    "a roof entered from plans must not be credited to Google");
+  const notFound = addressRoofView(
+    emptyJob({ roof_geometry: [roofRow({ found: false, source: null, planes: [] })] }),
+  );
+  assert.equal(showsGoogleSolarAttribution(notFound), false);
+  assert.equal(showsGoogleSolarAttribution(addressRoofView(null)), false);
 });
