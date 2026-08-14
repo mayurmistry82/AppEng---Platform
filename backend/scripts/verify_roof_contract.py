@@ -339,6 +339,208 @@ def t4() -> None:
         roof_geometry.fetch_roof_geometry = original_fetch
 
 
+
+# ── 3.4-C: roof plausibility ─────────────────────────────────────────────────
+# The 14 Frome St fixture is TRANSCRIBED FROM THE STORED ROW written during 3.4-B
+# acceptance on 2026-08-14 (roof_geometry: pitches 76.4/77.0, areas 2.3/68.32,
+# solarPanels absent, maxArrayPanelsCount null) — not invented. Pre-3.4-C this
+# returned low_confidence FALSE: 2 segments defeated the first clause, and g_max
+# being None short-circuited the second, so "Google told us nothing" read as
+# "Google told us it is fine".
+FROME_ST = {
+    "solarPotential": {
+        "roofSegmentStats": [
+            {"pitchDegrees": 76.4, "azimuthDegrees": 14.7,
+             "stats": {"areaMeters2": 2.3, "sunshineQuantiles": [686.2] * 11}},
+            {"pitchDegrees": 77.0, "azimuthDegrees": 173.1,
+             "stats": {"areaMeters2": 68.32, "sunshineQuantiles": [504.5] * 11}},
+        ],
+        # solarPanels ABSENT, maxArrayPanelsCount null — exactly what Google returned.
+    },
+    "imageryQuality": "MEDIUM",
+    "imageryDate": {"year": 2018, "month": 11, "day": 17},
+}
+
+# A normal roof: 3 faces at ordinary pitches WITH a real Google layout. The
+# false-positive guard — this must never be flagged.
+NORMAL_ROOF = {
+    "solarPotential": {
+        "roofSegmentStats": [
+            {"pitchDegrees": 18.0, "azimuthDegrees": 0.0,
+             "stats": {"areaMeters2": 40.0, "sunshineQuantiles": [1300.0] * 11}},
+            {"pitchDegrees": 22.0, "azimuthDegrees": 90.0,
+             "stats": {"areaMeters2": 35.0, "sunshineQuantiles": [1250.0] * 11}},
+            {"pitchDegrees": 22.0, "azimuthDegrees": 270.0,
+             "stats": {"areaMeters2": 30.0, "sunshineQuantiles": [1200.0] * 11}},
+        ],
+        "solarPanels": (
+            [{"segmentIndex": 0}] * 15 + [{"segmentIndex": 1}] * 13
+            + [{"segmentIndex": 2}] * 12
+        ),
+        "maxArrayPanelsCount": 40,
+    },
+    "imageryQuality": "HIGH",
+    "imageryDate": {"year": 2025, "month": 1, "day": 10},
+}
+
+
+def _causes_for(data: dict, usability: float = 0.7) -> tuple[dict, dict]:
+    """
+    Run the REAL fetch_roof_geometry over a fixture, offline.
+
+    The network seams (_api_key, _geocode, _building_insights) and the Supabase
+    client are stubbed; the confidence rules themselves are NOT — this calls the
+    shipping code path. An earlier version of this helper RE-IMPLEMENTED those
+    rules, which meant deleting a clause from roof_geometry.py left the suite
+    green: a test that could not detect the thing it exists to detect, the exact
+    F39 fault this row was written to fix. Caught by running the red proof.
+
+    Returns (model, norm) — the model from the real entry point, and _normalise's
+    own dict for the two internals the model does not carry.
+    """
+    saved = (
+        roof_geometry._api_key,
+        roof_geometry._geocode,
+        roof_geometry._building_insights,
+        roof_geometry._client,
+    )
+    try:
+        roof_geometry._api_key = lambda: "stub-key"
+        roof_geometry._geocode = lambda _a, _k: (
+            -34.92, 138.60, roof_geometry._blank_geocoded(), None,
+        )
+        roof_geometry._building_insights = lambda _lat, _lng, _k, expanded=False: (
+            200, data, None,
+        )
+        roof_geometry._client = lambda: None  # fallback panel, no DB
+        model = roof_geometry.fetch_roof_geometry("stub address", usability_factor=usability)
+    finally:
+        (
+            roof_geometry._api_key,
+            roof_geometry._geocode,
+            roof_geometry._building_insights,
+            roof_geometry._client,
+        ) = saved
+    norm = roof_geometry._normalise(data, dict(PANEL), usability)
+    return model, norm
+
+
+def t_confidence() -> None:
+    print("\nT-3.4C. roof plausibility — the 14 Frome St regression")
+    model, norm = _causes_for(FROME_ST)
+    causes = model["low_confidence_causes"]
+
+    check("low_confidence is now TRUE (was False — the bug)",
+          model["low_confidence"] is True, str(model["low_confidence"]))
+    check("needs_manual_confirmation is TRUE",
+          model["needs_manual_confirmation"] is True)
+    check("causes include no_google_panel_layout", "no_google_panel_layout" in causes,
+          f"causes={causes}")
+    check("causes include implausible_pitch", "implausible_pitch" in causes,
+          f"causes={causes}")
+    check("summary flag low_confidence_result KEPT", "low_confidence_result" in model["flags"],
+          str(model["flags"]))
+    check("per-cause flags present",
+          "low_confidence_implausible_pitch" in model["flags"]
+          and "low_confidence_no_google_panel_layout" in model["flags"],
+          str(model["flags"]))
+    check("plane_1_implausible_pitch flagged (77 degrees, 23 panels)",
+          "plane_1_implausible_pitch" in norm["flags"], f"flags={norm['flags']}")
+    check("plane_0_implausible_pitch ABSENT (76.4 degrees but 0 panels)",
+          "plane_0_implausible_pitch" not in norm["flags"], f"flags={norm['flags']}")
+    check("max_flagged_pitch is 77.0", norm["max_flagged_pitch"] == 77.0,
+          str(norm["max_flagged_pitch"]))
+
+    # THE MOST IMPORTANT ASSERTION IN THIS TASK: flagging changes NO number and
+    # drops NO plane. If any of these move, the fix has silently altered a
+    # recommendation, which is the failure mode this row exists to prevent.
+    check("plane 1 panel_count STILL 23", model["planes"][1]["panel_count"] == 23,
+          str(model["planes"][1]["panel_count"]))
+    check("plane 1 kwp STILL 10.12", model["planes"][1]["kwp"] == 10.12,
+          str(model["planes"][1]["kwp"]))
+    check("total_kwp STILL 10.12", model["total_kwp"] == 10.12, str(model["total_kwp"]))
+    check("max_panels STILL 23", model["max_panels"] == 23, str(model["max_panels"]))
+    check("BOTH planes still present — none dropped", len(model["planes"]) == 2,
+          f"{len(model['planes'])} planes")
+    check("plane 0 still rendered with its area", model["planes"][0]["area_m2"] == 2.3,
+          str(model["planes"][0]))
+    check("found is still True — the roof is not rejected", model["found"] is True)
+
+    # False-positive guard on an ordinary roof.
+    print("\n   false-positive guard — an ordinary 3-face roof")
+    normal_model, normal_norm = _causes_for(NORMAL_ROOF)
+    check("ordinary roof yields NO causes",
+          normal_model["low_confidence_causes"] == [],
+          str(normal_model["low_confidence_causes"]))
+    check("ordinary roof low_confidence FALSE", normal_model["low_confidence"] is False)
+    check("ordinary roof carries no low_confidence_result flag",
+          "low_confidence_result" not in normal_model["flags"], str(normal_model["flags"]))
+    check("ordinary roof has no pitch flag", normal_norm["max_flagged_pitch"] is None,
+          str(normal_norm["max_flagged_pitch"]))
+    check("ordinary roof HAS a google layout", normal_norm["have_google_layout"] is True)
+
+    # Threshold behaviour at the edges.
+    print("\n   pitch threshold edges")
+    steep_empty = {"solarPotential": {"roofSegmentStats": [
+        {"pitchDegrees": 50.0, "stats": {"areaMeters2": 1.0}}], "maxArrayPanelsCount": 40,
+        "solarPanels": [{"segmentIndex": 0}] * 40}}
+    n = roof_geometry._normalise(steep_empty, dict(PANEL), 0.7)
+    check("50 degrees carrying 0 panels -> NOT flagged",
+          n["max_flagged_pitch"] is None and n["planes"][0]["panel_count"] == 0,
+          f"pitch flag={n['max_flagged_pitch']} count={n['planes'][0]['panel_count']}")
+
+    steep_full = {"solarPotential": {"roofSegmentStats": [
+        {"pitchDegrees": 46.0, "stats": {"areaMeters2": 20.0}}], "maxArrayPanelsCount": 40,
+        "solarPanels": [{"segmentIndex": 0}] * 40}}
+    n = roof_geometry._normalise(steep_full, dict(PANEL), 0.7)
+    check("46 degrees carrying panels -> flagged",
+          n["max_flagged_pitch"] == 46.0 and n["planes"][0]["panel_count"] > 0,
+          f"pitch flag={n['max_flagged_pitch']} count={n['planes'][0]['panel_count']}")
+
+    for label, pitch in (("None", None), ("negative", -10.0), ("above 90", 120.0)):
+        seg = {"stats": {"areaMeters2": 20.0}}
+        if pitch is not None:
+            seg["pitchDegrees"] = pitch
+        data = {"solarPotential": {"roofSegmentStats": [seg],
+                "maxArrayPanelsCount": 40, "solarPanels": [{"segmentIndex": 0}] * 40}}
+        try:
+            n = roof_geometry._normalise(data, dict(PANEL), 0.7)
+            ok = n["max_flagged_pitch"] is None and len(n["planes"]) == 1
+        except Exception as exc:  # noqa: BLE001
+            ok = False
+            n = {"err": str(exc)}
+        check(f"pitch {label} -> not flagged, plane still rendered, no throw", ok, str(n))
+
+    # The `g_max is None` clause is LOAD-BEARING and needs its own fixture: on
+    # 14 Frome St solarPanels is absent, so `not have_layout` already fires and the
+    # clause is redundant there. This case — Google DID return a layout but reported
+    # no maxArrayPanelsCount — is the only one that isolates it, and without this
+    # check the clause could be deleted with the suite still green (found while
+    # running the red proof for this very clause).
+    layout_no_max = {"solarPotential": {
+        "roofSegmentStats": [
+            {"pitchDegrees": 20.0, "stats": {"areaMeters2": 40.0}},
+            {"pitchDegrees": 22.0, "stats": {"areaMeters2": 35.0}},
+            {"pitchDegrees": 20.0, "stats": {"areaMeters2": 30.0}},
+        ],
+        "solarPanels": [{"segmentIndex": 0}] * 12 + [{"segmentIndex": 1}] * 10,
+        # maxArrayPanelsCount deliberately ABSENT while a layout exists.
+    }}
+    lnm_model, lnm_norm = _causes_for(layout_no_max)
+    lnm_causes = lnm_model["low_confidence_causes"]
+    check("layout present but maxArrayPanelsCount null -> have_google_layout True",
+          lnm_norm["have_google_layout"] is True)
+    check("layout present but maxArrayPanelsCount null -> STILL flagged "
+          "no_google_panel_layout", "no_google_panel_layout" in lnm_causes,
+          f"causes={lnm_causes}")
+
+    # The reason sentence names the causes and never leaks a raw cause id.
+    reason = roof_geometry._confidence_reason(causes, norm["max_flagged_pitch"])
+    check("reason names the steep pitch in degrees", "77" in reason, reason)
+    check("reason mentions confirming against plans", "plans" in reason.lower(), reason)
+    check("_blank carries low_confidence_causes on every path",
+          roof_geometry._blank().get("low_confidence_causes") == [])
+
 def t5_live() -> None:
     print("\nT5. LIVE Google checks (fetch_roof_geometry directly — no DB write)")
     if not os.getenv("GOOGLE_MAPS_API_KEY"):
@@ -386,6 +588,7 @@ def main() -> int:
     t2()
     t3()
     t4()
+    t_confidence()
     if live:
         t5_live()
 

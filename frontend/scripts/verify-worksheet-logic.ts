@@ -797,3 +797,148 @@ test("addressRoofView: junk-safe, serialisable, correct states", () => {
   // No function values anywhere — the view crosses the server/client boundary.
   assert.doesNotThrow(() => JSON.stringify(found));
 });
+
+// ── Roof plausibility notices (3.4-C) ────────────────────────────────────────
+// Causes are read from `flags`, not from `low_confidence_causes`: a row written
+// before 3.4-C has flags but no such key, and the newest-row rule means such a
+// row can still be the one on screen.
+
+/** The real 14 Frome St row, as stored on 2026-08-14. */
+const FROME_ROW = {
+  created_at: "2026-08-14T05:00:00Z",
+  found: true,
+  source: "google_solar",
+  low_confidence: true,
+  needs_manual_confirmation: true,
+  flags: [
+    "google_panel_layout_absent",
+    "plane_1_implausible_pitch",
+    "imagery_7y_old",
+    "low_confidence_no_google_panel_layout",
+    "low_confidence_implausible_pitch",
+    "low_confidence_result",
+  ],
+  planes: [
+    { azimuth: 14.7, pitch: 76.4, area_m2: 2.3, usable_area_m2: 1.61, panel_count: 0, kwp: 0 },
+    { azimuth: 173.1, pitch: 77, area_m2: 68.32, usable_area_m2: 47.82, panel_count: 23, kwp: 10.12 },
+  ],
+};
+
+const viewFor = (row: unknown) =>
+  addressRoofView(emptyJob({ roof_geometry: [row] }));
+
+test("confidenceNotices: both causes render, in the stated order", () => {
+  const view = viewFor(FROME_ROW);
+  assert.equal(view.confidenceNotices.length, 2);
+  assert.equal(
+    view.confidenceNotices[0].title,
+    "One of these faces is too steep to be a roof",
+  );
+  assert.equal(
+    view.confidenceNotices[1].title,
+    "Google could not fit any panels on this building",
+  );
+  for (const n of view.confidenceNotices) assert.equal(n.tone, "caution");
+  // The pitch is DERIVED from planes (77, the face carrying panels — not 76.4).
+  assert.ok(view.confidenceNotices[0].body.includes("77°"),
+    view.confidenceNotices[0].body);
+  // The generic state notice no longer hardcodes the new-build wording.
+  assert.equal(view.notice?.title, "Check this roof before you use it");
+  // And nothing was hidden: the planes and totals still render.
+  assert.equal(view.planes.length, 2);
+  assert.equal(view.totals.panels, 23);
+  assert.equal(view.totals.kwp, 10.12);
+});
+
+test("confidenceNotices: a single cause renders exactly one notice", () => {
+  const view = viewFor({
+    ...FROME_ROW,
+    flags: ["low_confidence_too_few_segments", "low_confidence_result"],
+  });
+  assert.equal(view.confidenceNotices.length, 1);
+  assert.equal(view.confidenceNotices[0].title, "This may be a newer build than the photo");
+});
+
+test("confidenceNotices: too_few_segments and too_few_panels dedup to one notice", () => {
+  const view = viewFor({
+    ...FROME_ROW,
+    flags: ["low_confidence_too_few_segments", "low_confidence_too_few_panels"],
+  });
+  assert.equal(view.confidenceNotices.length, 1);
+});
+
+test("confidenceNotices: an UNRECOGNISED cause renders a caution, never silence", () => {
+  const view = viewFor({ ...FROME_ROW, flags: ["low_confidence_madeup"] });
+  assert.equal(view.confidenceNotices.length, 1);
+  assert.equal(view.confidenceNotices[0].title, "Something about this result looks wrong");
+  assert.ok(view.confidenceNotices[0].body.includes("madeup"),
+    view.confidenceNotices[0].body);
+});
+
+test("confidenceNotices: all four causes stack in order", () => {
+  const view = viewFor({
+    ...FROME_ROW,
+    flags: [
+      "low_confidence_too_few_segments",
+      "low_confidence_madeup",
+      "low_confidence_no_google_panel_layout",
+      "low_confidence_implausible_pitch",
+      "low_confidence_result",
+    ],
+  });
+  assert.deepEqual(
+    view.confidenceNotices.map((n) => n.title),
+    [
+      "One of these faces is too steep to be a roof",
+      "Google could not fit any panels on this building",
+      "This may be a newer build than the photo",
+      "Something about this result looks wrong",
+    ],
+  );
+});
+
+test("confidenceNotices: junk-safe and empty when there are no causes", () => {
+  assert.deepEqual(viewFor({ ...FROME_ROW, flags: [] }).confidenceNotices, []);
+  const noFlags = { ...FROME_ROW };
+  delete (noFlags as { flags?: unknown }).flags;
+  assert.deepEqual(viewFor(noFlags).confidenceNotices, []);
+  assert.deepEqual(
+    viewFor({ ...FROME_ROW, flags: "not-an-array" }).confidenceNotices,
+    [],
+  );
+  assert.deepEqual(
+    viewFor({ ...FROME_ROW, flags: [1, null, {}] }).confidenceNotices,
+    [],
+  );
+  // low_confidence_result ALONE is the summary flag, not a cause.
+  assert.deepEqual(
+    viewFor({ ...FROME_ROW, flags: ["low_confidence_result"] }).confidenceNotices,
+    [],
+  );
+  assert.doesNotThrow(() => viewFor({ ...FROME_ROW, planes: "junk" }));
+});
+
+test("confidenceNotices: a PRE-3.4-C row renders none and does not throw", () => {
+  // Exactly what was stored before this change: flags present, no cause entries.
+  const preChange = {
+    ...FROME_ROW,
+    low_confidence: false,
+    needs_manual_confirmation: false,
+    flags: ["google_panel_layout_absent", "imagery_7y_old"],
+  };
+  const view = viewFor(preChange);
+  assert.deepEqual(view.confidenceNotices, []);
+  assert.equal(view.state, "found"); // low_confidence reads whatever was stored
+  assert.equal(view.totals.panels, 23);
+});
+
+test("confidenceNotices: pitch falls back when no plane carries panels", () => {
+  const view = viewFor({
+    ...FROME_ROW,
+    flags: ["low_confidence_implausible_pitch"],
+    planes: [{ azimuth: 0, pitch: 77, area_m2: 2.3, panel_count: 0, kwp: 0 }],
+  });
+  assert.equal(view.confidenceNotices.length, 1);
+  assert.ok(view.confidenceNotices[0].body.includes("that angle"),
+    view.confidenceNotices[0].body);
+});

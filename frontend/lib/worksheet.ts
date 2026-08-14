@@ -533,6 +533,9 @@ export function roofEntryState(row: unknown): RoofEntryState {
   return "found";
 }
 
+/** Mirrors backend/roof_geometry.py IMPLAUSIBLE_PITCH_DEGREES — keep the two equal. */
+const IMPLAUSIBLE_PITCH_DEGREES = 45;
+
 const COMPASS_16 = [
   "N", "NNE", "NE", "ENE", "E", "ESE", "SE", "SSE",
   "S", "SSW", "SW", "WSW", "W", "WNW", "NW", "NNW",
@@ -587,6 +590,8 @@ export interface AddressRoofView {
   } | null;
   notice: RoofNoticeView | null;
   staleNotice: RoofNoticeView | null;
+  /** One caution per low-confidence cause (3.4-C). Empty array, never null. */
+  confidenceNotices: RoofNoticeView[];
   /** From PATH_RULES via pathRule() — 3.3b's fields, first consumer. */
   solarMode: PathRule["solarMode"] | null;
   showsExistingArray: boolean;
@@ -627,10 +632,12 @@ function roofStateNotice(
         body: "The aerial imagery doesn't cover this area — that's normal for about one address in five. Entering the roof from plans is the accurate way to do it anyway.",
       };
     case "low_confidence":
+      // Generic since 3.4-C: the new-build wording moved into its own cause, and
+      // the specific reasons render as confidenceNotices below this one.
       return {
         tone: "caution",
-        title: "This looks like a newer build than the photo",
-        body: "The aerial photo seems to predate the house, so the roof it found is probably not the real one. Check it against the plans.",
+        title: "Check this roof before you use it",
+        body: "The lookup returned a result, but something about it does not look right. The details are below.",
       };
     case "manual":
       if (source === "manual_plans") {
@@ -655,6 +662,88 @@ function roofStateNotice(
     default:
       return null;
   }
+}
+
+
+/**
+ * The low-confidence cautions for a stored roof row (3.4-C), one per cause.
+ *
+ * Causes are read from the row's `flags` array, NOT from `low_confidence_causes`:
+ * a row written before 3.4-C has flags but no such key, and the newest-row rule
+ * means such a row can still be the one on screen. The displayed pitch is
+ * likewise derived from `planes` rather than a stored `max_flagged_pitch`, for
+ * the same reason.
+ *
+ * An UNRECOGNISED `low_confidence_*` flag still produces a visible caution —
+ * never silence. A cause we cannot name is exactly the case an installer most
+ * needs told about.
+ */
+function confidenceNotices(row: Record<string, unknown>): RoofNoticeView[] {
+  const flags = Array.isArray(row.flags)
+    ? row.flags.filter((f): f is string => typeof f === "string")
+    : [];
+  const causes = new Set(
+    flags
+      .filter((f) => f.startsWith("low_confidence_") && f !== "low_confidence_result")
+      .map((f) => f.slice("low_confidence_".length)),
+  );
+  if (causes.size === 0) return [];
+
+  // Steepest pitch among planes that actually carry panels — a steep face with no
+  // panels contributes nothing and is not what the notice is about.
+  let steepest: number | null = null;
+  for (const plane of arr(row.planes)) {
+    const pitch = plane.pitch;
+    const count = plane.panel_count;
+    if (
+      typeof pitch === "number" &&
+      Number.isFinite(pitch) &&
+      pitch > IMPLAUSIBLE_PITCH_DEGREES &&
+      typeof count === "number" &&
+      count > 0 &&
+      (steepest === null || pitch > steepest)
+    ) {
+      steepest = pitch;
+    }
+  }
+
+  const notices: RoofNoticeView[] = [];
+  if (causes.delete("implausible_pitch")) {
+    const degrees = steepest !== null ? `${Math.round(steepest)}°` : "that angle";
+    notices.push({
+      tone: "caution",
+      title: "One of these faces is too steep to be a roof",
+      body: `A roof face at ${degrees} is closer to a wall than a roof, and it is carrying panels in the table below. It is still shown so you can see it — check it against the plans before you rely on this.`,
+    });
+  }
+  if (causes.delete("no_google_panel_layout")) {
+    notices.push({
+      tone: "caution",
+      title: "Google could not fit any panels on this building",
+      body: "Its model placed none at all, so the panel count below was worked out from the roof area alone rather than from a real layout. Treat it as an upper bound and confirm against the plans.",
+    });
+  }
+  // Both deletes must run — `||` would short-circuit and leave the second cause in
+  // the set, where it would fall through to the unknown-cause branch below and
+  // render a spurious second notice.
+  const tooFewSegments = causes.delete("too_few_segments");
+  const tooFewPanels = causes.delete("too_few_panels");
+  if (tooFewSegments || tooFewPanels) {
+    notices.push({
+      tone: "caution",
+      title: "This may be a newer build than the photo",
+      body: "The aerial photo looks like it predates this house, so the roof found may not be the real one. Confirm against the plans.",
+    });
+  }
+  // Anything left is a cause this build does not know about — say so, never hide it.
+  for (const unknown of causes) {
+    notices.push({
+      tone: "caution",
+      title: "Something about this result looks wrong",
+      body: `The lookup flagged "${unknown}", which this version does not have wording for. Check the roof against the plans before relying on it.`,
+    });
+  }
+  return notices;
 }
 
 /**
@@ -685,6 +774,7 @@ export function addressRoofView(job: unknown): AddressRoofView {
     crossCheck: null,
     notice: null,
     staleNotice: null,
+    confidenceNotices: [],
     solarMode: rule ? rule.solarMode : null,
     showsExistingArray: rule ? rule.showsExistingArray : false,
   };
@@ -765,6 +855,7 @@ export function addressRoofView(job: unknown): AddressRoofView {
     };
   }
 
+  view.confidenceNotices = confidenceNotices(row);
   view.notice = roofStateNotice(view.state, source);
   if (view.imageryStale && view.state !== "manual") {
     const years = view.imageryAgeYears;

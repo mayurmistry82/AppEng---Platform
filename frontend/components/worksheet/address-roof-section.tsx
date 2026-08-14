@@ -536,6 +536,14 @@ export function AddressRoofSection({
           {view.notice.body}
         </Notice>
       ) : null}
+      {/* One caution per low-confidence cause (3.4-C), between the state notice
+          and the stale-imagery one. Never hides a number — the plane table below
+          renders unchanged. */}
+      {view.confidenceNotices.map((notice, i) => (
+        <Notice key={`confidence-${i}`} tone={notice.tone} title={notice.title}>
+          {notice.body}
+        </Notice>
+      ))}
       {view.staleNotice ? (
         <Notice tone={view.staleNotice.tone} title={view.staleNotice.title}>
           {view.staleNotice.body}

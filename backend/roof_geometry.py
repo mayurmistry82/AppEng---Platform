@@ -49,6 +49,17 @@ STALE_IMAGERY_YEARS = 3
 JUNK_MAX_SEGMENTS = 1
 JUNK_MIN_PANELS = 6
 
+# A roof face steeper than this is far more likely a wall, a parapet or a facade than a
+# roof plane. Australian pitched roofs are commonly 15-25° for tile and 5-15° for metal;
+# steep gables and heritage reach the mid-30s and rarely 45°.
+#
+# 45 is deliberately GENEROUS. This flag says "look at this", never "reject this" — no
+# plane is ever dropped and no number ever changes because of it. A false positive costs
+# one glance; a false negative puts a wrong system on a customer's quote. Found live on
+# 2026-08-14: 14 Frome St returned two faces at 76.4° and 77.0° and was reported as a
+# clean 10.12 kW roof.
+IMPLAUSIBLE_PITCH_DEGREES = 45.0
+
 # Fallback panel when the catalogue is unreachable — Jinko Tiger Neo 440 W (1762×1134 mm).
 # Keeps normalisation working even if Supabase is down; flagged so it's never silent.
 _FALLBACK_PANEL: dict[str, Any] = {
@@ -361,6 +372,7 @@ def _normalise(data: dict, panel: dict, usability: float) -> dict:
         flags.append("google_panel_layout_absent")
 
     planes: list[dict] = []
+    max_flagged_pitch: Optional[float] = None
     for i, seg in enumerate(segments):
         if not isinstance(seg, dict):
             flags.append(f"segment_{i}_malformed")
@@ -393,6 +405,21 @@ def _normalise(data: dict, panel: dict, usability: float) -> dict:
         kwp = round(panel_count * panel_watts / 1000.0, 3)
         az = _num(seg.get("azimuthDegrees"))
         pitch = _num(seg.get("pitchDegrees"))
+
+        # Implausible pitch (3.4-C). Flagged ONLY when this face actually carries
+        # panels — a steep face with 0 panels contributes nothing to any number and is
+        # harmless. A missing/negative/>90 pitch is UNKNOWN, not suspicious: never
+        # invent a cause from absent data. The plane is flagged, never excluded.
+        plane_index = len(planes)
+        if (
+            pitch is not None
+            and IMPLAUSIBLE_PITCH_DEGREES < pitch <= 90.0
+            and panel_count > 0
+        ):
+            flags.append(f"plane_{plane_index}_implausible_pitch")
+            if max_flagged_pitch is None or pitch > max_flagged_pitch:
+                max_flagged_pitch = pitch
+
         planes.append(
             {
                 "azimuth": round(az, 1) if az is not None else None,
@@ -462,6 +489,10 @@ def _normalise(data: dict, panel: dict, usability: float) -> dict:
         "max_panels": cum_panels,
         "google_max_array_panels_count": sp.get("maxArrayPanelsCount"),
         "roof_segment_count": len(segments),
+        # Surfaced for the caller's confidence rules (3.4-C) — both were local, and
+        # re-deriving them in the caller is how the original guard drifted.
+        "have_google_layout": have_layout,
+        "max_flagged_pitch": max_flagged_pitch,
         "flags": flags,
         # Retained verbatim — see comment above.
         "panels_raw": panels_raw,
@@ -574,6 +605,9 @@ def _blank(found: bool = False) -> dict:
         "geocoded_postcode": None,
         "geocoded_state": None,
         "geocoded_formatted_address": None,
+        # 3.4-C — why a result is low confidence, if it is. Present (empty) on every
+        # path so the contract is stable for the route and the UI.
+        "low_confidence_causes": [],
         "error": None,
     }
 
@@ -672,18 +706,76 @@ def fetch_roof_geometry(
             out["imagery_stale"] = True
             flags.append(f"imagery_{age}y_old")
 
-    # Junk detection (new-build gap): <=1 segment or implausibly few Google-placed panels.
+    # ── Confidence causes (3.4-C) ────────────────────────────────────────────
+    # Evaluated INDEPENDENTLY and collected, not OR-ed into one boolean. The old
+    # single expression was
+    #     junk = seg_count <= 1 or (g_max is not None and g_max < 6)
+    # and on 14 Frome St it returned False because there were 2 segments and g_max
+    # was None — the `is not None` guard short-circuited, so "Google told us
+    # NOTHING" was read as "Google told us it is FINE". Absence of evidence was
+    # being treated as evidence of soundness. Each cause now stands alone and can
+    # fire on its own.
+    #
+    # NO NUMBER CHANGES HERE and NO PLANE IS DROPPED. Everything below only sets
+    # flags and wording — the panel counts, kWp and configs computed above are
+    # returned exactly as they were. Silently excluding a plane would change a
+    # recommendation without telling anyone, which is the black-box behaviour this
+    # product exists to replace (D4: hide controls, never information).
     seg_count = norm["roof_segment_count"]
     g_max = norm["google_max_array_panels_count"]
-    junk = seg_count <= JUNK_MAX_SEGMENTS or (g_max is not None and g_max < JUNK_MIN_PANELS)
-    if junk:
+    have_layout = norm["have_google_layout"]
+
+    causes: list[str] = []
+    if seg_count <= JUNK_MAX_SEGMENTS:
+        causes.append("too_few_segments")
+    if g_max is not None and g_max < JUNK_MIN_PANELS:
+        causes.append("too_few_panels")
+    if not have_layout or g_max is None:
+        # Google placed no panels at all, or told us nothing about a layout: the
+        # counts above came from raw area alone and are an UPPER BOUND.
+        causes.append("no_google_panel_layout")
+    if norm["max_flagged_pitch"] is not None:
+        causes.append("implausible_pitch")
+
+    if causes:
         out["low_confidence"] = True
         out["needs_manual_confirmation"] = True
-        out["reason"] = "result may predate a recent build — confirm against plans"
+        out["reason"] = _confidence_reason(causes, norm["max_flagged_pitch"])
+        for cause in causes:
+            flags.append(f"low_confidence_{cause}")
+        # The pre-3.4-C summary flag is KEPT unchanged — the frontend and later
+        # consumers already look for it. Never rename or drop an existing flag.
         flags.append("low_confidence_result")
+    out["low_confidence_causes"] = causes
 
     out["flags"] = flags
     return out
+
+
+# ── Confidence wording (3.4-C) ───────────────────────────────────────────────
+_CAUSE_PHRASES = {
+    "too_few_segments": "the photo shows only one roof face",
+    "too_few_panels": "Google placed implausibly few panels",
+    "no_google_panel_layout": (
+        "Google could not fit any panels on this building, so the count comes from roof "
+        "area alone"
+    ),
+    "implausible_pitch": "a roof face is too steep to be a roof",
+}
+
+
+def _confidence_reason(causes: list[str], max_pitch: Optional[float]) -> str:
+    """Plain-English sentence naming the causes. Never raises."""
+    parts: list[str] = []
+    for cause in causes:
+        phrase = _CAUSE_PHRASES.get(cause, cause)
+        if cause == "implausible_pitch" and max_pitch is not None:
+            phrase = f"a roof face at {round(max_pitch)}\u00b0 is too steep to be a roof"
+        parts.append(phrase)
+    if not parts:
+        return ""
+    joined = parts[0] if len(parts) == 1 else ", ".join(parts[:-1]) + " and " + parts[-1]
+    return f"Check this roof before you use it: {joined} \u2014 confirm against the plans."
 
 
 # ── Manual / plans entry (OI-10) ─────────────────────────────────────────────
