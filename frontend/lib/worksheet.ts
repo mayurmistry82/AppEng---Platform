@@ -620,6 +620,18 @@ export function worksheetErrorCopy(
           body: "The server answers identically for a job that was never created and a job that belongs to another company, so this page can't tell you which happened. Head back to the job list to find the job you meant.",
         };
       }
+      if (kind === "http" && status === 503) {
+        // DELIBERATELY says nothing about permissions, signing in or the session:
+        // a 503 here means the server could not reach its own database, so it
+        // could not check anything about you. Before the 2026-08-14 auth fix a
+        // transient lookup failure surfaced as 403 "Forbidden" and sent installers
+        // hunting an access problem that did not exist. Do not reword this toward
+        // authorisation.
+        return {
+          heading: "Couldn't load this job — the server is briefly unavailable",
+          body: "The server could not reach its database for a moment. This is usually temporary — wait a few seconds and reload.",
+        };
+      }
       return {
         heading: "Couldn't load this job",
         body: `${endpoint} responded with HTTP ${status}. The backend hit an error — try reloading, and check the backend logs if it persists.`,

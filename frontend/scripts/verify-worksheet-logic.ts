@@ -569,3 +569,55 @@ test("two different paths yield two different section lists", () => {
     ids(sectionStates(emptyJob({ path: "E" }))),
   );
 });
+
+// ── 503 error copy (auth membership-lookup fix, 2026-08-14) ──────────────────
+//
+// A 503 from /api/job/{id} now means the backend could not reach its database to
+// check anything — NOT that the caller lacks access. Before the auth fix that
+// case surfaced as 403 "Forbidden" and sent installers hunting a permissions
+// problem that did not exist, so this copy must never point that way.
+test("worksheetErrorCopy: 503 is distinct from 404 and from the generic http case", () => {
+  const endpoint = "/api/job/x";
+  const unavailable = worksheetErrorCopy("http", 503, endpoint);
+  const notFound = worksheetErrorCopy("http", 404, endpoint);
+  const generic = worksheetErrorCopy("http", 500, endpoint);
+
+  assert.notEqual(unavailable.heading, notFound.heading);
+  assert.notEqual(unavailable.heading, generic.heading);
+  assert.notEqual(unavailable.body, notFound.body);
+  assert.notEqual(unavailable.body, generic.body);
+  assert.ok(unavailable.heading.trim().length > 0);
+  assert.ok(unavailable.body.trim().length > 0);
+});
+
+test("worksheetErrorCopy: the 503 copy never blames access or the session", () => {
+  const copy = worksheetErrorCopy("http", 503, "/api/job/x");
+  const text = `${copy.heading} ${copy.body}`.toLowerCase();
+  for (const banned of [
+    "permission",
+    "sign in",
+    "signed out",
+    "session",
+    "forbidden",
+  ]) {
+    assert.ok(!text.includes(banned), `503 copy must not contain ${JSON.stringify(banned)}: ${text}`);
+  }
+  // It should say what actually happened and that it is transient.
+  assert.ok(text.includes("temporar"), text);
+});
+
+test("worksheetErrorCopy: every other branch is unchanged by the 503 addition", () => {
+  const endpoint = "/api/job/x";
+  assert.equal(
+    worksheetErrorCopy("http", 404, endpoint).heading,
+    "This job doesn't exist, or isn't yours",
+  );
+  assert.equal(worksheetErrorCopy("http", 500, endpoint).heading, "Couldn't load this job");
+  assert.ok(worksheetErrorCopy("auth", 401, endpoint).body.includes("sign in again"));
+  assert.ok(worksheetErrorCopy("network", 0, endpoint).body.includes("port 8000"));
+  // A 503 under a NON-http kind still takes that kind's own branch.
+  assert.equal(
+    worksheetErrorCopy("network", 503, endpoint).heading,
+    worksheetErrorCopy("network", 0, endpoint).heading,
+  );
+});

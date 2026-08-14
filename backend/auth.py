@@ -21,9 +21,14 @@ FAIL-CLOSED CONTRACT:
     never distinguishes forged from expired; the distinction is logged server-side only).
   * Supabase auth service unreachable             -> 503. Failing OPEN — returning a
     Caller without a verified token — is the one outcome that is never acceptable here.
-  * company_members lookup fails                  -> Caller with company_id=None. Never
-    guess a company, never fall back to "the only company in the table".
-  * No unhandled exceptions escape: every failure becomes a 401 or 503, never a 500.
+  * company_members lookup RAISES (network/DNS/timeout) -> 503. Membership is UNKNOWABLE
+    for this request, which is not the same fact as "this user has no company". Returning
+    company_id=None there made a one-second blip read as "Forbidden" to a valid member,
+    and the short-TTL cache then held that wrong answer for up to 60s (observed live
+    2026-08-14). Never guess a company, never fall back to "the only company in the table".
+  * company_members lookup SUCCEEDS with zero rows -> Caller with company_id=None. This is
+    the legitimate company-less user; require_company answers 403, which is correct.
+  * No unhandled exceptions escape: every failure becomes a 401, 403 or 503, never a 500.
 
 ACCEPTED TRADE-OFF — token cache: validated tokens are cached in-process for
 CACHE_TTL_SECONDS (default 60s, keyed on the raw token, capped at CACHE_MAX_ENTRIES with
@@ -56,6 +61,11 @@ _401 = HTTPException(
     status_code=401, detail="Not authenticated", headers={"WWW-Authenticate": "Bearer"}
 )
 _503 = HTTPException(status_code=503, detail="Authentication service unavailable")
+# Distinct detail from _503 so the two unavailable-services are tellable apart in a log
+# or a bug report. Fixed human string only — never the exception text, user id or key.
+_503_MEMBERSHIP = HTTPException(
+    status_code=503, detail="Membership lookup temporarily unavailable"
+)
 
 
 class Caller(BaseModel):
@@ -165,14 +175,22 @@ def _validate_token(token: str) -> Optional[dict]:
 # ── Company membership lookup (service role — RLS must not affect this) ───────
 def _lookup_company(user_id: str) -> tuple[Optional[str], Optional[str]]:
     """
-    (company_id, role) for this user, or (None, None) if there is no membership or a
-    TRANSIENT lookup failure. Never guesses, never falls back to "the only company in
-    the table". Deterministic when a user someday has multiple memberships: earliest
-    joined wins.
+    (company_id, role) for this user, or (None, None) when the query SUCCEEDED and the
+    user genuinely has no membership. Never guesses, never falls back to "the only
+    company in the table". Deterministic when a user someday has multiple memberships:
+    earliest joined wins.
 
-    MISCONFIGURATION IS NOT "NO COMPANY": when the service client is absent (no
-    SUPABASE_SERVICE_ROLE_KEY), membership is unknowable for every caller — silently
-    treating that as company-less would 403 everyone with no visible cause. Fail 503.
+    "UNKNOWABLE" IS NOT "NO COMPANY" — there are three outcomes, not two, and each has
+    its own answer:
+      * service client absent (no SUPABASE_SERVICE_ROLE_KEY) -> 503
+      * query raised (network, DNS, timeout)                 -> 503
+      * query returned zero rows                             -> (None, None)
+    The first two mean membership could not be checked; the third means it was checked
+    and there is none. Collapsing the middle case into (None, None) is what made a
+    transient blip surface as 403 "Forbidden" to a valid company member on 2026-08-14 —
+    and because require_caller caches the resulting Caller, one failed lookup poisoned
+    every request for that token for the rest of the 60s TTL. Raising means no Caller is
+    built, so nothing is cached and the next request retries cleanly.
     """
     _build_clients()
     if _service_client is None:
@@ -194,9 +212,13 @@ def _lookup_company(user_id: str) -> tuple[Optional[str], Optional[str]]:
         if not rows:
             return None, None
         return rows[0].get("company_id"), rows[0].get("role")
-    except Exception as exc:  # noqa: BLE001 — membership failure must not block identity
+    except Exception as exc:  # noqa: BLE001 — classified here, never re-raised raw
+        # The lookup did not complete, so membership is unknowable for this request —
+        # exactly the situation the missing-service-key branch above answers with 503.
+        # Fail CLOSED and honestly: 503, never a company-less Caller. The warning below
+        # is what made this diagnosable live; keep it.
         logger.warning("auth: company_members lookup failed for %s: %s", user_id, exc)
-        return None, None
+        raise _503_MEMBERSHIP from None
 
 
 # ── Short-TTL token -> Caller cache ───────────────────────────────────────────
@@ -249,6 +271,11 @@ def require_caller(request: Request) -> Caller:
         return cached
 
     identity = _validate_token(token)          # 401/503 on any failure — never None here
+    # 503 on any failure too. LOAD-BEARING ORDERING: this raises BEFORE the Caller below
+    # is constructed, so _cache_put is unreachable and an unknown membership is never
+    # cached. Caching one failed lookup is what stretched a one-second blip into a full
+    # 60s TTL of 403s. Do not move _cache_put above this line, and do not "helpfully"
+    # catch here.
     company_id, role = _lookup_company(identity["user_id"])
     caller = Caller(
         user_id=identity["user_id"],
