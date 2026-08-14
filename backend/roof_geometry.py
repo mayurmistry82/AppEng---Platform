@@ -112,26 +112,75 @@ def _get_with_retry(url: str, params: dict) -> requests.Response:
     return last  # type: ignore[return-value]
 
 
-def _geocode(address: str, key: str) -> tuple[Optional[float], Optional[float], Optional[str]]:
-    """Return (lat, lng, error). error is None on success."""
+def _blank_geocoded() -> dict:
+    """The three authoritative-geocode keys, all None — the F22 contract skeleton."""
+    return {
+        "geocoded_postcode": None,
+        "geocoded_state": None,
+        "geocoded_formatted_address": None,
+    }
+
+
+def _extract_geocoded(result: Any) -> dict:
+    """
+    F22: pull the authoritative postcode/state/formatted address out of one geocode
+    result. Every value is OPTIONAL — a missing component yields None and is NEVER
+    inferred from anything else (no guessing a postcode from the address string).
+    Never raises, whatever shape Google hands back.
+    """
+    out = _blank_geocoded()
+    if not isinstance(result, dict):
+        return out
+    formatted = result.get("formatted_address")
+    if isinstance(formatted, str) and formatted:
+        out["geocoded_formatted_address"] = formatted
+    components = result.get("address_components")
+    if not isinstance(components, list):
+        return out
+    for comp in components:
+        if not isinstance(comp, dict):
+            continue
+        types = comp.get("types")
+        if not isinstance(types, list):
+            continue
+        if "postal_code" in types and out["geocoded_postcode"] is None:
+            value = comp.get("long_name")
+            if isinstance(value, str) and value:
+                out["geocoded_postcode"] = value
+        if "administrative_area_level_1" in types and out["geocoded_state"] is None:
+            value = comp.get("short_name")  # e.g. "SA"
+            if isinstance(value, str) and value:
+                out["geocoded_state"] = value
+    return out
+
+
+def _geocode(
+    address: str, key: str
+) -> tuple[Optional[float], Optional[float], dict, Optional[str]]:
+    """
+    Return (lat, lng, geocoded, error). error is None on success. `geocoded` always
+    carries the three F22 keys (possibly all None) — the authoritative values Google
+    already computed, previously fetched and discarded.
+    """
     params = {"address": address, "key": key, "region": "au", "components": "country:AU"}
     try:
         resp = _get_with_retry(GEOCODE_URL, params)
     except Exception as exc:  # noqa: BLE001
-        return None, None, f"geocode request failed: {exc}"
+        return None, None, _blank_geocoded(), f"geocode request failed: {exc}"
     try:
         data = resp.json()
     except Exception:
-        return None, None, f"geocode HTTP {resp.status_code} (non-JSON response)"
+        return None, None, _blank_geocoded(), f"geocode HTTP {resp.status_code} (non-JSON response)"
     status = data.get("status")
     if status == "OK" and data.get("results"):
-        loc = data["results"][0]["geometry"]["location"]
-        return float(loc["lat"]), float(loc["lng"]), None
+        result = data["results"][0]
+        loc = result["geometry"]["location"]
+        return float(loc["lat"]), float(loc["lng"]), _extract_geocoded(result), None
     if status == "REQUEST_DENIED":
         msg = data.get("error_message") or "request denied"
-        return None, None, f"geocode REQUEST_DENIED: {msg}"
+        return None, None, _blank_geocoded(), f"geocode REQUEST_DENIED: {msg}"
     msg = data.get("error_message") or status or f"HTTP {resp.status_code}"
-    return None, None, f"geocode failed: {msg}"
+    return None, None, _blank_geocoded(), f"geocode failed: {msg}"
 
 
 def _building_insights(
@@ -268,17 +317,42 @@ def _age_years(d: _dt.date) -> int:
 
 # ── Normalisation ─────────────────────────────────────────────────────────────
 def _normalise(data: dict, panel: dict, usability: float) -> dict:
-    """Turn one buildingInsights response into our normalised roof model. Geometry only."""
-    sp = data.get("solarPotential") or {}
-    segments = sp.get("roofSegmentStats") or []
+    """
+    Turn one buildingInsights response into our normalised roof model. Geometry only.
+
+    F17: every Google-shaped substructure is isinstance-guarded before use. A
+    malformed `solarPanels`, `roofSegmentStats`, segment or `stats` degrades to
+    []/None with a flag — the module docstring's "Never raises" is a contract,
+    not an aspiration, and this function sits directly on third-party JSON.
+    """
+    if not isinstance(data, dict):
+        data = {}
+    sp = data.get("solarPotential")
+    if not isinstance(sp, dict):
+        sp = {}
     panel_area = panel["area_m2"]
     panel_watts = panel["watts"]
     flags: list[str] = []
 
+    segments_raw = sp.get("roofSegmentStats")
+    if isinstance(segments_raw, list):
+        segments = segments_raw
+    else:
+        segments = []
+        if segments_raw is not None:
+            flags.append("roof_segments_malformed")
+
     # Google's per-segment panel counts (from the max-array layout). segmentIndex only —
-    # yearlyEnergyDcKwh on each panel is intentionally ignored.
+    # yearlyEnergyDcKwh on each panel is intentionally ignored. F17: iterated only when
+    # it is actually a list, and each entry only when it is actually a dict.
     seg_counts: dict[int, int] = {}
-    for p in sp.get("solarPanels") or []:
+    solar_panels = sp.get("solarPanels")
+    if solar_panels is not None and not isinstance(solar_panels, list):
+        flags.append("solar_panels_malformed")
+        solar_panels = []
+    for p in solar_panels or []:
+        if not isinstance(p, dict):
+            continue
         idx = p.get("segmentIndex")
         if isinstance(idx, int):
             seg_counts[idx] = seg_counts.get(idx, 0) + 1
@@ -288,9 +362,18 @@ def _normalise(data: dict, panel: dict, usability: float) -> dict:
 
     planes: list[dict] = []
     for i, seg in enumerate(segments):
-        stats = seg.get("stats") or {}
+        if not isinstance(seg, dict):
+            flags.append(f"segment_{i}_malformed")
+            continue
+        stats = seg.get("stats")
+        if not isinstance(stats, dict):
+            if stats is not None:
+                flags.append(f"segment_{i}_stats_malformed")
+            stats = {}
         area = _num(stats.get("areaMeters2"))  # NULL-safe — never coerced to 0
-        quantiles = stats.get("sunshineQuantiles") or []
+        quantiles = stats.get("sunshineQuantiles")
+        if not isinstance(quantiles, list):
+            quantiles = []
         sunshine_med = _num(quantiles[len(quantiles) // 2]) if quantiles else None
 
         if area is None:
@@ -486,6 +569,11 @@ def _blank(found: bool = False) -> dict:
         "segment_bounding_boxes": [],
         "building_center": None,
         "building_bounding_box": None,
+        # F22 — the authoritative geocode. Present on EVERY path (404, API error,
+        # manual) so the contract is stable; populated the moment a geocode succeeds.
+        "geocoded_postcode": None,
+        "geocoded_state": None,
+        "geocoded_formatted_address": None,
         "error": None,
     }
 
@@ -518,7 +606,7 @@ def fetch_roof_geometry(
     out["selected_panel"] = panel
 
     # 1) Geocode
-    lat, lng, geo_err = _geocode(address, key)
+    lat, lng, geocoded, geo_err = _geocode(address, key)
     if lat is None or lng is None:
         out["manual_entry_required"] = True
         out["reason"] = "Could not locate this address — enter roof planes manually."
@@ -527,6 +615,10 @@ def fetch_roof_geometry(
         return out
     out["lat"] = lat
     out["lng"] = lng
+    # F22: populated as soon as the geocode succeeds — so the NOT_FOUND path below
+    # (the regional case that goes to manual entry) still carries the authoritative
+    # postcode/state it needs. A missing component stays None; nothing is inferred.
+    out.update(geocoded)
 
     # 2) buildingInsights (retry once with EXPANDED_COVERAGE on NOT_FOUND)
     http_status, data, err = _building_insights(lat, lng, key)
@@ -589,6 +681,128 @@ def fetch_roof_geometry(
         out["needs_manual_confirmation"] = True
         out["reason"] = "result may predate a recent build — confirm against plans"
         flags.append("low_confidence_result")
+
+    out["flags"] = flags
+    return out
+
+
+# ── Manual / plans entry (OI-10) ─────────────────────────────────────────────
+_MANUAL_BASES = ("plans", "site_measure", "estimate")
+
+
+def build_manual_roof_model(
+    basis: str,
+    planes: Any,
+    panel: dict,
+    usability: float,
+    note: Optional[str] = None,
+    lat: Optional[float] = None,
+    lng: Optional[float] = None,
+    geocoded: Optional[dict] = None,
+) -> dict:
+    """
+    OI-10: a roof the installer entered by hand — from plans, a site measure or an
+    estimate — as a FIRST-CLASS model with the SAME shape as fetch_roof_geometry, so
+    the worksheet and the optimiser consume both identically. This is the normal path
+    for the regional coverage gap (1 in 5 addresses in the 2026-06-12 test), not a
+    404 fallback, and it is the highest-trust geometry source when basis is plans.
+
+    Makes NO network call of any kind. panel_count / kwp / candidate_configs come
+    from the EXISTING rescale_planes_for_panel — one implementation of the cumulative
+    best-plane-first logic, shared with the Google path, deliberately.
+
+    NEVER raises, for any input, matching the module contract.
+    """
+    out = _blank(found=True)
+    basis_str = basis if isinstance(basis, str) and basis in _MANUAL_BASES else "estimate"
+    flags: list[str] = ["manual_entry", f"manual_basis_{basis_str}"]
+    if basis_str != basis:
+        flags.append("manual_basis_unrecognised_defaulted")
+
+    out["source"] = f"manual_{basis_str}"
+    out["manual_entry_required"] = False
+    out["low_confidence"] = False
+    out["needs_manual_confirmation"] = False
+    out["imagery_stale"] = False
+    out["selected_panel"] = panel if isinstance(panel, dict) else dict(_FALLBACK_PANEL)
+
+    try:
+        usability_val = float(usability)
+        if usability_val <= 0:
+            raise ValueError
+    except (TypeError, ValueError):
+        usability_val = DEFAULT_USABILITY_FACTOR
+        flags.append("usability_factor_invalid_defaulted")
+    out["usability_factor"] = usability_val
+
+    if lat is not None and lng is not None:
+        out["lat"] = _num(lat)
+        out["lng"] = _num(lng)
+    if out["lat"] is None or out["lng"] is None:
+        out["lat"] = None
+        out["lng"] = None
+        flags.append("manual_no_coordinates")
+    if isinstance(geocoded, dict):
+        for key in ("geocoded_postcode", "geocoded_state", "geocoded_formatted_address"):
+            value = geocoded.get(key)
+            if isinstance(value, str) and value:
+                out[key] = value
+
+    # Shape the supplied planes defensively; the arithmetic itself is delegated.
+    shaped: list[dict] = []
+    plane_list = planes if isinstance(planes, list) else []
+    if planes is not None and not isinstance(planes, list):
+        flags.append("manual_planes_malformed")
+    for i, raw in enumerate(plane_list):
+        entry = raw if isinstance(raw, dict) else {}
+        if not isinstance(raw, dict):
+            flags.append(f"plane_{i}_malformed")
+        area = _num(entry.get("area_m2"))
+        if area is None or area <= 0:
+            usable = None
+            if entry.get("area_m2") is not None or not isinstance(raw, dict):
+                flags.append(f"plane_{i}_area_invalid")
+            else:
+                flags.append(f"plane_{i}_area_missing")
+            area = None
+        else:
+            usable = round(area * usability_val, 2)
+        az = _num(entry.get("azimuth"))
+        pitch = _num(entry.get("pitch"))
+        label = entry.get("label")
+        shaped.append(
+            {
+                "azimuth": round(az, 1) if az is not None else None,
+                "pitch": round(pitch, 1) if pitch is not None else None,
+                "area_m2": round(area, 2) if area is not None else None,
+                "usable_area_m2": usable,
+                "sunshine_quantile": None,
+                "google_panel_count": None,
+                "center": None,
+                "label": label if isinstance(label, str) and label else None,
+            }
+        )
+
+    try:
+        rescaled = rescale_planes_for_panel(shaped, out["selected_panel"])
+        out["planes"] = rescaled["planes"]
+        out["candidate_configs"] = rescaled["candidate_configs"]
+        flags.extend(rescaled["flags"])
+    except Exception:  # noqa: BLE001 — belt and braces; the contract is never-raise
+        out["planes"] = shaped
+        out["candidate_configs"] = []
+        flags.append("manual_rescale_failed")
+
+    configs = out["candidate_configs"]
+    out["total_kwp"] = configs[-1]["kwp"] if configs else 0.0
+    out["max_panels"] = configs[-1]["panel_count"] if configs else 0
+    if not plane_list:
+        flags.append("manual_no_planes")
+    elif not configs:
+        flags.append("manual_no_usable_planes")
+
+    if isinstance(note, str) and note.strip():
+        out["reason"] = f"Manual entry: {note.strip()}"
 
     out["flags"] = flags
     return out
