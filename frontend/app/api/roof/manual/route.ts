@@ -17,6 +17,7 @@ interface ManualBody {
   panel_id?: unknown;
   usability_factor?: unknown;
   note?: unknown;
+  prefilled_from_lookup?: unknown;
 }
 
 export async function POST(request: Request): Promise<NextResponse> {
@@ -48,6 +49,9 @@ export async function POST(request: Request): Promise<NextResponse> {
     panel_id: raw.panel_id ?? null,
     usability_factor: raw.usability_factor ?? null,
     note: raw.note ?? null,
+    // 3.4-D provenance. `planes` is forwarded WHOLE (not field-picked), so each
+    // plane's `label` already travels with it.
+    prefilled_from_lookup: raw.prefilled_from_lookup === true,
   };
 
   try {

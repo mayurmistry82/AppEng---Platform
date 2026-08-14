@@ -24,8 +24,10 @@ import {
   phaseStates,
   resultsBarDefaultCollapsed,
   resultsBarMaxHeight,
+  EMPTY_PLANE_FORM_ROW,
   addressRoofView,
   azimuthLabel,
+  planeFormRowsFromView,
   latestRoofGeometry,
   resultsBarView,
   roofEntryState,
@@ -941,4 +943,80 @@ test("confidenceNotices: pitch falls back when no plane carries panels", () => {
   assert.equal(view.confidenceNotices.length, 1);
   assert.ok(view.confidenceNotices[0].body.includes("that angle"),
     view.confidenceNotices[0].body);
+});
+
+// ── Manual-form pre-fill (3.4-D) ─────────────────────────────────────────────
+
+const plane = (over: Record<string, unknown> = {}) => ({
+  index: 0, label: null, azimuth: 0, azimuthLabel: "N", pitch: 22,
+  areaM2: 50, usableAreaM2: 35, panelCount: 17, kwp: 7.48, ...over,
+});
+
+test("planeFormRowsFromView: exact compass points select that point", () => {
+  for (const deg of [0, 45, 90, 135, 180, 225, 270, 315]) {
+    const [row] = planeFormRowsFromView([plane({ azimuth: deg })]);
+    assert.equal(row.direction, String(deg), `azimuth ${deg}`);
+    assert.equal(row.exactDegrees, "", `azimuth ${deg} must not fill exactDegrees`);
+  }
+});
+
+test("planeFormRowsFromView: an off-point azimuth uses Exact degrees", () => {
+  const [row] = planeFormRowsFromView([plane({ azimuth: 173.1 })]);
+  assert.equal(row.direction, "exact");
+  assert.equal(row.exactDegrees, "173.1"); // 173.1 is NOT South
+  const [r2] = planeFormRowsFromView([plane({ azimuth: 14.7 })]);
+  assert.deepEqual([r2.direction, r2.exactDegrees], ["exact", "14.7"]);
+});
+
+test("planeFormRowsFromView: nulls become empty strings, never 'null'", () => {
+  const [row] = planeFormRowsFromView([
+    plane({ azimuth: null, pitch: null, areaM2: null, label: null }),
+  ]);
+  assert.deepEqual(row, EMPTY_PLANE_FORM_ROW);
+  for (const value of Object.values(row)) assert.equal(typeof value, "string");
+});
+
+test("planeFormRowsFromView: a label is carried through", () => {
+  const [row] = planeFormRowsFromView([plane({ label: "main north face" })]);
+  assert.equal(row.label, "main north face");
+});
+
+test("planeFormRowsFromView: junk-safe", () => {
+  assert.deepEqual(planeFormRowsFromView([]), []);
+  assert.deepEqual(planeFormRowsFromView("not-an-array"), []);
+  assert.deepEqual(planeFormRowsFromView(null), []);
+  assert.deepEqual(planeFormRowsFromView(undefined), []);
+  // A non-object entry is skipped; its neighbours still map.
+  const rows = planeFormRowsFromView(["junk", plane({ azimuth: 90 }), null]);
+  assert.equal(rows.length, 1);
+  assert.equal(rows[0].direction, "90");
+  assert.doesNotThrow(() => planeFormRowsFromView([{}]));
+  assert.deepEqual(planeFormRowsFromView([{}]), [EMPTY_PLANE_FORM_ROW]);
+});
+
+test("planeFormRowsFromView: the REAL 14 Frome St roof pre-fills for correction", () => {
+  // Straight from the stored row: azimuths 14.7/173.1, pitches 76.4/77, areas 2.3/68.32.
+  const rows = planeFormRowsFromView([
+    plane({ index: 0, azimuth: 14.7, pitch: 76.4, areaM2: 2.3, panelCount: 0, kwp: 0 }),
+    plane({ index: 1, azimuth: 173.1, pitch: 77, areaM2: 68.32, panelCount: 23, kwp: 10.12 }),
+  ]);
+  assert.equal(rows.length, 2);
+  assert.deepEqual(rows[0], {
+    direction: "exact", exactDegrees: "14.7", pitch: "76.4", area: "2.3", label: "",
+  });
+  assert.deepEqual(rows[1], {
+    direction: "exact", exactDegrees: "173.1", pitch: "77", area: "68.32", label: "",
+  });
+  // No rounding and no unit suffix — opening the form must not alter the data.
+  assert.ok(!rows[1].pitch.includes("°"));
+  assert.ok(!rows[1].area.includes("m"));
+});
+
+test("planeFormRowsFromView: feeds straight from a stored roof view", () => {
+  // End to end: the view the section renders is the view the form pre-fills from.
+  const view = addressRoofView(emptyJob({ roof_geometry: [FROME_ROW] }));
+  const rows = planeFormRowsFromView(view.planes);
+  assert.equal(rows.length, 2);
+  assert.equal(rows[1].pitch, "77");
+  assert.equal(rows[1].exactDegrees, "173.1");
 });

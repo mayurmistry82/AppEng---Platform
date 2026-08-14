@@ -541,6 +541,77 @@ def t_confidence() -> None:
     check("_blank carries low_confidence_causes on every path",
           roof_geometry._blank().get("low_confidence_causes") == [])
 
+
+def t_prefill_provenance() -> None:
+    """3.4-D: pre-filling must never launder a lookup into a trusted source."""
+    print("\nT-3.4D. manual pre-fill provenance")
+
+    # The request model accepts the flag, defaults it false, and a body omitting
+    # it still validates (an older client must not error).
+    omitted = roof.ManualRoofRequest(
+        job_id="j", basis="plans",
+        planes=[roof.ManualPlane(azimuth=0, pitch=20, area_m2=50)])
+    check("body omitting prefilled_from_lookup still validates",
+          omitted.prefilled_from_lookup is False, str(omitted.prefilled_from_lookup))
+    explicit = roof.ManualRoofRequest(
+        job_id="j", basis="plans", prefilled_from_lookup=True,
+        planes=[roof.ManualPlane(azimuth=0, pitch=20, area_m2=50)])
+    check("body setting it true validates", explicit.prefilled_from_lookup is True)
+
+    # ManualPlane carries a label, bounded at 80 characters.
+    check("ManualPlane accepts a label",
+          roof.ManualPlane(azimuth=0, pitch=20, area_m2=50, label="main north face").label
+          == "main north face")
+    try:
+        roof.ManualPlane(azimuth=0, pitch=20, area_m2=50, label="x" * 81)
+        check("a label over 80 chars is rejected", False, "no ValidationError")
+    except ValidationError:
+        check("a label over 80 chars is rejected", True)
+
+    # Run the REAL endpoint both ways against a stubbed Supabase — never the
+    # re-implemented-logic mistake caught at 3.4-C.
+    original_client = roof._client
+    original_rg_client = roof_geometry._client
+    try:
+        roof_geometry._client = lambda: None  # fallback panel, no DB
+        mine = StubClient(jobs_rows=[{"job_id": "j2", "company_id": "co-1",
+                                      "site_postcode": "5000", "site_state": "SA"}])
+        roof._client = lambda: mine
+
+        def run(prefilled: bool) -> dict:
+            body = roof.ManualRoofRequest(
+                job_id="j2", basis="plans", prefilled_from_lookup=prefilled,
+                planes=[roof.ManualPlane(azimuth=173.1, pitch=22, area_m2=68.32,
+                                         label="main face")],
+                persist=False)
+            return _run(roof.roof_manual_endpoint(body, CALLER))
+
+        on = run(True)
+        off = run(False)
+
+        check("flag present when prefilled_from_lookup is true",
+              "manual_prefilled_from_lookup" in on["flags"], str(on["flags"]))
+        check("flag ABSENT when false — never present-and-false",
+              "manual_prefilled_from_lookup" not in off["flags"], str(off["flags"]))
+
+        # THE SAFEGUARD: provenance records where the numbers started, it never
+        # downgrades what the installer said. Both must be identical either way.
+        check("source IDENTICAL either way", on["source"] == off["source"] == "manual_plans",
+              f"{on['source']!r} vs {off['source']!r}")
+        check("the chosen basis is NOT downgraded",
+              "manual_basis_plans" in on["flags"] and "manual_basis_plans" in off["flags"],
+              f"{on['flags']} vs {off['flags']}")
+        check("the numbers are identical either way",
+              on["total_kwp"] == off["total_kwp"] and on["max_panels"] == off["max_panels"],
+              f"{on['total_kwp']}/{on['max_panels']} vs {off['total_kwp']}/{off['max_panels']}")
+        check("the plane label survives to the model",
+              on["planes"][0].get("label") == "main face", str(on["planes"][0]))
+        check("persist=false still wrote nothing", mine.inserts == [], str(mine.inserts))
+    finally:
+        roof._client = original_client
+        roof_geometry._client = original_rg_client
+
+
 def t5_live() -> None:
     print("\nT5. LIVE Google checks (fetch_roof_geometry directly — no DB write)")
     if not os.getenv("GOOGLE_MAPS_API_KEY"):
@@ -589,6 +660,7 @@ def main() -> int:
     t3()
     t4()
     t_confidence()
+    t_prefill_provenance()
     if live:
         t5_live()
 

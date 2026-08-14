@@ -868,6 +868,80 @@ export function addressRoofView(job: unknown): AddressRoofView {
   return view;
 }
 
+
+// ── Manual-form pre-fill (3.4-D) ─────────────────────────────────────────────
+
+/**
+ * One row of the manual roof form. ALL STRINGS — these populate form inputs, and
+ * a number here would fight React's controlled-input contract. This is the ONLY
+ * definition of the shape: the component imports it rather than declaring its
+ * own, so the mapping below cannot drift from the form it feeds.
+ */
+export interface PlaneFormRow {
+  direction: string;
+  exactDegrees: string;
+  pitch: string;
+  area: string;
+  label: string;
+}
+
+export const EMPTY_PLANE_FORM_ROW: PlaneFormRow = {
+  direction: "",
+  exactDegrees: "",
+  pitch: "",
+  area: "",
+  label: "",
+};
+
+/** The eight compass values the form's select offers, as strings. */
+const COMPASS_POINT_VALUES = ["0", "45", "90", "135", "180", "225", "270", "315"];
+
+function formNumber(value: unknown): string {
+  return typeof value === "number" && Number.isFinite(value) ? String(value) : "";
+}
+
+/**
+ * Stored planes → pre-filled form rows, so correcting one wrong number is an edit
+ * rather than a full re-entry.
+ *
+ * An azimuth that is EXACTLY one of the eight compass points selects that point;
+ * anything else selects "Exact degrees" with the number shown (173.1 is not
+ * South). Numbers are stringified verbatim — no rounding, no unit suffix — because
+ * a pre-fill that quietly rounds would change the installer's data just by opening
+ * the form.
+ *
+ * Never throws: a non-array, or an entry that is not an object, yields [] or is
+ * skipped.
+ */
+export function planeFormRowsFromView(planes: unknown): PlaneFormRow[] {
+  if (!Array.isArray(planes)) return [];
+  const rows: PlaneFormRow[] = [];
+  for (const plane of planes) {
+    if (typeof plane !== "object" || plane === null) continue;
+    const p = plane as Record<string, unknown>;
+    const azimuth = p.azimuth;
+    let direction = "";
+    let exactDegrees = "";
+    if (typeof azimuth === "number" && Number.isFinite(azimuth)) {
+      const asString = String(azimuth);
+      if (COMPASS_POINT_VALUES.includes(asString)) {
+        direction = asString;
+      } else {
+        direction = "exact";
+        exactDegrees = asString;
+      }
+    }
+    rows.push({
+      direction,
+      exactDegrees,
+      pitch: formNumber(p.pitch),
+      area: formNumber(p.areaM2),
+      label: typeof p.label === "string" ? p.label : "",
+    });
+  }
+  return rows;
+}
+
 // ── Results-bar geometry + preference (3.3a) ─────────────────────────────────
 //
 // The risky arithmetic lives here, unit-tested, rather than inline in the

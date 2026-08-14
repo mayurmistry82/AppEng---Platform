@@ -22,7 +22,12 @@ import {
   TableHeader,
   TableRow,
 } from "@/components/ui/table";
-import type { AddressRoofView } from "@/lib/worksheet";
+import {
+  EMPTY_PLANE_FORM_ROW,
+  planeFormRowsFromView,
+  type AddressRoofView,
+  type PlaneFormRow,
+} from "@/lib/worksheet";
 
 /**
  * Address & roof (checklist 3.4-B) — the worksheet's first real section body.
@@ -53,14 +58,8 @@ const COMPASS_OPTIONS = [
   { label: "Exact degrees", value: "exact" },
 ] as const;
 
-interface PlaneRow {
-  direction: string; // one of COMPASS_OPTIONS values
-  exactDegrees: string;
-  pitch: string;
-  area: string;
-}
-
-const EMPTY_ROW: PlaneRow = { direction: "", exactDegrees: "", pitch: "", area: "" };
+/** The manual endpoint accepts at most 12 faces (ManualRoofRequest). */
+const MAX_FORM_PLANES = 12;
 
 interface PlaneRowError {
   direction?: string;
@@ -75,7 +74,7 @@ function fmt(value: number | null, digits = 1, suffix = ""): string {
   return `${rounded}${suffix}`;
 }
 
-function planeAzimuth(row: PlaneRow): number | null {
+function planeAzimuth(row: PlaneFormRow): number | null {
   const raw = row.direction === "exact" ? row.exactDegrees : row.direction;
   if (raw.trim() === "") return null;
   const value = Number(raw);
@@ -103,7 +102,16 @@ export function AddressRoofSection({
   // Manual form state — survives a failed submit intact (never cleared on failure).
   const [formOpen, setFormOpen] = React.useState(false);
   const [basis, setBasis] = React.useState<string>("");
-  const [rows, setRows] = React.useState<PlaneRow[]>([{ ...EMPTY_ROW }]);
+  const [rows, setRows] = React.useState<PlaneFormRow[]>([
+    { ...EMPTY_PLANE_FORM_ROW },
+  ]);
+  // Provenance (3.4-D): true when THIS open was pre-filled from a Google lookup.
+  // Pre-filling makes it trivially easy to open a lookup result, pick "From plans"
+  // and save unchanged — laundering an unverified lookup into the highest-trust
+  // source. The saved row records where the numbers started; convenience must not
+  // quietly upgrade how trustworthy a number is.
+  const [prefilledFromLookup, setPrefilledFromLookup] = React.useState(false);
+  const [omittedPlanes, setOmittedPlanes] = React.useState(0);
   const [usability, setUsability] = React.useState<string>(
     view.usabilityFactor !== null ? String(view.usabilityFactor) : "0.7",
   );
@@ -207,7 +215,9 @@ export function AddressRoofSection({
             azimuth: planeAzimuth(row),
             pitch: Number(row.pitch),
             area_m2: Number(row.area),
+            label: row.label.trim() || null,
           })),
+          prefilled_from_lookup: prefilledFromLookup,
           usability_factor:
             Number.isFinite(usabilityNum) && usabilityNum > 0 ? usabilityNum : null,
           note: note.trim() || null,
@@ -219,7 +229,7 @@ export function AddressRoofSection({
         return; // the form stays open, values intact
       }
       if (data.persisted === false) setUnsaved(true);
-      setFormOpen(false);
+      closeForm();
       router.refresh();
     } catch {
       setActionError("Could not reach the server — check the backend is running.");
@@ -228,24 +238,61 @@ export function AddressRoofSection({
     }
   }
 
+  /**
+   * Open the form, ALWAYS from the stored roof — never from whatever was left in
+   * state last time. Pre-fills from a lookup as well as a manual entry, so
+   * correcting the one number the product just told you to doubt is an edit
+   * rather than a full re-entry.
+   *
+   * `basis` is deliberately NOT carried over and NOT defaulted: the installer is
+   * being asked where the numbers they are about to save came from, and after an
+   * edit that answer may have changed.
+   */
   function openForm() {
     setActionError(null);
-    // Prefill from the existing roof when editing a manual entry.
-    if (view.state === "manual" && view.planes.length > 0) {
-      setRows(
-        view.planes.map((p) => ({
-          direction: "exact",
-          exactDegrees: p.azimuth !== null ? String(p.azimuth) : "",
-          pitch: p.pitch !== null ? String(p.pitch) : "",
-          area: p.areaM2 !== null ? String(p.areaM2) : "",
-        })),
+    setBasis("");
+    setBasisError(null);
+    setRowErrors([]);
+    setNote(view.note ?? "");
+
+    const mapped = planeFormRowsFromView(view.planes);
+    if (mapped.length > 0) {
+      // Google can return more faces than the manual endpoint accepts (Malvern
+      // returned 15). Pre-fill the first 12 and SAY how many were left out —
+      // never truncate silently, and never submit 15 and take a 422.
+      setRows(mapped.slice(0, MAX_FORM_PLANES));
+      setOmittedPlanes(Math.max(0, mapped.length - MAX_FORM_PLANES));
+      setPrefilledFromLookup(
+        view.state === "found" || view.state === "low_confidence",
       );
+    } else {
+      setRows([{ ...EMPTY_PLANE_FORM_ROW }]);
+      setOmittedPlanes(0);
+      setPrefilledFromLookup(false);
     }
     setFormOpen(true);
   }
 
+  function closeForm() {
+    setFormOpen(false);
+    setPrefilledFromLookup(false);
+    setOmittedPlanes(0);
+  }
+
   const lookupBusy = busy === "lookup";
-  const primaryManual = view.state === "not_found" || view.state === "low_confidence";
+  const hasPlanes = view.planes.length > 0;
+  const fromLookupState = view.state === "found" || view.state === "low_confidence";
+  // What the form is doing, not merely which state we are in.
+  const formHeading = !hasPlanes
+    ? "Enter the roof"
+    : fromLookupState
+      ? "Correct the roof"
+      : "Edit the roof";
+  const manualTriggerLabel = !hasPlanes
+    ? "Enter it from plans"
+    : fromLookupState
+      ? "Correct these values"
+      : "Edit the roof";
 
   const planeTable =
     view.planes.length > 0 ? (
@@ -342,6 +389,23 @@ export function AddressRoofSection({
 
   const manualForm = formOpen ? (
     <div className="mt-3 flex flex-col gap-3 rounded-lg border border-border bg-card p-3">
+      <h3 className="text-h3 text-foreground">{formHeading}</h3>
+
+      {prefilledFromLookup ? (
+        <Notice tone="caution" title="These values came from the lookup">
+          They are Google&apos;s numbers, not yours. Change what is wrong, and only
+          choose a source below that matches how you actually checked it.
+        </Notice>
+      ) : null}
+      {omittedPlanes > 0 ? (
+        <Notice tone="caution" title={`Only the first ${MAX_FORM_PLANES} faces are shown`}>
+          This roof has {omittedPlanes + MAX_FORM_PLANES} faces and a manual entry
+          accepts {MAX_FORM_PLANES}, so {omittedPlanes}{" "}
+          {omittedPlanes === 1 ? "was" : "were"} left out. Saving replaces the roof
+          with what you see here.
+        </Notice>
+      ) : null}
+
       <div>
         <label className="text-label text-foreground" htmlFor="roof-basis">
           How did you get these measurements?
@@ -446,6 +510,21 @@ export function AddressRoofSection({
               }
             />
           </div>
+          <div>
+            <label className="text-caption text-muted-foreground" htmlFor={`plane-label-${i}`}>
+              Label (optional)
+            </label>
+            <Input
+              id={`plane-label-${i}`}
+              className="mt-1 w-[170px]"
+              maxLength={80}
+              placeholder="e.g. main north face"
+              value={row.label}
+              onChange={(e) =>
+                setRows((r) => r.map((x, j) => (j === i ? { ...x, label: e.target.value } : x)))
+              }
+            />
+          </div>
           {i > 0 ? (
             <Button
               variant="ghost"
@@ -468,12 +547,12 @@ export function AddressRoofSection({
           ) : null}
         </div>
       ))}
-      {rows.length < 12 ? (
+      {rows.length < MAX_FORM_PLANES ? (
         <div>
           <Button
             variant="secondary"
             size="sm"
-            onClick={() => setRows((r) => [...r, { ...EMPTY_ROW }])}
+            onClick={() => setRows((r) => [...r, { ...EMPTY_PLANE_FORM_ROW }])}
           >
             + Add another roof face
           </Button>
@@ -520,7 +599,7 @@ export function AddressRoofSection({
         <Button onClick={save} disabled={busy !== null}>
           {busy === "save" ? "Saving…" : "Save this roof"}
         </Button>
-        <Button variant="ghost" onClick={() => setFormOpen(false)} disabled={busy !== null}>
+        <Button variant="ghost" onClick={closeForm} disabled={busy !== null}>
           Cancel
         </Button>
       </div>
@@ -593,19 +672,33 @@ export function AddressRoofSection({
                   {lookupBusy ? "Looking up…" : "Look up again"}
                 </Button>
                 <Button variant="secondary" onClick={openForm} disabled={busy !== null}>
-                  Enter it from plans
+                  {manualTriggerLabel}
                 </Button>
               </>
             ) : null}
-            {primaryManual ? (
+            {view.state === "low_confidence" ? (
+              <>
+                <Button onClick={openForm} disabled={busy !== null}>
+                  {manualTriggerLabel}
+                </Button>
+                {/* Restored at 3.4-D: a low-confidence roof is exactly where you
+                    might re-run after checking, and the retry had vanished. */}
+                <Button variant="secondary" onClick={lookup} disabled={busy !== null}>
+                  {lookupBusy ? "Looking up…" : "Look up again"}
+                </Button>
+              </>
+            ) : null}
+            {view.state === "not_found" ? (
+              // No retry here: the address has no coverage, and offering a retry
+              // that cannot succeed is worse than not offering it.
               <Button onClick={openForm} disabled={busy !== null}>
-                Enter it from plans
+                {manualTriggerLabel}
               </Button>
             ) : null}
             {view.state === "manual" ? (
               <>
                 <Button variant="secondary" onClick={openForm} disabled={busy !== null}>
-                  Edit the roof
+                  {manualTriggerLabel}
                 </Button>
                 {view.lat !== null && view.lng !== null ? (
                   <Button variant="secondary" onClick={lookup} disabled={busy !== null}>

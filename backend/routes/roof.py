@@ -76,6 +76,10 @@ class ManualRoofRequest(BaseModel):
     panel_id: Optional[str] = None
     usability_factor: Optional[float] = None
     note: Optional[str] = Field(default=None, max_length=500)
+    # 3.4-D provenance. Defaults False so a client that omits it still validates.
+    # This records where the numbers STARTED; it never overrides the basis the
+    # installer chose and never changes `source`. Both facts survive.
+    prefilled_from_lookup: bool = False
     persist: bool = True
 
 
@@ -297,6 +301,12 @@ async def roof_manual_endpoint(
         )
         if panel_flags:
             model.setdefault("flags", []).extend(panel_flags)
+        if body.prefilled_from_lookup:
+            # Provenance for the assumptions panel and the ML flywheel, NOT a
+            # verdict: the installer said where these came from, and we also record
+            # that they started from a lookup rather than a blank form. Absent when
+            # false — never present-and-false.
+            model.setdefault("flags", []).append("manual_prefilled_from_lookup")
         # 3.4-B correction (b): a manual row otherwise stores address NULL. Inherit it
         # from the newest existing row; with no previous row it stays NULL — never
         # invented, and job_customers is never queried for it.
