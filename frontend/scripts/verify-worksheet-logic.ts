@@ -33,6 +33,7 @@ import {
   roofEntryState,
   sectionStates,
   sectionsForPath,
+  siteDetailsView,
   worksheetErrorCopy,
   type JobDetailLike,
 } from "../lib/worksheet.ts";
@@ -1019,4 +1020,85 @@ test("planeFormRowsFromView: feeds straight from a stored roof view", () => {
   assert.equal(rows.length, 2);
   assert.equal(rows[1].pitch, "77");
   assert.equal(rows[1].exactDegrees, "173.1");
+});
+
+// ── Site details view (3.4b) ─────────────────────────────────────────────────
+// D5 governs everything here: site-visit fields, optional, never gating.
+
+test("siteDetailsView: a full job maps raw + text for all seven", () => {
+  const view = siteDetailsView(emptyJob({
+    storeys: 2, roof_material: "colorbond or metal", dwelling_type: "detached",
+    year_built: 1995, bedrooms: 3, floor_area_m2: 180.5, electrical_phase: "single",
+  }));
+  assert.deepEqual(view.storeys, { raw: 2, text: "2" });
+  assert.deepEqual(view.roofMaterial, { raw: "colorbond or metal", text: "colorbond or metal" });
+  assert.deepEqual(view.yearBuilt, { raw: 1995, text: "1995" });
+  assert.deepEqual(view.bedrooms, { raw: 3, text: "3" });
+  assert.deepEqual(view.floorAreaM2, { raw: 180.5, text: "180.5" });
+  assert.deepEqual(view.electricalPhase, { raw: "single", text: "single" });
+  assert.equal(view.dwellingType, "detached");
+  assert.doesNotThrow(() => JSON.stringify(view)); // crosses the boundary
+});
+
+test("siteDetailsView: empty / junk jobs yield a usable view, never a throw", () => {
+  for (const input of [emptyJob(), null, "garbage", {}, 42]) {
+    const view = siteDetailsView(input);
+    assert.equal(view.storeys.raw, null, String(input));
+    assert.equal(view.storeys.text, "");
+    assert.equal(view.dwellingType, null);
+    assert.equal(view.showsMultiDwellingCaution, false);
+  }
+});
+
+test("siteDetailsView: the multi-dwelling caution fires ONLY for unit/townhouse", () => {
+  const caution = (dwelling: unknown) =>
+    siteDetailsView(emptyJob({ dwelling_type: unsafe<string>(dwelling) }))
+      .showsMultiDwellingCaution;
+  assert.equal(caution("unit"), true);
+  assert.equal(caution("townhouse"), true);
+  assert.equal(caution("detached"), false);
+  assert.equal(caution("other"), false, "other means unknown, not multi-dwelling (F96)");
+  assert.equal(caution(null), false, "absence is not a signal");
+  assert.equal(caution("UNIT"), false, "the DB stores lowercase; do not invent a signal");
+  assert.equal(caution(7), false);
+});
+
+test("siteDetailsView: an out-of-list roof_material survives into the view", () => {
+  // No DB constraint exists on roof_material, so a stored value outside the UI
+  // list is possible — it must reach the view intact, never silently reset.
+  const view = siteDetailsView(emptyJob({ roof_material: "thatched heritage" }));
+  assert.deepEqual(view.roofMaterial, { raw: "thatched heritage", text: "thatched heritage" });
+});
+
+test("3.4b changes nothing about section state or completeness (D5)", () => {
+  // A job with a usable roof row and NO site details: Site details is the active
+  // section and the phase rail reads exactly as before this task. Asserted
+  // against the exact pre-change output, not eyeballed.
+  const job = emptyJob({
+    roof_geometry: [{ created_at: "2026-08-01T00:00:00Z", found: true, planes: [{ panel_count: 12 }] }],
+  });
+  const states = sectionStates(job);
+  assert.equal(states[0].id, "address-roof");
+  assert.equal(states[0].state, "complete");
+  assert.equal(states[1].id, "site-details");
+  assert.equal(states[1].state, "active");
+  assert.equal(states[2].state, "locked");
+  assert.deepEqual(phaseStates(job), ["current", "pending", "pending", "pending"]);
+
+  // And filling every site field does not tick anything EXTRA beyond the four
+  // fields the (unchanged) predicate has always read.
+  const spec = SECTIONS.find((s) => s.id === "site-details");
+  assert.ok(spec);
+  assert.equal(
+    spec.complete(emptyJob({ year_built: 1995, bedrooms: 3, floor_area_m2: 180 })),
+    false,
+    "the three NEW fields must not complete the section — the predicate is unchanged",
+  );
+  assert.equal(
+    spec.complete(emptyJob({
+      storeys: 1, roof_material: "tile", dwelling_type: "unit", electrical_phase: "single",
+    })),
+    true,
+    "the original four fields still complete it exactly as before",
+  );
 });

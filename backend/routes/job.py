@@ -30,6 +30,7 @@ import uuid
 from datetime import datetime, timedelta, timezone
 from typing import Any, Literal, Optional
 
+import httpx
 import sentry_sdk
 from fastapi import APIRouter, Depends, HTTPException, Query
 from fastapi.responses import JSONResponse
@@ -438,11 +439,20 @@ def _derive_site(address: Any) -> tuple[Optional[str], Optional[str], list[str]]
 
 
 def _get_company_job(client: Any, job_id: str, company_id: str) -> dict:
-    """Fetch one job IFF it belongs to this company. Any other outcome — bad uuid,
-    no such job, someone else's job — is the same 404, so existence never leaks."""
+    """Fetch one job IFF it belongs to this company. Bad uuid, no such job or someone
+    else's job are the SAME 404, so existence never leaks.
+
+    3.4b (F88): a TRANSPORT failure — the database unreachable, a timeout — is not
+    "not yours", it is "could not check". That answers 503, never 404: before this
+    a network blip during any job fetch read as "Job not found", the same
+    unknowable-as-verdict fault the auth layer fixed on 2026-08-14. Every other
+    exception (an invalid uuid rejected by Postgres, a malformed id) stays 404."""
     try:
         res = client.table("jobs").select("*").eq("job_id", job_id).limit(1).execute()
         rows = getattr(res, "data", None) or []
+    except (httpx.TransportError, TimeoutError, OSError) as exc:
+        logger.warning("job CRUD: job fetch TRANSPORT failure for %r: %s", job_id, exc)
+        raise _UNAVAILABLE from None
     except Exception as exc:  # noqa: BLE001 — bad uuid etc. must read as not-found
         logger.info("job CRUD: job fetch failed for %r: %s", job_id, exc)
         raise _NOT_FOUND from None
@@ -465,6 +475,35 @@ class JobCreateRequest(BaseModel):
 
 class StatusPatchRequest(BaseModel):
     status: Literal["draft", "sized", "sent", "won", "installed", "lost"]
+
+
+class JobSitePatch(BaseModel):
+    """Body for PATCH /api/job/{id} — the ONE job-field writer (3.4b). F83 closed.
+
+    THE WHITELIST IS THE SECURITY BOUNDARY: pydantic drops unknown keys, so
+    company_id / installer_id / path / status / address in a payload are ignored
+    silently — never echoed, never an error. `path` is a GENERATED column and an
+    attempted write would fail loudly; this whitelist is what stops it being tried.
+    3.3c EXTENDS this model (customer_name, intent, the solar fields) — one
+    whitelist that grows, never a second implementation (D2).
+
+    ABSENT vs NULL are different facts: an explicit null CLEARS a column, a field
+    absent from the payload is LEFT ALONE (model_dump(exclude_unset=True)).
+    Conflating them is how a partial save wipes another visit's data.
+
+    All optional, never gating (D5): these are site-visit fields, and a job with
+    every one of them empty is NOT incomplete.
+    """
+
+    storeys: Optional[int] = Field(default=None, ge=1, le=5)
+    # No DB constraint exists on roof_material — this bound and the UI list are
+    # the only guards. Stored lowercase.
+    roof_material: Optional[str] = Field(default=None, max_length=40)
+    dwelling_type: Optional[Literal["detached", "townhouse", "unit", "other"]] = None
+    year_built: Optional[int] = Field(default=None, ge=1800, le=2100)
+    bedrooms: Optional[int] = Field(default=None, ge=0, le=20)
+    floor_area_m2: Optional[float] = Field(default=None, gt=0, le=2000)
+    electrical_phase: Optional[Literal["single", "three"]] = None
 
 
 @router.post("/api/job")
@@ -720,3 +759,39 @@ async def patch_job_status(
         **updated,
         "path_label": job_paths.PATH_LABELS.get(path) if path else None,
     }
+
+
+@router.patch("/api/job/{job_id}")
+async def patch_job(
+    job_id: str, body: JobSitePatch, caller: Caller = Depends(require_company)
+):
+    """Update a job's site-detail fields. See JobSitePatch for the whitelist rules."""
+    client = _require_svc()
+    _get_company_job(client, job_id, caller.company_id)  # 404 absent/foreign, 503 transport
+
+    # exclude_unset: only fields the payload actually carried. An explicit null
+    # arrives here as None and CLEARS its column; an absent field never appears.
+    updates = body.model_dump(exclude_unset=True)
+    if "roof_material" in updates and isinstance(updates["roof_material"], str):
+        updates["roof_material"] = updates["roof_material"].strip().lower() or None
+
+    if not updates:
+        # Nothing to write — no update call at all, and no updated_at bump for a no-op.
+        job = _get_company_job(client, job_id, caller.company_id)
+        path = job.get("path")
+        return {**job, "path_label": job_paths.PATH_LABELS.get(path) if path else None}
+
+    updates["updated_at"] = datetime.now(timezone.utc).isoformat()
+    try:
+        client.table("jobs").update(updates).eq("job_id", job_id).eq(
+            "company_id", caller.company_id
+        ).execute()
+        updated = (
+            client.table("jobs").select("*").eq("job_id", job_id).limit(1).execute()
+        ).data[0]
+    except Exception as exc:  # noqa: BLE001
+        sentry_sdk.capture_exception(exc)
+        return JSONResponse(status_code=500, content={"detail": "job update failed"})
+
+    path = updated.get("path")
+    return {**updated, "path_label": job_paths.PATH_LABELS.get(path) if path else None}

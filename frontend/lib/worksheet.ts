@@ -31,6 +31,9 @@ export interface JobDetailLike {
   roof_material?: string | null;
   dwelling_type?: string | null;
   electrical_phase?: string | null;
+  year_built?: number | null;
+  bedrooms?: number | null;
+  floor_area_m2?: number | null;
   customer?: unknown;
   bills?: unknown;
   tariffs?: unknown;
@@ -868,6 +871,78 @@ export function addressRoofView(job: unknown): AddressRoofView {
   return view;
 }
 
+
+
+// ── Site details (3.4b) ──────────────────────────────────────────────────────
+
+export type DwellingType = "detached" | "townhouse" | "unit" | "other";
+
+export interface SiteFieldView<T> {
+  raw: T | null;
+  /** For a form input — "" when null, never the string "null". */
+  text: string;
+}
+
+export interface SiteDetailsView {
+  storeys: SiteFieldView<number>;
+  roofMaterial: SiteFieldView<string>;
+  dwellingTypeField: SiteFieldView<string>;
+  yearBuilt: SiteFieldView<number>;
+  bedrooms: SiteFieldView<number>;
+  floorAreaM2: SiteFieldView<number>;
+  electricalPhase: SiteFieldView<string>;
+  /** The discriminant — null unless the stored value is one of the four. */
+  dwellingType: DwellingType | null;
+  /**
+   * F99 — true ONLY for `unit` and `townhouse`. Never for `detached`; never for
+   * `other` (other means unknown, and warning on unknown is how a warning becomes
+   * noise, F96); never for null (absence is not a signal). The DB stores
+   * lowercase, and this deliberately does NOT case-fold: an uppercase value is
+   * not a value the schema can produce, and guessing at it would be inventing a
+   * signal. ONE derivation — both the Site details and Address & roof sections
+   * read this same field.
+   */
+  showsMultiDwellingCaution: boolean;
+}
+
+const DWELLING_TYPES: readonly DwellingType[] = [
+  "detached",
+  "townhouse",
+  "unit",
+  "other",
+];
+
+function siteNumField(value: unknown): SiteFieldView<number> {
+  const raw = typeof value === "number" && Number.isFinite(value) ? value : null;
+  return { raw, text: raw !== null ? String(raw) : "" };
+}
+
+function siteStrField(value: unknown): SiteFieldView<string> {
+  const raw = typeof value === "string" && value !== "" ? value : null;
+  return { raw, text: raw ?? "" };
+}
+
+/**
+ * The serialisable Site details view (3.4b). D5 governs this section: every
+ * field is optional, none of it gates anything, and the completion predicate is
+ * deliberately NOT derived from this view. Tolerates any input; never throws.
+ */
+export function siteDetailsView(job: unknown): SiteDetailsView {
+  const detail = asObject(job);
+  const dwellingField = siteStrField(detail.dwelling_type);
+  const dwellingType = DWELLING_TYPES.find((t) => t === dwellingField.raw) ?? null;
+  return {
+    storeys: siteNumField(detail.storeys),
+    roofMaterial: siteStrField(detail.roof_material),
+    dwellingTypeField: dwellingField,
+    yearBuilt: siteNumField(detail.year_built),
+    bedrooms: siteNumField(detail.bedrooms),
+    floorAreaM2: siteNumField(detail.floor_area_m2),
+    electricalPhase: siteStrField(detail.electrical_phase),
+    dwellingType,
+    showsMultiDwellingCaution: dwellingType === "unit" || dwellingType === "townhouse",
+  };
+}
 
 // ── Manual-form pre-fill (3.4-D) ─────────────────────────────────────────────
 

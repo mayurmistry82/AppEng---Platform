@@ -8,6 +8,7 @@ import {
   phaseStates,
   resultsBarView,
   sectionStates,
+  siteDetailsView,
   worksheetErrorCopy,
 } from "@/lib/worksheet";
 
@@ -81,6 +82,7 @@ export default async function Page({
         sections={sections}
         phases={phaseStates(job)}
         addressRoof={addressRoofView(job)}
+        siteDetails={siteDetailsView(job)}
         jobId={id}
       />
     </div>

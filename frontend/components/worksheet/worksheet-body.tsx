@@ -9,9 +9,11 @@ import {
 } from "@/components/ui/phase-rail";
 import { WorksheetSection } from "@/components/ui/worksheet-section";
 import { AddressRoofSection } from "@/components/worksheet/address-roof-section";
+import { SiteDetailsSection } from "@/components/worksheet/site-details-section";
 import {
   groupSectionsByPhase,
   type AddressRoofView,
+  type SiteDetailsView,
   type WorksheetSectionUnlockState,
 } from "@/lib/worksheet";
 
@@ -62,6 +64,7 @@ export function WorksheetBody({
   sections,
   phases,
   addressRoof,
+  siteDetails,
   jobId,
 }: {
   sections: readonly WorksheetBodySection[];
@@ -69,6 +72,9 @@ export function WorksheetBody({
   /** 3.4-B: the serialisable Address & roof view; with it, that ONE section
       renders the real body instead of its placeholder. */
   addressRoof?: AddressRoofView;
+  /** 3.4b: the Site details view. Its showsMultiDwellingCaution flag is ALSO
+      handed to the Address & roof section — one derivation, two renderers (F99). */
+  siteDetails?: SiteDetailsView;
   jobId?: string;
 }) {
   const [openIds, setOpenIds] = React.useState<Record<string, boolean>>(() => {
@@ -106,7 +112,10 @@ export function WorksheetBody({
           view={addressRoof}
           jobId={jobId}
           isOpen={!!openIds[section.id]}
+          showsMultiDwellingCaution={siteDetails?.showsMultiDwellingCaution ?? false}
         />
+      ) : section.id === "site-details" && siteDetails && jobId ? (
+        <SiteDetailsSection view={siteDetails} jobId={jobId} />
       ) : (
         <p className="text-caption text-muted-foreground">
           Built at {section.builtAt}

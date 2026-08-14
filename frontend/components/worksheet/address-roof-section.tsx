@@ -89,10 +89,14 @@ export function AddressRoofSection({
   view,
   jobId,
   isOpen,
+  showsMultiDwellingCaution = false,
 }: {
   view: AddressRoofView;
   jobId: string;
   isOpen: boolean;
+  /** F99 (3.4b) — derived ONCE in siteDetailsView; this section only renders it,
+      beside the roof numbers the warning is about. */
+  showsMultiDwellingCaution?: boolean;
 }) {
   const router = useRouter();
   const [busy, setBusy] = React.useState<"lookup" | "save" | null>(null);
@@ -616,6 +620,14 @@ export function AddressRoofSection({
           {notice.body}
         </Notice>
       ))}
+      {showsMultiDwellingCaution ? (
+        <Notice tone="caution" title="The roof lookup may not be this dwelling">
+          Google returns the one building nearest the address. On a
+          multi-dwelling site that may not be this one. Check the roof against
+          the plans, and note that a shared roof usually needs body corporate
+          approval.
+        </Notice>
+      ) : null}
       {view.staleNotice ? (
         <Notice tone={view.staleNotice.tone} title={view.staleNotice.title}>
           {view.staleNotice.body}
