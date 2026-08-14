@@ -9,9 +9,10 @@ import {
   RESULTS_BAR_MIN_HEIGHT,
   RESULTS_BAR_STORAGE_KEY,
   clampResultsBarHeight,
+  resultsBarCeiling,
   parseResultsBarPreference,
   resultsBarDefaultCollapsed,
-  resultsBarMaxHeight,
+  type ResultsBarMetrics,
   type ResultsBarView,
 } from "@/lib/worksheet";
 
@@ -75,14 +76,45 @@ export function ResultsBar({ view }: { view: ResultsBarView }) {
   const [maxHeight, setMaxHeight] = React.useState(RESULTS_BAR_DEFAULT_HEIGHT);
   const barRef = React.useRef<HTMLElement | null>(null);
   const drag = React.useRef<{ startY: number; startHeight: number } | null>(null);
+  // (3.3a-fix2) The last height the USER actually chose — set only by a drag end,
+  // a keyboard commit, or a valid stored preference. `toggleCollapsed` persists
+  // THIS, never the live clamped state: persisting a squashed height as though it
+  // were a choice is what made the fault survive every reload.
+  const lastUserChosenHeight = React.useRef(RESULTS_BAR_DEFAULT_HEIGHT);
 
-  /** Where the bar starts, and how tall it may be right now. */
-  const measure = React.useCallback(() => {
-    // An unattached ref yields 0 — clamped, never NaN and never negative.
-    const barTop = barRef.current?.getBoundingClientRect().top ?? 0;
+  /**
+   * The bar's RESTING top and the viewport height (3.3a-fix2).
+   *
+   * `barRef.getBoundingClientRect().top` is VIEWPORT-relative and grows as the
+   * page scrolls, so measuring it on a restored-scroll reload computed a ceiling
+   * at the floor and squashed the bar to a stripe. We measure the bar's nearest
+   * SCROLLING ANCESTOR instead: that element does not move when its own content
+   * scrolls, so its top is the same number at scroll 0 and scroll 2000 — which is
+   * precisely the bar's resting top, since the bar is `sticky top-0` as that
+   * container's first child.
+   *
+   * No scrolling ancestor found, or no DOM at all (SSR) -> containerTop null,
+   * which resultsBarCeiling reads as suspect. Never fall back to the scrolled
+   * value: that is the bug.
+   */
+  const measure = React.useCallback((): ResultsBarMetrics => {
     const viewportHeight =
       typeof window === "undefined" ? 0 : window.innerHeight;
-    return { barTop, viewportHeight };
+    const bar = barRef.current;
+    const barTop = bar?.getBoundingClientRect().top ?? 0;
+    let containerTop: number | null = null;
+    if (bar && typeof window !== "undefined") {
+      let node: HTMLElement | null = bar.parentElement;
+      while (node) {
+        const overflowY = window.getComputedStyle(node).overflowY;
+        if (overflowY === "auto" || overflowY === "scroll") {
+          containerTop = node.getBoundingClientRect().top;
+          break;
+        }
+        node = node.parentElement;
+      }
+    }
+    return { viewportHeight, containerTop, barTop };
   }, []);
 
   const persist = React.useCallback(
@@ -103,8 +135,8 @@ export function ResultsBar({ view }: { view: ResultsBarView }) {
   // the CURRENT window (a height saved on a large monitor must not swallow a
   // laptop screen).
   React.useEffect(() => {
-    const { barTop, viewportHeight } = measure();
-    setMaxHeight(resultsBarMaxHeight(viewportHeight, barTop));
+    const metrics = measure();
+    const ceiling = resultsBarCeiling(metrics);
 
     let stored: { collapsed: boolean; height: number } | null = null;
     try {
@@ -114,12 +146,22 @@ export function ResultsBar({ view }: { view: ResultsBarView }) {
     } catch {
       stored = null;
     }
-    if (stored) setCollapsed(stored.collapsed);
+    // The collapsed flag is a plain choice and never depends on a measurement.
+    if (stored) {
+      setCollapsed(stored.collapsed);
+      // A stored height that survived parsing WAS a real user choice.
+      lastUserChosenHeight.current = stored.height;
+    }
+
+    // A suspect measurement leaves BOTH maxHeight and height alone — the bar
+    // keeps its default rather than being shrunk by a reading we do not trust.
+    if (ceiling === null) return;
+    setMaxHeight(ceiling);
     setHeight(
       clampResultsBarHeight(
         stored ? stored.height : RESULTS_BAR_DEFAULT_HEIGHT,
-        viewportHeight,
-        barTop,
+        metrics.viewportHeight,
+        metrics.containerTop ?? 0,
       ),
     );
   }, [measure]);
@@ -128,10 +170,16 @@ export function ResultsBar({ view }: { view: ResultsBarView }) {
   // the worksheet strip stays visible.
   React.useEffect(() => {
     function onResize() {
-      const { barTop, viewportHeight } = measure();
-      setMaxHeight(resultsBarMaxHeight(viewportHeight, barTop));
+      const metrics = measure();
+      const ceiling = resultsBarCeiling(metrics);
+      if (ceiling === null) return; // suspect — never shrink on a bad reading
+      setMaxHeight(ceiling);
       setHeight((current) =>
-        clampResultsBarHeight(current, viewportHeight, barTop),
+        clampResultsBarHeight(
+          current,
+          metrics.viewportHeight,
+          metrics.containerTop ?? 0,
+        ),
       );
     }
     window.addEventListener("resize", onResize);
@@ -141,12 +189,22 @@ export function ResultsBar({ view }: { view: ResultsBarView }) {
   function toggleCollapsed() {
     const next = !collapsed;
     setCollapsed(next);
-    persist({ collapsed: next, height });
+    // The user's height, never the live clamped state (3.3a-fix2 link d).
+    persist({ collapsed: next, height: lastUserChosenHeight.current });
   }
 
   function applyHeight(desired: number): number {
-    const { barTop, viewportHeight } = measure();
-    const clamped = clampResultsBarHeight(desired, viewportHeight, barTop);
+    const metrics = measure();
+    // A suspect measurement must not clamp a deliberate drag downward either —
+    // fall back to the floor-only clamp rather than a ceiling we do not trust.
+    const clamped =
+      resultsBarCeiling(metrics) === null
+        ? Math.max(RESULTS_BAR_MIN_HEIGHT, desired)
+        : clampResultsBarHeight(
+            desired,
+            metrics.viewportHeight,
+            metrics.containerTop ?? 0,
+          );
     setHeight(clamped);
     return clamped;
   }
@@ -167,8 +225,11 @@ export function ResultsBar({ view }: { view: ResultsBarView }) {
     if (e.currentTarget.hasPointerCapture(e.pointerId)) {
       e.currentTarget.releasePointerCapture(e.pointerId);
     }
-    // Write only once the value has settled.
-    if (wasDragging) persist({ collapsed, height });
+    // Write only once the value has settled. A drag end IS a user choice.
+    if (wasDragging) {
+      lastUserChosenHeight.current = height;
+      persist({ collapsed, height });
+    }
   }
 
   /**
@@ -185,7 +246,9 @@ export function ResultsBar({ view }: { view: ResultsBarView }) {
     else if (e.key === "End") desired = maxHeight;
     if (desired === null) return;
     e.preventDefault(); // arrows resize the bar; they must not scroll the page
-    persist({ collapsed, height: applyHeight(desired) });
+    const chosen = applyHeight(desired); // a keyboard commit IS a user choice
+    lastUserChosenHeight.current = chosen;
+    persist({ collapsed, height: chosen });
   }
 
   const heroValue = view.sized
@@ -217,8 +280,12 @@ export function ResultsBar({ view }: { view: ResultsBarView }) {
         Chart
       </button>
 
+      {/* overflow-hidden is the single most important token in this file: without
+          it, content that does not fit the fixed height SPILLS OUT and paints over
+          the worksheet, because bg-background only covers this box. That spill is
+          what read as "the page scrambled" on 2026-08-14. */}
       <div
-        className={collapsed ? "" : "flex min-h-0 flex-col gap-2"}
+        className={collapsed ? "" : "flex min-h-0 flex-col gap-2 overflow-hidden"}
         style={collapsed ? undefined : { height }}
       >
         {/* Metrics — full width. Keeps its own scrollbar only if it genuinely

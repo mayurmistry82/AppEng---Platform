@@ -22,6 +22,8 @@ import {
   parseResultsBarPreference,
   pathRule,
   phaseStates,
+  resultsBarCeiling,
+  resultsBarCeilingIsSuspect,
   resultsBarDefaultCollapsed,
   resultsBarMaxHeight,
   EMPTY_PLANE_FORM_ROW,
@@ -1101,4 +1103,92 @@ test("3.4b changes nothing about section state or completeness (D5)", () => {
     true,
     "the original four fields still complete it exactly as before",
   );
+});
+
+// ── Results-bar ceiling trust (3.3a-fix2) ────────────────────────────────────
+// The 2026-08-14 defect: a reload restores scroll position, a viewport-relative
+// barTop reads large, the ceiling collapses to the floor, the bar is clamped to
+// 96px, that height is persisted as though chosen, and the screen stays broken.
+
+test("resultsBarCeilingIsSuspect: trusts a normal reading, distrusts a floor-level one", () => {
+  assert.equal(resultsBarCeilingIsSuspect(1000, 0), false);
+  assert.equal(resultsBarCeilingIsSuspect(1000, 800), true);
+  // Exactly at the floor is suspect — no real device is that short.
+  assert.equal(resultsBarCeilingIsSuspect(1000, 784), true, "1000-784-120 = 96");
+  assert.equal(resultsBarCeilingIsSuspect(1000, 783), false, "1000-783-120 = 97");
+});
+
+test("resultsBarCeilingIsSuspect: junk and negative readings are suspect", () => {
+  for (const [vh, top] of [
+    [NaN, 0], [Infinity, 0], [-Infinity, 0], [1000, NaN], [1000, Infinity],
+    [1000, -1], [1000, -500],
+  ] as [number, number][]) {
+    assert.equal(resultsBarCeilingIsSuspect(vh, top), true, `vh=${vh} top=${top}`);
+  }
+  assert.equal(resultsBarCeilingIsSuspect(unsafe<number>(null), 0), true);
+  assert.equal(resultsBarCeilingIsSuspect(1000, unsafe<number>(null)), true);
+  assert.equal(resultsBarCeilingIsSuspect(undefined, undefined), true);
+  assert.doesNotThrow(() => resultsBarCeilingIsSuspect(unsafe<number>("tall"), 0));
+});
+
+// T2 — THE SCROLL-INDEPENDENCE PROOF. `barTop` is the scroll-DEPENDENT reading
+// that caused the fault; the ceiling must ignore it entirely.
+test("resultsBarCeiling: identical at scroll 0 and scroll 2000", () => {
+  const viewportHeight = 1000;
+  const containerTop = 140; // the scroll container does not move with its content
+  const atTop = resultsBarCeiling({ viewportHeight, containerTop, barTop: 140 });
+  const scrolled = resultsBarCeiling({ viewportHeight, containerTop, barTop: 2140 });
+  assert.equal(atTop, scrolled, "the ceiling moved when only barTop changed");
+  assert.equal(atTop, resultsBarMaxHeight(viewportHeight, containerTop));
+  assert.equal(atTop, 740); // 1000 - 140 - 120
+
+  // Sweep a whole scroll range — no barTop may influence the result.
+  for (const barTop of [0, 140, 500, 2000, 12000, -50, NaN]) {
+    assert.equal(
+      resultsBarCeiling({ viewportHeight, containerTop, barTop }),
+      740,
+      `barTop ${barTop} changed the ceiling`,
+    );
+  }
+});
+
+test("resultsBarCeiling: null (suspect) when the container cannot be measured", () => {
+  // No scrolling ancestor found, or SSR — never fall back to the scrolled value.
+  assert.equal(resultsBarCeiling({ viewportHeight: 1000, containerTop: null, barTop: 140 }), null);
+  assert.equal(
+    resultsBarCeiling({ viewportHeight: 1000, containerTop: unsafe<number>(NaN), barTop: 140 }),
+    null,
+  );
+  // A genuinely tiny window reads suspect rather than squashing the bar.
+  assert.equal(resultsBarCeiling({ viewportHeight: 300, containerTop: 140, barTop: 140 }), null);
+  // And a healthy reading still returns a real number.
+  assert.equal(resultsBarCeiling({ viewportHeight: 900, containerTop: 140, barTop: 9999 }), 640);
+});
+
+test("parseResultsBarPreference: a floor-level stored height reads as NO preference", () => {
+  // THE SELF-HEAL — a browser already carrying the squashed 96 recovers on load.
+  assert.equal(parseResultsBarPreference('{"collapsed":false,"height":96}'), null);
+  assert.equal(parseResultsBarPreference('{"collapsed":false,"height":95}'), null);
+  assert.equal(parseResultsBarPreference('{"collapsed":false,"height":1}'), null);
+  assert.equal(parseResultsBarPreference('{"collapsed":false,"height":0}'), null);
+  assert.equal(parseResultsBarPreference('{"collapsed":false,"height":-40}'), null);
+  // Just above the floor is still a real preference.
+  assert.deepEqual(parseResultsBarPreference('{"collapsed":false,"height":97}'), {
+    collapsed: false,
+    height: 97,
+  });
+  assert.deepEqual(parseResultsBarPreference('{"collapsed":true,"height":320}'), {
+    collapsed: true,
+    height: 320,
+  });
+});
+
+test("resultsBarMaxHeight and clampResultsBarHeight are UNCHANGED by 3.3a-fix2", () => {
+  // Pinned byte-for-byte: this row changed neither, and other tests rely on them.
+  assert.equal(resultsBarMaxHeight(900, 140), 640);
+  assert.equal(resultsBarMaxHeight(400, 300), RESULTS_BAR_MIN_HEIGHT);
+  assert.equal(resultsBarMaxHeight(400, 140), 140);
+  assert.equal(clampResultsBarHeight(5000, 900, 140), 640);
+  assert.equal(clampResultsBarHeight(10, 900, 140), RESULTS_BAR_MIN_HEIGHT);
+  assert.equal(clampResultsBarHeight(NaN, 900, 140), RESULTS_BAR_DEFAULT_HEIGHT);
 });

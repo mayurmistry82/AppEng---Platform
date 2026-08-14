@@ -1067,6 +1067,62 @@ export function resultsBarMaxHeight(
 }
 
 /**
+ * "This measurement cannot be trusted" — NOT "the bar must be tiny" (3.3a-fix2).
+ *
+ * No device this product targets has a window too short to show a 96px bar plus a
+ * 120px strip of worksheet. So a computed ceiling at or below the floor is
+ * evidence of a BAD READING, not a real constraint — and acting on it is what
+ * squashed the bar to a stripe on 2026-08-14: a reload restores scroll position,
+ * a viewport-relative barTop reads large, the ceiling collapses to the floor, and
+ * the caller clamps a perfectly good bar down to 96px.
+ *
+ * The caller consults this FIRST and skips the update entirely when it is true.
+ * `resultsBarMaxHeight` itself is unchanged — its arithmetic was never wrong.
+ *
+ * Widened past `number` to accept null/undefined so a missing measurement is a
+ * normal input, not a cast at every call site.
+ */
+export function resultsBarCeilingIsSuspect(
+  viewportHeight: number | null | undefined,
+  barTop: number | null | undefined,
+): boolean {
+  if (typeof viewportHeight !== "number" || !Number.isFinite(viewportHeight)) return true;
+  if (typeof barTop !== "number" || !Number.isFinite(barTop)) return true;
+  if (barTop < 0) return true;
+  return !(viewportHeight - barTop - RESULTS_BAR_STRIP > RESULTS_BAR_MIN_HEIGHT);
+}
+
+/**
+ * What the component measures. `containerTop` is the viewport top of the bar's
+ * SCROLLING ANCESTOR, which does not move when its content scrolls; `barTop` is
+ * the bar's own rect top, which does. `barTop` is carried here ONLY so the tests
+ * can prove it has no influence — the ceiling must never depend on it, and that
+ * dependency is exactly the bug this row fixes.
+ */
+export interface ResultsBarMetrics {
+  viewportHeight: number;
+  /** null when no scrolling ancestor could be identified — treated as suspect. */
+  containerTop: number | null;
+  barTop: number;
+}
+
+/**
+ * The bar's height ceiling, or null when the measurement is suspect and the
+ * caller must leave the height alone.
+ *
+ * SCROLL-INDEPENDENT BY CONSTRUCTION: it reads `containerTop` and never `barTop`.
+ * Two metrics differing only in `barTop` must yield the same number — asserted in
+ * verify-worksheet-logic.ts, and the assertion fails if anyone reintroduces the
+ * scrolled value.
+ */
+export function resultsBarCeiling(metrics: ResultsBarMetrics): number | null {
+  const { viewportHeight, containerTop } = metrics;
+  if (typeof containerTop !== "number" || !Number.isFinite(containerTop)) return null;
+  if (resultsBarCeilingIsSuspect(viewportHeight, containerTop)) return null;
+  return resultsBarMaxHeight(viewportHeight, containerTop);
+}
+
+/**
  * `desired` clamped into [floor, ceiling]. A NaN / Infinity / null / undefined
  * desired falls back to the default height — never NaN, never 0, never
  * negative. This is what re-clamps a height saved on a large monitor when the
@@ -1119,6 +1175,15 @@ export function parseResultsBarPreference(
   if (typeof record.height !== "number" || !Number.isFinite(record.height)) {
     return null;
   }
+  // THE SELF-HEAL (3.3a-fix2). A stored height at or below the floor is read as
+  // NO PREFERENCE, so the D3 default applies and a browser already carrying a
+  // squashed 96 recovers on its own — no console, no support call.
+  //
+  // TRADE-OFF, accepted deliberately: a user who genuinely dragged the bar to
+  // exactly the floor loses that preference on reload. A 96px bar is barely
+  // legible anyway, and one lost preference is far cheaper than a permanently
+  // broken screen with no way out through the UI.
+  if (record.height <= RESULTS_BAR_MIN_HEIGHT) return null;
   return { collapsed: record.collapsed, height: record.height };
 }
 
