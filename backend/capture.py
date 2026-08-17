@@ -11,12 +11,19 @@ CRITICAL CONTRACT — capture is best-effort and MUST NEVER block or crash the u
     (if configured) and returns None. It never raises to the caller.
   * If SUPABASE_URL / key is missing, every function no-ops and logs a warning once.
 
-DE-IDENTIFICATION:
+DE-IDENTIFICATION — two layers, because one was not enough:
   * This module writes NO customer PII. Customer name / address belong in the separate
     `job_customers` table, which is intentionally not written here.
-  * Each writer filters its payload to an explicit column allowlist, so a stray PII key
-    (e.g. customer_name accidentally placed on a jobs payload) is silently dropped rather
-    than persisted to a non-PII table.
+  * COLUMNS: each writer filters its payload to an explicit column allowlist, so a stray
+    PII key (e.g. customer_name accidentally placed on a jobs payload) is silently
+    dropped rather than persisted to a non-PII table.
+  * INSIDE JSONB: the allowlist matches TOP-LEVEL KEYS ONLY and cannot see into a jsonb
+    value, so an allowed column such as bills.parsed_json could carry the customer's name
+    and supply address nested inside it — which is exactly what a full bill-parser payload
+    does (bill_parser extracts property_address and customer_name by design). Every
+    filtered payload is therefore ALSO passed through a recursive key scrub
+    (_scrub_pii / _PII_KEYS) that removes PII keys at any depth. The guard lives here,
+    not in the callers, so no future writer can forget it.
 
 KEY SELECTION:
   * Prefers SUPABASE_SERVICE_ROLE_KEY (correct for trusted server-side writes; bypasses
@@ -143,6 +150,77 @@ _PK: dict[str, str] = {
 }
 
 
+# ── Nested-PII deny-list ──────────────────────────────────────────────────────
+# Keys removed at ANY depth of a payload, matched case-insensitively.
+#
+# AUDITABLE, not guessed:
+#   customer_name / property_address        — what bill_parser.parse_bill returns today
+#   customer_name / property_address_full /
+#     contact_email / contact_phone         — routes/job.py's CustomerPII fields, i.e.
+#                                             the real job_customers column names
+#   the rest                                — the aliases the bill_parser Vision prompt's
+#                                             own wording invites ("Supply address",
+#                                             "Property address", "Service address",
+#                                             "Site address") plus the obvious near-misses.
+# A deny-list covering only today's exact spellings is one prompt-wording change away
+# from being useless, which is why the aliases are here before anything emits them.
+#
+# DELIBERATELY NOT LISTED: `combined_usage_periods`. The frontend's lib/store.ts drops it
+# too, but for SIZE, not privacy — it is the parser's own usage history and it is useful
+# flywheel data. Conflating a size decision with a privacy one would leave a later reader
+# concluding this list is arbitrary.
+_PII_KEYS: frozenset = frozenset(
+    {
+        "customer_name", "property_address", "property_address_full",
+        "contact_email", "contact_phone", "customer_email", "customer_phone",
+        "account_name", "account_holder", "mailing_address", "postal_address",
+        "supply_address", "service_address", "site_address", "full_address",
+        "street_address",
+    }
+)
+
+# Recursion cap. Real payloads nest a handful of levels; anything deeper is either a bug
+# or a cycle. On hitting the cap the value is DROPPED, never kept — an unscrubbable blob
+# must not be stored, and the cap is also what makes a self-referencing payload terminate
+# instead of hanging.
+_MAX_SCRUB_DEPTH = 12
+
+# Sentinel: "this value could not be scrubbed, omit it entirely."
+_DROP = object()
+
+
+def _scrub_pii(value: Any, _depth: int = 0) -> Any:
+    """
+    Recursively remove PII KEYS from dicts and lists. Pure and total: returns new
+    containers, never mutates the input, never raises, never performs I/O.
+
+    Matches KEYS, not values — a corrections row whose `field_path` is the STRING
+    "customer_name" keeps that value untouched. Non-container values pass through
+    unchanged; a non-string key cannot be PII and is left alone.
+    """
+    if _depth > _MAX_SCRUB_DEPTH:
+        return _DROP
+    if isinstance(value, dict):
+        out: dict = {}
+        for key, item in value.items():
+            if isinstance(key, str) and key.lower() in _PII_KEYS:
+                continue
+            scrubbed = _scrub_pii(item, _depth + 1)
+            if scrubbed is _DROP:
+                continue
+            out[key] = scrubbed
+        return out
+    if isinstance(value, (list, tuple)):
+        cleaned = []
+        for item in value:
+            scrubbed = _scrub_pii(item, _depth + 1)
+            if scrubbed is _DROP:
+                continue
+            cleaned.append(scrubbed)
+        return cleaned
+    return value
+
+
 # ── Client (lazy, cached) ─────────────────────────────────────────────────────
 _CLIENT: Any = None
 _CLIENT_READY = False
@@ -199,9 +277,17 @@ def reset_client_cache() -> None:
 
 
 def _filtered(table: str, payload: dict) -> dict:
-    """Keep only known columns for `table`. Defends against schema errors and stray PII."""
+    """
+    Keep only known columns for `table`, then scrub PII keys at every depth.
+
+    TWO PASSES, IN THIS ORDER, deliberately not merged: the allowlist decides which
+    COLUMNS exist (schema safety), the scrub decides what may hide INSIDE them (privacy).
+    Merging them would make a column's existence depend on its contents.
+    """
     allowed = _ALLOWED.get(table, set())
-    return {k: v for k, v in dict(payload).items() if k in allowed}
+    row = {k: v for k, v in dict(payload).items() if k in allowed}
+    scrubbed = _scrub_pii(row)
+    return scrubbed if isinstance(scrubbed, dict) else {}
 
 
 def _write(table: str, payload: Optional[dict]) -> Optional[str]:
