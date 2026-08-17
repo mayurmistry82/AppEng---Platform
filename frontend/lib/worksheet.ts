@@ -1086,6 +1086,447 @@ export function showsGoogleSolarAttribution(view: AddressRoofView): boolean {
   return view.state === "found" || view.state === "low_confidence";
 }
 
+// ── Panel-layout diagram (3.5 prompt 2) ──────────────────────────────────────
+//
+// Draws GOOGLE'S indicative panel layout — panels_raw at Google's stored panel
+// size — and the measured building's extent over the satellite tile, so an
+// installer can LOOK and tell whether the lookup measured their building (F99:
+// buildingInsights returns the ONE building nearest the coordinate and no
+// number can catch a wrong-building result whose geometry is internally
+// consistent). This is NOT the proposed system: the table above shows the
+// catalogue-panel numbers, and the two must never be conflated or reconciled.
+// The building shape is an axis-aligned bounding BOX — the extent of the area
+// Google measured — never a roof outline.
+
+/**
+ * The tile the backend proxies is FIXED at 640x360 (routes/roof.py sets
+ * `size=640x360`, not client-controlled), and the component's container is
+ * `aspect-video` (16:9). 640/360 IS exactly 16:9, which is the only reason the
+ * SVG overlay and the <img> align at any rendered width — that equality is
+ * load-bearing and nothing else protects it, so it is asserted in
+ * verify-worksheet-logic.ts. The overlay viewBox and every pixel computed
+ * below derive from this pair.
+ */
+export const TILE_W = 640;
+export const TILE_H = 360;
+/**
+ * Pixel-density multiplier for the DIAGRAM's tile request (Maps Static
+ * `scale`). scale=2 returns twice the pixels at the SAME ground coverage —
+ * a sharper photo, identical geography — so the viewBox stays 0 0 640 360 and
+ * NO projection maths involves it: none of the functions below take a scale
+ * argument (asserted in verify-worksheet-logic.ts, so a sharper tile can
+ * never silently shift the overlay). Billing checked 2026-08-17: Static Maps
+ * bills per map load; scale is not a billing dimension.
+ */
+export const TILE_IMG_SCALE = 2;
+/** routes/roof.py's default zoom — used when there is no building box to fit. */
+export const DEFAULT_TILE_ZOOM = 19;
+/** The tile endpoint's own clamp — never request outside it. */
+const TILE_ZOOM_MIN = 17;
+const TILE_ZOOM_MAX = 21;
+/** fitZoomForBuilding keeps at least this fraction of the frame clear on every side. */
+const TILE_FIT_PADDING = 0.15;
+/** Web Mercator breaks down past ±85°; nothing in Australia comes close. */
+const MAX_MERCATOR_LAT = 85;
+/** Ground metres per pixel at the equator at zoom 0, scale 1 (256px world). */
+const EQUATOR_METRES_PER_PIXEL = 156543.03392;
+
+/** World size in pixels at scale=1 (the tile endpoint sets no `scale`). */
+export function worldSizePx(zoom: number): number | null {
+  if (typeof zoom !== "number" || !Number.isFinite(zoom)) return null;
+  const size = 256 * 2 ** zoom;
+  return Number.isFinite(size) ? size : null;
+}
+
+/**
+ * Web Mercator projection to world pixels. Null — never NaN — on non-finite
+ * input or a latitude outside ±85: a NaN that reaches an SVG attribute renders
+ * nothing and reports nothing.
+ */
+export function projectWebMercator(
+  lat: number,
+  lng: number,
+  zoom: number,
+): { x: number; y: number } | null {
+  const size = worldSizePx(zoom);
+  if (size === null) return null;
+  if (typeof lat !== "number" || !Number.isFinite(lat)) return null;
+  if (typeof lng !== "number" || !Number.isFinite(lng)) return null;
+  if (Math.abs(lat) > MAX_MERCATOR_LAT) return null;
+  const latRad = (lat * Math.PI) / 180;
+  const x = ((lng + 180) / 360) * size;
+  const y =
+    ((1 - Math.log(Math.tan(latRad) + 1 / Math.cos(latRad)) / Math.PI) / 2) *
+    size;
+  if (!Number.isFinite(x) || !Number.isFinite(y)) return null;
+  return { x, y };
+}
+
+/** Ground metres per tile pixel at this latitude and zoom. Null on junk input. */
+export function metresPerPixel(lat: number, zoom: number): number | null {
+  if (typeof lat !== "number" || !Number.isFinite(lat)) return null;
+  if (Math.abs(lat) > MAX_MERCATOR_LAT) return null;
+  if (typeof zoom !== "number" || !Number.isFinite(zoom)) return null;
+  const mpp = (EQUATOR_METRES_PER_PIXEL * Math.cos((lat * Math.PI) / 180)) / 2 ** zoom;
+  return Number.isFinite(mpp) && mpp > 0 ? mpp : null;
+}
+
+/**
+ * Pixel position of a lat/lng ON THE TILE. The projection origin and the tile
+ * centre MUST be the same point: the tile <img> is requested centred on
+ * (centreLat, centreLng) and this maps that exact point to (320, 180) — if the
+ * two ever differ, every drawn shape is offset by exactly that difference and
+ * it looks like a rotation bug.
+ */
+export function tilePixel(
+  lat: number,
+  lng: number,
+  centreLat: number,
+  centreLng: number,
+  zoom: number,
+): { px: number; py: number } | null {
+  const p = projectWebMercator(lat, lng, zoom);
+  const c = projectWebMercator(centreLat, centreLng, zoom);
+  if (!p || !c) return null;
+  const px = TILE_W / 2 + (p.x - c.x);
+  const py = TILE_H / 2 + (p.y - c.y);
+  if (!Number.isFinite(px) || !Number.isFinite(py)) return null;
+  return { px, py };
+}
+
+/** {latitude, longitude} (Google's shape) → {lat, lng}, or null. */
+function latLngOf(value: unknown): { lat: number; lng: number } | null {
+  if (typeof value !== "object" || value === null) return null;
+  const v = value as Record<string, unknown>;
+  const lat = roofNum(v.latitude);
+  const lng = roofNum(v.longitude);
+  if (lat === null || lng === null) return null;
+  return { lat, lng };
+}
+
+/**
+ * The LARGEST integer zoom (clamped to the endpoint's 17..21) at which the
+ * building bounding box fits inside the 640x360 tile centred on `centre`, with
+ * at least 15% of the frame clear on every side — so the measured building
+ * fills the frame while the NEIGHBOURING buildings stay visible for
+ * comparison. Neighbours are the point: this picture is a comparison, not a
+ * portrait. Null when the box or centre cannot be read; if even the widest
+ * allowed zoom cannot contain the box, returns that widest zoom (17).
+ */
+export function fitZoomForBuilding(
+  bbox: unknown,
+  centre: { lat: number; lng: number },
+): number | null {
+  if (typeof bbox !== "object" || bbox === null) return null;
+  if (!latLngOf({ latitude: centre?.lat, longitude: centre?.lng })) return null;
+  const b = bbox as Record<string, unknown>;
+  const ne = latLngOf(b.ne);
+  const sw = latLngOf(b.sw);
+  if (!ne || !sw) return null;
+  const corners = [
+    [ne.lat, ne.lng],
+    [ne.lat, sw.lng],
+    [sw.lat, ne.lng],
+    [sw.lat, sw.lng],
+  ];
+  const minX = TILE_W * TILE_FIT_PADDING;
+  const maxX = TILE_W * (1 - TILE_FIT_PADDING);
+  const minY = TILE_H * TILE_FIT_PADDING;
+  const maxY = TILE_H * (1 - TILE_FIT_PADDING);
+  for (let zoom = TILE_ZOOM_MAX; zoom >= TILE_ZOOM_MIN; zoom--) {
+    let fits = true;
+    for (const [lat, lng] of corners) {
+      const p = tilePixel(lat, lng, centre.lat, centre.lng, zoom);
+      if (!p || p.px < minX || p.px > maxX || p.py < minY || p.py > maxY) {
+        fits = false;
+        break;
+      }
+    }
+    if (fits) return zoom;
+  }
+  return TILE_ZOOM_MIN;
+}
+
+/**
+ * Why the panel rectangles cannot be drawn. NEVER an empty array instead: []
+ * would render as "no panels on this roof", which is a claim, not a fallback.
+ * `dimensions_not_stored` is the CORRECT state for rows captured before 3.5
+ * prompt 1 — not an error.
+ */
+export type RoofDiagramReason =
+  | "no_panel_positions"
+  | "dimensions_not_stored"
+  | "segment_join_failed"
+  | "no_coordinates"
+  | "solar_data_expired";
+
+export interface PanelRect {
+  cx: number;
+  cy: number;
+  widthPx: number;
+  heightPx: number;
+  rotationDeg: number;
+  /** Google's segment index — lets the component vary styling per roof face. */
+  segmentIndex: number;
+}
+
+export type PanelRectanglesResult =
+  | { rects: PanelRect[]; reason: null }
+  | { rects: null; reason: RoofDiagramReason };
+
+/**
+ * §20.2 — the same three-signal OR as addressRoofView's solarDataExpired
+ * (backend redaction flag, sweep tombstone, client-side age check), kept
+ * inline there because its 75-test suite pins that function. Google-sourced
+ * rows only; a manual row is never expired.
+ */
+function rowSolarDataExpired(row: Record<string, unknown>): boolean {
+  if (row.source !== "google_solar") return false;
+  if (row.solar_data_expired === true) return true;
+  if (isParseableDate(row.solar_data_expired_at)) return true;
+  const referenceRaw =
+    typeof row.solar_data_captured_at === "string"
+      ? row.solar_data_captured_at
+      : row.created_at;
+  const reference =
+    typeof referenceRaw === "string" ? new Date(referenceRaw).getTime() : NaN;
+  return (
+    Number.isFinite(reference) &&
+    Date.now() - reference > SOLAR_DATA_RETENTION_DAYS * 24 * 3600 * 1000
+  );
+}
+
+/** The tile centre + zoom for a row: building_center (falling back to the row's
+ *  lat/lng) and the fitted zoom (falling back to the endpoint default). */
+function diagramFrame(
+  row: Record<string, unknown>,
+): { lat: number; lng: number; zoom: number } | null {
+  const centre =
+    latLngOf(row.building_center) ??
+    (roofNum(row.lat) !== null && roofNum(row.lng) !== null
+      ? { lat: roofNum(row.lat) as number, lng: roofNum(row.lng) as number }
+      : null);
+  if (!centre) return null;
+  const zoom =
+    fitZoomForBuilding(row.building_bounding_box, centre) ?? DEFAULT_TILE_ZOOM;
+  return { lat: centre.lat, lng: centre.lng, zoom };
+}
+
+/**
+ * THE SEGMENT JOIN. Each stored panel carries `segmentIndex` in GOOGLE'S
+ * segment numbering; planes[] was built by iterating Google's segments with a
+ * `continue` past malformed ones, so `planes[segmentIndex]` is WRONG the
+ * moment any segment was skipped — panels silently attach to the wrong roof
+ * face with the wrong azimuth, and the diagram still looks reasonable.
+ * Resolution order per plane:
+ *   1. the explicit `segment_index` written by _normalise since 3.5 prompt 2;
+ *   2. for older rows: the plane's `center` matched EXACTLY against
+ *      segment_bounding_boxes[].center (same source object copied into both,
+ *      verified 4/4 exact on the live row);
+ *   3. otherwise the plane is unresolvable — any panel referencing it FAILS
+ *      CLOSED (segment_join_failed), because a partly-wrong diagram is worse
+ *      than no diagram.
+ * The map holds a LIST per index so a duplicate claim (two planes resolving to
+ * one segment) is detectable as ambiguity rather than silently last-wins.
+ */
+function planesBySegmentIndex(
+  row: Record<string, unknown>,
+): Map<number, Record<string, unknown>[]> {
+  const map = new Map<number, Record<string, unknown>[]>();
+  const boxes = arr(row.segment_bounding_boxes);
+  for (const plane of arr(row.planes)) {
+    let index: number | null = null;
+    const explicit = plane.segment_index;
+    if (typeof explicit === "number" && Number.isInteger(explicit) && explicit >= 0) {
+      index = explicit;
+    } else {
+      const centre = latLngOf(plane.center);
+      if (centre) {
+        const matches: number[] = [];
+        for (const box of boxes) {
+          const boxCentre = latLngOf(box.center);
+          const boxIndex = box.segment_index;
+          if (
+            boxCentre !== null &&
+            boxCentre.lat === centre.lat &&
+            boxCentre.lng === centre.lng &&
+            typeof boxIndex === "number" &&
+            Number.isInteger(boxIndex)
+          ) {
+            matches.push(boxIndex);
+          }
+        }
+        if (matches.length === 1) index = matches[0];
+      }
+    }
+    if (index !== null) {
+      const list = map.get(index) ?? [];
+      list.push(plane);
+      map.set(index, list);
+    }
+  }
+  return map;
+}
+
+/**
+ * One rectangle per stored panel, in tile pixel space, or a named reason.
+ *
+ * ORIENTATION CONVENTION (an explicit assumption — no unit test can settle it;
+ * it is settled by looking at the photo): Google's panelHeightMeters (1.879 m,
+ * the long side) runs UP THE ROOF SLOPE in PORTRAIT and ACROSS the slope in
+ * LANDSCAPE. So the un-rotated rectangle has heightPx along the screen's
+ * vertical axis = the up-slope dimension: PORTRAIT maps panelHeightMeters to
+ * heightPx, LANDSCAPE swaps the two. An unrecognised orientation string is
+ * drawn as LANDSCAPE (Google's usual layout) rather than failing the diagram.
+ *
+ * ROTATION SIGN: Google's azimuth is degrees CLOCKWISE FROM NORTH (the
+ * direction the face slopes down towards). On screen, north is up and SVG
+ * rotation is also clockwise (positive angles turn the up-axis towards east,
+ * because y increases downward). An un-rotated rectangle's up-slope axis
+ * points north; rotating it clockwise by `azimuth` points that axis at the
+ * face's compass bearing — the two conventions run the same way, so
+ * rotationDeg = azimuth with NO sign flip.
+ */
+export function panelRectangles(row: unknown): PanelRectanglesResult {
+  if (typeof row !== "object" || row === null) {
+    return { rects: null, reason: "no_coordinates" };
+  }
+  const r = row as Record<string, unknown>;
+  if (rowSolarDataExpired(r)) {
+    return { rects: null, reason: "solar_data_expired" };
+  }
+  const frame = diagramFrame(r);
+  if (!frame) return { rects: null, reason: "no_coordinates" };
+  const panels = arr(r.panels_raw);
+  if (!Array.isArray(r.panels_raw) || panels.length === 0) {
+    return { rects: null, reason: "no_panel_positions" };
+  }
+  const widthM = roofNum(r.google_panel_width_m);
+  const heightM = roofNum(r.google_panel_height_m);
+  if (widthM === null || heightM === null || widthM <= 0 || heightM <= 0) {
+    return { rects: null, reason: "dimensions_not_stored" };
+  }
+  const bySegment = planesBySegmentIndex(r);
+  const rects: PanelRect[] = [];
+  for (const panel of panels) {
+    const segmentIndex = panel.segmentIndex;
+    if (typeof segmentIndex !== "number" || !Number.isInteger(segmentIndex)) {
+      return { rects: null, reason: "segment_join_failed" };
+    }
+    const candidates = bySegment.get(segmentIndex);
+    if (!candidates || candidates.length !== 1) {
+      return { rects: null, reason: "segment_join_failed" };
+    }
+    const plane = candidates[0];
+    const centre = latLngOf(panel.center);
+    if (!centre) return { rects: null, reason: "no_coordinates" };
+    const pos = tilePixel(centre.lat, centre.lng, frame.lat, frame.lng, frame.zoom);
+    const mpp = metresPerPixel(centre.lat, frame.zoom);
+    if (!pos || mpp === null) return { rects: null, reason: "no_coordinates" };
+    const portrait = panel.orientation === "PORTRAIT";
+    const widthPx = (portrait ? widthM : heightM) / mpp;
+    const heightPx = (portrait ? heightM : widthM) / mpp;
+    const azimuth = roofNum(plane.azimuth);
+    rects.push({
+      cx: pos.px,
+      cy: pos.py,
+      widthPx,
+      heightPx,
+      rotationDeg: azimuth ?? 0,
+      segmentIndex,
+    });
+  }
+  return { rects, reason: null };
+}
+
+/**
+ * Everything the diagram needs, serialisable (it crosses the server/client
+ * boundary). `show: false` means render NOTHING diagram-related: no roof row,
+ * a not-found row, a manual roof (no Google layout, no Google attribution),
+ * or expired Solar Data (the existing expired notice stands, and a box must
+ * not be drawn from deleted data). With `show: true`, either `rects` is
+ * populated or `reason` names why not — and the building box renders whenever
+ * it can be computed, so a failed panel join still shows the measured extent.
+ */
+export interface RoofDiagramView {
+  show: boolean;
+  /** Tile request centre — the SAME point the rectangles are projected against. */
+  tileLat: number | null;
+  tileLng: number | null;
+  zoom: number;
+  /** The extent of the area Google measured — an axis-aligned box, NOT an outline. */
+  buildingBox: { x: number; y: number; width: number; height: number } | null;
+  rects: PanelRect[];
+  reason: RoofDiagramReason | null;
+  /** Count of DRAWN rectangles — Google's layout, never the table's number. */
+  panelCount: number;
+  panelWidthM: number | null;
+  panelHeightM: number | null;
+  panelCapacityW: number | null;
+}
+
+const HIDDEN_DIAGRAM: RoofDiagramView = {
+  show: false,
+  tileLat: null,
+  tileLng: null,
+  zoom: DEFAULT_TILE_ZOOM,
+  buildingBox: null,
+  rects: [],
+  reason: null,
+  panelCount: 0,
+  panelWidthM: null,
+  panelHeightM: null,
+  panelCapacityW: null,
+};
+
+export function roofDiagramView(job: unknown): RoofDiagramView {
+  const row = latestRoofGeometry(job);
+  if (!row) return HIDDEN_DIAGRAM;
+  const state = roofEntryState(row);
+  if (state !== "found" && state !== "low_confidence") return HIDDEN_DIAGRAM;
+  if (rowSolarDataExpired(row)) return HIDDEN_DIAGRAM;
+
+  const frame = diagramFrame(row);
+  if (!frame) {
+    return { ...HIDDEN_DIAGRAM, show: true, reason: "no_coordinates" };
+  }
+
+  let buildingBox: RoofDiagramView["buildingBox"] = null;
+  const bbox =
+    typeof row.building_bounding_box === "object" && row.building_bounding_box !== null
+      ? (row.building_bounding_box as Record<string, unknown>)
+      : null;
+  const ne = bbox ? latLngOf(bbox.ne) : null;
+  const sw = bbox ? latLngOf(bbox.sw) : null;
+  if (ne && sw) {
+    const a = tilePixel(ne.lat, ne.lng, frame.lat, frame.lng, frame.zoom);
+    const b = tilePixel(sw.lat, sw.lng, frame.lat, frame.lng, frame.zoom);
+    if (a && b) {
+      buildingBox = {
+        x: Math.min(a.px, b.px),
+        y: Math.min(a.py, b.py),
+        width: Math.abs(a.px - b.px),
+        height: Math.abs(a.py - b.py),
+      };
+    }
+  }
+
+  const result = panelRectangles(row);
+  return {
+    show: true,
+    tileLat: frame.lat,
+    tileLng: frame.lng,
+    zoom: frame.zoom,
+    buildingBox,
+    rects: result.reason === null ? result.rects : [],
+    reason: result.reason,
+    panelCount: result.reason === null ? result.rects.length : 0,
+    panelWidthM: roofNum(row.google_panel_width_m),
+    panelHeightM: roofNum(row.google_panel_height_m),
+    panelCapacityW: roofNum(row.google_panel_capacity_w),
+  };
+}
+
 // ── Results-bar geometry + preference (3.3a) ─────────────────────────────────
 //
 // The risky arithmetic lives here, unit-tested, rather than inline in the

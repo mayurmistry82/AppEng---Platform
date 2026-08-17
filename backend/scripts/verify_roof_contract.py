@@ -623,6 +623,64 @@ def t_panel_dimensions() -> None:
               ("google_panel_width_m", "google_panel_height_m", "google_panel_capacity_w")))
 
 
+def t_segment_index() -> None:
+    """3.5 prompt 2: each plane records GOOGLE'S segment index (the enumerate
+    index), so panels_raw[].segmentIndex can be joined to the right roof face
+    even when a malformed segment was skipped and list positions diverge."""
+    print("\nT-3.5p2. plane segment_index")
+
+    clean = {"solarPotential": {
+        "roofSegmentStats": [
+            {"pitchDegrees": 20.0, "azimuthDegrees": 0.0, "stats": {"areaMeters2": 40.0}},
+            {"pitchDegrees": 22.0, "azimuthDegrees": 90.0, "stats": {"areaMeters2": 30.0}},
+        ],
+        "solarPanels": [{"segmentIndex": 0}] * 5 + [{"segmentIndex": 1}] * 5,
+        "maxArrayPanelsCount": 40,
+    }}
+    n = roof_geometry._normalise(clean, dict(PANEL), 0.7)
+    check("clean row: segment_index equals list position",
+          [p.get("segment_index") for p in n["planes"]] == [0, 1],
+          str([p.get("segment_index") for p in n["planes"]]))
+
+    # THE TRAP: a malformed segment between two valid ones. The second valid
+    # plane sits at LIST position 1 but is GOOGLE segment 2 — positional
+    # indexing would hand its panels to the wrong face.
+    skipped = {"solarPotential": {
+        "roofSegmentStats": [
+            {"pitchDegrees": 20.0, "azimuthDegrees": 0.0, "stats": {"areaMeters2": 40.0}},
+            "junk-not-a-segment",
+            {"pitchDegrees": 22.0, "azimuthDegrees": 90.0, "stats": {"areaMeters2": 30.0}},
+        ],
+        "solarPanels": [{"segmentIndex": 0}] * 5 + [{"segmentIndex": 2}] * 5,
+        "maxArrayPanelsCount": 40,
+    }}
+    s = roof_geometry._normalise(skipped, dict(PANEL), 0.7)
+    check("skipped segment: 2 planes from 3 segments", len(s["planes"]) == 2,
+          str(len(s["planes"])))
+    check("skipped segment: indices are [0, 2], NOT [0, 1]",
+          [p.get("segment_index") for p in s["planes"]] == [0, 2],
+          str([p.get("segment_index") for p in s["planes"]]))
+    check("plane at list position 1 carries segment 2's azimuth",
+          s["planes"][1]["azimuth"] == 90.0 and s["planes"][1]["segment_index"] == 2,
+          str(s["planes"][1]))
+
+    # Manual planes have no Google segment — the key must NOT appear (additive
+    # only; inventing an index for a manual face would be a fake join target).
+    manual = roof_geometry.build_manual_roof_model(
+        "plans", [{"azimuth": 0, "pitch": 20, "area_m2": 50.0}], dict(PANEL), 0.7)
+    check("manual planes carry NO segment_index key",
+          all("segment_index" not in p for p in manual["planes"]),
+          str(manual["planes"][0].keys()))
+
+    # Refinement: the tile endpoint's scale param — optional, defaulting to 1,
+    # so every pre-existing caller is untouched (the clamp to 1..2 runs in the
+    # handler body, after auth, like the zoom clamp).
+    scale_param = inspect.signature(roof.roof_tile_endpoint).parameters.get("scale")
+    check("tile endpoint has optional scale param defaulting to 1",
+          scale_param is not None and scale_param.default == 1,
+          f"default={getattr(scale_param, 'default', None)!r}")
+
+
 def t_prefill_provenance() -> None:
     """3.4-D: pre-filling must never launder a lookup into a trusted source."""
     print("\nT-3.4D. manual pre-fill provenance")
@@ -743,6 +801,7 @@ def main() -> int:
     t_confidence()
     t_prefill_provenance()
     t_panel_dimensions()
+    t_segment_index()
     if live:
         t5_live()
 

@@ -27,10 +27,15 @@ import { postJson } from "@/lib/client-api";
 import { clientActionErrorCopy } from "@/lib/jobs";
 import {
   EMPTY_PLANE_FORM_ROW,
+  TILE_H,
+  TILE_IMG_SCALE,
+  TILE_W,
   planeFormRowsFromView,
   showsGoogleSolarAttribution,
   type AddressRoofView,
   type PlaneFormRow,
+  type RoofDiagramReason,
+  type RoofDiagramView,
 } from "@/lib/worksheet";
 import type { ApiErrorKind } from "@/lib/jobs";
 
@@ -86,11 +91,54 @@ function planeAzimuth(row: PlaneFormRow): number | null {
   return Number.isFinite(value) ? value : null;
 }
 
+/**
+ * Why the panel layout is not drawn (3.5 prompt 2) — every non-drawable state
+ * gets a visible, specific line; never a blank box, never a spinner.
+ * `dimensions_not_stored` is the normal state for rows looked up before the
+ * dimensions were captured; it points at the EXISTING "Look up again" button
+ * and never auto-fetches (every lookup is billable).
+ */
+const DIAGRAM_REASON_COPY: Record<RoofDiagramReason, string> = {
+  dimensions_not_stored:
+    "The panel size wasn't recorded when this roof was looked up, so the layout can't be drawn to scale. “Look up again” will record it.",
+  segment_join_failed:
+    "Google's panel layout couldn't be matched to the roof faces, so it isn't drawn.",
+  no_panel_positions:
+    "Google recorded no panel positions for this roof, so there is no layout to draw.",
+  no_coordinates:
+    "No coordinates were stored for this roof, so the layout can't be drawn.",
+  // Unreachable in practice — roofDiagramView hides the diagram entirely on
+  // expiry (the §20.2 notice above the table already explains it) — but the
+  // Record must be total and a reachable string beats a runtime hole.
+  solar_data_expired:
+    "Google's roof data for this job has been deleted, so the layout can't be drawn.",
+};
+
+/**
+ * Per-face styling, cycled by Google's segment index — fill-opacity steps far
+ * apart plus a dash-pattern change, so adjacent faces read as different at a
+ * glance. Style only, zero new colour tokens — the count stays 83.
+ */
+const FACE_STYLES: readonly {
+  fillOpacity: number;
+  strokeDasharray?: string;
+}[] = [
+  { fillOpacity: 0.6 },
+  { fillOpacity: 0.25 },
+  { fillOpacity: 0.6, strokeDasharray: "4 2" },
+  { fillOpacity: 0.25, strokeDasharray: "4 2" },
+];
+
+function fmtMetres(value: number | null): string {
+  return value !== null ? String(Math.round(value * 100) / 100) : "—";
+}
+
 export function AddressRoofSection({
   view,
   jobId,
   isOpen,
   showsMultiDwellingCaution = false,
+  diagram,
 }: {
   view: AddressRoofView;
   jobId: string;
@@ -98,6 +146,9 @@ export function AddressRoofSection({
   /** F99 (3.4b) — derived ONCE in siteDetailsView; this section only renders it,
       beside the roof numbers the warning is about. */
   showsMultiDwellingCaution?: boolean;
+  /** 3.5 prompt 2 — Google's indicative panel layout over the tile. Optional:
+      absent renders exactly the pre-3.5 thumbnail. */
+  diagram?: RoofDiagramView;
 }) {
   const router = useRouter();
   const [busy, setBusy] = React.useState<"lookup" | "save" | null>(null);
@@ -350,19 +401,94 @@ export function AddressRoofSection({
     ) : null;
 
   const thumbnail = (() => {
-    const hasCoords = view.lat !== null && view.lng !== null;
+    const diagramActive = diagram !== undefined && diagram.show;
+    // 1b (3.5 prompt 2): the tile is REQUESTED centred on the exact point the
+    // overlay projects against (building_center, with the fitted zoom). If the
+    // request centre and the projection origin ever differ, every drawn shape
+    // is offset by exactly that difference — which looks like a rotation bug
+    // and is not one. Without a diagram frame, the pre-3.5 request stands.
+    const useDiagramTile =
+      diagramActive && diagram.tileLat !== null && diagram.tileLng !== null;
+    const hasCoords =
+      useDiagramTile || (view.lat !== null && view.lng !== null);
     const showImage = hasCoords && isOpen && !tileFailed;
-    return (
-      <figure className="w-full max-w-[520px]">
-        <div className="aspect-video w-full overflow-hidden rounded-lg border border-border bg-bg-subtle">
-          {showImage ? (
-            // eslint-disable-next-line @next/next/no-img-element
-            <img
-              src={`/api/roof/tile?lat=${view.lat}&lng=${view.lng}`}
-              alt={`Satellite view of ${view.address}`}
-              className="h-full w-full object-cover"
-              onError={() => setTileFailed(true)}
+    // scale=2 sharpens the photo WITHOUT changing its ground coverage, so the
+    // 0 0 640 360 viewBox and every projected coordinate are untouched by it.
+    const tileSrc = useDiagramTile
+      ? `/api/roof/tile?lat=${diagram.tileLat}&lng=${diagram.tileLng}&zoom=${diagram.zoom}&scale=${TILE_IMG_SCALE}`
+      : `/api/roof/tile?lat=${view.lat}&lng=${view.lng}`;
+    // No overlay floating on an empty background: it exists only while the
+    // tile <img> does. pointer-events-none — the picture is not a control.
+    const overlay =
+      showImage &&
+      diagramActive &&
+      (diagram.rects.length > 0 || diagram.buildingBox !== null) ? (
+        <svg
+          viewBox={`0 0 ${TILE_W} ${TILE_H}`}
+          preserveAspectRatio="xMidYMid slice"
+          className="pointer-events-none absolute inset-0 h-full w-full"
+          aria-hidden="true"
+        >
+          {/* Back to front: the measured extent first (an axis-aligned BOX,
+              never a roof outline), then Google's panels over it. */}
+          {diagram.buildingBox ? (
+            <rect
+              x={diagram.buildingBox.x}
+              y={diagram.buildingBox.y}
+              width={diagram.buildingBox.width}
+              height={diagram.buildingBox.height}
+              fill="none"
+              className="stroke-primary"
+              strokeWidth={1.5}
+              strokeDasharray="6 4"
             />
+          ) : null}
+          {diagram.rects.map((r, i) => {
+            // Inset each rectangle so neighbouring panels keep a visible gap
+            // and stay individually countable — display only, the stored
+            // geometry is untouched. Capped at 10% of the smaller side so tiny
+            // rectangles at low zoom never invert.
+            const inset = Math.min(1.25, r.widthPx * 0.1, r.heightPx * 0.1);
+            const style = FACE_STYLES[r.segmentIndex % FACE_STYLES.length];
+            return (
+              <g
+                key={i}
+                transform={`translate(${r.cx} ${r.cy}) rotate(${r.rotationDeg})`}
+              >
+                <rect
+                  x={-r.widthPx / 2 + inset}
+                  y={-r.heightPx / 2 + inset}
+                  width={r.widthPx - 2 * inset}
+                  height={r.heightPx - 2 * inset}
+                  className="fill-primary stroke-primary"
+                  fillOpacity={style.fillOpacity}
+                  strokeDasharray={style.strokeDasharray}
+                  strokeOpacity={1}
+                  strokeWidth={1}
+                />
+              </g>
+            );
+          })}
+        </svg>
+      ) : null;
+    return (
+      // Full section width — this diagram is the deliverable of row 3.5 and
+      // has to be large enough to answer "did we measure THIS building".
+      <figure className="w-full">
+        {/* `relative` anchors the overlay; aspect-video is 16:9 = 640/360, the
+            equality lib/worksheet.ts documents and the suite asserts. */}
+        <div className="relative aspect-video w-full overflow-hidden rounded-lg border border-border bg-bg-subtle">
+          {showImage ? (
+            <>
+              {/* eslint-disable-next-line @next/next/no-img-element */}
+              <img
+                src={tileSrc}
+                alt={`Satellite view of ${view.address}`}
+                className="h-full w-full object-cover"
+                onError={() => setTileFailed(true)}
+              />
+              {overlay}
+            </>
           ) : (
             <div className="flex h-full w-full items-center justify-center">
               <span className="px-4 text-center text-caption text-muted-foreground">
@@ -371,6 +497,46 @@ export function AddressRoofSection({
             </div>
           )}
         </div>
+        {diagramActive ? (
+          <p className="mt-1 text-caption text-muted-foreground">
+            {diagram.reason === null ? (
+              <>
+                {/* GOOGLE'S layout at GOOGLE'S panel size — never the table's
+                    panel count or kW, which describe a different panel. */}
+                Google&apos;s indicative panel layout: {diagram.panelCount}{" "}
+                panels at {fmtMetres(diagram.panelWidthM)} m ×{" "}
+                {fmtMetres(diagram.panelHeightM)} m
+                {diagram.panelCapacityW !== null
+                  ? `, ${Math.round(diagram.panelCapacityW)} W each`
+                  : null}
+                .
+                {diagram.buildingBox
+                  ? " The dashed box is the extent of the area Google measured."
+                  : null}{" "}
+                The recommended system in the table above uses a different
+                panel.
+              </>
+            ) : (
+              <>
+                {DIAGRAM_REASON_COPY[diagram.reason]}
+                {diagram.buildingBox
+                  ? " The dashed box is the extent of the area Google measured."
+                  : null}
+              </>
+            )}
+          </p>
+        ) : null}
+        {diagramActive && diagram.reason === null ? (
+          // The honest caveat: two imagery sources, so edges won't line up
+          // exactly — and that is fine, because this picture answers WHICH
+          // building, not where panels go. Plain words, no jargon.
+          <p className="mt-1 text-caption text-muted-foreground">
+            The panels are drawn where Google measured them, but the photo
+            comes from a different supplier, so they can sit slightly off a
+            roof edge. Use this picture to check which building was measured —
+            not exactly where panels would go.
+          </p>
+        ) : null}
         <figcaption className="mt-1 text-caption text-muted-foreground">
           {[
             view.imageryDate ? `Imagery ${view.imageryDate}` : null,

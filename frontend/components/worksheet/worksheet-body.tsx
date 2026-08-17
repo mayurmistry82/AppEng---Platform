@@ -13,6 +13,7 @@ import { SiteDetailsSection } from "@/components/worksheet/site-details-section"
 import {
   groupSectionsByPhase,
   type AddressRoofView,
+  type RoofDiagramView,
   type SiteDetailsView,
   type WorksheetSectionUnlockState,
 } from "@/lib/worksheet";
@@ -65,6 +66,7 @@ export function WorksheetBody({
   phases,
   addressRoof,
   siteDetails,
+  roofDiagram,
   jobId,
 }: {
   sections: readonly WorksheetBodySection[];
@@ -75,6 +77,8 @@ export function WorksheetBody({
   /** 3.4b: the Site details view. Its showsMultiDwellingCaution flag is ALSO
       handed to the Address & roof section — one derivation, two renderers (F99). */
   siteDetails?: SiteDetailsView;
+  /** 3.5 prompt 2: Google's indicative panel layout — pass-through only. */
+  roofDiagram?: RoofDiagramView;
   jobId?: string;
 }) {
   const [openIds, setOpenIds] = React.useState<Record<string, boolean>>(() => {
@@ -113,6 +117,7 @@ export function WorksheetBody({
           jobId={jobId}
           isOpen={!!openIds[section.id]}
           showsMultiDwellingCaution={siteDetails?.showsMultiDwellingCaution ?? false}
+          diagram={roofDiagram}
         />
       ) : section.id === "site-details" && siteDetails && jobId ? (
         <SiteDetailsSection view={siteDetails} jobId={jobId} />

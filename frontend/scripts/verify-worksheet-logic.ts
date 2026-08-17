@@ -27,9 +27,19 @@ import {
   resultsBarDefaultCollapsed,
   resultsBarMaxHeight,
   EMPTY_PLANE_FORM_ROW,
+  TILE_H,
+  TILE_IMG_SCALE,
+  TILE_W,
   addressRoofView,
   azimuthLabel,
+  fitZoomForBuilding,
+  metresPerPixel,
+  panelRectangles,
   planeFormRowsFromView,
+  projectWebMercator,
+  roofDiagramView,
+  tilePixel,
+  worldSizePx,
   latestRoofGeometry,
   resultsBarView,
   roofEntryState,
@@ -1321,4 +1331,417 @@ test("showsGoogleSolarAttribution: google yes, manual no, not-found no", () => {
   );
   assert.equal(showsGoogleSolarAttribution(notFound), false);
   assert.equal(showsGoogleSolarAttribution(addressRoofView(null)), false);
+});
+
+// ── Panel-layout diagram (3.5 prompt 2) ──────────────────────────────────────
+//
+// STEP 1 proves the projection against arithmetic computed independently HERE,
+// not against the picture. STEP 2 is the segment-join trap: panels_raw carries
+// GOOGLE'S segment numbering, planes[] can have skipped a malformed segment,
+// so positional indexing attaches panels to the wrong roof face. STEP 3 is the
+// named reasons — never a throw, never a bare [].
+
+const DIAG_LAT = -34.9259;
+const DIAG_LNG = 138.6472;
+const gp = (latitude: number, longitude: number) => ({ latitude, longitude });
+
+// Modelled on the live 53 Bishops Pl row (74f3d9e2): plane centers are copied
+// VERBATIM into segment_bounding_boxes[].center (same source object in
+// _normalise), which is what makes the exact-equality centre match sound.
+const SEG_CENTRES = [gp(-34.9258666, 138.647133), gp(-34.9258745, 138.6472159)];
+function diagramRoof(over: Record<string, unknown> = {}): Record<string, unknown> {
+  return googleRoof({
+    lat: DIAG_LAT,
+    lng: DIAG_LNG,
+    building_center: gp(-34.9258552, 138.6471519),
+    building_bounding_box: {
+      ne: gp(-34.9257983, 138.6472459),
+      sw: gp(-34.925898, 138.6470736),
+    },
+    planes: [
+      { azimuth: 0, pitch: 20, area_m2: 40, panel_count: 3, kwp: 1.32, center: SEG_CENTRES[0] },
+      { azimuth: 90, pitch: 22, area_m2: 30, panel_count: 2, kwp: 0.88, center: SEG_CENTRES[1] },
+    ],
+    segment_bounding_boxes: [
+      { segment_index: 0, center: SEG_CENTRES[0], boundingBox: null },
+      { segment_index: 1, center: SEG_CENTRES[1], boundingBox: null },
+    ],
+    panels_raw: [
+      { center: gp(-34.9258508, 138.6471713), orientation: "LANDSCAPE", segmentIndex: 0 },
+      { center: gp(-34.92586, 138.6471885), orientation: "PORTRAIT", segmentIndex: 1 },
+      { center: gp(-34.9258550, 138.6471900), orientation: "LANDSCAPE", segmentIndex: 1 },
+    ],
+    google_panel_width_m: 1.045,
+    google_panel_height_m: 1.879,
+    google_panel_capacity_w: 400,
+    solar_data_captured_at: daysAgo(1),
+    ...over,
+  });
+}
+
+test("diagram: TILE_W/TILE_H are 640x360 and exactly 16:9 (aspect-video)", () => {
+  // The overlay only aligns with the <img> because 640/360 === 16/9. Nothing
+  // else protects that equality — this assertion is the guard the component
+  // comment points at.
+  assert.equal(TILE_W, 640);
+  assert.equal(TILE_H, 360);
+  assert.equal(TILE_W / TILE_H, 16 / 9);
+});
+
+test("diagram STEP 1: metresPerPixel matches the independent formula at zooms 19-21", () => {
+  for (const zoom of [19, 20, 21]) {
+    const independent =
+      (156543.03392 * Math.cos((DIAG_LAT * Math.PI) / 180)) / 2 ** zoom;
+    assert.equal(metresPerPixel(DIAG_LAT, zoom), independent, `zoom ${zoom}`);
+  }
+});
+
+test("diagram STEP 1: the tile centre projects to exactly (320, 180)", () => {
+  for (const zoom of [17, 19, 21]) {
+    assert.deepEqual(
+      tilePixel(DIAG_LAT, DIAG_LNG, DIAG_LAT, DIAG_LNG, zoom),
+      { px: 320, py: 180 },
+      `zoom ${zoom}`,
+    );
+  }
+});
+
+test("diagram STEP 1: one panel-width east lands width/mpp pixels east", () => {
+  // Independent path: degrees of longitude per ground metre from the WGS84
+  // equatorial circumference; expected pixel offset from metresPerPixel. The
+  // two constants (156543.03392*256 vs 40075016.686) differ by ~5e-8
+  // relative, hence the small tolerance rather than exact equality.
+  const widthM = 1.045;
+  const zoom = 21;
+  const metresPerDegLng =
+    (40075016.686 / 360) * Math.cos((DIAG_LAT * Math.PI) / 180);
+  const dLng = widthM / metresPerDegLng;
+  const p = tilePixel(DIAG_LAT, DIAG_LNG + dLng, DIAG_LAT, DIAG_LNG, zoom);
+  const mpp = metresPerPixel(DIAG_LAT, zoom);
+  assert.ok(p !== null && mpp !== null);
+  const expected = 320 + widthM / mpp;
+  assert.ok(
+    Math.abs(p.px - expected) < 1e-4,
+    `px ${p.px} vs expected ${expected}`,
+  );
+  assert.ok(Math.abs(p.py - 180) < 1e-9, `py moved: ${p.py}`);
+});
+
+test("diagram STEP 1: out-of-range and non-finite inputs return null, never NaN", () => {
+  assert.equal(projectWebMercator(86, DIAG_LNG, 19), null, "lat 86");
+  assert.equal(projectWebMercator(-85.1, DIAG_LNG, 19), null, "lat -85.1");
+  assert.equal(projectWebMercator(NaN, DIAG_LNG, 19), null);
+  assert.equal(projectWebMercator(DIAG_LAT, Infinity, 19), null);
+  assert.equal(projectWebMercator(DIAG_LAT, DIAG_LNG, NaN), null);
+  assert.equal(metresPerPixel(NaN, 19), null);
+  assert.equal(metresPerPixel(90, 19), null, "cos(90°) would zero the scale");
+  assert.equal(metresPerPixel(DIAG_LAT, Infinity), null);
+  assert.equal(worldSizePx(NaN), null);
+  assert.equal(tilePixel(NaN, DIAG_LNG, DIAG_LAT, DIAG_LNG, 19), null);
+  assert.equal(tilePixel(DIAG_LAT, DIAG_LNG, 86, DIAG_LNG, 19), null, "bad centre");
+});
+
+test("diagram: fitZoomForBuilding — Bishops-sized box fits tight, huge box floors at 17, junk is null", () => {
+  const centre = { lat: -34.9258552, lng: 138.6471519 };
+  const bbox = {
+    ne: gp(-34.9257983, 138.6472459),
+    sw: gp(-34.925898, 138.6470736),
+  };
+  const zoom = fitZoomForBuilding(bbox, centre);
+  assert.ok(zoom !== null && Number.isInteger(zoom) && zoom >= 17 && zoom <= 21);
+  // At the chosen zoom every corner sits inside the 15%-padded frame…
+  const corners = [
+    [bbox.ne.latitude, bbox.ne.longitude],
+    [bbox.ne.latitude, bbox.sw.longitude],
+    [bbox.sw.latitude, bbox.ne.longitude],
+    [bbox.sw.latitude, bbox.sw.longitude],
+  ];
+  for (const [lat, lng] of corners) {
+    const p = tilePixel(lat, lng, centre.lat, centre.lng, zoom!);
+    assert.ok(
+      p !== null &&
+        p.px >= 96 && p.px <= 544 &&
+        p.py >= 54 && p.py <= 306,
+      `corner outside padded frame at zoom ${zoom}: ${JSON.stringify(p)}`,
+    );
+  }
+  // …and it is the LARGEST such zoom (21 caps the scale).
+  if (zoom! < 21) {
+    const above = corners.some(([lat, lng]) => {
+      const p = tilePixel(lat, lng, centre.lat, centre.lng, zoom! + 1);
+      return (
+        p === null || p.px < 96 || p.px > 544 || p.py < 54 || p.py > 306
+      );
+    });
+    assert.ok(above, `zoom ${zoom! + 1} would also have fitted`);
+  }
+
+  // A whole-street box cannot fit even at 17 — return the widest allowed, 17.
+  const huge = { ne: gp(-34.92, 138.66), sw: gp(-34.93, 138.64) };
+  assert.equal(fitZoomForBuilding(huge, centre), 17);
+
+  assert.equal(fitZoomForBuilding(null, centre), null);
+  assert.equal(fitZoomForBuilding({ ne: "junk" }, centre), null);
+  assert.equal(
+    fitZoomForBuilding({ ne: gp(1, 2), sw: gp(3, 4) }, { lat: NaN, lng: 0 }),
+    null,
+  );
+});
+
+test("diagram STEP 2: explicit segment_index resolves (no centres needed)", () => {
+  const row = diagramRoof({
+    planes: [
+      { azimuth: 0, pitch: 20, segment_index: 0 },
+      { azimuth: 90, pitch: 22, segment_index: 1 },
+    ],
+    segment_bounding_boxes: [],
+  });
+  const res = panelRectangles(row);
+  assert.equal(res.reason, null);
+  assert.equal(res.rects!.length, 3);
+  assert.equal(res.rects![1].rotationDeg, 90, "panel on segment 1 takes plane 1's azimuth");
+});
+
+test("diagram STEP 2: the live shape — no segment_index, centres match the boxes", () => {
+  const res = panelRectangles(diagramRoof());
+  assert.equal(res.reason, null);
+  assert.equal(res.rects!.length, 3);
+  assert.equal(res.rects![0].rotationDeg, 0);
+  assert.equal(res.rects![1].rotationDeg, 90);
+  assert.equal(res.rects![1].segmentIndex, 1);
+});
+
+test("diagram STEP 2: a SKIPPED segment — centre match survives where positional indexing lies", () => {
+  // Google segment 1 was malformed and skipped, so the plane at LIST position
+  // 1 is GOOGLE segment 2. planes[segmentIndex] would hand segment-2 panels a
+  // rotation of 0 (plane 0) or nothing at all — the diagram would look
+  // entirely reasonable and be wrong.
+  const c0 = gp(-34.9258666, 138.647133);
+  const c2 = gp(-34.9258428, 138.6471632);
+  const row = diagramRoof({
+    planes: [
+      { azimuth: 0, pitch: 20, center: c0 },
+      { azimuth: 90, pitch: 22, center: c2 },
+    ],
+    segment_bounding_boxes: [
+      { segment_index: 0, center: c0, boundingBox: null },
+      { segment_index: 2, center: c2, boundingBox: null },
+    ],
+    panels_raw: [
+      { center: gp(-34.925845, 138.64716), orientation: "LANDSCAPE", segmentIndex: 2 },
+    ],
+  });
+  const res = panelRectangles(row);
+  assert.equal(res.reason, null);
+  assert.equal(res.rects!.length, 1);
+  assert.equal(res.rects![0].segmentIndex, 2);
+  assert.equal(
+    res.rects![0].rotationDeg,
+    90,
+    "the segment-2 panel must take the SECOND plane's azimuth (centre match), not a positional guess",
+  );
+});
+
+test("diagram STEP 2: unresolvable and ambiguous joins FAIL CLOSED — reason, never []", () => {
+  // Neither path works: no segment_index, centre matches no box.
+  const orphan = panelRectangles(
+    diagramRoof({
+      planes: [{ azimuth: 0, pitch: 20, center: gp(-34.999, 138.999) }],
+      segment_bounding_boxes: [],
+      panels_raw: [
+        { center: gp(-34.9258508, 138.6471713), orientation: "LANDSCAPE", segmentIndex: 0 },
+      ],
+    }),
+  );
+  assert.equal(orphan.reason, "segment_join_failed");
+  assert.equal(orphan.rects, null, "MUST be null, not an empty array");
+
+  // Two planes claiming the same segment: not exactly one — ambiguous, closed.
+  const ambiguous = panelRectangles(
+    diagramRoof({
+      planes: [
+        { azimuth: 0, pitch: 20, segment_index: 0 },
+        { azimuth: 180, pitch: 22, segment_index: 0 },
+      ],
+    }),
+  );
+  assert.equal(ambiguous.reason, "segment_join_failed");
+
+  // A panel whose segmentIndex is junk.
+  const junkIndex = panelRectangles(
+    diagramRoof({
+      panels_raw: [{ center: gp(-34.9258508, 138.6471713), segmentIndex: "two" }],
+    }),
+  );
+  assert.equal(junkIndex.reason, "segment_join_failed");
+});
+
+test("diagram: orientation swaps which stored dimension is the long on-screen axis", () => {
+  const res = panelRectangles(diagramRoof());
+  assert.equal(res.reason, null);
+  const landscape = res.rects![0];
+  const portrait = res.rects![1];
+  // Convention (stated in lib/worksheet.ts): heightPx is the up-slope axis.
+  // PORTRAIT puts the 1.879 m side up-slope; LANDSCAPE puts it across.
+  assert.ok(landscape.widthPx > landscape.heightPx, "LANDSCAPE: long side across");
+  assert.ok(portrait.heightPx > portrait.widthPx, "PORTRAIT: long side up-slope");
+  const ratio = 1.879 / 1.045;
+  assert.ok(Math.abs(landscape.widthPx / landscape.heightPx - ratio) < 1e-9);
+  assert.ok(Math.abs(portrait.heightPx / portrait.widthPx - ratio) < 1e-9);
+  // And the drawn size is the GOOGLE panel at ground scale: width/mpp pixels.
+  const mpp = metresPerPixel(-34.9258508, 21);
+  if (roofDiagramView(emptyJob({ roof_geometry: [diagramRoof()] })).zoom === 21) {
+    assert.ok(mpp !== null && Math.abs(landscape.widthPx - 1.879 / mpp) < 1e-6);
+  }
+});
+
+test("diagram STEP 3: every named reason, none throwing, none returning []", () => {
+  const dims = panelRectangles(
+    diagramRoof({
+      google_panel_width_m: null,
+      google_panel_height_m: null,
+      google_panel_capacity_w: null,
+    }),
+  );
+  assert.equal(dims.reason, "dimensions_not_stored");
+  assert.equal(dims.rects, null);
+
+  const expired = panelRectangles(
+    diagramRoof({ solar_data_captured_at: daysAgo(31) }),
+  );
+  assert.equal(expired.reason, "solar_data_expired");
+
+  const noPanels = panelRectangles(diagramRoof({ panels_raw: [] }));
+  assert.equal(noPanels.reason, "no_panel_positions");
+
+  const noCoords = panelRectangles(
+    diagramRoof({ building_center: null, lat: null, lng: null }),
+  );
+  assert.equal(noCoords.reason, "no_coordinates");
+
+  // Junk inputs: a reason, never a throw.
+  assert.equal(panelRectangles(null).reason, "no_coordinates");
+  assert.equal(panelRectangles("junk").reason, "no_coordinates");
+  assert.equal(
+    panelRectangles(diagramRoof({ panels_raw: "junk" })).reason,
+    "no_panel_positions",
+  );
+});
+
+test("diagram: roofDiagramView — drawable google row", () => {
+  const view = roofDiagramView(emptyJob({ roof_geometry: [diagramRoof()] }));
+  assert.equal(view.show, true);
+  assert.equal(view.reason, null);
+  assert.equal(view.tileLat, -34.9258552, "tile centred on building_center");
+  assert.equal(view.tileLng, 138.6471519);
+  assert.ok(view.zoom >= 17 && view.zoom <= 21 && Number.isInteger(view.zoom));
+  assert.equal(view.rects.length, 3);
+  assert.equal(view.panelCount, 3);
+  assert.equal(view.panelWidthM, 1.045);
+  assert.equal(view.panelHeightM, 1.879);
+  assert.equal(view.panelCapacityW, 400);
+  assert.ok(view.buildingBox !== null);
+  const box = view.buildingBox!;
+  assert.ok(box.width > 0 && box.height > 0);
+  assert.ok(box.x >= 0 && box.x + box.width <= 640);
+  assert.ok(box.y >= 0 && box.y + box.height <= 360);
+  // Every drawn number is finite — a NaN in an SVG attribute renders nothing.
+  for (const r of view.rects) {
+    assert.ok(
+      [r.cx, r.cy, r.widthPx, r.heightPx, r.rotationDeg].every(Number.isFinite),
+    );
+  }
+});
+
+test("diagram: roofDiagramView — dimensions_not_stored still shows the building box", () => {
+  const view = roofDiagramView(
+    emptyJob({
+      roof_geometry: [
+        diagramRoof({
+          google_panel_width_m: null,
+          google_panel_height_m: null,
+          google_panel_capacity_w: null,
+        }),
+      ],
+    }),
+  );
+  assert.equal(view.show, true);
+  assert.equal(view.reason, "dimensions_not_stored");
+  assert.deepEqual(view.rects, []);
+  assert.ok(view.buildingBox !== null, "the measured extent still draws");
+});
+
+test("diagram: roofDiagramView hides for manual, not-found, expired, junk", () => {
+  const manual = roofDiagramView(
+    emptyJob({ roof_geometry: [diagramRoof({ source: "manual_plans" })] }),
+  );
+  assert.equal(manual.show, false, "a manual roof has no Google layout and no diagram");
+
+  const notFound = roofDiagramView(
+    emptyJob({
+      roof_geometry: [diagramRoof({ found: false, source: null, planes: [] })],
+    }),
+  );
+  assert.equal(notFound.show, false);
+
+  const expired = roofDiagramView(
+    emptyJob({
+      roof_geometry: [diagramRoof({ solar_data_captured_at: daysAgo(31) })],
+    }),
+  );
+  assert.equal(expired.show, false, "never draw a box from deleted data");
+  const tombstoned = roofDiagramView(
+    emptyJob({
+      roof_geometry: [diagramRoof({ solar_data_expired_at: daysAgo(1) })],
+    }),
+  );
+  assert.equal(tombstoned.show, false);
+
+  assert.equal(roofDiagramView(null).show, false);
+  assert.equal(roofDiagramView(emptyJob()).show, false);
+  assert.equal(roofDiagramView({ roof_geometry: "junk" }).show, false);
+});
+
+test("diagram STEP 1: absolute projection matches an independently computed Mercator", () => {
+  // The centre-lands-at-(320,180) check CANNOT catch a sign error in the y
+  // formula: tilePixel subtracts two identical projections, so any monotonic
+  // corruption cancels exactly. Only an ABSOLUTE assertion, against the
+  // formula written out again here, can — this is the red-proof target.
+  const zoom = 19;
+  const size = 256 * 2 ** zoom;
+  const latRad = (DIAG_LAT * Math.PI) / 180;
+  const xExpected = ((DIAG_LNG + 180) / 360) * size;
+  const yExpected =
+    ((1 - Math.log(Math.tan(latRad) + 1 / Math.cos(latRad)) / Math.PI) / 2) *
+    size;
+  const p = projectWebMercator(DIAG_LAT, DIAG_LNG, zoom);
+  assert.ok(p !== null);
+  assert.equal(p.x, xExpected);
+  assert.equal(p.y, yExpected);
+  assert.equal(worldSizePx(zoom), size);
+});
+
+test("diagram: tile scale sharpens pixels only — viewBox and projection are scale-blind", () => {
+  // scale=2 doubles pixel density at the SAME ground coverage. If scale ever
+  // reached the geometry, the overlay would silently shift against the
+  // sharper tile. Guarded two ways: the constants the viewBox is built from
+  // stay 640x360, and NO projection function accepts a scale argument — the
+  // arity assertions fail if anyone threads one through.
+  assert.ok(Number.isInteger(TILE_IMG_SCALE) && TILE_IMG_SCALE >= 1 && TILE_IMG_SCALE <= 2);
+  assert.equal(TILE_W, 640);
+  assert.equal(TILE_H, 360);
+  assert.equal(worldSizePx.length, 1, "worldSizePx(zoom) — no scale");
+  assert.equal(projectWebMercator.length, 3, "projectWebMercator(lat,lng,zoom) — no scale");
+  assert.equal(metresPerPixel.length, 2, "metresPerPixel(lat,zoom) — no scale");
+  assert.equal(tilePixel.length, 5, "tilePixel(lat,lng,cLat,cLng,zoom) — no scale");
+  assert.equal(fitZoomForBuilding.length, 2, "fitZoomForBuilding(bbox,centre) — no scale");
+  assert.equal(panelRectangles.length, 1, "panelRectangles(row) — no scale");
+  assert.equal(roofDiagramView.length, 1, "roofDiagramView(job) — no scale");
+  // And the produced geometry carries no trace of the scale value: the same
+  // fixture projects to the same rectangles whatever the request's pixel
+  // density, because nothing here can even see it.
+  const a = panelRectangles(diagramRoof());
+  const b = panelRectangles(diagramRoof());
+  assert.deepEqual(a, b);
+  assert.equal(a.reason, null);
 });

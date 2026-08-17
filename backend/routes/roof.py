@@ -356,7 +356,11 @@ _AU_LNG = (112.0, 154.0)
 
 @router.get("/api/roof/tile")
 async def roof_tile_endpoint(
-    lat: float, lng: float, zoom: int = 19, caller: Caller = Depends(require_company)
+    lat: float,
+    lng: float,
+    zoom: int = 19,
+    scale: int = 1,
+    caller: Caller = Depends(require_company),
 ):
     """
     Proxy ONE Maps Static satellite tile (D8 Option B). The key lives only in
@@ -374,6 +378,12 @@ async def roof_tile_endpoint(
             status_code=422, detail="lat/lng outside supported bounds (Australia)"
         )
     zoom = max(17, min(21, zoom))
+    # 3.5 prompt 2 refinement: scale=2 doubles pixel density at the SAME ground
+    # coverage (the panel-layout overlay needs a sharp photo at large display
+    # sizes). Verified against Google's SKU definition 2026-08-17: Static Maps
+    # bills per map load; neither size, resolution nor scale is a billing
+    # dimension — scale=2 costs the same as scale=1.
+    scale = max(1, min(2, scale))
 
     key = roof_geometry._api_key()
     if not key:
@@ -385,6 +395,7 @@ async def roof_tile_endpoint(
                 "center": f"{lat},{lng}",
                 "zoom": zoom,
                 "size": "640x360",
+                "scale": scale,
                 "maptype": "satellite",
                 "key": key,
             },

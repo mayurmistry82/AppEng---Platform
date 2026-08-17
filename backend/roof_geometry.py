@@ -451,6 +451,15 @@ def _normalise(data: dict, panel: dict, usability: float) -> dict:
 
         planes.append(
             {
+                # 3.5 prompt 2: GOOGLE'S segment index for this plane — the
+                # enumerate index `i`, NOT len(planes). The loop `continue`s past
+                # a malformed segment, so the plane list position and Google's
+                # segment numbering diverge the moment any segment is skipped,
+                # and panels_raw[].segmentIndex refers to GOOGLE'S numbering.
+                # Joining panels to planes positionally would silently attach
+                # them to the wrong roof face. Additive; older rows lack this
+                # key and are joined by centre match on the frontend instead.
+                "segment_index": i,
                 "azimuth": round(az, 1) if az is not None else None,
                 "pitch": round(pitch, 1) if pitch is not None else None,
                 "area_m2": round(area, 2) if area is not None else None,

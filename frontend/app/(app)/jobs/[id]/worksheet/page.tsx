@@ -7,6 +7,7 @@ import {
   addressRoofView,
   phaseStates,
   resultsBarView,
+  roofDiagramView,
   sectionStates,
   siteDetailsView,
   worksheetErrorCopy,
@@ -83,6 +84,7 @@ export default async function Page({
         phases={phaseStates(job)}
         addressRoof={addressRoofView(job)}
         siteDetails={siteDetailsView(job)}
+        roofDiagram={roofDiagramView(job)}
         jobId={id}
       />
     </div>
