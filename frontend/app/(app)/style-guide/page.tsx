@@ -38,6 +38,7 @@ import {
 } from "@/components/ui/override-drawer";
 import { KpiStrip, KpiTile } from "@/components/ui/kpi-tile";
 import { Notice } from "@/components/ui/notice";
+import { NoticeCaption } from "@/components/ui/notice-caption";
 import { AccuracyMeter } from "@/components/ui/accuracy-meter";
 import { PhaseRailWithLabels } from "@/components/ui/phase-rail";
 import {
@@ -280,6 +281,23 @@ export default function StyleGuidePage() {
           <Notice tone="not-a-real-tone" title="Unknown tone → info">
             Falls back to info rather than throwing.
           </Notice>
+        </div>
+      </Section>
+
+      <Section
+        title="Notice caption"
+        note="The QUIET fifth level (DESIGN.md notice-caption, added 2026-08-17 for 3.6 under D25). A FACT about how the tool works — no border, no fill, no tone, no bold title. Findings always render above captions. The one question: could this ever NOT fire on a job like this one? No → caption."
+      >
+        <div className="flex max-w-xl flex-col gap-2">
+          <Notice tone="caution" title="One of these faces is too steep to be a roof">
+            A finding about THIS job keeps the bordered notice, above every caption.
+          </Notice>
+          <NoticeCaption icon="clock">
+            The photo is 7 years old. Anything built or planted since then will not appear.
+          </NoticeCaption>
+          <NoticeCaption>
+            Solar export channel(s) B1 present — automatically excluded (load profile uses consumption only).
+          </NoticeCaption>
         </div>
       </Section>
 

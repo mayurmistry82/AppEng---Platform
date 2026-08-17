@@ -5,6 +5,7 @@ import { WorksheetBody } from "@/components/worksheet/worksheet-body";
 import { getJob } from "@/lib/job-server";
 import {
   addressRoofView,
+  energyDataView,
   phaseStates,
   resultsBarView,
   roofDiagramView,
@@ -85,6 +86,7 @@ export default async function Page({
         addressRoof={addressRoofView(job)}
         siteDetails={siteDetailsView(job)}
         roofDiagram={roofDiagramView(job)}
+        energyData={energyDataView(job)}
         jobId={id}
       />
     </div>

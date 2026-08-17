@@ -74,6 +74,18 @@ export interface WorksheetSectionSpec {
   /** Checklist row that fills this section — rendered as the body line. */
   builtAt: string;
   complete: (job: JobDetailLike) => boolean;
+  /**
+   * A section that does NOT gate the ones after it (D5). It takes no part in
+   * choosing the active section: an incomplete non-gating section is
+   * "unlocked", never "active", and never locks anything below it. It still
+   * reports its own completeness honestly, and it still appears in its phase
+   * group in order.
+   *
+   * ABSENT OR TRUE = GATES, deliberately: a section added later gates unless
+   * someone says otherwise. A permissive default would silently un-gate a
+   * future required section, which is the worse failure.
+   */
+  gates?: boolean;
 }
 
 /**
@@ -108,6 +120,13 @@ export const SECTIONS: readonly WorksheetSectionSpec[] = [
     title: "Site details",
     phase: "site",
     builtAt: "3.4b",
+    // D5: site-visit fields are "optional, never gating". The section's own
+    // caption promises the same thing on screen ("None of this is needed to
+    // size the job"). Before this flag it was the first incomplete section on
+    // every real job — all four fields are NULL on all six — so it was the
+    // active section and LOCKED the entire Demand phase behind a visit that
+    // had not happened yet. The screen made a promise the unlock rule broke.
+    gates: false,
     complete: (job) =>
       job.storeys != null &&
       job.roof_material != null &&
@@ -334,13 +353,36 @@ export function sectionStates(job: unknown): WorksheetSectionView[] {
       return false;
     }
   });
-  const firstIncomplete = done.indexOf(false);
+  // D5: a NON-GATING section takes no part in the ordering, exactly as a hidden
+  // section takes no part in it. `gates` absent means gating — today's
+  // behaviour for the other ten sections.
+  const gates = visible.map((section) => section.gates !== false);
+
+  // The first incomplete GATING section, as an index into `visible`. -1 when
+  // every gating section is complete. A non-gating section can never be it.
+  let firstIncomplete = -1;
+  for (let i = 0; i < visible.length; i++) {
+    if (gates[i] && !done[i]) {
+      firstIncomplete = i;
+      break;
+    }
+  }
+  // Also counted over GATING sections only: an OPTIONAL section being filled in
+  // early must not by itself un-lock a first pass that has not been gone past.
   const anyLaterComplete =
-    firstIncomplete !== -1 && done.slice(firstIncomplete + 1).some(Boolean);
+    firstIncomplete !== -1 &&
+    visible.some((_section, i) => i > firstIncomplete && gates[i] && done[i]);
 
   return visible.map((section, i) => {
     let state: WorksheetSectionUnlockState;
-    if (done[i]) {
+    if (!gates[i]) {
+      // Honest about ITSELF and nothing else: "complete" only when actually
+      // filled in — never inheriting the all-complete shortcut, which would
+      // claim progress that has not happened. Never "active" (it is not what
+      // to do next) and never "locked" (an installer who has the information
+      // early must always be able to open it).
+      state = done[i] ? "complete" : "unlocked";
+    } else if (done[i]) {
       state = "complete";
     } else if (i === firstIncomplete) {
       state = "active";
@@ -382,13 +424,22 @@ export function groupSectionsByPhase<T extends { phase: string }>(
 }
 
 /**
- * done  — every VISIBLE section in the phase is complete
+ * done  — every GATING visible section in the phase is complete
  * current — the phase contains the active section
  * pending — otherwise
  *
  * 3.3b: counted over the visible list only, so a phase is never stuck pending
  * waiting on a section that is not on screen. On Path E, Optimise holds three
  * sections rather than four and completes when those three are done.
+ *
+ * D5 (2026-08-18): counted over GATING sections, for the same reason and by the
+ * same rule as sectionStates. Site holds Address & roof plus the OPTIONAL Site
+ * details, which is empty on every real job — counting it here would leave the
+ * Site node reading "pending", i.e. not-yet-started, permanently, while the
+ * installer works in Demand below it. The optional section still shows no tick
+ * of its own; what the phase tick means is that the phase's REQUIRED work is
+ * done. A phase holding only optional sections falls back to counting them all,
+ * so it cannot tick before anything has been filled in.
  *
  * An EMPTY phase reports pending, not done: `[].every(...)` is true, so without
  * this guard a phase with nothing in it would render a tick. Unreachable under
@@ -401,7 +452,9 @@ export function phaseStates(
   const states = PHASE_ORDER.map((phase) => {
     const sections = views.filter((v) => v.phase === phase);
     if (sections.length === 0) return "pending";
-    if (sections.every((v) => v.state === "complete")) return "done";
+    const gating = sections.filter((v) => v.gates !== false);
+    const counted = gating.length > 0 ? gating : sections;
+    if (counted.every((v) => v.state === "complete")) return "done";
     if (sections.some((v) => v.state === "active")) return "current";
     return "pending";
   });
@@ -570,6 +623,20 @@ export interface RoofNoticeView {
   tone: "info" | "success" | "caution" | "problem";
   title: string;
   body: string;
+  /**
+   * D25 (2026-08-17, closes F96): notices split on SPECIFICITY, not severity.
+   * "notice"  — a FINDING about THIS job; keeps the bordered Notice.
+   * "caption" — a FACT about how the tool works; renders as the quiet
+   *             NoticeCaption (muted, no border, no fill), always BELOW the
+   *             notices. The one question: could this ever NOT fire on a job
+   *             like this one? No → caption. Yes → notice.
+   * REQUIRED with no default so TypeScript forces every producer to state it —
+   * a future notice cannot silently inherit a level. The classification lives
+   * HERE, in the logic layer, never inside a component.
+   */
+  level: "notice" | "caption";
+  /** Caption glyph only: Info for a method fact, Clock for an age/recency fact. */
+  icon?: "info" | "clock";
 }
 
 export interface AddressRoofView {
@@ -636,15 +703,21 @@ function roofStateNotice(
   source: string | null,
 ): RoofNoticeView | null {
   switch (state) {
+    // D25: the success ticks fire on EVERY job of their kind — method facts,
+    // so captions. Agrees with D24 (the lookup is a prefill awaiting
+    // confirmation) and 3.4c(a)'s planned rework of the tick.
     case "found":
       return {
         tone: "success",
+        level: "caption",
         title: "Roof found",
         body: "Google's aerial imagery found this roof automatically.",
       };
     case "not_found":
+      // Fires on roughly one address in five — it CAN not fire, so a finding.
       return {
         tone: "info",
+        level: "notice",
         title: "No aerial photo out here",
         body: "The aerial imagery doesn't cover this area — that's normal for about one address in five. Entering the roof from plans is the accurate way to do it anyway.",
       };
@@ -653,6 +726,7 @@ function roofStateNotice(
       // the specific reasons render as confidenceNotices below this one.
       return {
         tone: "caution",
+        level: "notice",
         title: "Check this roof before you use it",
         body: "The lookup returned a result, but something about it does not look right. The details are below.",
       };
@@ -660,6 +734,7 @@ function roofStateNotice(
       if (source === "manual_plans") {
         return {
           tone: "success",
+          level: "caption",
           title: "Entered from plans",
           body: "Plans are the most accurate roof source we can get.",
         };
@@ -667,12 +742,14 @@ function roofStateNotice(
       if (source === "manual_site_measure") {
         return {
           tone: "success",
+          level: "caption",
           title: "Entered from a site measure",
           body: "Measured on site by the installer.",
         };
       }
       return {
         tone: "success",
+        level: "caption",
         title: "Estimated",
         body: "A best estimate — refine it from plans when you can.",
       };
@@ -680,6 +757,27 @@ function roofStateNotice(
       return null;
   }
 }
+
+/**
+ * D25 captions previously composed inside address-roof-section.tsx, moved here
+ * because the classification must live in the logic layer. Wording unchanged
+ * (3.4c owns wording). Both are method facts: the multi-dwelling caution is
+ * true of the METHOD on every unit, and the pre-fill caution is true of every
+ * pre-filled form.
+ */
+export const MULTI_DWELLING_CAPTION: RoofNoticeView = {
+  tone: "caution",
+  level: "caption",
+  title: "The roof lookup may not be this dwelling",
+  body: "Google returns the one building nearest the address. On a multi-dwelling site that may not be this one. Check the roof against the plans, and note that a shared roof usually needs body corporate approval.",
+};
+
+export const PREFILL_FROM_LOOKUP_CAPTION: RoofNoticeView = {
+  tone: "caution",
+  level: "caption",
+  title: "These values came from the lookup",
+  body: "They are Google's numbers, not yours. Change what is wrong, and only choose a source below that matches how you actually checked it.",
+};
 
 
 /**
@@ -729,6 +827,7 @@ function confidenceNotices(row: Record<string, unknown>): RoofNoticeView[] {
     const degrees = steepest !== null ? `${Math.round(steepest)}°` : "that angle";
     notices.push({
       tone: "caution",
+      level: "notice",
       title: "One of these faces is too steep to be a roof",
       body: `A roof face at ${degrees} is closer to a wall than a roof, and it is carrying panels in the table below. It is still shown so you can see it — check it against the plans before you rely on this.`,
     });
@@ -736,6 +835,7 @@ function confidenceNotices(row: Record<string, unknown>): RoofNoticeView[] {
   if (causes.delete("no_google_panel_layout")) {
     notices.push({
       tone: "caution",
+      level: "notice",
       title: "Google could not fit any panels on this building",
       body: "Its model placed none at all, so the panel count below was worked out from the roof area alone rather than from a real layout. Treat it as an upper bound and confirm against the plans.",
     });
@@ -748,6 +848,7 @@ function confidenceNotices(row: Record<string, unknown>): RoofNoticeView[] {
   if (tooFewSegments || tooFewPanels) {
     notices.push({
       tone: "caution",
+      level: "notice",
       title: "This may be a newer build than the photo",
       body: "The aerial photo looks like it predates this house, so the roof found may not be the real one. Confirm against the plans.",
     });
@@ -756,6 +857,7 @@ function confidenceNotices(row: Record<string, unknown>): RoofNoticeView[] {
   for (const unknown of causes) {
     notices.push({
       tone: "caution",
+      level: "notice",
       title: "Something about this result looks wrong",
       body: `The lookup flagged "${unknown}", which this version does not have wording for. Check the roof against the plans before relying on it.`,
     });
@@ -898,6 +1000,8 @@ export function addressRoofView(job: unknown): AddressRoofView {
     view.imageryQualityLabel = null;
     view.solarExpiredNotice = {
       tone: "caution",
+      // A finding: the §20.2 expiry fires only when THIS job's data aged out.
+      level: "notice",
       title: "Google's roof data for this job has been deleted",
       body: "Google only lets us keep the aerial roof data for 30 days. The roof sizes below are ours and are unchanged. Refresh to bring back the aerial view and the panel layout.",
     };
@@ -909,6 +1013,11 @@ export function addressRoofView(job: unknown): AddressRoofView {
     const years = view.imageryAgeYears;
     view.staleNotice = {
       tone: "caution",
+      // D25's founding case (F96): every located Australian building returns
+      // imagery dated 2018-11-17, so this fires on 100% of jobs — a method
+      // fact, quiet. Clock, because it is an age fact.
+      level: "caption",
+      icon: "clock",
       title: years !== null ? `The photo is ${years} years old` : "The photo is old",
       body: "Anything built or planted since then will not appear. Worth a check against the plans.",
     };
@@ -1764,4 +1873,232 @@ export function worksheetErrorCopy(
         body: `${endpoint} responded with HTTP ${status}. The backend hit an error — try reloading, and check the backend logs if it persists.`,
       };
   }
+}
+
+// ── Energy data (3.6 prompt 2) ───────────────────────────────────────────────
+//
+// The interval branch of the Energy data section: a pure view over the STORED
+// rows (energyDataView) and a pure mapping of a FRESH upload response
+// (intervalUploadView), both mirroring how addressRoofView is built — total,
+// tolerant of any shape, never throwing. The notice-vs-caption classification
+// for every flag lives HERE (D25), never in the component.
+
+/** Newest row by created_at — the same append-only rule roof_geometry follows. */
+function newestByCreatedAt(
+  rows: readonly Record<string, unknown>[],
+): Record<string, unknown> | null {
+  if (rows.length === 0) return null;
+  let best = rows[0];
+  let bestTime = roofRowTime(rows[0]);
+  for (let i = 1; i < rows.length; i++) {
+    const time = roofRowTime(rows[i]);
+    if (time > bestTime) {
+      best = rows[i];
+      bestTime = time;
+    }
+  }
+  return best;
+}
+
+/**
+ * The tier as an INTEGER or null — C10: `accuracy_tier` is stored as 1/2/3,
+ * never the string "tier_3". A string never becomes a number here, and a
+ * non-integer number is not a tier.
+ */
+function intTier(value: unknown): number | null {
+  return typeof value === "number" && Number.isInteger(value) ? value : null;
+}
+
+function roofStr(value: unknown): string | null {
+  return typeof value === "string" && value !== "" ? value : null;
+}
+
+export interface EnergyDataView {
+  state: "empty" | "have_interval";
+  /** From load_profiles ONLY — never inferred from the presence of a file. */
+  tier: number | null;
+  nmi: string | null;
+  source: string | null;
+  coverageDays: number | null;
+  periodStart: string | null;
+  periodEnd: string | null;
+  notices: RoofNoticeView[];
+}
+
+/**
+ * The stored-state view: the newest interval_data row (append-only, newest
+ * wins) plus the job's single load_profiles row. A job with an interval row
+ * but NO load_profiles row reports tier null — the profile write failed and
+ * showing Tier 3 off the mere presence of a file would be a lie the section's
+ * completeness predicate cannot catch.
+ */
+export function energyDataView(job: unknown): EnergyDataView {
+  const detail = asObject(job);
+  const view: EnergyDataView = {
+    state: "empty",
+    tier: null,
+    nmi: null,
+    source: null,
+    coverageDays: null,
+    periodStart: null,
+    periodEnd: null,
+    notices: [],
+  };
+  const row = newestByCreatedAt(arr(detail.interval_data));
+  const profile = newestByCreatedAt(arr(detail.load_profiles));
+  view.tier = profile ? intTier(profile.accuracy_tier) : null;
+  if (!row) return view;
+
+  view.state = "have_interval";
+  view.nmi = roofStr(row.nmi);
+  view.source = roofStr(row.source);
+  view.coverageDays =
+    typeof row.coverage_days === "number" && Number.isFinite(row.coverage_days)
+      ? row.coverage_days
+      : null;
+  view.periodStart = roofStr(row.period_start);
+  view.periodEnd = roofStr(row.period_end);
+  if (view.tier === null) {
+    // A finding about THIS job: the file is on record but its profile is not.
+    view.notices.push({
+      tone: "caution",
+      level: "notice",
+      title: "The usage profile wasn't recorded",
+      body: "The meter file is on record but its load profile didn't save, so the job's accuracy tier is not set. Upload the file again to re-record it.",
+    });
+  }
+  return view;
+}
+
+/**
+ * D25 classification of one interval-parser flag string. Matching is on the
+ * parser's own wording (interval_parser.py composes these strings), and an
+ * UNRECOGNISED flag becomes a NOTICE — defaulting an unknown to quiet is the
+ * one direction that loses information (the 3.4-C precedent).
+ */
+function classifyIntervalFlag(flag: string): RoofNoticeView {
+  const f = flag.toLowerCase();
+  // Findings about THIS file — bordered notices.
+  if (f.includes("annualised to a full year")) {
+    return { tone: "caution", level: "notice", title: "Less than a full year of data", body: flag };
+  }
+  if (f.includes("day gap")) {
+    return { tone: "caution", level: "notice", title: "There are gaps in this file", body: flag };
+  }
+  if (f.includes("multiple nmis")) {
+    // The parser CHOSE one meter — which home the data belongs to is exactly
+    // the F99 class of mistake.
+    return { tone: "caution", level: "notice", title: "More than one meter in this file", body: flag };
+  }
+  if (f.includes("not fully saved") || f.includes("could not be saved") || f.includes("tier not updated")) {
+    return { tone: "caution", level: "notice", title: "Not fully saved", body: flag };
+  }
+  // Method facts — true of every file of their kind. Quiet captions.
+  if (f.includes("solar export channel")) {
+    return { tone: "info", level: "caption", title: "", body: flag };
+  }
+  if (f.includes("generic csv")) {
+    return { tone: "info", level: "caption", title: "", body: flag };
+  }
+  if (f.includes("actual reads") && f.includes("substituted")) {
+    return { tone: "info", level: "caption", title: "", body: flag };
+  }
+  // Unrecognised → visible caution, never silence.
+  return { tone: "caution", level: "notice", title: "Something to check in this file", body: flag };
+}
+
+export interface IntervalUploadView {
+  ok: boolean;
+  /** The backend's own error string on the ok:false branch, verbatim. */
+  error: string | null;
+  /**
+   * The one-line readout as ordered plain parts, e.g.
+   * ["17,856 half-hours", "372 days", "0.2% filled", "Tier 3"]. Every part is
+   * DERIVED from the response — a figure the response does not carry is
+   * OMITTED from the array, never rendered as 0.
+   */
+  readoutParts: string[];
+  /** Classified flags — findings (level "notice") sorted before captions. */
+  notices: RoofNoticeView[];
+  tier: number | null;
+  persisted: boolean | null;
+  loadProfileSaved: boolean | null;
+}
+
+/**
+ * Map a FRESH /api/interval/upload response — of any shape whatsoever,
+ * including ok:false and undefined — into the readout and classified notices.
+ * Never throws; never assumes `metadata` exists.
+ */
+export function intervalUploadView(response: unknown): IntervalUploadView {
+  const view: IntervalUploadView = {
+    ok: false,
+    error: null,
+    readoutParts: [],
+    notices: [],
+    tier: null,
+    persisted: null,
+    loadProfileSaved: null,
+  };
+  if (typeof response !== "object" || response === null) return view;
+  const r = response as Record<string, unknown>;
+
+  if (r.ok !== true) {
+    view.error =
+      typeof r.error === "string" && r.error
+        ? r.error
+        : "Could not read this file.";
+    return view;
+  }
+  view.ok = true;
+  view.persisted = typeof r.persisted === "boolean" ? r.persisted : null;
+  view.loadProfileSaved =
+    typeof r.load_profile_saved === "boolean" ? r.load_profile_saved : null;
+
+  const metadata =
+    typeof r.metadata === "object" && r.metadata !== null
+      ? (r.metadata as Record<string, unknown>)
+      : {};
+  const load =
+    typeof r.load === "object" && r.load !== null
+      ? (r.load as Record<string, unknown>)
+      : {};
+
+  const coverageDays = roofNum(metadata.coverage_days);
+  const resolutionMinutes = roofNum(metadata.resolution_minutes);
+  // Interval count: coverage_days × intervals-per-day at the file's own
+  // resolution. Without a resolution there is no real count to show — the
+  // response carries no direct interval total, and we never invent one.
+  if (coverageDays !== null && resolutionMinutes !== null && resolutionMinutes > 0) {
+    const intervals = Math.round(coverageDays * (1440 / resolutionMinutes));
+    view.readoutParts.push(
+      `${intervals.toLocaleString("en-AU")} ${resolutionMinutes === 30 ? "half-hours" : "readings"}`,
+    );
+  }
+  if (coverageDays !== null) {
+    view.readoutParts.push(`${coverageDays} days`);
+  }
+  const pctActual = roofNum(metadata.pct_actual);
+  if (pctActual !== null) {
+    // pct_actual is the ACTUAL-reads share; "filled" is its complement. A
+    // missing pct_actual OMITS this part — 0% would be a lie about measured
+    // data.
+    const filled = Math.round((100 - pctActual) * 10) / 10;
+    view.readoutParts.push(`${filled}% filled`);
+  }
+  view.tier = intTier(load.accuracy_tier);
+  if (view.tier !== null) {
+    view.readoutParts.push(`Tier ${view.tier}`);
+  }
+
+  const flags = Array.isArray(r.flags)
+    ? r.flags.filter((f): f is string => typeof f === "string" && f !== "")
+    : [];
+  const classified = flags.map(classifyIntervalFlag);
+  // D25 ordering: every finding above every caption.
+  view.notices = [
+    ...classified.filter((n) => n.level === "notice"),
+    ...classified.filter((n) => n.level === "caption"),
+  ];
+  return view;
 }

@@ -7,6 +7,7 @@ import { Minus } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Notice } from "@/components/ui/notice";
+import { NoticeCaption } from "@/components/ui/notice-caption";
 import { OverrideDrawer } from "@/components/ui/override-drawer";
 import {
   Select,
@@ -27,6 +28,8 @@ import { postJson } from "@/lib/client-api";
 import { clientActionErrorCopy } from "@/lib/jobs";
 import {
   EMPTY_PLANE_FORM_ROW,
+  MULTI_DWELLING_CAPTION,
+  PREFILL_FROM_LOOKUP_CAPTION,
   TILE_H,
   TILE_IMG_SCALE,
   TILE_W,
@@ -36,6 +39,7 @@ import {
   type PlaneFormRow,
   type RoofDiagramReason,
   type RoofDiagramView,
+  type RoofNoticeView,
 } from "@/lib/worksheet";
 import type { ApiErrorKind } from "@/lib/jobs";
 
@@ -560,10 +564,11 @@ export function AddressRoofSection({
       <h3 className="text-h3 text-foreground">{formHeading}</h3>
 
       {prefilledFromLookup ? (
-        <Notice tone="caution" title="These values came from the lookup">
-          They are Google&apos;s numbers, not yours. Change what is wrong, and only
-          choose a source below that matches how you actually checked it.
-        </Notice>
+        // D25: true of every pre-filled form — a method fact, quiet. The object
+        // (and its unchanged wording) lives in lib/worksheet.ts.
+        <NoticeCaption icon={PREFILL_FROM_LOOKUP_CAPTION.icon ?? "info"}>
+          {PREFILL_FROM_LOOKUP_CAPTION.title}. {PREFILL_FROM_LOOKUP_CAPTION.body}
+        </NoticeCaption>
       ) : null}
       {omittedPlanes > 0 ? (
         <Notice tone="caution" title={`Only the first ${MAX_FORM_PLANES} faces are shown`}>
@@ -778,37 +783,22 @@ export function AddressRoofSection({
     <div className="flex flex-col gap-3">
       <p className="text-body text-foreground">{view.address}</p>
 
-      {view.notice ? (
-        <Notice tone={view.notice.tone} title={view.notice.title}>
-          {view.notice.body}
-        </Notice>
-      ) : null}
-      {/* One caution per low-confidence cause (3.4-C), between the state notice
-          and the stale-imagery one. Never hides a number — the plane table below
-          renders unchanged. */}
-      {view.confidenceNotices.map((notice, i) => (
-        <Notice key={`confidence-${i}`} tone={notice.tone} title={notice.title}>
+      {/* D25 ordering: every FINDING (bordered notice) renders above every
+          method-fact CAPTION. The level is decided in lib/worksheet.ts, never
+          here; this block only partitions. Wording untouched (3.4c owns it). */}
+      {(
+        [
+          view.notice,
+          ...view.confidenceNotices,
+          view.solarExpiredNotice,
+        ].filter(
+          (n): n is RoofNoticeView => n !== null && n.level === "notice",
+        )
+      ).map((notice, i) => (
+        <Notice key={`finding-${i}`} tone={notice.tone} title={notice.title}>
           {notice.body}
         </Notice>
       ))}
-      {view.solarExpiredNotice ? (
-        <Notice tone={view.solarExpiredNotice.tone} title={view.solarExpiredNotice.title}>
-          {view.solarExpiredNotice.body}
-        </Notice>
-      ) : null}
-      {showsMultiDwellingCaution ? (
-        <Notice tone="caution" title="The roof lookup may not be this dwelling">
-          Google returns the one building nearest the address. On a
-          multi-dwelling site that may not be this one. Check the roof against
-          the plans, and note that a shared roof usually needs body corporate
-          approval.
-        </Notice>
-      ) : null}
-      {view.staleNotice ? (
-        <Notice tone={view.staleNotice.tone} title={view.staleNotice.title}>
-          {view.staleNotice.body}
-        </Notice>
-      ) : null}
       {view.crossCheck?.mismatch || liveMismatch ? (
         <Notice tone="caution" title="The address geocodes to a different state">
           The job was set up as {view.crossCheck?.jobState ?? liveMismatch?.jobState}, but
@@ -835,6 +825,23 @@ export function AddressRoofSection({
           ) : null}
         </Notice>
       ) : null}
+
+      {/* The quiet captions — method facts, always BELOW every finding (D25).
+          Same objects, same wording; only the level moved them down here. */}
+      {(
+        [
+          view.notice,
+          showsMultiDwellingCaution ? MULTI_DWELLING_CAPTION : null,
+          view.staleNotice,
+        ].filter(
+          (n): n is RoofNoticeView => n !== null && n.level === "caption",
+        )
+      ).map((caption, i) => (
+        <NoticeCaption key={`caption-${i}`} icon={caption.icon ?? "info"}>
+          {caption.title ? `${caption.title}. ` : null}
+          {caption.body}
+        </NoticeCaption>
+      ))}
 
       {view.state !== "none" && view.state !== "not_found" ? thumbnail : null}
       {planeTable}

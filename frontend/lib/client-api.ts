@@ -94,3 +94,73 @@ export async function postJson<T>(
 
   return { ok: true, data: parsed as T };
 }
+
+/**
+ * Multipart POST (3.6) — same ClientResult shape and the same never-throws
+ * contract as postJson, including the 401 branch and the read-body-once-as-
+ * text protection. Added ALONGSIDE postJson (F100): postJson and ApiErrorKind
+ * are untouched, so 3.3c's planned requestJson cannot collide with this.
+ *
+ * DELIBERATELY SETS NO Content-Type HEADER: the browser must generate the
+ * multipart boundary itself. Setting Content-Type by hand omits the boundary,
+ * and the server then silently fails to parse the form — the classic multipart
+ * bug, asserted against in verify-worksheet-logic.ts.
+ */
+export async function postFormData<T>(
+  path: string,
+  form: FormData,
+): Promise<ClientResult<T>> {
+  let response: Response;
+  try {
+    response = await fetch(path, { method: "POST", body: form });
+  } catch {
+    return { ok: false, kind: "network", status: 0, message: `Could not reach ${path}` };
+  }
+
+  let raw = "";
+  try {
+    raw = await response.text();
+  } catch {
+    raw = "";
+  }
+  let parsed: unknown;
+  let parseFailed = false;
+  if (raw === "") {
+    parsed = null;
+  } else {
+    try {
+      parsed = JSON.parse(raw);
+    } catch {
+      parseFailed = true;
+    }
+  }
+
+  if (response.status === 401) {
+    return {
+      ok: false,
+      kind: "auth",
+      status: 401,
+      message: detailOf(parsed) ?? "No active session",
+    };
+  }
+
+  if (parseFailed) {
+    return {
+      ok: false,
+      kind: "parse",
+      status: response.status,
+      message: `${path} returned a response that could not be read`,
+    };
+  }
+
+  if (!response.ok) {
+    return {
+      ok: false,
+      kind: "http",
+      status: response.status,
+      message: detailOf(parsed) ?? `${path} responded ${response.status}`,
+    };
+  }
+
+  return { ok: true, data: parsed as T };
+}

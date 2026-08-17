@@ -27,10 +27,14 @@ import {
   resultsBarDefaultCollapsed,
   resultsBarMaxHeight,
   EMPTY_PLANE_FORM_ROW,
+  MULTI_DWELLING_CAPTION,
+  PREFILL_FROM_LOOKUP_CAPTION,
   TILE_H,
   TILE_IMG_SCALE,
   TILE_W,
   addressRoofView,
+  energyDataView,
+  intervalUploadView,
   azimuthLabel,
   fitZoomForBuilding,
   metresPerPixel,
@@ -49,8 +53,10 @@ import {
   siteDetailsView,
   worksheetErrorCopy,
   type JobDetailLike,
+  type WorksheetSectionSpec,
 } from "../lib/worksheet.ts";
 import type { ApiErrorKind } from "../lib/jobs.ts";
+import { postFormData } from "../lib/client-api.ts";
 
 function unsafe<T>(v: unknown): T {
   return v as T;
@@ -140,7 +146,12 @@ test("fresh job: section 1 active, rest locked, S current", () => {
   const states = sectionStates(emptyJob());
   assert.equal(states[0].state, "active");
   for (let i = 1; i < states.length; i++) {
-    assert.equal(states[i].state, "locked", states[i].id);
+    // D5 (2026-08-18): site-details is NON-GATING, so it is "unlocked" rather
+    // than "locked" even here, with the gating section above it still active —
+    // an optional section must always be openable. Every OTHER section locks
+    // exactly as before.
+    const expected = states[i].id === "site-details" ? "unlocked" : "locked";
+    assert.equal(states[i].state, expected, states[i].id);
   }
   assert.deepEqual(phaseStates(emptyJob()), [
     "current",
@@ -151,12 +162,17 @@ test("fresh job: section 1 active, rest locked, S current", () => {
 });
 
 // e. roof_geometry populated -> 1 complete, 2 active
-test("roof done: section 1 complete, section 2 active", () => {
+test("roof done: roof complete, Site details unlocked, Energy data active (D5)", () => {
   const job = emptyJob({ roof_geometry: [{ created_at: "2026-08-01T00:00:00Z", found: true, planes: [{ panel_count: 12 }] }] });
   const states = sectionStates(job);
   assert.equal(states[0].state, "complete");
-  assert.equal(states[1].state, "active");
-  assert.equal(states[2].state, "locked");
+  // D5: was "active" — the defect. An OPTIONAL section is never the thing to do
+  // next, and never gates what follows.
+  assert.equal(states[1].id, "site-details");
+  assert.equal(states[1].state, "unlocked");
+  assert.equal(states[2].id, "energy-data");
+  assert.equal(states[2].state, "active");
+  assert.equal(states[3].state, "locked");
 });
 
 // f. THE JUMPED-PASS CASE: section 1 incomplete but section 7 complete -> NOTHING locked
@@ -772,7 +788,10 @@ test("not-found row: Address & roof stays ACTIVE, Site current, next locked", ()
   assert.equal(states[0].id, "address-roof");
   assert.equal(states[0].state, "active", "must stay the active section");
   assert.equal(states[1].id, "site-details");
-  assert.equal(states[1].state, "locked", "Site details must stay locked");
+  // D5: was "locked". An optional section stays openable even when the gating
+  // section above it is the active one — it just never becomes active itself.
+  assert.equal(states[1].state, "unlocked", "Site details is optional — never locked");
+  assert.equal(states[2].state, "locked", "the gating section below still locks");
   assert.deepEqual(phaseStates(job), ["current", "pending", "pending", "pending"]);
 });
 
@@ -1084,9 +1103,14 @@ test("siteDetailsView: an out-of-list roof_material survives into the view", () 
 });
 
 test("3.4b changes nothing about section state or completeness (D5)", () => {
-  // A job with a usable roof row and NO site details: Site details is the active
-  // section and the phase rail reads exactly as before this task. Asserted
-  // against the exact pre-change output, not eyeballed.
+  // A job with a usable roof row and NO site details.
+  //
+  // THIS CHECK ORIGINALLY ASSERTED THE DEFECT: it pinned Site details as the
+  // ACTIVE section and the rail as ["current", ...] — the state 3.4b happened
+  // to leave behind — while citing D5, which says these fields are "optional,
+  // never gating". The pin was faithful to the code and wrong about the rule.
+  // Corrected 2026-08-18: an optional section is unlocked, Energy data is the
+  // active one, and the Site phase reads done because its GATING work is done.
   const job = emptyJob({
     roof_geometry: [{ created_at: "2026-08-01T00:00:00Z", found: true, planes: [{ panel_count: 12 }] }],
   });
@@ -1094,9 +1118,10 @@ test("3.4b changes nothing about section state or completeness (D5)", () => {
   assert.equal(states[0].id, "address-roof");
   assert.equal(states[0].state, "complete");
   assert.equal(states[1].id, "site-details");
-  assert.equal(states[1].state, "active");
-  assert.equal(states[2].state, "locked");
-  assert.deepEqual(phaseStates(job), ["current", "pending", "pending", "pending"]);
+  assert.equal(states[1].state, "unlocked");
+  assert.equal(states[2].id, "energy-data");
+  assert.equal(states[2].state, "active");
+  assert.deepEqual(phaseStates(job), ["done", "current", "pending", "pending"]);
 
   // And filling every site field does not tick anything EXTRA beyond the four
   // fields the (unchanged) predicate has always read.
@@ -1744,4 +1769,512 @@ test("diagram: tile scale sharpens pixels only — viewBox and projection are sc
   const b = panelRectangles(diagramRoof());
   assert.deepEqual(a, b);
   assert.equal(a.reason, null);
+});
+
+// ── Notice hierarchy (3.6 prompt 2, D25) + Energy data ───────────────────────
+//
+// D25: notices split on SPECIFICITY. `level` is REQUIRED on RoofNoticeView so
+// every producer states it; these checks prove it structurally by CALLING the
+// producers across their input space — a source grep would pass on a
+// commented-out field.
+
+const REAL_FLAGS = {
+  annualised: "4 months of data (120 days) — annualised to a full year.",
+  gaps: "3 day gap(s) within the period — filled with the average-day profile and excluded from coverage.",
+  substituted:
+    "97.5% of intervals are actual reads; the remainder are substituted/estimated (still used).",
+  solar:
+    "Solar export channel(s) B1 present — automatically excluded (load profile uses consumption only).",
+  nmis: "Multiple NMIs in file (6001234567, 6007654321) — used 6001234567.",
+  csv: "Generic CSV (long layout) — assumed to be consumption (import). If it contains solar export, remove that column before upload.",
+};
+
+function uploadResponse(over: Record<string, unknown> = {}): Record<string, unknown> {
+  return {
+    ok: true,
+    load: { accuracy_tier: 3, confidence_pct: 92 },
+    metadata: {
+      coverage_days: 372,
+      resolution_minutes: 30,
+      pct_actual: 99.8,
+      period_start: "2025-01-01",
+      period_end: "2026-01-07",
+      nmi: "6001234567",
+    },
+    persisted: true,
+    load_profile_saved: true,
+    accuracy_tier_written: 3,
+    flags: [],
+    ...over,
+  };
+}
+
+const intervalRow = (over: Record<string, unknown> = {}): Record<string, unknown> => ({
+  created_at: "2026-08-17T01:00:00Z",
+  nmi: "6001234567",
+  source: "NEM12",
+  period_start: "2025-01-01T00:00:00+00:00",
+  period_end: "2026-01-07T00:00:00+00:00",
+  ...over,
+});
+
+test("D25 check 1: every producer sets level, proven structurally", () => {
+  const collected: unknown[] = [];
+  const roofJobs = [
+    emptyJob({ roof_geometry: [googleRoof()] }),
+    emptyJob({ roof_geometry: [roofRow({ found: false, source: null, planes: [] })] }),
+    emptyJob({
+      roof_geometry: [
+        googleRoof({
+          low_confidence: true,
+          imagery_stale: true,
+          flags: [
+            "low_confidence_implausible_pitch",
+            "low_confidence_no_google_panel_layout",
+            "low_confidence_too_few_segments",
+            "low_confidence_never_seen_before_cause",
+          ],
+        }),
+      ],
+    }),
+    emptyJob({ roof_geometry: [roofRow({ source: "manual_plans" })] }),
+    emptyJob({ roof_geometry: [roofRow({ source: "manual_site_measure" })] }),
+    emptyJob({ roof_geometry: [roofRow({ source: "manual_estimate" })] }),
+    emptyJob({
+      roof_geometry: [googleRoof({ solar_data_captured_at: daysAgo(31) })],
+    }),
+  ];
+  for (const job of roofJobs) {
+    const view = addressRoofView(job);
+    collected.push(view.notice, view.staleNotice, view.solarExpiredNotice);
+    collected.push(...view.confidenceNotices);
+  }
+  collected.push(MULTI_DWELLING_CAPTION, PREFILL_FROM_LOOKUP_CAPTION);
+  collected.push(
+    ...energyDataView(emptyJob({ interval_data: [intervalRow()] })).notices,
+  );
+  collected.push(
+    ...intervalUploadView(
+      uploadResponse({ flags: [...Object.values(REAL_FLAGS), "novel flag"] }),
+    ).notices,
+  );
+  const present = collected.filter((n) => n !== null && n !== undefined);
+  assert.ok(present.length >= 15, `only ${present.length} notices collected`);
+  for (const n of present) {
+    const level = (n as { level?: unknown }).level;
+    assert.ok(
+      level === "notice" || level === "caption",
+      `missing/invalid level on ${JSON.stringify(n)}`,
+    );
+  }
+});
+
+test("D25 check 2: the roof reclassification, item by item", () => {
+  const stale = addressRoofView(
+    emptyJob({ roof_geometry: [googleRoof()] }),
+  ).staleNotice;
+  assert.equal(stale?.level, "caption", "stale imagery fires on 100% of jobs");
+  assert.equal(stale?.icon, "clock", "an age fact carries the clock glyph");
+
+  const conf = addressRoofView(
+    emptyJob({
+      roof_geometry: [
+        googleRoof({
+          low_confidence: true,
+          flags: [
+            "low_confidence_implausible_pitch",
+            "low_confidence_no_google_panel_layout",
+            "low_confidence_too_few_panels",
+            "low_confidence_unrecognised_thing",
+          ],
+        }),
+      ],
+    }),
+  );
+  assert.ok(conf.confidenceNotices.length === 4);
+  for (const n of conf.confidenceNotices) {
+    assert.equal(n.level, "notice", `${n.title} must stay a bordered notice`);
+  }
+  assert.equal(conf.notice?.level, "notice", "low_confidence state stays a notice");
+
+  const notFound = addressRoofView(
+    emptyJob({ roof_geometry: [roofRow({ found: false, source: null, planes: [] })] }),
+  );
+  assert.equal(notFound.notice?.level, "notice", "not_found CAN not fire — a finding");
+
+  const expired = addressRoofView(
+    emptyJob({ roof_geometry: [googleRoof({ solar_data_captured_at: daysAgo(31) })] }),
+  );
+  assert.equal(expired.solarExpiredNotice?.level, "notice");
+
+  // The four success states are method facts — captions (agrees with D24).
+  for (const source of ["manual_plans", "manual_site_measure", "manual_estimate"]) {
+    const v = addressRoofView(emptyJob({ roof_geometry: [roofRow({ source })] }));
+    assert.equal(v.notice?.level, "caption", `${source} tick goes quiet`);
+  }
+  const found = addressRoofView(emptyJob({ roof_geometry: [googleRoof()] }));
+  assert.equal(found.notice?.level, "caption", "'Roof found' goes quiet");
+
+  assert.equal(MULTI_DWELLING_CAPTION.level, "caption");
+  assert.equal(PREFILL_FROM_LOOKUP_CAPTION.level, "caption");
+});
+
+test("D25 check 3: energyDataView is total and newest-wins", () => {
+  assert.equal(energyDataView({}).state, "empty");
+  assert.equal(energyDataView(null).state, "empty");
+  assert.equal(energyDataView(emptyJob({ interval_data: "nope" })).state, "empty");
+
+  const outOfOrder = energyDataView(
+    emptyJob({
+      interval_data: [
+        intervalRow({ created_at: "2026-08-17T09:00:00Z", nmi: "NEWEST" }),
+        intervalRow({ created_at: "2026-08-01T09:00:00Z", nmi: "OLDEST" }),
+      ],
+    }),
+  );
+  assert.equal(outOfOrder.nmi, "NEWEST", "newest by created_at wins, not array order");
+
+  const noProfile = energyDataView(emptyJob({ interval_data: [intervalRow()] }));
+  assert.equal(noProfile.state, "have_interval");
+  assert.equal(noProfile.tier, null, "a file's presence NEVER implies Tier 3");
+  assert.ok(
+    noProfile.notices.some((n) => n.level === "notice"),
+    "the missing profile is a visible finding",
+  );
+
+  const withProfile = energyDataView(
+    emptyJob({
+      interval_data: [intervalRow()],
+      load_profiles: [{ job_id: "j", accuracy_tier: 3, confidence_pct: 92 }],
+    }),
+  );
+  assert.equal(withProfile.tier, 3);
+});
+
+test("D25 check 4: intervalUploadView across every shape", () => {
+  const good = intervalUploadView(uploadResponse());
+  assert.equal(good.ok, true);
+  assert.deepEqual(good.readoutParts, [
+    "17,856 half-hours",
+    "372 days",
+    "0.2% filled",
+    "Tier 3",
+  ]);
+
+  const failed = intervalUploadView({
+    ok: false,
+    error: "No consumption (E) channel found in this NEM12 file.",
+    suggest_tier2_fallback: true,
+  });
+  assert.equal(failed.ok, false);
+  assert.equal(failed.error, "No consumption (E) channel found in this NEM12 file.");
+  assert.deepEqual(failed.readoutParts, []);
+
+  const noMeta = intervalUploadView({ ok: true, load: { accuracy_tier: 3 } });
+  assert.deepEqual(noMeta.readoutParts, ["Tier 3"], "no metadata -> no invented figures");
+
+  const noPct = intervalUploadView(
+    uploadResponse({
+      metadata: { coverage_days: 372, resolution_minutes: 30 },
+    }),
+  );
+  assert.ok(
+    !noPct.readoutParts.some((p) => p.includes("filled")),
+    `missing pct_actual must OMIT the filled figure, got ${JSON.stringify(noPct.readoutParts)}`,
+  );
+
+  assert.equal(intervalUploadView(undefined).ok, false);
+  assert.equal(intervalUploadView("junk").ok, false);
+});
+
+test("D25 check 5: the six real parser flags land on the decided side; unknown -> NOTICE", () => {
+  const view = intervalUploadView(
+    uploadResponse({ flags: [...Object.values(REAL_FLAGS), "a brand new flag"] }),
+  );
+  const byBody = (body: string) => view.notices.find((n) => n.body === body);
+  assert.equal(byBody(REAL_FLAGS.annualised)?.level, "notice", "annualised: THIS file is short");
+  assert.equal(byBody(REAL_FLAGS.gaps)?.level, "notice", "gaps: THIS file has gaps");
+  assert.equal(byBody(REAL_FLAGS.nmis)?.level, "notice", "multiple NMIs: the F99 class");
+  assert.equal(byBody(REAL_FLAGS.solar)?.level, "caption", "solar exclusion: method fact");
+  assert.equal(byBody(REAL_FLAGS.csv)?.level, "caption", "generic CSV: method fact");
+  assert.equal(byBody(REAL_FLAGS.substituted)?.level, "caption", "substituted reads: method fact");
+  assert.equal(byBody("a brand new flag")?.level, "notice", "unknown NEVER defaults to quiet");
+  // D25 ordering inside the returned array: findings before captions.
+  const levels = view.notices.map((n) => n.level);
+  assert.ok(
+    levels.lastIndexOf("notice") < levels.indexOf("caption"),
+    `findings must sort above captions: ${levels.join(",")}`,
+  );
+});
+
+test("D25 check 6: the tier is an integer — 'tier_3' never becomes 3 (C10)", () => {
+  const stringTier = intervalUploadView(
+    uploadResponse({ load: { accuracy_tier: "tier_3" } }),
+  );
+  assert.equal(stringTier.tier, null);
+  assert.ok(!stringTier.readoutParts.some((p) => p.startsWith("Tier")));
+  const storedString = energyDataView(
+    emptyJob({
+      interval_data: [intervalRow()],
+      load_profiles: [{ job_id: "j", accuracy_tier: "tier_3" }],
+    }),
+  );
+  assert.equal(storedString.tier, null);
+});
+
+test("D25 check 7: postFormData sets NO Content-Type header", async () => {
+  const original = globalThis.fetch;
+  let captured: RequestInit | undefined;
+  globalThis.fetch = (async (_input: unknown, init?: RequestInit) => {
+    captured = init;
+    return new Response(JSON.stringify({ ok: true }), {
+      status: 200,
+      headers: { "Content-Type": "application/json" },
+    });
+  }) as typeof fetch;
+  try {
+    const form = new FormData();
+    form.append("job_id", "j1");
+    const result = await postFormData<{ ok: boolean }>("/api/interval/upload", form);
+    assert.equal(result.ok, true);
+    assert.ok(captured, "fetch was called");
+    // No headers at all: the browser derives the multipart boundary itself.
+    // Setting Content-Type by hand omits the boundary and the server silently
+    // fails to parse the form.
+    assert.equal(captured?.headers, undefined, "no headers object may be passed");
+    assert.ok(captured?.body instanceof FormData, "the FormData is the body");
+  } finally {
+    globalThis.fetch = original;
+  }
+});
+
+// ── D5: an OPTIONAL section must not gate the worksheet (2026-08-18) ─────────
+//
+// The defect these checks exist to catch: site-details' predicate requires four
+// fields that are NULL on all six live jobs, so it was `firstIncomplete` on
+// every job, became the ACTIVE section, and LOCKED the entire Demand phase —
+// while its own on-screen caption promised "None of this is needed to size the
+// job". A locked section renders no <summary>, so Energy data could not be
+// opened by mouse OR keyboard on any real job.
+
+/** The live shape: a usable roof, and all four site-detail fields NULL. */
+function liveShapedJob(over: Partial<JobDetailLike> = {}): JobDetailLike {
+  return emptyJob({
+    roof_geometry: [
+      {
+        created_at: "2026-08-14T05:00:00Z",
+        found: true,
+        source: "google_solar",
+        planes: [{ panel_count: 17, kwp: 7.48 }],
+      },
+    ],
+    storeys: null,
+    roof_material: null,
+    dwelling_type: null,
+    electrical_phase: null,
+    ...over,
+  });
+}
+
+const stateOf = (states: readonly { id: string; state: string }[], id: string) =>
+  states.find((s) => s.id === id)?.state;
+
+test("D5 check 1: THE REAL CASE — optional Site details does not lock Demand", () => {
+  const states = sectionStates(liveShapedJob());
+  assert.equal(stateOf(states, "address-roof"), "complete");
+  assert.equal(stateOf(states, "site-details"), "unlocked");
+  assert.equal(
+    stateOf(states, "energy-data"),
+    "active",
+    "Energy data is what the installer should be on — this is the check that would have caught the defect",
+  );
+  assert.equal(stateOf(states, "tariff-network"), "locked");
+});
+
+test("D5 check 2: Site details is NEVER 'active', for any input", () => {
+  const inputs: JobDetailLike[] = [
+    emptyJob(),                                            // nothing at all
+    liveShapedJob(),                                       // no fields
+    liveShapedJob({ storeys: 1 }),                         // one field
+    liveShapedJob({ storeys: 1, roof_material: "tile", dwelling_type: "unit" }), // three of four
+    liveShapedJob({
+      storeys: 1, roof_material: "tile", dwelling_type: "unit", electrical_phase: "single",
+    }),                                                    // all four
+  ];
+  for (const job of inputs) {
+    assert.notEqual(
+      stateOf(sectionStates(job), "site-details"),
+      "active",
+      JSON.stringify({ storeys: job.storeys, phase: job.electrical_phase }),
+    );
+  }
+});
+
+test("D5 check 3: Site details is NEVER 'locked', for any input", () => {
+  const inputs: JobDetailLike[] = [
+    emptyJob(),                                  // Address & roof is the active one
+    liveShapedJob(),
+    emptyJob({ roof_geometry: [{ created_at: "2026-08-01T00:00:00Z", found: false, planes: [] }] }),
+    liveShapedJob({ storeys: 2 }),
+  ];
+  for (const job of inputs) {
+    assert.notEqual(
+      stateOf(sectionStates(job), "site-details"),
+      "locked",
+      "an optional section must always be openable",
+    );
+  }
+});
+
+test("D5 check 4: every GATING section keeps today's behaviour exactly", () => {
+  // The PRE-CHANGE rule, reimplemented here as a reference, so "unchanged" is a
+  // comparison and not an assertion of faith. This is deliberately the old
+  // sequential logic verbatim.
+  function referenceStates(job: unknown): { id: string; state: string }[] {
+    const detail = (typeof job === "object" && job !== null ? job : {}) as JobDetailLike;
+    const visible = sectionsForPath(detail.path);
+    const done = visible.map((section) => {
+      try {
+        return section.complete(detail) === true;
+      } catch {
+        return false;
+      }
+    });
+    const firstIncomplete = done.indexOf(false);
+    const anyLaterComplete =
+      firstIncomplete !== -1 && done.slice(firstIncomplete + 1).some(Boolean);
+    return visible.map((section, i) => ({
+      id: section.id,
+      state: done[i]
+        ? "complete"
+        : i === firstIncomplete
+          ? "active"
+          : anyLaterComplete
+            ? "unlocked"
+            : "locked",
+    }));
+  }
+
+  // With site-details COMPLETE, it is not first-incomplete under either rule, so
+  // the two must agree on every one of the eleven sections.
+  const filled = liveShapedJob({
+    storeys: 1, roof_material: "tile", dwelling_type: "unit", electrical_phase: "single",
+  });
+  assert.deepEqual(
+    sectionStates(filled).map((s) => ({ id: s.id, state: s.state })),
+    referenceStates(filled),
+    "with the optional section filled in, the new rule and the old rule agree exactly",
+  );
+
+  // With it EMPTY, the ONLY differences allowed are site-details itself and the
+  // sections the defect was wrongly locking. Every gating section's state is
+  // checked against a hand-derived expectation:
+  //   address-roof complete -> the first incomplete GATING section is energy-data
+  //   -> energy-data active, everything gating below it locked.
+  const empty = liveShapedJob();
+  assert.deepEqual(
+    sectionStates(empty).map((s) => ({ id: s.id, state: s.state })),
+    [
+      { id: "address-roof", state: "complete" },
+      { id: "site-details", state: "unlocked" },
+      { id: "energy-data", state: "active" },
+      { id: "tariff-network", state: "locked" },
+      { id: "objective-budget", state: "locked" },
+      { id: "equipment-specs", state: "locked" },
+      { id: "solar-sizing", state: "locked" },
+      { id: "battery-sizing", state: "locked" },
+      { id: "results", state: "locked" },
+      { id: "incentives", state: "locked" },
+      { id: "summary-finish", state: "locked" },
+    ],
+  );
+  // ...and EXACTLY TWO sections differ from the old rule: the optional section
+  // itself (active -> unlocked) and the one that should have been active all
+  // along (locked -> active). Everything below was already locked under both
+  // rules and stays locked, so the change is narrower than it looks: the
+  // sections beneath are unlocked by DOING the work, not by this flag.
+  const before = referenceStates(empty);
+  const after = sectionStates(empty).map((s) => ({ id: s.id, state: s.state }));
+  const moved = after
+    .filter((a, i) => a.state !== before[i].state)
+    .map((a) => `${a.id}: ${before[after.indexOf(a)].state} -> ${a.state}`);
+  assert.deepEqual(moved, [
+    "site-details: active -> unlocked",
+    "energy-data: locked -> active",
+  ]);
+});
+
+test("D5 check 5: all gating complete + Site details empty -> unlocked, NOT complete", () => {
+  const allDone = liveShapedJob({
+    bills: [{ bill_id: "b1" }],
+    tariffs: [{ tariff_id: "t1" }],
+    sizing_results: [{ solar_kw: 6.6, battery_kwh: 10 }],
+    financial_results: [{ payback_years: 7 }],
+    status: "sized",
+  });
+  const states = sectionStates(allDone);
+  assert.equal(
+    stateOf(states, "site-details"),
+    "unlocked",
+    "it has NOT been filled in and must never inherit the all-complete shortcut",
+  );
+  assert.notEqual(stateOf(states, "site-details"), "complete");
+});
+
+test("D5 check 6: `gates` absent means GATING — the default is the safe one", () => {
+  // A section that omits the field must still lock what follows. Asserted on a
+  // local spec array so the real catalogue is untouched.
+  const specs: WorksheetSectionSpec[] = [
+    { id: "a", title: "A", phase: "site", builtAt: "x", complete: () => true },
+    { id: "b", title: "B", phase: "site", builtAt: "x", complete: () => false }, // no `gates`
+    { id: "c", title: "C", phase: "demand", builtAt: "x", complete: () => false },
+  ];
+  assert.equal(specs[1].gates, undefined, "the fixture really does omit the field");
+  // Mirrors sectionStates' rule over this array: b gates (absent = true), so it
+  // is first-incomplete -> active, and c locks behind it.
+  const gates = specs.map((s) => s.gates !== false);
+  assert.deepEqual(gates, [true, true, true]);
+  // And the catalogue itself: exactly ONE section is non-gating.
+  const nonGating = SECTIONS.filter((s) => s.gates === false).map((s) => s.id);
+  assert.deepEqual(nonGating, ["site-details"]);
+  for (const s of SECTIONS) {
+    if (s.id !== "site-details") {
+      assert.notEqual(s.gates, false, `${s.id} must keep gating`);
+    }
+  }
+});
+
+test("D5 check 7: junk inputs behave as before — no throw, shape unchanged", () => {
+  for (const junk of [null, undefined, "x", 42, [], { path: "ZZZ" }]) {
+    const states = sectionStates(junk);
+    assert.ok(Array.isArray(states), `${String(junk)} returned a non-array`);
+    assert.equal(states.length, 11, `${String(junk)} changed the visible count`);
+    for (const s of states) {
+      assert.ok(
+        ["locked", "active", "complete", "unlocked"].includes(s.state),
+        `${s.id} -> ${s.state}`,
+      );
+    }
+    assert.doesNotThrow(() => phaseStates(junk));
+  }
+});
+
+test("D5 check 8: the phase rail for the real case is coherent", () => {
+  // Site's GATING work (the roof) is done, so the node ticks; the optional
+  // section still shows no tick of its own. Demand holds the active section.
+  // Before this fix the rail read ["current", "pending", ...] with Demand
+  // unreachable; it must never regress to Site "pending" while Demand is
+  // "current", which would read as a phase that was never started.
+  assert.deepEqual(phaseStates(liveShapedJob()), ["done", "current", "pending", "pending"]);
+  // A fresh job is unchanged: Site is where the work is.
+  assert.deepEqual(phaseStates(emptyJob()), ["current", "pending", "pending", "pending"]);
+  // Filling the optional fields changes no phase state.
+  assert.deepEqual(
+    phaseStates(
+      liveShapedJob({
+        storeys: 1, roof_material: "tile", dwelling_type: "unit", electrical_phase: "single",
+      }),
+    ),
+    ["done", "current", "pending", "pending"],
+  );
 });

@@ -9,10 +9,12 @@ import {
 } from "@/components/ui/phase-rail";
 import { WorksheetSection } from "@/components/ui/worksheet-section";
 import { AddressRoofSection } from "@/components/worksheet/address-roof-section";
+import { EnergyDataSection } from "@/components/worksheet/energy-data-section";
 import { SiteDetailsSection } from "@/components/worksheet/site-details-section";
 import {
   groupSectionsByPhase,
   type AddressRoofView,
+  type EnergyDataView,
   type RoofDiagramView,
   type SiteDetailsView,
   type WorksheetSectionUnlockState,
@@ -67,6 +69,7 @@ export function WorksheetBody({
   addressRoof,
   siteDetails,
   roofDiagram,
+  energyData,
   jobId,
 }: {
   sections: readonly WorksheetBodySection[];
@@ -79,6 +82,8 @@ export function WorksheetBody({
   siteDetails?: SiteDetailsView;
   /** 3.5 prompt 2: Google's indicative panel layout — pass-through only. */
   roofDiagram?: RoofDiagramView;
+  /** 3.6 prompt 2: the Energy data section's stored-state view. */
+  energyData?: EnergyDataView;
   jobId?: string;
 }) {
   const [openIds, setOpenIds] = React.useState<Record<string, boolean>>(() => {
@@ -121,6 +126,8 @@ export function WorksheetBody({
         />
       ) : section.id === "site-details" && siteDetails && jobId ? (
         <SiteDetailsSection view={siteDetails} jobId={jobId} />
+      ) : section.id === "energy-data" && energyData && jobId ? (
+        <EnergyDataSection view={energyData} jobId={jobId} />
       ) : (
         <p className="text-caption text-muted-foreground">
           Built at {section.builtAt}
