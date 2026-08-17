@@ -167,6 +167,17 @@ def _persist(
         "period_start": parsed.get("period_start"),
         "period_end": parsed.get("period_end"),
         "parsed_series_ref": refs["parsed_series_ref"],
+        # 3.6 follow-up: the parser's own data-quality numbers, persisted so
+        # the readout survives a page load. coverage_days counts dates that
+        # actually carry data — the period SPAN overstates it on gappy files,
+        # which is why it is stored rather than recomputed. interval_minutes is
+        # the INTEGER twin of the display-text `resolution`, which stays as-is
+        # for the legacy readers. Insert and update share this dict, so a
+        # re-upload refreshes all four.
+        "coverage_days": parsed.get("coverage_days"),
+        "gap_days": parsed.get("gap_days"),
+        "pct_actual": parsed.get("pct_actual"),
+        "interval_minutes": parsed.get("resolution_minutes"),
     }
     written, err = _upsert_interval_row(client, job_id, fields)
     if err:

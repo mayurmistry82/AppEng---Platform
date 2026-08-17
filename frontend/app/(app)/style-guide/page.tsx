@@ -39,6 +39,8 @@ import {
 import { KpiStrip, KpiTile } from "@/components/ui/kpi-tile";
 import { Notice } from "@/components/ui/notice";
 import { NoticeCaption } from "@/components/ui/notice-caption";
+import { LoadPreviewStrip } from "@/components/worksheet/load-preview-strip";
+import { loadPreviewView } from "@/lib/worksheet";
 import { AccuracyMeter } from "@/components/ui/accuracy-meter";
 import { PhaseRailWithLabels } from "@/components/ui/phase-rail";
 import {
@@ -298,6 +300,21 @@ export default function StyleGuidePage() {
           <NoticeCaption>
             Solar export channel(s) B1 present — automatically excluded (load profile uses consumption only).
           </NoticeCaption>
+        </div>
+      </Section>
+
+      <Section
+        title="Load preview strip"
+        note="3.6 prompt 3 — 24 hand-drawn SVG bars from the profile's own weights, chart tokens only, no chart library (F47). The flat case names NO peak: deriving a peak from Tier 1's [1.0]×24 would be a confident fabrication. aria-label states the shape in words."
+      >
+        <div className="flex max-w-xl flex-col gap-4">
+          <LoadPreviewStrip
+            view={loadPreviewView([
+              0.3, 0.3, 0.3, 0.3, 0.3, 0.3, 0.9, 1.3, 1.1, 1.1, 1.1, 1.1,
+              1.2, 1.2, 0.9, 0.9, 0.9, 1.2, 1.8, 2.0, 1.8, 1.4, 0.6, 0.6,
+            ])}
+          />
+          <LoadPreviewStrip view={loadPreviewView(Array.from({ length: 24 }, () => 1))} />
         </div>
       </Section>
 

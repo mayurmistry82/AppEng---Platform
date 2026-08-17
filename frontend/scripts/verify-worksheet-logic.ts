@@ -32,9 +32,25 @@ import {
   TILE_H,
   TILE_IMG_SCALE,
   TILE_W,
+  FLAT_PROFILE_TOLERANCE,
+  SURVEY_OPTIONS,
   addressRoofView,
+  billAddressCheck,
+  billAddressNotice,
+  billParseView,
   energyDataView,
   intervalUploadView,
+  isFlatProfile,
+  loadPreviewView,
+  surveyComplete,
+  surveyPayload,
+  surveyView,
+  demandStatusLine,
+  intervalReadoutParts,
+  tierFor,
+  tierMismatchNotice,
+  typedUsageError,
+  usagePlausibilityNotice,
   azimuthLabel,
   fitZoomForBuilding,
   metresPerPixel,
@@ -57,6 +73,7 @@ import {
 } from "../lib/worksheet.ts";
 import type { ApiErrorKind } from "../lib/jobs.ts";
 import { postFormData } from "../lib/client-api.ts";
+import * as worksheetModule from "../lib/worksheet.ts";
 
 function unsafe<T>(v: unknown): T {
   return v as T;
@@ -1997,7 +2014,16 @@ test("D25 check 5: the six real parser flags land on the decided side; unknown -
   assert.equal(byBody(REAL_FLAGS.nmis)?.level, "notice", "multiple NMIs: the F99 class");
   assert.equal(byBody(REAL_FLAGS.solar)?.level, "caption", "solar exclusion: method fact");
   assert.equal(byBody(REAL_FLAGS.csv)?.level, "caption", "generic CSV: method fact");
-  assert.equal(byBody(REAL_FLAGS.substituted)?.level, "caption", "substituted reads: method fact");
+  // Item 0 (3.6 prompt 3): CORRECTED from "caption". The flag only fires when
+  // THIS file has substituted reads — 100%-actual files produce no flag — so by
+  // D25's question it is a finding. Prompt 2 classified it quiet in error.
+  const substituted = byBody(REAL_FLAGS.substituted);
+  assert.equal(substituted?.level, "notice", "substituted reads: a finding about THIS file");
+  assert.equal(substituted?.tone, "caution");
+  assert.ok(
+    typeof substituted?.title === "string" && substituted.title.length > 0,
+    "a notice needs a real title — the caption form had an empty one",
+  );
   assert.equal(byBody("a brand new flag")?.level, "notice", "unknown NEVER defaults to quiet");
   // D25 ordering inside the returned array: findings before captions.
   const levels = view.notices.map((n) => n.level);
@@ -2277,4 +2303,570 @@ test("D5 check 8: the phase rail for the real case is coherent", () => {
     ),
     ["done", "current", "pending", "pending"],
   );
+});
+
+// ── Bill + survey + preview + tier step-down (3.6 prompt 3) ──────────────────
+
+function billResponse(over: Record<string, unknown> = {}): Record<string, unknown> {
+  return {
+    ok: true,
+    parsed: {
+      total_kwh: 8240,
+      billing_period_days: 91,
+      daily_avg_kwh: 90.5,
+      retailer: "Origin Energy",
+      property_address: "14 Frome St, Adelaide SA 5000, Australia",
+      tariff_structured: { tariff_type: "tou" },
+      parse_confidence: { total_kwh: 0.95, billing_period_days: 0.9 },
+      ...((over.parsed as Record<string, unknown>) ?? {}),
+    },
+    raw_file_path: "bills/x.pdf",
+    bill_id: "b1",
+    persisted: true,
+    ...Object.fromEntries(Object.entries(over).filter(([k]) => k !== "parsed")),
+  };
+}
+
+test("3.6/3 check 2: billAddressCheck is quiet unless there is positive evidence", () => {
+  // a. formatting-only differences -> match
+  assert.equal(
+    billAddressCheck(
+      "14 Frome St, Adelaide SA 5000, Australia",
+      "14 FROME STREET ADELAIDE 5000",
+    ),
+    "match",
+  );
+  // b. different street number -> different_property
+  assert.equal(
+    billAddressCheck("16 Frome St, Adelaide SA 5000", "14 Frome St, Adelaide SA 5000"),
+    "different_property",
+  );
+  // c. different postcode -> different_property
+  assert.equal(
+    billAddressCheck("14 Frome St, Adelaide SA 5000", "14 Frome St, Unley SA 5061"),
+    "different_property",
+  );
+  // d. bill address null / empty / unparseable -> cannot_tell
+  assert.equal(billAddressCheck(null, "14 Frome St, Adelaide SA 5000"), "cannot_tell");
+  assert.equal(billAddressCheck("", "14 Frome St, Adelaide SA 5000"), "cannot_tell");
+  assert.equal(
+    billAddressCheck("the corner shop", "14 Frome St, Adelaide SA 5000"),
+    "cannot_tell",
+  );
+  // e. job address missing a postcode -> cannot_tell
+  assert.equal(
+    billAddressCheck("14 Frome St, Adelaide SA 5000", "14 Frome St, Adelaide"),
+    "cannot_tell",
+  );
+  // f. a unit number on one side only -> cannot_tell, NOT a mismatch
+  assert.equal(
+    billAddressCheck(
+      "Unit 5/53 Bishops Pl, Kensington SA 5068",
+      "53 Bishops Pl, Kensington SA 5068",
+    ),
+    "cannot_tell",
+  );
+  // g. a notice ONLY for different_property
+  assert.notEqual(billAddressNotice("different_property"), null);
+  assert.equal(billAddressNotice("match"), null);
+  assert.equal(billAddressNotice("cannot_tell"), null);
+  assert.equal(billAddressNotice("different_property")?.level, "notice");
+});
+
+test("3.6/3 check 3: parse_confidence absent -> ZERO notices; low -> named; high -> none", () => {
+  const absent = billParseView(
+    billResponse({ parsed: { parse_confidence: undefined } }),
+  );
+  assert.equal(
+    absent.notices.filter((n) => n.title === "This bill was unclear").length,
+    0,
+    "absent is unknown — an unknown must not render as a failure",
+  );
+  const low = billParseView(
+    billResponse({ parsed: { parse_confidence: { total_kwh: 0.3 } } }),
+  );
+  const lowNotices = low.notices.filter((n) => n.title === "This bill was unclear");
+  assert.equal(lowNotices.length, 1);
+  assert.ok(lowNotices[0].body.includes("total usage"), lowNotices[0].body);
+  const high = billParseView(billResponse());
+  assert.equal(
+    high.notices.filter((n) => n.title === "This bill was unclear").length,
+    0,
+  );
+  // The readout derives from what was parsed.
+  assert.deepEqual(high.readoutParts, [
+    "8,240 kWh over 91 days",
+    "Origin Energy",
+    "time of use",
+  ]);
+  // ok:false passes the backend's own error through; junk never throws.
+  assert.equal(billParseView({ ok: false, error: "X" }).error, "X");
+  assert.equal(billParseView(undefined).ok, false);
+  assert.equal(billParseView("junk").ok, false);
+});
+
+test("3.6/3 check 4: THE FLAT PROFILE — flat flag true, peak NULL, never a window", () => {
+  const flat = loadPreviewView(Array.from({ length: 24 }, () => 1.0));
+  assert.equal(flat.ok, true);
+  assert.equal(flat.flat, true);
+  assert.equal(flat.peak, null, "a peak derived from a flat line is a fabrication");
+  assert.ok(flat.ariaLabel.includes("no daily shape"), flat.ariaLabel);
+});
+
+test("3.6/3 check 5: a genuine evening peak returns the right window", () => {
+  const weights = Array.from({ length: 24 }, () => 0.8);
+  weights[18] = 2.5;
+  weights[19] = 3.0;
+  weights[20] = 2.5;
+  const view = loadPreviewView(weights);
+  assert.equal(view.flat, false);
+  assert.ok(view.peak !== null);
+  assert.equal(view.peak.startHour, 18);
+  assert.equal(view.peak.endHour, 20);
+  assert.equal(view.peak.label, "6pm to 9pm");
+  assert.ok(view.ariaLabel.includes("6pm to 9pm"), view.ariaLabel);
+});
+
+test("3.6/3 check 6: isFlatProfile tolerance read from the module, not duplicated", () => {
+  const exactly = Array.from({ length: 24 }, () => 1.0);
+  assert.equal(isFlatProfile(exactly), true);
+  // Within tolerance: spread strictly inside the module's own constant.
+  const inside = exactly.map((w, i) => (i % 2 === 0 ? w + FLAT_PROFILE_TOLERANCE * 0.45 : w - FLAT_PROFILE_TOLERANCE * 0.45));
+  assert.equal(isFlatProfile(inside), true, `spread ${FLAT_PROFILE_TOLERANCE * 0.9} must be flat`);
+  // Just outside: spread just past it.
+  const outside = exactly.map((w, i) => (i % 2 === 0 ? w + FLAT_PROFILE_TOLERANCE * 0.6 : w - FLAT_PROFILE_TOLERANCE * 0.6));
+  assert.equal(isFlatProfile(outside), false, `spread ${FLAT_PROFILE_TOLERANCE * 1.2} must not be flat`);
+});
+
+test("3.6/3 check 7: malformed profiles render NOTHING, never throw", () => {
+  const cases: unknown[] = [
+    Array.from({ length: 23 }, () => 1),
+    Array.from({ length: 25 }, () => 1),
+    [...Array.from({ length: 23 }, () => 1), "x"],
+    null,
+    undefined,
+    { hourly_profile_weights: "junk" },
+    42,
+  ];
+  for (const bad of cases) {
+    const view = loadPreviewView(bad);
+    assert.equal(view.ok, false, JSON.stringify(bad)?.slice(0, 40));
+    assert.deepEqual(view.bars, []);
+    assert.equal(view.peak, null);
+  }
+  // And the object form works when valid.
+  assert.equal(
+    loadPreviewView({ hourly_profile_weights: Array.from({ length: 24 }, () => 1) }).ok,
+    true,
+  );
+});
+
+test("3.6/3 check 9: every NEW notice producer sets level, structurally", () => {
+  const collected: unknown[] = [
+    ...billParseView(
+      billResponse({
+        parsed: {
+          parse_confidence: { total_kwh: 0.1, retailer: 0.2 },
+          billing_period_days: 30,
+        },
+      }),
+    ).notices,
+    billAddressNotice("different_property"),
+  ];
+  const present = collected.filter((n) => n !== null && n !== undefined);
+  assert.ok(present.length >= 4, `${present.length} collected`);
+  for (const n of present) {
+    const level = (n as { level?: unknown }).level;
+    assert.ok(level === "notice" || level === "caption", JSON.stringify(n));
+  }
+  // The thin-period finding fires under the threshold and not over it.
+  const thin = billParseView(billResponse({ parsed: { billing_period_days: 45 } }));
+  assert.ok(thin.notices.some((n) => n.title === "A short billing period"));
+  const fine = billParseView(billResponse({ parsed: { billing_period_days: 91 } }));
+  assert.ok(!fine.notices.some((n) => n.title === "A short billing period"));
+});
+
+test("3.6/3 check 10: option values are routes/load.py's own strings, exactly", () => {
+  assert.deepEqual([...SURVEY_OPTIONS.householdSize], ["1", "2", "3-4", "5+"]);
+  assert.deepEqual(
+    [...SURVEY_OPTIONS.occupancy],
+    ["always_home", "away_weekdays", "shift_work"],
+  );
+  assert.deepEqual(
+    [...SURVEY_OPTIONS.hotWater],
+    ["electric_storage", "heat_pump", "gas", "solar_hws"],
+  );
+  assert.deepEqual([...SURVEY_OPTIONS.appliances], ["ev", "pool_pump", "ducted_ac"]);
+  assert.deepEqual(
+    [...SURVEY_OPTIONS.tariffType],
+    ["single_rate", "tou", "demand", "not_sure"],
+  );
+  // The payload maps to the backend's snake_case field names verbatim.
+  const payload = surveyPayload(
+    {
+      householdSize: "3-4",
+      occupancy: "away_weekdays",
+      hotWater: "heat_pump",
+      appliances: ["ev"],
+      tariffType: "tou",
+    },
+    { dailyAvgKwh: 12.5 },
+  );
+  assert.deepEqual(payload, {
+    household_size: "3-4",
+    occupancy: "away_weekdays",
+    hot_water: "heat_pump",
+    appliances: ["ev"],
+    tariff_type: "tou",
+    annual_kwh: null,
+    daily_avg_kwh: 12.5,
+  });
+  assert.equal(
+    surveyComplete({
+      householdSize: "1", occupancy: "always_home", hotWater: "gas",
+      appliances: [], tariffType: "not_sure",
+    }),
+    true,
+    "an EMPTY appliance list is an answered 'none of these' (D26)",
+  );
+  // surveyView prefills from the stored row and never throws on junk.
+  const prefill = surveyView(
+    emptyJob({
+      surveys: [
+        { created_at: "2026-08-18T00:00:00Z", household_size: "2",
+          occupancy_pattern: "shift_work", hot_water_type: "gas",
+          has_ev: true, has_pool: false },
+      ],
+    }),
+  );
+  assert.equal(prefill.householdSize, "2");
+  assert.deepEqual(prefill.appliances, ["ev"]);
+  // D26: an untouched appliances control is NULL (unanswered), never a
+  // fabricated empty answer — [] would silently complete the survey.
+  assert.equal(surveyView(null).appliances, null);
+});
+
+// ── D26: the tier model the engine actually implements ───────────────────────
+//
+// ROUTE_TIERS mapped a ROUTE to a tier; that model does not exist in
+// routes/load.py. These checks pin the real one: interval → 3; a usage figure
+// is MANDATORY (none → 422, so NO tier); figure + all five answers → 2;
+// figure alone → 1 with a flat profile.
+
+const FULL_ANSWERS = {
+  householdSize: "3-4",
+  occupancy: "away_weekdays",
+  hotWater: "heat_pump",
+  appliances: ["ev"],
+  tariffType: "tou",
+};
+
+test("D26 check 1: tierFor mirrors load.py's four branches, in order", () => {
+  assert.equal(
+    tierFor({
+      hasIntervalProfile: true,
+      usageKwh: null,
+      usageSource: "interval",
+      surveyComplete: false,
+    }),
+    3,
+    "an interval profile short-circuits everything, even with nothing else",
+  );
+  assert.equal(
+    tierFor({
+      hasIntervalProfile: false,
+      usageKwh: 8240,
+      usageSource: "bill",
+      surveyComplete: true,
+    }),
+    2,
+  );
+  assert.equal(
+    tierFor({
+      hasIntervalProfile: false,
+      usageKwh: 8240,
+      usageSource: "typed",
+      surveyComplete: false,
+    }),
+    1,
+  );
+  assert.equal(
+    tierFor({
+      hasIntervalProfile: false,
+      usageKwh: null,
+      usageSource: null,
+      surveyComplete: false,
+    }),
+    null,
+    "no usage figure -> the engine answers 422 — NULL, never a Tier 1 floor",
+  );
+});
+
+test("D26 check 2: THE APPLIANCES TRAP — [] completes, undefined does not", () => {
+  // `appliances is not None` in load.py: an empty list IS an answer.
+  const noneOfThese = { ...FULL_ANSWERS, appliances: [] };
+  assert.equal(surveyComplete(noneOfThese), true);
+  assert.equal(
+    tierFor({
+      hasIntervalProfile: false,
+      usageKwh: 8240,
+      usageSource: "bill",
+      surveyComplete: surveyComplete(noneOfThese),
+    }),
+    2,
+    "no EV and no pool must still reach Tier 2",
+  );
+  const untouched = { ...FULL_ANSWERS, appliances: null };
+  assert.equal(surveyComplete(untouched), false);
+  assert.equal(
+    tierFor({
+      hasIntervalProfile: false,
+      usageKwh: 8240,
+      usageSource: "bill",
+      surveyComplete: surveyComplete(untouched),
+    }),
+    1,
+  );
+});
+
+test("D26 check 3: surveyComplete false when any ONE of the five is missing", () => {
+  assert.equal(surveyComplete(FULL_ANSWERS), true, "the positive control");
+  const drops = [
+    ["householdSize", { ...FULL_ANSWERS, householdSize: null }],
+    ["occupancy", { ...FULL_ANSWERS, occupancy: null }],
+    ["hotWater", { ...FULL_ANSWERS, hotWater: null }],
+    ["tariffType", { ...FULL_ANSWERS, tariffType: null }],
+    ["appliances", { ...FULL_ANSWERS, appliances: null }],
+  ] as const;
+  for (const [field, answers] of drops) {
+    assert.equal(surveyComplete(answers), false, `${field} missing must fail`);
+  }
+});
+
+test("D26 check 4: demandStatusLine states what we HAVE and what comes next", () => {
+  const tier1 = demandStatusLine({
+    hasIntervalProfile: false, usageKwh: 8240, usageSource: "bill", surveyComplete: false,
+  });
+  assert.equal(tier1.tier, 1);
+  assert.ok(tier1.next !== null && tier1.next.includes("five questions"), tier1.next ?? "");
+
+  const tier2 = demandStatusLine({
+    hasIntervalProfile: false, usageKwh: 8240, usageSource: "bill", surveyComplete: true,
+  });
+  assert.equal(tier2.tier, 2);
+  assert.ok(tier2.next !== null && tier2.next.toLowerCase().includes("smart-meter"), tier2.next ?? "");
+
+  const tier3 = demandStatusLine({
+    hasIntervalProfile: true, usageKwh: null, usageSource: "interval", surveyComplete: false,
+  });
+  assert.equal(tier3.tier, 3);
+  assert.equal(tier3.next, null);
+
+  const nothing = demandStatusLine({
+    hasIntervalProfile: false, usageKwh: null, usageSource: null, surveyComplete: false,
+  });
+  assert.equal(nothing.tier, null);
+  assert.ok(nothing.have.toLowerCase().includes("yearly total"), nothing.have);
+});
+
+test("D26 check 5: ROUTE_TIERS is GONE — a stale export is how the wrong model returns", () => {
+  assert.ok(!("ROUTE_TIERS" in worksheetModule), "ROUTE_TIERS must not be exported");
+  assert.ok(
+    !("tierStepDownOptions" in worksheetModule),
+    "tierStepDownOptions carried the same route→tier model and must be gone too",
+  );
+});
+
+test("D26 check 6: a typed figure of 0, -1, NaN, Infinity or a string never makes a call", () => {
+  for (const bad of [0, -1, NaN, Infinity, "8240"]) {
+    const error = typedUsageError(bad);
+    assert.ok(
+      typeof error === "string" && error.length > 0,
+      `${String(bad)} must produce an inline error and no call`,
+    );
+  }
+  assert.equal(typedUsageError(8240), null, "a real positive number passes");
+});
+
+test("D26 check 7: the new producers set level explicitly, structurally", () => {
+  const produced = [
+    usagePlausibilityNotice(worksheetModule.ANNUAL_KWH_PLAUSIBLE_MAX + 1),
+    usagePlausibilityNotice(worksheetModule.ANNUAL_KWH_PLAUSIBLE_MIN - 1),
+    tierMismatchNotice(2, 1),
+  ].filter((n) => n !== null);
+  assert.equal(produced.length, 3);
+  for (const n of produced) {
+    assert.ok(n.level === "notice" || n.level === "caption", JSON.stringify(n));
+  }
+  // Inside the bounds, and for agreeing tiers: NOTHING — quiet by default.
+  assert.equal(usagePlausibilityNotice(8240), null);
+  assert.equal(tierMismatchNotice(2, 2), null);
+  assert.equal(tierMismatchNotice(null, 1), null);
+  assert.equal(tierMismatchNotice(2, null), null);
+});
+
+test("D26 check 8: predicted vs recorded — the RECORDED tier wins, loudly", () => {
+  const notice = tierMismatchNotice(2, 1);
+  assert.ok(notice !== null);
+  assert.equal(notice.level, "notice");
+  assert.ok(
+    notice.body.includes("recorded Tier 1") &&
+      notice.body.includes("the one that counts"),
+    notice.body,
+  );
+});
+
+// ── One readout for fresh and stored (3.6 follow-up) ─────────────────────────
+//
+// The defect: intervalUploadView built the readout from the RESPONSE and
+// energyDataView from a ROW whose quality columns were never written — so the
+// numbers appeared once and vanished on reload. Both now feed ONE builder.
+
+test("readout check 6: the SAME file reads identically from response and from row", () => {
+  // One set of file facts — deliberately WITH GAPS, so the period span (104
+  // days) and the coverage (100 days) are different integers and a span-based
+  // shortcut cannot masquerade as coverage.
+  const facts = {
+    coverage_days: 100,
+    gap_days: 4,
+    pct_actual: 97.5,
+    resolution_minutes: 30,
+    period_start: "2025-01-01",
+    period_end: "2025-04-14",
+  };
+  const fromResponse = intervalUploadView(
+    uploadResponse({
+      metadata: {
+        coverage_days: facts.coverage_days,
+        gap_days: facts.gap_days,
+        pct_actual: facts.pct_actual,
+        resolution_minutes: facts.resolution_minutes,
+        period_start: facts.period_start,
+        period_end: facts.period_end,
+      },
+    }),
+  ).readoutParts;
+  const fromRow = energyDataView(
+    emptyJob({
+      interval_data: [
+        intervalRow({
+          coverage_days: facts.coverage_days,
+          gap_days: facts.gap_days,
+          pct_actual: facts.pct_actual,
+          interval_minutes: facts.resolution_minutes,
+          period_start: facts.period_start,
+          period_end: facts.period_end,
+        }),
+      ],
+      load_profiles: [{ job_id: "j", accuracy_tier: 3, confidence_pct: 92 }],
+    }),
+  ).readoutParts;
+  assert.deepEqual(
+    fromRow,
+    fromResponse,
+    "the stored row and the fresh response MUST produce identical readouts for the same file",
+  );
+  assert.deepEqual(fromResponse, [
+    "4,800 half-hours",
+    "100 days",
+    "4 day gaps",
+    "2.5% filled",
+    "Tier 3",
+  ]);
+});
+
+test("readout check 7: everything null -> empty array, nothing fabricated", () => {
+  assert.deepEqual(
+    intervalReadoutParts({
+      coverageDays: null, gapDays: null, pctActual: null,
+      intervalMinutes: null, tier: null,
+    }),
+    [],
+  );
+});
+
+test("readout check 8: gaps — zero is silence, one is singular, four is plural", () => {
+  const base = { coverageDays: 30, gapDays: 0, pctActual: null, intervalMinutes: null, tier: null };
+  assert.ok(
+    !intervalReadoutParts(base).some((p) => p.includes("gap")),
+    "a zero gap count says nothing",
+  );
+  assert.ok(intervalReadoutParts({ ...base, gapDays: 1 }).includes("1 day gap"));
+  assert.ok(intervalReadoutParts({ ...base, gapDays: 4 }).includes("4 day gaps"));
+});
+
+test("readout check 9: reads — 100 is 'all actual reads', 97.5 is '2.5% filled', null is neither", () => {
+  const base = { coverageDays: null, gapDays: null, intervalMinutes: null, tier: null };
+  assert.ok(
+    intervalReadoutParts({ ...base, pctActual: 100 }).includes("all actual reads"),
+  );
+  assert.ok(
+    intervalReadoutParts({ ...base, pctActual: 97.5 }).includes("2.5% filled"),
+  );
+  const neither = intervalReadoutParts({ ...base, pctActual: null });
+  assert.ok(
+    !neither.some((p) => p.includes("filled") || p.includes("actual reads")),
+    "a missing pct_actual renders NOTHING — 0% would be a lie about measured data",
+  );
+});
+
+test("readout check 10: the interval count derives, labels, and never invents", () => {
+  const base = { gapDays: null, pctActual: null, tier: null };
+  assert.ok(
+    intervalReadoutParts({ ...base, coverageDays: 372, intervalMinutes: 30 })
+      .includes("17,856 half-hours"),
+  );
+  const fifteen = intervalReadoutParts({ ...base, coverageDays: 10, intervalMinutes: 15 });
+  assert.ok(fifteen.includes("960 readings"), fifteen.join("|"));
+  assert.ok(!fifteen.some((p) => p.includes("half-hours")));
+  const noRes = intervalReadoutParts({ ...base, coverageDays: 372, intervalMinutes: null });
+  assert.ok(
+    !noRes.some((p) => p.includes("half-hours") || p.includes("readings")),
+    "no resolution -> no interval count; the day count still shows",
+  );
+  assert.ok(noRes.includes("372 days"));
+});
+
+test("readout check 11: energyDataView — full columns full readout, null columns tier only", () => {
+  const full = energyDataView(
+    emptyJob({
+      interval_data: [
+        intervalRow({
+          coverage_days: 372, gap_days: 0, pct_actual: 100, interval_minutes: 30,
+        }),
+      ],
+      load_profiles: [{ job_id: "j", accuracy_tier: 3 }],
+    }),
+  );
+  assert.deepEqual(full.readoutParts, [
+    "17,856 half-hours", "372 days", "all actual reads", "Tier 3",
+  ]);
+  // A pre-migration row: all four null -> only the tier, nothing fabricated.
+  const bare = energyDataView(
+    emptyJob({
+      interval_data: [intervalRow()],
+      load_profiles: [{ job_id: "j", accuracy_tier: 3 }],
+    }),
+  );
+  assert.deepEqual(bare.readoutParts, ["Tier 3"]);
+  assert.doesNotThrow(() => energyDataView(emptyJob({ interval_data: [intervalRow({ coverage_days: "junk" })] })));
+});
+
+test("readout check 12: negative and non-numeric values are MISSING, not zero", () => {
+  const bads: [string, unknown][] = [
+    ["coverage_days", -1], ["coverage_days", "372"],
+    ["gap_days", -4], ["gap_days", NaN],
+    ["pct_actual", -5], ["pct_actual", "97.5"],
+    ["interval_minutes", -30], ["interval_minutes", Infinity],
+  ];
+  for (const [column, value] of bads) {
+    const view = energyDataView(
+      emptyJob({ interval_data: [intervalRow({ [column]: value })] }),
+    );
+    assert.deepEqual(
+      view.readoutParts,
+      view.tier !== null ? [`Tier ${view.tier}`] : [],
+      `${column}=${String(value)} must read as missing`,
+    );
+  }
 });

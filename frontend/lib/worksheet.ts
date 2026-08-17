@@ -1913,6 +1913,72 @@ function roofStr(value: unknown): string | null {
   return typeof value === "string" && value !== "" ? value : null;
 }
 
+/** A quality number off a row or response: finite and non-negative, else MISSING
+ *  — a negative or junk value must read as absent, never as zero. */
+function qualityNum(value: unknown): number | null {
+  return typeof value === "number" && Number.isFinite(value) && value >= 0
+    ? value
+    : null;
+}
+
+/** A tier narrowed to the three real values, else null. */
+function knownTier(value: unknown): 1 | 2 | 3 | null {
+  return value === 1 || value === 2 || value === 3 ? value : null;
+}
+
+export interface IntervalFacts {
+  coverageDays: number | null;
+  gapDays: number | null;
+  pctActual: number | null;
+  intervalMinutes: number | null;
+  tier: 1 | 2 | 3 | null;
+}
+
+/**
+ * THE ONE readout builder (3.6 follow-up). There were two — one over the
+ * upload response, one over the stored row — and that duplication is exactly
+ * why the readout could vanish on reload: the row path read columns that were
+ * never written. Both callers now build an IntervalFacts and call this;
+ * NEITHER formats a part itself, so the fresh and the stored readout cannot
+ * disagree about the same file.
+ *
+ * Every part is DERIVED or OMITTED, never invented: a null renders as nothing,
+ * not as 0 days or 0% filled. And coverageDays is the parser's count of dates
+ * that CARRY DATA — never the period span, which overstates on gappy files.
+ */
+export function intervalReadoutParts(facts: IntervalFacts): string[] {
+  const parts: string[] = [];
+  if (
+    facts.coverageDays !== null &&
+    facts.intervalMinutes !== null &&
+    facts.intervalMinutes > 0
+  ) {
+    const count = Math.round(facts.coverageDays * (1440 / facts.intervalMinutes));
+    parts.push(
+      `${count.toLocaleString("en-AU")} ${facts.intervalMinutes === 30 ? "half-hours" : "readings"}`,
+    );
+  }
+  if (facts.coverageDays !== null) {
+    parts.push(`${facts.coverageDays} days`);
+  }
+  // A zero gap count says NOTHING — silence is the correct rendering of no gaps.
+  if (facts.gapDays !== null && facts.gapDays > 0) {
+    parts.push(`${facts.gapDays} day gap${facts.gapDays === 1 ? "" : "s"}`);
+  }
+  if (facts.pctActual !== null && facts.pctActual <= 100) {
+    if (facts.pctActual === 100) {
+      parts.push("all actual reads");
+    } else {
+      const filled = Math.round((100 - facts.pctActual) * 10) / 10;
+      parts.push(`${filled}% filled`);
+    }
+  }
+  if (facts.tier !== null) {
+    parts.push(`Tier ${facts.tier}`);
+  }
+  return parts;
+}
+
 export interface EnergyDataView {
   state: "empty" | "have_interval";
   /** From load_profiles ONLY — never inferred from the presence of a file. */
@@ -1920,9 +1986,20 @@ export interface EnergyDataView {
   nmi: string | null;
   source: string | null;
   coverageDays: number | null;
+  gapDays: number | null;
+  pctActual: number | null;
+  intervalMinutes: number | null;
   periodStart: string | null;
   periodEnd: string | null;
+  /** From intervalReadoutParts — the SAME function the fresh upload uses. */
+  readoutParts: string[];
   notices: RoofNoticeView[];
+  /** The job's address (raw, null when absent) — for the bill cross-check. */
+  address: string | null;
+  /** The stored profile's 24 weights when valid, for the preview strip. */
+  profileWeights: number[] | null;
+  /** Pre-filled survey answers from the stored surveys row. */
+  survey: SurveyAnswers;
 }
 
 /**
@@ -1940,24 +2017,52 @@ export function energyDataView(job: unknown): EnergyDataView {
     nmi: null,
     source: null,
     coverageDays: null,
+    gapDays: null,
+    pctActual: null,
+    intervalMinutes: null,
     periodStart: null,
     periodEnd: null,
+    readoutParts: [],
     notices: [],
+    address: null,
+    profileWeights: null,
+    survey: { ...EMPTY_SURVEY_ANSWERS },
   };
+  view.survey = surveyView(detail);
+  const customer = arr(detail.customer);
+  const address = customer[0]?.property_address_full;
+  view.address = typeof address === "string" && address.trim() ? address : null;
   const row = newestByCreatedAt(arr(detail.interval_data));
   const profile = newestByCreatedAt(arr(detail.load_profiles));
   view.tier = profile ? intTier(profile.accuracy_tier) : null;
+  if (profile) {
+    const weights = profile.hourly_profile_weights;
+    if (
+      Array.isArray(weights) &&
+      weights.length === 24 &&
+      weights.every((w) => typeof w === "number" && Number.isFinite(w))
+    ) {
+      view.profileWeights = weights as number[];
+    }
+  }
   if (!row) return view;
 
   view.state = "have_interval";
   view.nmi = roofStr(row.nmi);
   view.source = roofStr(row.source);
-  view.coverageDays =
-    typeof row.coverage_days === "number" && Number.isFinite(row.coverage_days)
-      ? row.coverage_days
-      : null;
+  view.coverageDays = qualityNum(row.coverage_days);
+  view.gapDays = qualityNum(row.gap_days);
+  view.pctActual = qualityNum(row.pct_actual);
+  view.intervalMinutes = qualityNum(row.interval_minutes);
   view.periodStart = roofStr(row.period_start);
   view.periodEnd = roofStr(row.period_end);
+  view.readoutParts = intervalReadoutParts({
+    coverageDays: view.coverageDays,
+    gapDays: view.gapDays,
+    pctActual: view.pctActual,
+    intervalMinutes: view.intervalMinutes,
+    tier: knownTier(view.tier),
+  });
   if (view.tier === null) {
     // A finding about THIS job: the file is on record but its profile is not.
     view.notices.push({
@@ -2001,7 +2106,16 @@ function classifyIntervalFlag(flag: string): RoofNoticeView {
     return { tone: "info", level: "caption", title: "", body: flag };
   }
   if (f.includes("actual reads") && f.includes("substituted")) {
-    return { tone: "info", level: "caption", title: "", body: flag };
+    // RECLASSIFIED 3.6 prompt 3 (Item 0): this flag only exists when THIS file
+    // contains substituted/estimated reads — a NEM12 that is 100% actual
+    // produces no flag at all, so by D25's own question it CAN not fire and is
+    // a FINDING, not a method fact. Prompt 2 shipped it as a caption in error.
+    return {
+      tone: "caution",
+      level: "notice",
+      title: "Some readings are estimates, not measurements",
+      body: flag,
+    };
   }
   // Unrecognised → visible caution, never silence.
   return { tone: "caution", level: "notice", title: "Something to check in this file", body: flag };
@@ -2064,32 +2178,17 @@ export function intervalUploadView(response: unknown): IntervalUploadView {
       ? (r.load as Record<string, unknown>)
       : {};
 
-  const coverageDays = roofNum(metadata.coverage_days);
-  const resolutionMinutes = roofNum(metadata.resolution_minutes);
-  // Interval count: coverage_days × intervals-per-day at the file's own
-  // resolution. Without a resolution there is no real count to show — the
-  // response carries no direct interval total, and we never invent one.
-  if (coverageDays !== null && resolutionMinutes !== null && resolutionMinutes > 0) {
-    const intervals = Math.round(coverageDays * (1440 / resolutionMinutes));
-    view.readoutParts.push(
-      `${intervals.toLocaleString("en-AU")} ${resolutionMinutes === 30 ? "half-hours" : "readings"}`,
-    );
-  }
-  if (coverageDays !== null) {
-    view.readoutParts.push(`${coverageDays} days`);
-  }
-  const pctActual = roofNum(metadata.pct_actual);
-  if (pctActual !== null) {
-    // pct_actual is the ACTUAL-reads share; "filled" is its complement. A
-    // missing pct_actual OMITS this part — 0% would be a lie about measured
-    // data.
-    const filled = Math.round((100 - pctActual) * 10) / 10;
-    view.readoutParts.push(`${filled}% filled`);
-  }
   view.tier = intTier(load.accuracy_tier);
-  if (view.tier !== null) {
-    view.readoutParts.push(`Tier ${view.tier}`);
-  }
+  // ONE readout builder for the fresh response and the stored row — neither
+  // caller formats a part itself, so the two can never disagree about the
+  // same file (a missing number is OMITTED there, never rendered as 0).
+  view.readoutParts = intervalReadoutParts({
+    coverageDays: qualityNum(metadata.coverage_days),
+    gapDays: qualityNum(metadata.gap_days),
+    pctActual: qualityNum(metadata.pct_actual),
+    intervalMinutes: qualityNum(metadata.resolution_minutes),
+    tier: knownTier(view.tier),
+  });
 
   const flags = Array.isArray(r.flags)
     ? r.flags.filter((f): f is string => typeof f === "string" && f !== "")
@@ -2101,4 +2200,555 @@ export function intervalUploadView(response: unknown): IntervalUploadView {
     ...classified.filter((n) => n.level === "caption"),
   ];
   return view;
+}
+
+// ── Bill + survey + preview + tier step-down (3.6 prompt 3) ──────────────────
+//
+// The remaining Demand routes, all pure and total. Notice-vs-caption for every
+// producer is decided HERE (D25); the component renders what these decide.
+
+/** Below this, a parsed bill field is flagged as low-confidence — a finding. */
+export const BILL_CONFIDENCE_THRESHOLD = 0.6;
+/** Under this many days, annualising a bill's totals is thin — a finding. */
+export const BILL_THIN_PERIOD_DAYS = 60;
+
+const BILL_FIELD_NAMES: Record<string, string> = {
+  total_kwh: "the total usage",
+  billing_period_days: "the billing period",
+  daily_avg_kwh: "the daily average",
+  tariff_rate: "the tariff rate",
+  daily_supply_charge: "the daily supply charge",
+  feed_in_tariff: "the feed-in tariff",
+  retailer: "the retailer",
+  plan_name: "the plan name",
+  nmi: "the NMI",
+  has_solar: "whether the home already has solar",
+  tariff_structured: "the tariff structure",
+};
+
+const TARIFF_TYPE_LABELS: Record<string, string> = {
+  single_rate: "single rate",
+  tou: "time of use",
+  demand: "demand tariff",
+};
+
+export interface BillParseView {
+  ok: boolean;
+  /** The backend's own error string on the ok:false branch, verbatim. */
+  error: string | null;
+  /** "8,240 kWh over 91 days · Origin Energy · time of use" — derived parts only. */
+  readoutParts: string[];
+  totalKwh: number | null;
+  periodDays: number | null;
+  dailyAvgKwh: number | null;
+  tariffType: string | null;
+  billAddress: string | null;
+  /** Findings about THIS bill: low-confidence fields, a thin period. */
+  notices: RoofNoticeView[];
+  persisted: boolean | null;
+  warning: string | null;
+  /** The correction form's initial values — strings, for controlled inputs. */
+  correction: { totalKwh: string; periodDays: string; dailyAvgKwh: string };
+}
+
+/**
+ * Map a POST /api/job/{id}/bill response — any shape at all — into the readout,
+ * the per-field low-confidence findings and the correction form's initial
+ * values. `parse_confidence` ABSENT raises NO confidence notices: absent is
+ * unknown, and an unknown must not render as a failure (the 3.4-A rule).
+ */
+export function billParseView(response: unknown): BillParseView {
+  const view: BillParseView = {
+    ok: false,
+    error: null,
+    readoutParts: [],
+    totalKwh: null,
+    periodDays: null,
+    dailyAvgKwh: null,
+    tariffType: null,
+    billAddress: null,
+    notices: [],
+    persisted: null,
+    warning: null,
+    correction: { totalKwh: "", periodDays: "", dailyAvgKwh: "" },
+  };
+  if (typeof response !== "object" || response === null) return view;
+  const r = response as Record<string, unknown>;
+  if (r.ok !== true) {
+    view.error =
+      typeof r.error === "string" && r.error ? r.error : "Could not read this bill.";
+    return view;
+  }
+  view.ok = true;
+  view.persisted = typeof r.persisted === "boolean" ? r.persisted : null;
+  view.warning = typeof r.warning === "string" && r.warning ? r.warning : null;
+
+  const parsed =
+    typeof r.parsed === "object" && r.parsed !== null
+      ? (r.parsed as Record<string, unknown>)
+      : {};
+  view.totalKwh = roofNum(parsed.total_kwh);
+  view.periodDays = roofNum(parsed.billing_period_days);
+  view.dailyAvgKwh = roofNum(parsed.daily_avg_kwh);
+  view.billAddress = roofStr(parsed.property_address);
+  const structured =
+    typeof parsed.tariff_structured === "object" && parsed.tariff_structured !== null
+      ? (parsed.tariff_structured as Record<string, unknown>)
+      : {};
+  view.tariffType = roofStr(structured.tariff_type);
+
+  if (view.totalKwh !== null && view.periodDays !== null) {
+    view.readoutParts.push(
+      `${Math.round(view.totalKwh).toLocaleString("en-AU")} kWh over ${view.periodDays} days`,
+    );
+  } else if (view.totalKwh !== null) {
+    view.readoutParts.push(`${Math.round(view.totalKwh).toLocaleString("en-AU")} kWh`);
+  }
+  const retailer = roofStr(parsed.retailer);
+  if (retailer) view.readoutParts.push(retailer);
+  const tariffLabel = view.tariffType ? TARIFF_TYPE_LABELS[view.tariffType] : undefined;
+  if (tariffLabel) view.readoutParts.push(tariffLabel);
+
+  // Low-confidence findings — one per field the parser itself doubted.
+  const confidence =
+    typeof parsed.parse_confidence === "object" && parsed.parse_confidence !== null
+      ? (parsed.parse_confidence as Record<string, unknown>)
+      : null;
+  if (confidence) {
+    for (const [field, value] of Object.entries(confidence)) {
+      if (typeof value === "number" && Number.isFinite(value) && value < BILL_CONFIDENCE_THRESHOLD) {
+        view.notices.push({
+          tone: "caution",
+          level: "notice",
+          title: "This bill was unclear",
+          body: `The parser was not confident about ${BILL_FIELD_NAMES[field] ?? field} — check it against the bill before using these figures.`,
+        });
+      }
+    }
+  }
+  if (view.periodDays !== null && view.periodDays < BILL_THIN_PERIOD_DAYS) {
+    view.notices.push({
+      tone: "caution",
+      level: "notice",
+      title: "A short billing period",
+      body: `This bill covers ${view.periodDays} days — scaling that to a full year is thin. A longer bill or the smart-meter data would be firmer.`,
+    });
+  }
+
+  view.correction = {
+    totalKwh: view.totalKwh !== null ? String(view.totalKwh) : "",
+    periodDays: view.periodDays !== null ? String(view.periodDays) : "",
+    dailyAvgKwh: view.dailyAvgKwh !== null ? String(view.dailyAvgKwh) : "",
+  };
+  return view;
+}
+
+export type BillAddressCheck = "match" | "different_property" | "cannot_tell";
+
+interface ParsedAddress {
+  unit: string | null;
+  streetNumber: string;
+  postcode: string;
+}
+
+function parseAuAddress(value: unknown): ParsedAddress | null {
+  if (typeof value !== "string") return null;
+  const text = value.toLowerCase().replace(/,?\s*australia\s*$/i, "").trim();
+  if (!text) return null;
+  // Postcode: the LAST standalone 4-digit group.
+  const postcodes = [...text.matchAll(/(?<!\d)(\d{4})(?!\d)/g)];
+  if (postcodes.length === 0) return null;
+  const postcodeMatch = postcodes[postcodes.length - 1];
+  const postcode = postcodeMatch[1];
+  const beforePostcode = text.slice(0, postcodeMatch.index);
+  // Unit form: "unit 5/53", "u5/53" or "5/53" — the street number is AFTER the slash.
+  const unitForm = beforePostcode.match(/(?:unit\s*|u\s*)?(\d+[a-z]?)\s*\/\s*(\d+[a-z]?)/);
+  if (unitForm) {
+    return { unit: unitForm[1], streetNumber: unitForm[2], postcode };
+  }
+  const plain = beforePostcode.match(/(?<![\d/])(\d+[a-z]?)\b/);
+  if (!plain) return null;
+  return { unit: null, streetNumber: plain[1], postcode };
+}
+
+/**
+ * THE SUPPLY-ADDRESS CROSS-CHECK — deliberately conservative, the same rule
+ * 3.4-A applied to site_cross_check: an unchecked thing must never render as a
+ * passed thing, and a check that fired on every bill would by D25's own rule
+ * stop being a finding at all. "different_property" requires POSITIVE evidence:
+ * a different street NUMBER or a different POSTCODE, both present and
+ * parseable on BOTH sides. Formatting, abbreviations, case, "St" vs "Street",
+ * a missing ", Australia" — and a unit number present on only one side — are
+ * all "cannot_tell" and produce NOTHING.
+ */
+export function billAddressCheck(
+  billAddress: unknown,
+  jobAddress: unknown,
+): BillAddressCheck {
+  const bill = parseAuAddress(billAddress);
+  const job = parseAuAddress(jobAddress);
+  if (!bill || !job) return "cannot_tell";
+  if (bill.postcode !== job.postcode) return "different_property";
+  if (bill.streetNumber !== job.streetNumber) return "different_property";
+  // Same street number and postcode. A unit on exactly one side — or two
+  // different units — is NOT positive evidence of a different property; unit
+  // formatting on bills is far too loose to convict on.
+  if ((bill.unit === null) !== (job.unit === null)) return "cannot_tell";
+  if (bill.unit !== null && job.unit !== null && bill.unit !== job.unit) {
+    return "cannot_tell";
+  }
+  return "match";
+}
+
+/** The mismatch FINDING — produced ONLY on "different_property", never else. */
+export function billAddressNotice(check: BillAddressCheck): RoofNoticeView | null {
+  if (check !== "different_property") return null;
+  return {
+    tone: "caution",
+    level: "notice",
+    title: "This bill may be for a different property",
+    body: "The supply address on the bill doesn't match this job's address — the street number or postcode differs. Check it is the right customer's bill before using the figures.",
+  };
+}
+
+// ── Survey (route 3) ─────────────────────────────────────────────────────────
+
+/**
+ * The option VALUES routes/load.py actually accepts — read from that file,
+ * never invented. A wrong string here silently falls back to a default
+ * archetype server-side and the survey does nothing, visible nowhere.
+ */
+export const SURVEY_OPTIONS = {
+  householdSize: ["1", "2", "3-4", "5+"],
+  occupancy: ["always_home", "away_weekdays", "shift_work"],
+  hotWater: ["electric_storage", "heat_pump", "gas", "solar_hws"],
+  appliances: ["ev", "pool_pump", "ducted_ac"],
+  tariffType: ["single_rate", "tou", "demand", "not_sure"],
+} as const;
+
+export interface SurveyAnswers {
+  householdSize: string | null;
+  occupancy: string | null;
+  hotWater: string | null;
+  /**
+   * D26/load.py: `appliances is not None` is the fifth completeness test. An
+   * EMPTY array is a real answer ("none of these") and completes the survey;
+   * NULL is an untouched control and does not. Getting this backwards silently
+   * costs every installer with no EV or pool a whole tier.
+   */
+  appliances: string[] | null;
+  tariffType: string | null;
+}
+
+export const EMPTY_SURVEY_ANSWERS: SurveyAnswers = {
+  householdSize: null,
+  occupancy: null,
+  hotWater: null,
+  appliances: null,
+  tariffType: null,
+};
+
+/**
+ * Pre-fill from the job's stored surveys row (UNIQUE(job_id)). ducted_ac has no
+ * stored column, so it cannot be recovered — an unanswered box, not a "no".
+ * tariff_type is not stored on surveys at all.
+ */
+export function surveyView(job: unknown): SurveyAnswers {
+  const row = newestByCreatedAt(arr(asObject(job).surveys));
+  if (!row) return { ...EMPTY_SURVEY_ANSWERS };
+  // has_ev / has_pool are booleans only when the appliances question was
+  // actually answered; both null means it never was — so appliances stays
+  // null (unanswered), never a fabricated empty answer.
+  const answered =
+    typeof row.has_ev === "boolean" || typeof row.has_pool === "boolean";
+  const appliances: string[] = [];
+  if (row.has_ev === true) appliances.push("ev");
+  if (row.has_pool === true) appliances.push("pool_pump");
+  return {
+    householdSize: roofStr(row.household_size),
+    occupancy: roofStr(row.occupancy_pattern),
+    hotWater: roofStr(row.hot_water_type),
+    appliances: answered ? appliances : null,
+    tariffType: null,
+  };
+}
+
+/**
+ * ALL FIVE answered, mirroring load.py's `survey_complete` exactly:
+ * household_size, hot_water, occupancy, tariff_type, and `appliances is not
+ * None` — so an empty appliance list ("none of these") completes it and an
+ * untouched (null) control does not.
+ */
+export function surveyComplete(answers: SurveyAnswers): boolean {
+  return (
+    answers.householdSize !== null &&
+    answers.occupancy !== null &&
+    answers.hotWater !== null &&
+    answers.tariffType !== null &&
+    answers.appliances !== null
+  );
+}
+
+/**
+ * The /api/job/{id}/demand body for a survey submission. The consumption
+ * figures come from the bill (or interval data) — the five questions carry no
+ * kWh, and routes/load.py 422s without one; the caller passes what it has.
+ */
+export function surveyPayload(
+  answers: SurveyAnswers,
+  figures: { annualKwh?: number | null; dailyAvgKwh?: number | null } = {},
+): Record<string, unknown> {
+  return {
+    household_size: answers.householdSize,
+    occupancy: answers.occupancy,
+    hot_water: answers.hotWater,
+    appliances: answers.appliances,
+    tariff_type: answers.tariffType,
+    annual_kwh: figures.annualKwh ?? null,
+    daily_avg_kwh: figures.dailyAvgKwh ?? null,
+  };
+}
+
+// ── Load preview strip ───────────────────────────────────────────────────────
+
+/**
+ * A profile whose weights vary by no more than this (max minus min, on the
+ * mean-1.0 normalised weights) is FLAT. Named and exported so the threshold is
+ * visible and testable, not buried in a comparison. Tier 1's profile is
+ * literally [1.0] x 24; real archetypes swing by ~1.9.
+ */
+export const FLAT_PROFILE_TOLERANCE = 0.15;
+
+export function isFlatProfile(weights: readonly number[]): boolean {
+  if (weights.length === 0) return true;
+  let min = weights[0];
+  let max = weights[0];
+  for (const w of weights) {
+    if (w < min) min = w;
+    if (w > max) max = w;
+  }
+  return max - min <= FLAT_PROFILE_TOLERANCE;
+}
+
+function hourLabel(hour: number): string {
+  const h = ((hour % 24) + 24) % 24;
+  if (h === 0) return "12am";
+  if (h === 12) return "12pm";
+  return h < 12 ? `${h}am` : `${h - 12}pm`;
+}
+
+export interface LoadPreviewView {
+  ok: boolean;
+  /** 24 heights normalised 0..1 for drawing. Empty when not drawable. */
+  bars: number[];
+  flat: boolean;
+  /** Inclusive hour window, or NULL — always null on a flat profile. */
+  peak: { startHour: number; endHour: number; label: string } | null;
+  /** States the shape in words — the strip's aria-label. */
+  ariaLabel: string;
+}
+
+/**
+ * The 24-bar preview. Accepts the weights array itself or an object carrying
+ * `hourly_profile_weights`. A profile with the wrong length or a non-numeric
+ * entry renders NOTHING (ok:false) — a malformed chart must degrade to absent,
+ * never to a misleading picture.
+ *
+ * THE FLAT-PROFILE CASE IS THE ONE THAT MATTERS: Tier 1's weights are
+ * [1.0] x 24, and a peak finder run over that would print a confident,
+ * invented "peak" for a national-average estimate. Flat -> peak is NULL and
+ * the words say there is no daily shape.
+ */
+export function loadPreviewView(profile: unknown): LoadPreviewView {
+  const none: LoadPreviewView = { ok: false, bars: [], flat: false, peak: null, ariaLabel: "" };
+  const raw = Array.isArray(profile)
+    ? profile
+    : typeof profile === "object" && profile !== null
+      ? (profile as Record<string, unknown>).hourly_profile_weights
+      : null;
+  if (!Array.isArray(raw) || raw.length !== 24) return none;
+  const weights: number[] = [];
+  for (const w of raw) {
+    if (typeof w !== "number" || !Number.isFinite(w) || w < 0) return none;
+    weights.push(w);
+  }
+  const max = Math.max(...weights);
+  const bars = weights.map((w) => (max > 0 ? w / max : 0));
+  const flat = isFlatProfile(weights);
+  if (flat) {
+    return {
+      ok: true,
+      bars,
+      flat: true,
+      peak: null,
+      ariaLabel:
+        "Hourly load profile: no daily shape — a flat national-average estimate.",
+    };
+  }
+  // Peak: the contiguous run of hours around the maximum holding at least 80%
+  // of it.
+  const peakHour = weights.indexOf(max);
+  const threshold = max * 0.8;
+  let start = peakHour;
+  while (start > 0 && weights[start - 1] >= threshold) start--;
+  let end = peakHour;
+  while (end < 23 && weights[end + 1] >= threshold) end++;
+  const label = `${hourLabel(start)} to ${hourLabel(end + 1)}`;
+  return {
+    ok: true,
+    bars,
+    flat: false,
+    peak: { startHour: start, endHour: end, label },
+    ariaLabel: `Hourly load profile: highest use ${label}.`,
+  };
+}
+
+// ── The tier model (D26 — the engine is the fact) ────────────────────────────
+//
+// ROUTE_TIERS is GONE, deliberately: it mapped a ROUTE to a tier, and that
+// model does not exist. A bill and a survey are not two rungs on a ladder —
+// they are two halves of the same rung. The bill (or a typed figure) supplies
+// the yearly total and says nothing about when power is used; the five
+// questions supply the shape and contain no kilowatt-hours.
+//
+// THE ONE PLACE the tier numbers and confidences live in this file. They are
+// routes/load.py's values, mirrored — never invented here.
+export const TIER_TABLE = {
+  3: { confidence: 92, means: "A real total and a real shape, measured" },
+  2: { confidence: 82, means: "A real total, and a shape from a matched archetype" },
+  1: { confidence: 65, means: "A real total, and no daily shape" },
+} as const;
+
+export interface DemandInputs {
+  hasIntervalProfile: boolean;
+  /** From a parsed bill OR typed by the installer — a REAL number either way. */
+  usageKwh: number | null;
+  usageSource: "interval" | "bill" | "typed" | null;
+  /** ALL FIVE, mirroring load.py's survey_complete. */
+  surveyComplete: boolean;
+}
+
+/**
+ * A MIRROR of routes/load.py's branching, in ITS order — do not reorder:
+ *   1. `_valid_interval_profile(body.interval_profile)` → tier 3, 92%
+ *   2. `annual_kwh is None and daily_avg_kwh is None` → HTTPException 422:
+ *      a usage quantity is MANDATORY; NOTHING exists without one → null
+ *   3. `survey_complete` (all five, `appliances is not None`) → tier 2, 82%
+ *   4. otherwise → tier 1, 65%, and the profile is FLAT
+ *
+ * null = no profile is possible; the engine would answer 422. Never render a
+ * tier for that state — a tier shown for a job with no profile is the exact
+ * lie D26 exists to stop.
+ */
+export function tierFor(inputs: DemandInputs): 1 | 2 | 3 | null {
+  if (inputs.hasIntervalProfile) return 3;
+  if (inputs.usageKwh === null) return null;
+  if (inputs.surveyComplete) return 2;
+  return 1;
+}
+
+export interface DemandStatusLine {
+  /** What we HAVE — never which control was clicked. */
+  have: string;
+  tier: 1 | 2 | 3 | null;
+  /** What would raise the tier, or null at tier 3. */
+  next: string | null;
+}
+
+/** The live line under the two halves — derived from the same predicate the
+ *  engine uses, so the screen cannot promise a tier the engine will not record. */
+export function demandStatusLine(inputs: DemandInputs): DemandStatusLine {
+  const tier = tierFor(inputs);
+  if (tier === 3) {
+    return {
+      have: "Smart-meter interval data — a measured total and a measured shape",
+      tier,
+      next: null,
+    };
+  }
+  if (tier === 2) {
+    return {
+      have:
+        inputs.usageSource === "typed"
+          ? "Annual total entered by you, with the five questions answered"
+          : "Annual total from the bill, with the five questions answered",
+      tier,
+      next: "A smart-meter interval file would make this Tier 3 — measured, not matched",
+    };
+  }
+  if (tier === 1) {
+    return {
+      have:
+        inputs.usageSource === "typed"
+          ? "Annual total entered by you · no daily shape yet"
+          : "Annual total from the bill · no daily shape yet",
+      tier,
+      next: "Answer the five questions and this becomes Tier 2",
+    };
+  }
+  return {
+    have: "We cannot work out a profile without a yearly total",
+    tier: null,
+    next: "Add a bill or type the annual usage to get started",
+  };
+}
+
+/**
+ * Deliberately WIDE plausibility bounds for a typed annual figure. There is no
+ * authoritative consumption dataset in this repo to derive tight bounds from,
+ * so these are stated as what they are: a sanity net, not an authority. An
+ * Australian home averages roughly 4,000–7,000 kWh/yr; 300 allows a barely
+ * used holiday unit, 60,000 a large all-electric home with two EVs and a heated
+ * pool. Outside this we still SEND the figure (the installer may know something
+ * we do not) — we just say it looks unusual.
+ */
+export const ANNUAL_KWH_PLAUSIBLE_MIN = 300;
+export const ANNUAL_KWH_PLAUSIBLE_MAX = 60000;
+
+/**
+ * The inline validation for a TYPED annual figure. Returns the error string,
+ * or null when the value is usable. Only a positive finite NUMBER passes —
+ * a string, NaN or Infinity never reaches the backend.
+ */
+export function typedUsageError(value: unknown): string | null {
+  if (typeof value !== "number" || !Number.isFinite(value) || value <= 0) {
+    return "Enter the yearly usage as a number of kilowatt-hours, greater than zero.";
+  }
+  return null;
+}
+
+/** The implausible-figure FINDING — the call still goes ahead; this only speaks. */
+export function usagePlausibilityNotice(kwh: number): RoofNoticeView | null {
+  if (
+    !Number.isFinite(kwh) ||
+    (kwh >= ANNUAL_KWH_PLAUSIBLE_MIN && kwh <= ANNUAL_KWH_PLAUSIBLE_MAX)
+  ) {
+    return null;
+  }
+  return {
+    tone: "caution",
+    level: "notice",
+    title: "That figure is outside what an Australian home usually uses",
+    body: `${Math.round(kwh).toLocaleString("en-AU")} kWh a year is outside the ${ANNUAL_KWH_PLAUSIBLE_MIN.toLocaleString("en-AU")}–${ANNUAL_KWH_PLAUSIBLE_MAX.toLocaleString("en-AU")} range we sanity-check against. It will still be used — just check it is a yearly figure, not a quarterly one.`,
+  };
+}
+
+/**
+ * WHERE THE PREDICTED AND RECORDED TIERS DISAGREE, the RECORDED one is shown
+ * and this notice says they differ — loudly, because that disagreement is the
+ * exact bug D26 fixed, and assuming it can no longer happen is how it returns.
+ */
+export function tierMismatchNotice(
+  predicted: number | null,
+  recorded: number | null,
+): RoofNoticeView | null {
+  if (predicted === null || recorded === null || predicted === recorded) {
+    return null;
+  }
+  return {
+    tone: "caution",
+    level: "notice",
+    title: "The recorded tier differs from what this screen expected",
+    body: `The engine recorded Tier ${recorded}, but from what is on screen this should be Tier ${predicted}. The recorded tier is the one that counts — report this mismatch.`,
+  };
 }

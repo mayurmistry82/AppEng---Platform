@@ -789,6 +789,86 @@ def t_live() -> None:
               job_after == before_job, f"before={before_job} after={job_after}")
 
 
+def make_generic_csv(days: int = 2) -> bytes:
+    """A generic long-layout CSV — the parser path with NO resolution_minutes."""
+    lines = ["datetime,kwh"]
+    for d in range(1, days + 1):
+        for h in range(24):
+            lines.append(f"2025-01-{d:02d} {h:02d}:00,0.5")
+    return ("\n".join(lines) + "\n").encode()
+
+
+def t12_quality_columns() -> None:
+    """3.6 follow-up: the parser's quality numbers are PERSISTED, so the readout
+    survives a page load — and a re-upload refreshes them."""
+    print("\n12. interval data-quality columns persisted")
+
+    stub = StubClient(jobs_rows=[dict(MY_JOB)])
+    restore = _patch(stub)
+    try:
+        _run(interval.upload_interval(
+            file=_upload_file(make_nem12(30, start=dt.date(2025, 1, 1))),
+            job_id="j1", include_controlled_load=False, caller=CALLER))
+        inserts = stub.ops("interval_data", "insert")
+        check("(1) insert carries all four quality keys with the parser's values",
+              bool(inserts)
+              and inserts[0].get("coverage_days") == 30
+              and inserts[0].get("gap_days") == 0
+              and inserts[0].get("pct_actual") == 100.0
+              and inserts[0].get("interval_minutes") == 30,
+              str({k: inserts[0].get(k) for k in
+                   ("coverage_days", "gap_days", "pct_actual", "interval_minutes")}
+                  if inserts else None))
+
+        _run(interval.upload_interval(
+            file=_upload_file(make_nem12(45, start=dt.date(2025, 3, 1))),
+            job_id="j1", include_controlled_load=False, caller=CALLER))
+        updates = stub.ops("interval_data", "update")
+        check("(2) a same-meter re-upload UPDATES the four as well",
+              bool(updates)
+              and updates[-1].get("coverage_days") == 45
+              and updates[-1].get("interval_minutes") == 30
+              and "gap_days" in updates[-1] and "pct_actual" in updates[-1],
+              str(updates[-1:]))
+    finally:
+        restore()
+
+    # (3) The generic-CSV path has NO resolution -> interval_minutes null, no raise.
+    stub = StubClient(jobs_rows=[dict(MY_JOB)])
+    restore = _patch(stub)
+    try:
+        resp = _run(interval.upload_interval(
+            file=_upload_file(make_generic_csv(), "usage.csv"),
+            job_id="j1", include_controlled_load=False, caller=CALLER))
+        inserts = stub.ops("interval_data", "insert")
+        check("(3) no resolution_minutes -> interval_minutes None, no raise",
+              resp.get("ok") is True and bool(inserts)
+              and inserts[0].get("interval_minutes") is None
+              and inserts[0].get("coverage_days") == 2,
+              str(inserts[:1]))
+    finally:
+        restore()
+
+    # (4) The legacy backfill path carries none of the four keys: absent from
+    # the insert means the columns default NULL — never invented, never raising.
+    stub = StubClient(jobs_rows=[dict(MY_JOB)])
+    restore = _patch(stub)
+    try:
+        written, err = interval.backfill_interval_row(
+            "j1", {"nmi": "6001234567", "raw_file_path": "bills/x.csv",
+                   "source": "NEM12", "resolution": "30 min",
+                   "period_start": "2025-01-01", "period_end": "2025-01-30",
+                   "parsed_series_ref": "bills/x.series.json"})
+        inserts = stub.ops("interval_data", "insert")
+        check("(4) backfill without the keys -> nulls by omission, no raise",
+              written is True and err is None and bool(inserts)
+              and all(inserts[0].get(k) is None for k in
+                      ("coverage_days", "gap_days", "pct_actual", "interval_minutes")),
+              f"written={written} err={err} insert_keys={sorted(inserts[0]) if inserts else None}")
+    finally:
+        restore()
+
+
 PII_NAME = "Jane Q. Testerson"
 PII_ADDRESS = "42 Wallaby Way, Kensington SA 5068"
 
@@ -956,6 +1036,7 @@ def main_() -> int:
     t9_http_shapes()
     t10_annualise_boundary()
     t11_pii_scrub()
+    t12_quality_columns()
     if live:
         t_live()
 
