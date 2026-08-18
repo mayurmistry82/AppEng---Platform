@@ -38,7 +38,9 @@ import {
   formatAnnualKwh,
   formatDailyKwh,
   peakHeadline,
+  ADDRESS_LOCK_REASON,
   addressRoofView,
+  jobEditView,
   billAddressCheck,
   billAddressNotice,
   billParseView,
@@ -76,7 +78,7 @@ import {
   type WorksheetSectionSpec,
 } from "../lib/worksheet.ts";
 import type { ApiErrorKind } from "../lib/jobs.ts";
-import { postFormData } from "../lib/client-api.ts";
+import { postFormData, postJson, requestJson } from "../lib/client-api.ts";
 import * as worksheetModule from "../lib/worksheet.ts";
 
 function unsafe<T>(v: unknown): T {
@@ -3225,4 +3227,156 @@ test("colour check 5: no reduced fill-opacity survives on any bar", () => {
     [],
     `opacity cannot carry the peak distinction at an accessible contrast — found ${opacities.join(", ")}`,
   );
+});
+
+// ── 3.3c: the job-edit view and the address lock ─────────────────────────────
+//
+// The rule: the address locks the moment ANY of roof_geometry, sizing_results,
+// tariffs or interval_data carries a row — those four DERIVE from the address.
+// A bill or a survey does not, and does not lock it.
+
+const EDIT_JOB_BASE = {
+  job_id: "j-77",
+  intent: "both",
+  has_existing_solar: true,
+  existing_solar_kw: 6.6,
+  existing_inverter_kw: 5,
+  customer: [{ customer_name: "J. Nguyen", property_address_full: "14 Frome St" }],
+};
+
+test("3.3c 2a-2b: each of the four derived tables locks the address, separately", () => {
+  for (const table of [
+    "roof_geometry",
+    "sizing_results",
+    "tariffs",
+    "interval_data",
+  ]) {
+    const view = jobEditView(emptyJob({ ...EDIT_JOB_BASE, [table]: [{ id: 1 }] }));
+    assert.equal(view.addressLocked, true, `${table} must lock`);
+    assert.equal(
+      view.addressLockReason,
+      ADDRESS_LOCK_REASON,
+      `${table}: the exact sentence`,
+    );
+  }
+});
+
+test("3.3c 2c: all four empty -> unlocked, reason NULL (null, not '')", () => {
+  const view = jobEditView(emptyJob(EDIT_JOB_BASE));
+  assert.equal(view.addressLocked, false);
+  assert.strictEqual(view.addressLockReason, null);
+});
+
+test("3.3c 2d: bills and surveys do NOT lock the address", () => {
+  const view = jobEditView(
+    emptyJob({
+      ...EDIT_JOB_BASE,
+      bills: [{ bill_id: "b1" }],
+      surveys: [{ survey_id: "s1" }],
+    }),
+  );
+  assert.equal(
+    view.addressLocked,
+    false,
+    "a bill does not follow from the address — adding it 'to be safe' breaks this",
+  );
+});
+
+test("3.3c 2e: empty customer array -> '' strings; the lock follows DERIVED rows", () => {
+  const view = jobEditView(
+    emptyJob({ ...EDIT_JOB_BASE, customer: [], roof_geometry: [{ id: 1 }] }),
+  );
+  assert.equal(view.address, "");
+  assert.equal(view.customerName, "");
+  assert.equal(
+    view.addressLocked,
+    true,
+    "an unrecorded address with roof geometry still locks — the rows decide",
+  );
+});
+
+test("3.3c 2f: numeric fields arrive as input strings", () => {
+  const view = jobEditView(emptyJob(EDIT_JOB_BASE));
+  assert.strictEqual(view.existingSolarKw, "6.6");
+  assert.strictEqual(view.existingInverterKw, "5");
+  const NULL_KW_JOB = { status: "draft", job_id: "x", existing_solar_kw: null, existing_inverter_kw: null };
+  const nulls = jobEditView(emptyJob(NULL_KW_JOB));
+  assert.strictEqual(nulls.existingSolarKw, "");
+  assert.strictEqual(nulls.existingInverterKw, "");
+});
+
+test("3.3c 2g: garbage in every position -> no throw, sane defaults", () => {
+  const cases: unknown[] = [
+    null,
+    undefined,
+    "x",
+    42,
+    { job_id: 9, intent: 7, has_existing_solar: "yes", existing_solar_kw: "6.6",
+      customer: "not-an-array", roof_geometry: "nope", tariffs: 3 },
+  ];
+  for (const junk of cases) {
+    const view = jobEditView(junk);
+    assert.equal(typeof view.address, "string");
+    assert.equal(typeof view.customerName, "string");
+    assert.equal(view.intent, null);
+    assert.equal(view.hasExistingSolar, null);
+    assert.strictEqual(view.existingSolarKw, "");
+    assert.equal(view.addressLocked, false);
+    assert.strictEqual(view.addressLockReason, null);
+  }
+});
+
+test("3.3c 2h: jobBarView's four existing fields are unchanged by the edit field", () => {
+  const job = emptyJob({
+    status: "sized",
+    path: "B",
+    path_label: "Solar + battery",
+    accuracy_tier: 3,
+    customer: [{ property_address_full: "14 Frome St, Adelaide SA 5000" }],
+  });
+  const view = jobBarView(job);
+  assert.equal(view.address, "14 Frome St, Adelaide SA 5000");
+  assert.equal(view.statusRaw, "sized");
+  assert.equal(view.jobTypeLabel, "Solar + battery (B)");
+  assert.equal(view.tier, 3);
+  const empty = jobBarView(emptyJob());
+  assert.equal(empty.address, "Address not recorded");
+  assert.equal(empty.jobTypeLabel, "Job type not set");
+  // And the new field is populated.
+  assert.equal(view.edit.address, "14 Frome St, Adelaide SA 5000");
+});
+
+// ── Test 5: postJson is genuinely unchanged behind the delegation ────────────
+// The F121 lesson — measure what ships. Both functions run against the same
+// stubbed fetch and the RESULT OBJECTS are compared, not the source.
+
+async function bothResults(
+  respond: () => Response | Promise<Response>,
+): Promise<[unknown, unknown]> {
+  const original = globalThis.fetch;
+  const make = (async () => respond()) as unknown as typeof fetch;
+  try {
+    globalThis.fetch = make;
+    const a = await postJson("/x", { a: 1 });
+    globalThis.fetch = make;
+    const b = await requestJson("POST", "/x", { a: 1 });
+    return [a, b];
+  } finally {
+    globalThis.fetch = original;
+  }
+}
+
+test("3.3c test 5: postJson === requestJson('POST') across five response shapes", async () => {
+  const shapes: [string, () => Response | Promise<Response>][] = [
+    ["200 JSON", () => new Response(JSON.stringify({ ok: 1 }), { status: 200 })],
+    ["200 empty body", () => new Response("", { status: 200 })],
+    ["401 HTML body", () => new Response("<html>login</html>", { status: 401 })],
+    ["500 JSON detail", () =>
+      new Response(JSON.stringify({ detail: "boom" }), { status: 500 })],
+    ["fetch throws", () => { throw new TypeError("network down"); }],
+  ];
+  for (const [label, respond] of shapes) {
+    const [a, b] = await bothResults(respond);
+    assert.deepEqual(a, b, `${label}: the two results must be identical`);
+  }
 });

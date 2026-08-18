@@ -517,3 +517,56 @@ export function summariseJobs(
 
   return { tiles, rows };
 }
+
+// ── 3.3c — the unit-address nudge (F99) and the edit-error copy ──────────────
+
+/** The caption under a bare street address. A caption, never a gate. */
+export const UNIT_ADDRESS_HINT =
+  "No unit number. On a unit, townhouse or duplex the roof lookup measures whichever building is nearest — which may not be your customer's. Add the unit number if there is one.";
+
+const UNIT_PREFIX_WORDS = [
+  "unit", "u", "apt", "apartment", "flat", "suite", "ste", "lot", "shop",
+  "villa", "townhouse",
+];
+
+/**
+ * True when the trimmed address is at least 6 characters, starts with a street
+ * number, and carries NO unit/subpremise marker — a "/" before the first
+ * comma, or a leading unit word followed by a number.
+ *
+ * A HEURISTIC, and wrong sometimes, acceptably: a false positive shows a
+ * caption suggesting something already true; a false negative is the status
+ * quo. It NEVER changes the submitted value and never parses or normalises
+ * the address.
+ */
+export function needsUnitNumberHint(address: string): boolean {
+  const trimmed = typeof address === "string" ? address.trim() : "";
+  if (trimmed.length < 6) return false;
+  const lower = trimmed.toLowerCase();
+  // A slash before the first comma is a subpremise marker ("5/53 Bishops Pl").
+  const head = lower.split(",")[0];
+  if (head.includes("/")) return false;
+  // A leading unit word followed by a number ("Unit 5 ...", "U5 ...", "Apt 2, ...").
+  const wordMatch = lower.match(/^([a-z]+)\s*(\d)/);
+  if (wordMatch && UNIT_PREFIX_WORDS.includes(wordMatch[1])) return false;
+  // Otherwise it must START with a street number to look like an address at all.
+  return /^\d/.test(lower);
+}
+
+/**
+ * Error copy for the job-edit dialog (3.3c): identical to
+ * clientActionErrorCopy EXCEPT a 409, whose body is the SERVER'S OWN detail —
+ * a 409 here always carries a specific, true reason (the address lock), and
+ * discarding it for generic copy is the opposite of what this product is for.
+ * Falls back to the generic copy when the server message is empty.
+ */
+export function jobEditErrorCopy(
+  kind: ApiErrorKind,
+  status: number,
+  serverMessage: string,
+): ErrorPanelCopy {
+  if (kind === "http" && status === 409 && serverMessage.trim() !== "") {
+    return { heading: "This change was rejected", body: serverMessage };
+  }
+  return clientActionErrorCopy(kind, status);
+}

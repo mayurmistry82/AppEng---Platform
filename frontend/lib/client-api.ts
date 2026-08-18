@@ -28,14 +28,22 @@ function detailOf(body: unknown): string | null {
   return typeof detail === "string" && detail ? detail : null;
 }
 
-export async function postJson<T>(
+/**
+ * The general JSON request (3.3c, F100 closed) — postJson's never-throws
+ * contract, byte-for-byte, with the method as a parameter: read the body ONCE
+ * as text, the 401 branch, the parse branch with the REAL status, the !ok
+ * branch, the same ClientResult shape. postJson below is now a one-line
+ * delegation to this, so the two cannot drift.
+ */
+export async function requestJson<T>(
+  method: "POST" | "PATCH" | "PUT" | "DELETE",
   path: string,
   body: unknown,
 ): Promise<ClientResult<T>> {
   let response: Response;
   try {
     response = await fetch(path, {
-      method: "POST",
+      method,
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(body),
     });
@@ -93,6 +101,13 @@ export async function postJson<T>(
   }
 
   return { ok: true, data: parsed as T };
+}
+
+export async function postJson<T>(
+  path: string,
+  body: unknown,
+): Promise<ClientResult<T>> {
+  return requestJson<T>("POST", path, body);
 }
 
 /**

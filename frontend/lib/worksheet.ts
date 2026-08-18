@@ -1,4 +1,4 @@
-import type { ApiErrorKind, PathLetter } from "@/lib/jobs";
+import type { ApiErrorKind, JobIntent, PathLetter } from "@/lib/jobs";
 
 /**
  * Worksheet shell logic (checklist 3.3) — PURE. No React, no JSX, no fetch,
@@ -463,12 +463,86 @@ export function phaseStates(
 
 // ── Job bar ──────────────────────────────────────────────────────────────────
 
+/**
+ * The job-bar edit view (3.3c) — everything the edit dialog pre-fills, plus THE
+ * ADDRESS LOCK RULE (F82). The rule lives HERE, pure and tested, never inside a
+ * component: the address locks the moment ANY of the four tables that DERIVE
+ * from it carries a row — roof_geometry, sizing_results, tariffs,
+ * interval_data. Those four and no others: a bill or a survey does not follow
+ * from the address. The lock follows the DERIVED ROWS, not the address string —
+ * an unrecorded address with roof geometry still locks. The server enforces the
+ * same rule with a 409; this view only decides what the dialog shows.
+ */
+export interface JobEditView {
+  jobId: string;
+  /** "" when not recorded. */
+  address: string;
+  /** "" when null. */
+  customerName: string;
+  hasExistingSolar: boolean | null;
+  /** Strings because they feed <input>s: "" when null, never "null"/"0". */
+  existingSolarKw: string;
+  existingInverterKw: string;
+  intent: JobIntent | null;
+  addressLocked: boolean;
+  /** The exact on-screen sentence when locked; NULL when not — never "". */
+  addressLockReason: string | null;
+}
+
+export const ADDRESS_LOCK_REASON =
+  "The address is locked because this job has already been measured against it. Roof geometry, irradiance, network and incentives all follow from it — a different address is a different job. Create a new job instead.";
+
+const ADDRESS_LOCK_TABLES = [
+  "roof_geometry",
+  "sizing_results",
+  "tariffs",
+  "interval_data",
+] as const;
+
+function editStr(value: unknown): string {
+  return typeof value === "string" ? value : "";
+}
+
+function editKw(value: unknown): string {
+  return typeof value === "number" && Number.isFinite(value) ? String(value) : "";
+}
+
+export function jobEditView(job: unknown): JobEditView {
+  const detail = asObject(job);
+  const record = detail as Record<string, unknown>;
+  const customer = arr(detail.customer);
+  const intentRaw = record.intent;
+  const intent: JobIntent | null =
+    intentRaw === "solar" || intentRaw === "battery" || intentRaw === "both"
+      ? intentRaw
+      : null;
+  const addressLocked = ADDRESS_LOCK_TABLES.some(
+    (table) => arr(record[table]).length > 0,
+  );
+  return {
+    jobId: editStr(record.job_id),
+    address: editStr(customer[0]?.property_address_full),
+    customerName: editStr(customer[0]?.customer_name),
+    hasExistingSolar:
+      typeof record.has_existing_solar === "boolean"
+        ? record.has_existing_solar
+        : null,
+    existingSolarKw: editKw(record.existing_solar_kw),
+    existingInverterKw: editKw(record.existing_inverter_kw),
+    intent,
+    addressLocked,
+    addressLockReason: addressLocked ? ADDRESS_LOCK_REASON : null,
+  };
+}
+
 export interface JobBarView {
   address: string;
   statusRaw: string;
   jobTypeLabel: string;
   /** Passed straight through — AccuracyMeter renders non-1|2|3 as "not yet assessed" (C10). */
   tier: number | null;
+  /** 3.3c — what the pencil's edit dialog opens with. */
+  edit: JobEditView;
 }
 
 export function jobBarView(job: unknown): JobBarView {
@@ -490,6 +564,7 @@ export function jobBarView(job: unknown): JobBarView {
       ? `${detail.path_label} (${detail.path})`
       : "Job type not set",
     tier: typeof detail.accuracy_tier === "number" ? detail.accuracy_tier : null,
+    edit: jobEditView(job),
   };
 }
 

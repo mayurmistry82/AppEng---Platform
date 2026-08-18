@@ -17,6 +17,7 @@ can prove it.
 from __future__ import annotations
 
 import asyncio
+import json
 import os
 import sys
 import traceback
@@ -66,9 +67,11 @@ class _Result:
 
 
 class _Table:
-    def __init__(self, client):
+    def __init__(self, client, name):
         self._client = client
+        self._name = name
         self._update_payload = None
+        self._upsert = None
 
     def select(self, *_a, **_k):
         return self
@@ -83,26 +86,55 @@ class _Table:
         self._update_payload = payload
         return self
 
+    def upsert(self, payload, on_conflict=None):
+        self._upsert = (payload, on_conflict)
+        return self
+
     def execute(self):
         if self._client.raise_transport:
             raise httpx.ConnectError("connection refused")
         if self._update_payload is not None:
+            # `updates` stays the flat list the pre-3.3c checks index into; the
+            # (table, payload) record is what proves customer fields never land
+            # in a jobs update (check 1b).
             self._client.updates.append(self._update_payload)
+            self._client.update_calls.append((self._name, self._update_payload))
             self._update_payload = None
             return _Result([])
-        return _Result(list(self._client.jobs_rows))
+        if self._upsert is not None:
+            payload, on_conflict = self._upsert
+            self._client.upserts.append((self._name, payload, on_conflict))
+            self._upsert = None
+            return _Result([dict(payload)])
+        return _Result(list(self._client.tables.get(self._name, [])))
 
 
 class StubClient:
-    """Records every update() payload; serves fixed job rows."""
+    """Records every update()/upsert() payload; serves fixed rows PER TABLE.
 
-    def __init__(self, jobs_rows=None, raise_transport=False):
-        self.jobs_rows = jobs_rows if jobs_rows is not None else [dict(JOB_ROW)]
+    3.3c: patch_job reads jobs, the four address-lock tables and job_customers,
+    and writes jobs (update) and job_customers (upsert) — so the stub carries a
+    table map. `jobs_rows` keeps its original meaning; `table_rows` seeds any
+    other table (the lock checks read roof_geometry / sizing_results / tariffs
+    / interval_data)."""
+
+    def __init__(self, jobs_rows=None, raise_transport=False, table_rows=None):
+        self.tables: dict[str, list] = {
+            "jobs": jobs_rows if jobs_rows is not None else [dict(JOB_ROW)],
+        }
+        if table_rows:
+            self.tables.update(table_rows)
         self.updates: list[dict] = []
+        self.update_calls: list[tuple[str, dict]] = []
+        self.upserts: list[tuple[str, dict, str]] = []
         self.raise_transport = raise_transport
 
-    def table(self, _name):
-        return _Table(self)
+    @property
+    def jobs_rows(self):
+        return self.tables["jobs"]
+
+    def table(self, name):
+        return _Table(self, name)
 
 
 def run_patch(stub, payload, job_id="j1"):
@@ -121,11 +153,15 @@ def run_patch(stub, payload, job_id="j1"):
 def main() -> int:
     print("verify_job_patch.py — PATCH /api/job/{id} contract (offline)\n")
 
-    print("1. the whitelist: exactly seven fields, everything else DROPPED silently")
+    print("1. the whitelist: exactly thirteen fields, everything else DROPPED silently")
+    # 3.3c grew the seven site fields by the six job-bar-edit fields — one
+    # whitelist that grows, never a second implementation (D2).
     fields = set(job_route.JobSitePatch.model_fields.keys())
-    check("model has exactly the seven fields",
+    check("model has exactly the thirteen fields",
           fields == {"storeys", "roof_material", "dwelling_type", "year_built",
-                     "bedrooms", "floor_area_m2", "electrical_phase"}, str(fields))
+                     "bedrooms", "floor_area_m2", "electrical_phase",
+                     "customer_name", "has_existing_solar", "existing_solar_kw",
+                     "existing_inverter_kw", "intent", "address"}, str(fields))
     stub = StubClient()
     smuggle = {"storeys": 2, "company_id": "co-EVIL", "installer_id": "x",
                "path": "F", "status": "won", "address": "1 Evil St"}
@@ -207,6 +243,111 @@ def main() -> int:
     check("Supabase unreachable -> 503, never 404 (F88)",
           exc_down is not None and exc_down.status_code == 503,
           f"got {getattr(exc_down, 'status_code', None)}")
+
+    print("\n7. 3.3c — the two-table write and the address lock")
+    ALL13 = {
+        "storeys": 2, "roof_material": "tile", "dwelling_type": "unit",
+        "year_built": 1995, "bedrooms": 3, "floor_area_m2": 180.0,
+        "electrical_phase": "single",
+        "customer_name": "N. Chen", "has_existing_solar": True,
+        "existing_solar_kw": 6.6, "existing_inverter_kw": 5.0, "intent": "both",
+        "address": "10 High St, Adelaide SA 5000",
+    }
+    stub = StubClient()
+    _res, exc = run_patch(stub, dict(ALL13))
+    check("(1a) all 13 accepted — no error", exc is None, str(exc))
+    jobs_sent = stub.updates[0] if stub.updates else {}
+    check("(1a) the jobs dict carries the 11 jobs columns + updated_at",
+          set(jobs_sent) == {"storeys", "roof_material", "dwelling_type",
+                             "year_built", "bedrooms", "floor_area_m2",
+                             "electrical_phase", "has_existing_solar",
+                             "existing_solar_kw", "existing_inverter_kw",
+                             "intent", "updated_at"}, str(sorted(jobs_sent)))
+    cust_upserts = [(t, p, oc) for (t, p, oc) in stub.upserts if t == "job_customers"]
+    cust_sent = cust_upserts[0][1] if cust_upserts else {}
+    check("(1a) the job_customers upsert carries name + mapped address + key",
+          set(cust_sent) == {"customer_name", "property_address_full",
+                             "updated_at", "job_id"}
+          and cust_sent.get("property_address_full") == ALL13["address"]
+          and cust_upserts[0][2] == "job_id", str(cust_sent))
+
+    # (1b) THE CENTRAL CHECK: PII never lands in a jobs update, in ANY update.
+    jobs_update_payloads = [p for (t, p) in stub.update_calls if t == "jobs"]
+    check("(1b) customer_name / address in NO jobs update dict",
+          all("customer_name" not in p and "address" not in p
+              and "property_address_full" not in p for p in jobs_update_payloads),
+          str(jobs_update_payloads))
+    check("(1b) ...and they DID land in job_customers",
+          cust_sent.get("customer_name") == "N. Chen", str(cust_sent))
+
+    stub = StubClient()
+    _res, exc = run_patch(stub, {"storeys": 1, "path": "F", "company_id": "co-EVIL",
+                                 "installer_id": "x", "status": "won", "job_id": "zzz"})
+    check("(1c) path/company_id/installer_id/status/job_id silently dropped",
+          exc is None and stub.updates
+          and set(stub.updates[0]) == {"storeys", "updated_at"}
+          and stub.upserts == [], f"{stub.updates} / {stub.upserts}")
+
+    stub = StubClient()
+    _res, exc = run_patch(stub, {"customer_name": None})
+    cust = [p for (t, p, _o) in stub.upserts if t == "job_customers"]
+    check("(1d) {'customer_name': null} -> upsert KEYS carry customer_name=None",
+          exc is None and cust and "customer_name" in cust[0]
+          and cust[0]["customer_name"] is None
+          and set(cust[0]) == {"customer_name", "updated_at", "job_id"},
+          str(cust))
+    check("(1d) ...and NO jobs update for a customer-only payload",
+          stub.updates == [], str(stub.updates))
+    stub = StubClient()
+    _res, exc = run_patch(stub, {"intent": "both"})
+    check("(1d) {'intent':'both'} -> jobs update only, ZERO job_customers writes",
+          exc is None and stub.updates
+          and set(stub.updates[0]) == {"intent", "updated_at"}
+          and stub.upserts == [], f"{stub.updates} / {stub.upserts}")
+
+    for label, payload in (
+        ("intent='rubbish'", {"intent": "rubbish"}),
+        ("existing_solar_kw=-1", {"existing_solar_kw": -1}),
+        ("address=''", {"address": ""}),
+    ):
+        try:
+            job_route.JobSitePatch(**payload)
+            check(f"(1e) {label} rejected", False, "validated cleanly")
+        except ValidationError:
+            check(f"(1e) {label} rejected", True)
+
+    # (1f) THE LOCK, each table independently — a rule written as
+    # `if roof_geometry_count` passes one combined test and fails three of these.
+    for table in ("roof_geometry", "sizing_results", "tariffs", "interval_data"):
+        stub = StubClient(table_rows={table: [{"job_id": "j1"}]})
+        res, exc = run_patch(stub, {"address": "1 New St, Adelaide SA 5000"})
+        body_json = json.loads(res.body) if isinstance(res, JSONResponse) else None
+        check(f"(1f) {table} row present -> 409, exact detail",
+              exc is None and isinstance(res, JSONResponse)
+              and res.status_code == 409
+              and body_json == {"detail": job_route._ADDRESS_LOCKED_DETAIL},
+              f"res={res!r} body={body_json}")
+        check(f"(1f) {table}: ZERO update calls and ZERO upserts",
+              stub.updates == [] and stub.upserts == [],
+              f"{stub.updates} / {stub.upserts}")
+    stub = StubClient()  # all four empty
+    _res, exc = run_patch(stub, {"address": "1 New St, Adelaide SA 5000"})
+    check("(1f) all four empty -> the address writes normally",
+          exc is None and stub.upserts
+          and stub.upserts[0][1].get("property_address_full")
+          == "1 New St, Adelaide SA 5000", str(stub.upserts))
+
+    stub = StubClient(table_rows={"roof_geometry": [{"job_id": "j1"}]})
+    res, exc = run_patch(stub, {"address": "1 New St", "customer_name": "X",
+                                "storeys": 3})
+    check("(1g) locked + mixed payload -> 409 and NOTHING written at all",
+          exc is None and isinstance(res, JSONResponse) and res.status_code == 409
+          and stub.updates == [] and stub.upserts == [],
+          f"{stub.updates} / {stub.upserts}")
+
+    check("(1h) updated_at set on the jobs write", "updated_at" in jobs_sent)
+    check("(1h) updated_at set on the job_customers write — no trigger sets it",
+          "updated_at" in cust_sent)
 
     print("\n6. empty payload -> no update call at all")
     stub = StubClient()

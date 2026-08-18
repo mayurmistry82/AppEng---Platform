@@ -13,7 +13,7 @@ import {
   SelectTrigger,
   SelectValue,
 } from "@/components/ui/select";
-import { postJson } from "@/lib/client-api";
+import { requestJson } from "@/lib/client-api";
 import { clientActionErrorCopy } from "@/lib/jobs";
 import type { SiteDetailsView } from "@/lib/worksheet";
 
@@ -169,7 +169,8 @@ export function SiteDetailsSection({
           payload[API_FIELDS[key]] = NUMERIC_FIELDS.has(key) ? Number(text) : text;
         }
       }
-      const result = await postJson<Record<string, unknown>>(
+      const result = await requestJson<Record<string, unknown>>(
+        "PATCH",
         `/api/job/${encodeURIComponent(jobId)}`,
         payload,
       );

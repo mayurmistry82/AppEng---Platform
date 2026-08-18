@@ -15,11 +15,10 @@ import { createClient } from "@/lib/supabase/server";
  * The dynamic segment is the job id — validated non-empty and forwarded, no
  * further: the backend does the ownership check (404 absent/foreign, F88 503).
  *
- * POST IS AN ALIAS FOR PATCH, deliberately: lib/client-api.ts (frozen at 3.4-E)
- * only speaks POST, and editing it silently is forbidden. The browser calls
- * POST via postJson; the canonical method for tools and future clients is
- * PATCH. Both run the identical handler. If client-api.ts ever grows a method
- * parameter, this alias can go.
+ * The POST alias is GONE (3.3c): client-api.ts now speaks every method via
+ * requestJson (F100 closed), so PATCH is the only verb this route answers and
+ * both browser callers — the site-details section and the job-edit dialog —
+ * use it.
  */
 
 const API_BASE = process.env.NEXT_PUBLIC_API_URL ?? "http://localhost:8000";
@@ -32,6 +31,14 @@ const FIELDS = [
   "bedrooms",
   "floor_area_m2",
   "electrical_phase",
+  // 3.3c — the job-bar edit fields. customer_name and address land on
+  // job_customers server-side; the proxy just whitelists and forwards.
+  "customer_name",
+  "has_existing_solar",
+  "existing_solar_kw",
+  "existing_inverter_kw",
+  "intent",
+  "address",
 ] as const;
 
 async function forward(
@@ -109,9 +116,3 @@ export async function PATCH(
   return forward(request, context.params);
 }
 
-export async function POST(
-  request: Request,
-  context: { params: Promise<{ id: string }> },
-): Promise<NextResponse> {
-  return forward(request, context.params);
-}

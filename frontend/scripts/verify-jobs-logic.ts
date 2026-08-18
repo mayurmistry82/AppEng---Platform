@@ -31,6 +31,9 @@ import {
   type JobIntent,
   type JobKpis,
   type JobListItem,
+  UNIT_ADDRESS_HINT,
+  jobEditErrorCopy,
+  needsUnitNumberHint,
 } from "../lib/jobs.ts";
 
 /** Runtime-shaped garbage reaching a typed formatter — cast via unknown, never `any`. */
@@ -571,4 +574,54 @@ test("errorPanelCopy: all six branches BYTE-IDENTICAL after 3.4-E", () => {
     heading: "Couldn't load jobs",
     body: `${ENDPOINT} responded with HTTP 500. The backend hit an error — try reloading, and check the backend logs if it persists.`,
   });
+});
+
+// ── 3.3c: the unit-address nudge (F99) and the edit-error copy ───────────────
+
+test("3.3c 2i: bare street addresses need the unit hint", () => {
+  // Both are REAL rows in the live database — the exact strings the check
+  // exists for.
+  assert.equal(
+    needsUnitNumberHint("53 Bishops Pl, Kensington SA 5068, Australia"),
+    true,
+  );
+  assert.equal(
+    needsUnitNumberHint("14 Frome St, Adelaide SA 5000, Australia"),
+    true,
+  );
+  assert.ok(UNIT_ADDRESS_HINT.includes("Add the unit number"));
+});
+
+test("3.3c 2j: unit-marked addresses do NOT get the hint", () => {
+  for (const address of [
+    "Unit 5/53 Bishops Pl, Kensington SA 5068",
+    "unit 5/53 Bishops Pl, Kensington SA 5068, Australia",
+    "5/53 Bishops Pl, Kensington SA 5068",
+    "U5 53 Bishops Pl",
+    "Apt 2, 10 High St",
+    "Lot 3, 22 Oak Ave",
+  ]) {
+    assert.equal(needsUnitNumberHint(address), false, address);
+  }
+});
+
+test("3.3c 2k: empty and non-address strings never get the hint", () => {
+  assert.equal(needsUnitNumberHint(""), false);
+  assert.equal(needsUnitNumberHint("   "), false);
+  assert.equal(needsUnitNumberHint("abc"), false);
+});
+
+test("3.3c 2l: jobEditErrorCopy — the 409 carries the server's own words", () => {
+  const specific = jobEditErrorCopy("http", 409, "This job's address is locked — X.");
+  assert.equal(specific.heading, "This change was rejected");
+  assert.equal(specific.body, "This job's address is locked — X.");
+  // Empty server message falls back to the generic copy.
+  assert.deepEqual(jobEditErrorCopy("http", 409, ""), clientActionErrorCopy("http", 409));
+  assert.deepEqual(jobEditErrorCopy("http", 409, "   "), clientActionErrorCopy("http", 409));
+  // Every other kind/status is EXACTLY the shared copy.
+  assert.deepEqual(jobEditErrorCopy("http", 500, "x"), clientActionErrorCopy("http", 500));
+  assert.deepEqual(jobEditErrorCopy("http", 404, "x"), clientActionErrorCopy("http", 404));
+  assert.deepEqual(jobEditErrorCopy("auth", 401, "x"), clientActionErrorCopy("auth", 401));
+  assert.deepEqual(jobEditErrorCopy("network", 0, "x"), clientActionErrorCopy("network", 0));
+  assert.deepEqual(jobEditErrorCopy("parse", 200, "x"), clientActionErrorCopy("parse", 200));
 });

@@ -490,10 +490,19 @@ class JobSitePatch(BaseModel):
 
     ABSENT vs NULL are different facts: an explicit null CLEARS a column, a field
     absent from the payload is LEFT ALONE (model_dump(exclude_unset=True)).
-    Conflating them is how a partial save wipes another visit's data.
+    Conflating them is how a partial save wipes another visit's data — and since
+    3.3c added customer_name it is how a partial save wipes a customer's NAME.
 
-    All optional, never gating (D5): these are site-visit fields, and a job with
-    every one of them empty is NOT incomplete.
+    The ORIGINAL SEVEN (storeys .. electrical_phase) are site-visit fields: all
+    optional, never gating (D5), and a job with every one empty is NOT
+    incomplete. THAT SENTENCE DOES NOT COVER THE SIX 3.3c FIELDS BELOW THEM:
+    customer_name and address are job identity (PII, stored on job_customers,
+    never on jobs); has_existing_solar / existing_solar_kw /
+    existing_inverter_kw / intent are the six-path routing inputs, and changing
+    intent re-derives the GENERATED `path` column and with it which worksheet
+    sections exist. `address` is additionally guarded server-side: once
+    anything has been derived from it (roof_geometry, sizing_results, tariffs,
+    interval_data) the PATCH answers 409 and writes nothing (F82).
     """
 
     storeys: Optional[int] = Field(default=None, ge=1, le=5)
@@ -505,6 +514,40 @@ class JobSitePatch(BaseModel):
     bedrooms: Optional[int] = Field(default=None, ge=0, le=20)
     floor_area_m2: Optional[float] = Field(default=None, gt=0, le=2000)
     electrical_phase: Optional[Literal["single", "three"]] = None
+    # ── 3.3c — job-bar edit. See the docstring: these are NOT site-visit fields.
+    customer_name: Optional[str] = Field(default=None, max_length=200)
+    has_existing_solar: Optional[bool] = None
+    existing_solar_kw: Optional[float] = Field(default=None, ge=0, le=1000)
+    existing_inverter_kw: Optional[float] = Field(default=None, ge=0, le=1000)
+    intent: Optional[Literal["solar", "battery", "both"]] = None
+    address: Optional[str] = Field(default=None, min_length=1, max_length=500)
+
+
+# Where each JobSitePatch field is WRITTEN (3.3c). jobs has NO address and NO
+# customer_name column — both live on job_customers — so the PATCH writes two
+# tables and this mapping is the single place that decides which. A model field
+# in neither set raises at request time rather than being dropped silently: a
+# field added to the model and forgotten here is exactly the silent no-op the
+# 3.3c correction exists to prevent.
+_JOBS_PATCH_FIELDS = {
+    "storeys", "roof_material", "dwelling_type", "year_built", "bedrooms",
+    "floor_area_m2", "electrical_phase",
+    "has_existing_solar", "existing_solar_kw", "existing_inverter_kw", "intent",
+}
+_CUSTOMER_PATCH_FIELDS = {
+    "customer_name": "customer_name",
+    "address": "property_address_full",
+}
+
+# The four tables that DERIVE from the address (F82). A bill or a survey does
+# not follow from the address and deliberately does not lock it.
+_ADDRESS_LOCK_TABLES = ("roof_geometry", "sizing_results", "tariffs", "interval_data")
+
+_ADDRESS_LOCKED_DETAIL = (
+    "This job's address is locked — it has already been measured. Roof geometry, "
+    "irradiance, network and incentives all follow from it. Create a new job for "
+    "a different address."
+)
 
 
 @router.post("/api/job")
@@ -772,7 +815,11 @@ async def patch_job_status(
 async def patch_job(
     job_id: str, body: JobSitePatch, caller: Caller = Depends(require_company)
 ):
-    """Update a job's site-detail fields. See JobSitePatch for the whitelist rules."""
+    """Update a job's fields. See JobSitePatch for the whitelist rules.
+
+    3.3c: this is a TWO-TABLE write — jobs has no address and no customer_name
+    column; both live on job_customers. The address lock (F82) is enforced HERE,
+    not by the UI disabling a field: it must hold against a raw curl."""
     client = _require_svc()
     _get_company_job(client, job_id, caller.company_id)  # 404 absent/foreign, 503 transport
 
@@ -788,11 +835,80 @@ async def patch_job(
         path = job.get("path")
         return {**job, "path_label": job_paths.PATH_LABELS.get(path) if path else None}
 
-    updates["updated_at"] = datetime.now(timezone.utc).isoformat()
+    # THE ADDRESS LOCK (F82), before ANY write. All-or-nothing: a 409 writes
+    # NOTHING, including the other fields in the same payload — a partial write
+    # would show the installer a rejection while half their edit landed anyway.
+    if "address" in updates:
+        for table in _ADDRESS_LOCK_TABLES:
+            try:
+                res = (
+                    client.table(table)
+                    .select("job_id")
+                    .eq("job_id", job_id)
+                    .limit(1)
+                    .execute()
+                )
+                rows = getattr(res, "data", None) or []
+            except Exception as exc:  # noqa: BLE001 — unknowable is not "unlocked"
+                sentry_sdk.capture_exception(exc)
+                return JSONResponse(
+                    status_code=503,
+                    content={
+                        "detail": "Could not check whether the address is locked — try again in a moment."
+                    },
+                )
+            if rows:
+                return JSONResponse(
+                    status_code=409, content={"detail": _ADDRESS_LOCKED_DETAIL}
+                )
+
+    # Split into the two tables' dicts. A model field in neither mapping is a
+    # BUG — raise loudly rather than dropping it into the silent-no-op class.
+    jobs_updates: dict = {}
+    customer_updates: dict = {}
+    for key, value in updates.items():
+        if key in _JOBS_PATCH_FIELDS:
+            jobs_updates[key] = value
+        elif key in _CUSTOMER_PATCH_FIELDS:
+            customer_updates[_CUSTOMER_PATCH_FIELDS[key]] = value
+        else:
+            raise RuntimeError(
+                f"JobSitePatch field {key!r} is mapped to neither jobs nor "
+                "job_customers — fix _JOBS_PATCH_FIELDS/_CUSTOMER_PATCH_FIELDS"
+            )
+
+    # No triggers exist on either table: updated_at only moves because a writer
+    # sets it, so BOTH writes set it explicitly.
+    now = datetime.now(timezone.utc).isoformat()
+
+    if jobs_updates:
+        jobs_updates["updated_at"] = now
+        try:
+            client.table("jobs").update(jobs_updates).eq("job_id", job_id).eq(
+                "company_id", caller.company_id
+            ).execute()
+        except Exception as exc:  # noqa: BLE001
+            sentry_sdk.capture_exception(exc)
+            return JSONResponse(status_code=500, content={"detail": "job update failed"})
+
+    customer_wrote = False
+    if customer_updates:
+        customer_updates["updated_at"] = now
+        try:
+            # UPSERT, not update: a job whose PII write failed at creation has no
+            # job_customers row, and an update would silently affect zero rows
+            # and report success.
+            client.table("job_customers").upsert(
+                {**customer_updates, "job_id": job_id}, on_conflict="job_id"
+            ).execute()
+            customer_wrote = True
+        except Exception as exc:  # noqa: BLE001 — NEVER downgrade an edit miss to a flag
+            sentry_sdk.capture_exception(exc)
+            return JSONResponse(
+                status_code=500, content={"detail": "customer update failed"}
+            )
+
     try:
-        client.table("jobs").update(updates).eq("job_id", job_id).eq(
-            "company_id", caller.company_id
-        ).execute()
         updated = (
             client.table("jobs").select("*").eq("job_id", job_id).limit(1).execute()
         ).data[0]
@@ -800,5 +916,33 @@ async def patch_job(
         sentry_sdk.capture_exception(exc)
         return JSONResponse(status_code=500, content={"detail": "job update failed"})
 
+    # Read the PII back so the response is TRUE (the frontend refreshes anyway;
+    # tools and tests read this). If the customer write just succeeded, a failed
+    # read-back must not report success it cannot show.
+    customer_name = None
+    address = None
+    try:
+        pii_rows = (
+            client.table("job_customers")
+            .select("customer_name, property_address_full")
+            .eq("job_id", job_id)
+            .limit(1)
+            .execute()
+        ).data or []
+        if pii_rows:
+            customer_name = pii_rows[0].get("customer_name")
+            address = pii_rows[0].get("property_address_full")
+    except Exception as exc:  # noqa: BLE001
+        sentry_sdk.capture_exception(exc)
+        if customer_wrote:
+            return JSONResponse(
+                status_code=500, content={"detail": "customer update failed"}
+            )
+
     path = updated.get("path")
-    return {**updated, "path_label": job_paths.PATH_LABELS.get(path) if path else None}
+    return {
+        **updated,
+        "path_label": job_paths.PATH_LABELS.get(path) if path else None,
+        "customer_name": customer_name,
+        "address": address,
+    }
