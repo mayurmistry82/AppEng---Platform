@@ -8,11 +8,14 @@ Run:  /opt/anaconda3/bin/python3 backend/scripts/verify_sizing_time_base.py
 
 Tests 1 and 3 are offline. Tests 2, 4 and 5 READ the live database and Storage
 (pvgis_cache, interval_data, load_profiles, the series object) — reads only.
-THE GATE WRITES NOTHING: test 5 runs the optimiser on a roof built from the
-two planes ALREADY IN pvgis_cache (cell -34.93/138.6, tilt 22, aspects
--180/-90), so both planes are cache HITS — no PVGIS network call, no cache
-write — and generation._cache_put is additionally no-opped for the run as belt
-and braces. The roof is therefore synthetic; the LOAD is job 456e0242's real
+THE GATE WRITES NOTHING: test 5 runs the optimiser on a roof built from two
+planes ALREADY IN pvgis_cache — the cell -34.93/138.6 at tilt 22.0 facing
+-180 and -90 — so both planes are cache HITS: no PVGIS network call, no cache
+write, and generation._cache_put is additionally no-opped for the run as belt
+and braces. Those two planes are SELECTED BY FULL KEY (lat, lon, tilt,
+azimuth) from however many rows the cache happens to hold; the cache GROWS
+with real platform use, so neither its size nor the position of a row in it
+may be assumed. See select_reference_row. The roof is therefore synthetic; the LOAD is job 456e0242's real
 data on both paths, which is what test 5 measures. sizing_results is asserted
 0 before and after.
 """
@@ -52,6 +55,46 @@ def check(name: str, condition: bool, detail: str = "") -> None:
 
 
 LIVE_JOB = "456e0242-17f9-4b2a-8faa-f664ddd9eed9"
+
+# THE REFERENCE PLANE, by its FULL key. Azimuth alone stopped identifying it on
+# 2026-08-18, when real platform use cached a second -180.0 row at tilt 20.0 in
+# the same cell: an azimuth-only pick could then bind to a DIFFERENT ROOF and
+# nothing would fail, because a 20-degree roof yields a perfectly plausible
+# generation curve. t5's synthetic roof is built at pitch 22.0 to match this.
+REF_LAT, REF_LON, REF_TILT = -34.93, 138.6, 22.0
+
+
+def select_reference_row(rows, *, lat, lon, tilt, azimuth, tol=1e-6):
+    """Every row matching ALL FOUR key fields, as a LIST.
+
+    Returns a list rather than a row so the caller can assert HOW MANY matched:
+    zero means the reference data is gone, two-or-more means the gate no longer
+    knows which roof it is measuring, and both must be loud rather than
+    silently binding to whichever row PostgREST happened to return first (it
+    guarantees no order without an ORDER BY).
+
+    PostgREST returns numerics as STRINGS ("22.0", not 22.0), so every value is
+    coerced with float() and compared within `tol` — a bare == against a float
+    fails on the string form, and a bare == between strings is brittle
+    ("22.0" != "22.00"). Total: a junk row is skipped, never raised on."""
+    want = {"lat_cell": lat, "lon_cell": lon, "tilt": tilt, "azimuth": azimuth}
+    out = []
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        try:
+            if all(abs(float(row[col]) - value) <= tol for col, value in want.items()):
+                out.append(row)
+        except (KeyError, TypeError, ValueError):
+            continue
+    return out
+
+
+def _key_of(row) -> str:
+    """The four key fields of a row, for a failure message that names WHICH
+    rows matched rather than just how many."""
+    return (f"(lat {row.get('lat_cell')}, lon {row.get('lon_cell')}, "
+            f"tilt {row.get('tilt')}, az {row.get('azimuth')})")
 
 
 def hour_of_day_means(hourly: list[float]) -> list[float]:
@@ -140,6 +183,62 @@ def t1_offsets_and_rotation() -> None:
               "utc_offset" in window, window[:80])
 
 
+def t1b_reference_selection() -> None:
+    """The helper, offline. Without this the only proof that the full-key pick
+    works is the live data agreeing with it today — which is exactly the
+    assumption that went stale."""
+    print("\nT1b. select_reference_row — full-key selection, offline")
+    A = {"lat_cell": -34.93, "lon_cell": 138.6, "tilt": 22.0, "azimuth": -180.0, "tag": "A"}
+    B = {"lat_cell": -34.93, "lon_cell": 138.6, "tilt": 20.0, "azimuth": -180.0, "tag": "B"}
+    C = {"lat_cell": -34.93, "lon_cell": 138.6, "tilt": 22.0, "azimuth": -90.0, "tag": "C"}
+    D = {"lat_cell": -35.50, "lon_cell": 138.6, "tilt": 22.0, "azimuth": -180.0, "tag": "D"}
+    rows = [A, B, C, D]
+
+    # The OLD azimuth-only predicate matches A, B AND D — three different roofs
+    # (a different tilt in the same cell, and a different cell entirely), any
+    # of which `next()` could bind depending on PostgREST's unordered return.
+    # This is the fault, expressed as a number.
+    old_way = [r for r in rows if float(r["azimuth"]) == -180.0]
+    print(f"        azimuth-only predicate matches: {[r['tag'] for r in old_way]} "
+          f"({len(old_way)} rows — the fault)")
+    check("(1b) the azimuth-only predicate is genuinely ambiguous (A, B and D)",
+          [r["tag"] for r in old_way] == ["A", "B", "D"],
+          str([r["tag"] for r in old_way]))
+
+    north = select_reference_row(rows, lat=-34.93, lon=138.6, tilt=22.0, azimuth=-180.0)
+    check("(1b) full key tilt 22.0 / az -180.0 returns exactly [A]",
+          north == [A], str([r["tag"] for r in north]))
+    west = select_reference_row(rows, lat=-34.93, lon=138.6, tilt=22.0, azimuth=-90.0)
+    check("(1b) full key tilt 22.0 / az -90.0 returns exactly [C]",
+          west == [C], str([r["tag"] for r in west]))
+
+    # The ZERO case must be LOUD, not skipped: the helper returns [] and the
+    # exactly-one predicate t2 applies evaluates False, so t2 FAILS.
+    absent = select_reference_row(rows, lat=-34.93, lon=138.6, tilt=21.0, azimuth=-180.0)
+    check("(1b) an absent tilt returns [] and FAILS the exactly-one predicate",
+          absent == [] and not (len(absent) == 1), str(absent))
+
+    # lat is genuinely part of the key, not decoration: D shares tilt and
+    # azimuth with A and must not match.
+    check("(1b) a different lat (D) is excluded — lat is part of the key",
+          D not in north and select_reference_row(
+              rows, lat=-35.50, lon=138.6, tilt=22.0, azimuth=-180.0) == [D],
+          str([r["tag"] for r in north]))
+
+    # What PostgREST ACTUALLY returns: every key field as a string.
+    as_strings = [{"lat_cell": "-34.93", "lon_cell": "138.6", "tilt": "22.0",
+                   "azimuth": "-180.0", "tag": "A-str"}]
+    check("(1b) STRING key fields still match (PostgREST's real shape)",
+          len(select_reference_row(as_strings, lat=-34.93, lon=138.6,
+                                   tilt=22.0, azimuth=-180.0)) == 1,
+          str(as_strings))
+    # Junk never raises.
+    check("(1b) junk rows are skipped, never raised on",
+          select_reference_row([None, "x", 42, {}, {"lat_cell": "nope"}],
+                               lat=-34.93, lon=138.6, tilt=22.0, azimuth=-180.0) == [],
+          "raised or matched")
+
+
 def t2_the_fault_measured(client) -> tuple[list[float], list[float]]:
     """Returns (adelaide_north_hourly_utc, load_weights) for later tests."""
     print("\nT2. the fault itself, measured on the real cached data (read-only)")
@@ -148,9 +247,28 @@ def t2_the_fault_measured(client) -> tuple[list[float], list[float]]:
         .select("lat_cell,lon_cell,tilt,azimuth,hourly")
         .execute()
     ).data or []
-    check("(2) two cached PVGIS rows", len(rows) == 2, str(len(rows)))
-    north = next((r for r in rows if float(r["azimuth"]) == -180.0), None)
-    other = next((r for r in rows if float(r["azimuth"]) != -180.0), None)
+    # NEVER an absolute count of live production data — F77's rule applied to a
+    # gate instead of a prompt. The cache grows with real use; that is evidence
+    # the platform is being used, not a regression. The total is PRINTED so the
+    # growth stays visible without failing anything.
+    print(f"        pvgis_cache holds {len(rows)} row(s)")
+    check("(2) at least the two reference PVGIS rows are cached", len(rows) >= 2,
+          str(len(rows)))
+
+    north_matches = select_reference_row(
+        rows, lat=REF_LAT, lon=REF_LON, tilt=REF_TILT, azimuth=-180.0)
+    west_matches = select_reference_row(
+        rows, lat=REF_LAT, lon=REF_LON, tilt=REF_TILT, azimuth=-90.0)
+    check(f"(2) EXACTLY ONE north reference row (lat {REF_LAT}, lon {REF_LON}, "
+          f"tilt {REF_TILT}, az -180.0)",
+          len(north_matches) == 1,
+          f"{len(north_matches)} matched: {[_key_of(r) for r in north_matches]}")
+    check(f"(2) EXACTLY ONE west reference row (lat {REF_LAT}, lon {REF_LON}, "
+          f"tilt {REF_TILT}, az -90.0)",
+          len(west_matches) == 1,
+          f"{len(west_matches)} matched: {[_key_of(r) for r in west_matches]}")
+    north = north_matches[0] if len(north_matches) == 1 else None
+    other = west_matches[0] if len(west_matches) == 1 else None
     check("(2) the north-facing Adelaide row is present", north is not None)
     hourly = [float(v) for v in (north or {}).get("hourly", [])]
 
@@ -434,6 +552,7 @@ def t5_two_modes(client, true_hourly: list[float]) -> None:
 def main() -> int:
     print("verify_sizing_time_base.py — 3.7: one time base, then the true series\n")
     t1_offsets_and_rotation()
+    t1b_reference_selection()
     client = sizing_route._sb()
     if client is None:
         check("(live) Supabase client available", False, "env not configured")

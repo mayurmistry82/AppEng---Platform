@@ -1073,7 +1073,14 @@ async def battery_sizing(body: BatteryRequest):
         full_catalogue: list[dict] = []
         if client is not None:
             try:
-                full_catalogue = client.table("batteries").select("*").eq("status", "active").execute().data or []
+                # 3.10 — the engine picks FOR the installer here, on the
+                # SERVICE ROLE (RLS bypassed), with no authenticated caller to
+                # scope against (this endpoint carries no auth dependency —
+                # 9.3b). An automatic recommendation is therefore restricted
+                # to curated catalogue equipment; an installer's own custom
+                # battery still reaches the LP by being named explicitly in
+                # constraints.battery_ids, which is prompt 2's path.
+                full_catalogue = client.table("batteries").select("*").eq("status", "active").eq("origin", "catalogue").execute().data or []
             except Exception:
                 full_catalogue = []
         if not full_catalogue:

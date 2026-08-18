@@ -283,10 +283,18 @@ def _get_panel(panel_id: Optional[str]) -> tuple[dict, list[str]]:
                     return panel, flags
             flags.append("panel_id_not_found_used_default")
         # Default: prefer Jinko Tiger Neo, else first active panel deterministically.
+        # 3.10 — BOTH default queries are scoped to origin='catalogue': this
+        # branch picks a panel FOR the installer on the service role (RLS
+        # bypassed, no authenticated caller — 9.3b), and without the scope a
+        # foreign company's user-defined 700 W "panel" would become the
+        # default for every job on the platform via the rated_power_w
+        # ordering below. The explicit-id lookup above is deliberately NOT
+        # scoped — it resolves an id the caller supplied.
         pref = (
             client.table("panels")
             .select("*")
             .eq("status", "active")
+            .eq("origin", "catalogue")
             .eq("brand", "Jinko")
             .eq("model", "Tiger Neo")
             .limit(1)
@@ -296,6 +304,7 @@ def _get_panel(panel_id: Optional[str]) -> tuple[dict, list[str]]:
             client.table("panels")
             .select("*")
             .eq("status", "active")
+            .eq("origin", "catalogue")
             .order("rated_power_w", desc=True)
             .order("created_at")
             .limit(1)

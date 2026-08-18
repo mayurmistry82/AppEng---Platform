@@ -90,6 +90,12 @@ _ALLOWED: dict[str, set[str]] = {
         # and leaving that gap open is how a later task discovers three NULLs
         # and no error.
         "objective", "custom_weight", "budget_aud",
+        # 3.10 — equipment constraints (the quoted_* trio above are the OUTCOME
+        # labels; these are the INPUTS). Same reason as 3.9: this allowlist
+        # SILENTLY DROPS unknown columns, so a name missing here is one the
+        # legacy /api/job/save path and the flywheel writer discard without a
+        # word. PATCH writes jobs directly and never passes through here.
+        "equipment_panel_id", "equipment_inverter_id", "equipment_battery_id",
     },
     "bills": {
         "bill_id", "job_id", "raw_file_path", "parsed_json", "parser_version",

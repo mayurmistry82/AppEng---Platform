@@ -153,17 +153,27 @@ def run_patch(stub, payload, job_id="j1"):
 def main() -> int:
     print("verify_job_patch.py — PATCH /api/job/{id} contract (offline)\n")
 
-    print("1. the whitelist: exactly sixteen fields, everything else DROPPED silently")
-    # 3.3c grew the seven site fields by the six job-bar-edit fields; 3.9 grew
-    # them again by the three optimisation inputs — one whitelist that grows,
-    # never a second implementation (D2).
+    print("1. the whitelist: exactly nineteen fields, everything else DROPPED silently")
+    # ONE whitelist that GROWS, never a second implementation (D2). Four growth
+    # events so far: 3.4b seven site fields, 3.3c six job-bar-edit fields, 3.9
+    # three optimisation inputs, 3.10 three equipment constraints.
+    #
+    # The assertion stays an ENUMERATION on purpose: it catches an
+    # UNAUTHORISED field appearing as well as an authorised one going missing,
+    # which a length check cannot. What went stale at 3.10 was the enumeration
+    # being frozen while the model legitimately grew — not the decision to
+    # enumerate. The count is PRINTED from the model itself so the word in the
+    # name above can never quietly drift from reality again.
     fields = set(job_route.JobSitePatch.model_fields.keys())
-    check("model has exactly the sixteen fields",
+    print(f"   len(JobSitePatch.model_fields) = {len(fields)}")
+    check("model has exactly the nineteen fields",
           fields == {"storeys", "roof_material", "dwelling_type", "year_built",
                      "bedrooms", "floor_area_m2", "electrical_phase",
                      "customer_name", "has_existing_solar", "existing_solar_kw",
                      "existing_inverter_kw", "intent", "address",
-                     "objective", "custom_weight", "budget_aud"}, str(fields))
+                     "objective", "custom_weight", "budget_aud",
+                     "equipment_panel_id", "equipment_inverter_id",
+                     "equipment_battery_id"}, str(fields))
     stub = StubClient()
     smuggle = {"storeys": 2, "company_id": "co-EVIL", "installer_id": "x",
                "path": "F", "status": "won", "address": "1 Evil St"}

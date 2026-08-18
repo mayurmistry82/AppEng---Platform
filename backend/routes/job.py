@@ -540,6 +540,16 @@ class JobSitePatch(BaseModel):
     # already means "no cap". le=500000 catches a stray zero on a residential
     # job while leaving headroom for the C&I segment 10.5 un-hides.
     budget_aud: Optional[float] = Field(default=None, gt=0, le=500000)
+    # ── 3.10 — EQUIPMENT CONSTRAINTS, a FOURTH kind of field again: the panel
+    # / inverter / battery the engine is pinned to before it runs. NULL means
+    # Auto (the engine chooses). Optional[str], not a UUID type — ids cross
+    # this boundary as strings everywhere in this codebase, and the database
+    # FK is the one place a non-existent id is rejected; a second validation
+    # site here would just drift. NOT the quoted_* outcome labels. No part in
+    # the address lock.
+    equipment_panel_id: Optional[str] = None
+    equipment_inverter_id: Optional[str] = None
+    equipment_battery_id: Optional[str] = None
 
 
 # Where each JobSitePatch field is WRITTEN (3.3c). jobs has NO address and NO
@@ -553,6 +563,7 @@ _JOBS_PATCH_FIELDS = {
     "floor_area_m2", "electrical_phase",
     "has_existing_solar", "existing_solar_kw", "existing_inverter_kw", "intent",
     "objective", "custom_weight", "budget_aud",
+    "equipment_panel_id", "equipment_inverter_id", "equipment_battery_id",
 }
 _CUSTOMER_PATCH_FIELDS = {
     "customer_name": "customer_name",
