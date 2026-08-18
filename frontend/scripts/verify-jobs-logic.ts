@@ -31,7 +31,10 @@ import {
   type JobIntent,
   type JobKpis,
   type JobListItem,
+  EDIT_JOB_FOOTER_NOTE,
+  NEW_JOB_FOOTER_NOTE,
   UNIT_ADDRESS_HINT,
+  jobDialogFooterNote,
   jobEditErrorCopy,
   needsUnitNumberHint,
 } from "../lib/jobs.ts";
@@ -624,4 +627,24 @@ test("3.3c 2l: jobEditErrorCopy — the 409 carries the server's own words", () 
   assert.deepEqual(jobEditErrorCopy("auth", 401, "x"), clientActionErrorCopy("auth", 401));
   assert.deepEqual(jobEditErrorCopy("network", 0, "x"), clientActionErrorCopy("network", 0));
   assert.deepEqual(jobEditErrorCopy("parse", 200, "x"), clientActionErrorCopy("parse", 200));
+});
+
+// ── F133: the modal footer sentence is mode-dependent ────────────────────────
+
+test("F133 1a-1b: jobDialogFooterNote returns the right constant per mode", () => {
+  assert.equal(jobDialogFooterNote("create"), NEW_JOB_FOOTER_NOTE);
+  assert.equal(jobDialogFooterNote("edit"), EDIT_JOB_FOOTER_NOTE);
+});
+
+test("F133 1c: the two constants are NOT equal — this is the check that would have caught it", () => {
+  // If a future edit collapses them back to one string, 1a and 1b both still
+  // pass and only this fails.
+  assert.notEqual(NEW_JOB_FOOTER_NOTE, EDIT_JOB_FOOTER_NOTE);
+});
+
+test("F133 1d: EDIT_JOB_FOOTER_NOTE does not contain the false create-mode phrase", () => {
+  // The fault WAS this sentence appearing in edit mode — the substring check
+  // is the fault itself, not a proxy for it: it directly re-tests the exact
+  // false claim ("editable later in the worksheet") that F133 was raised over.
+  assert.ok(!EDIT_JOB_FOOTER_NOTE.includes("later in the worksheet"));
 });

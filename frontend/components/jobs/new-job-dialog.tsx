@@ -20,6 +20,7 @@ import {
   DISABLED_PATH_REASON,
   UNIT_ADDRESS_HINT,
   clientActionErrorCopy,
+  jobDialogFooterNote,
   jobEditErrorCopy,
   needsUnitNumberHint,
   sizingOptions,
@@ -443,7 +444,7 @@ export function NewJobDialog(props: NewJobDialogProps) {
 
         <DialogFooter className="justify-between">
           <p className="text-caption text-muted-foreground">
-            Job type is shown and editable later in the worksheet.
+            {jobDialogFooterNote(isEdit ? "edit" : "create")}
           </p>
           <div className="flex items-center gap-3">
             <Button variant="secondary" onClick={() => setOpen(false)}>

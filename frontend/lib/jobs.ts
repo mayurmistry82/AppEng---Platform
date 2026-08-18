@@ -271,6 +271,37 @@ export const DISABLED_PATH_REASON =
   "Battery sizing on a home that already has solar needs true consumption, which the meter cannot see. That calculation is being built (4.1).";
 
 /**
+ * The New Job modal's footer caption in create mode. Do not reword it — the
+ * sentence is specific and true, and it is FALSE if shown in edit mode (F133):
+ * it tells an installer editing a job from inside the worksheet to go to the
+ * worksheet later, when they are already there.
+ */
+export const NEW_JOB_FOOTER_NOTE =
+  "Job type is shown and editable later in the worksheet.";
+
+/**
+ * The footer caption in edit mode (F133). Do not reword it — chosen because it
+ * is true and it is what the installer standing in this window needs to know
+ * (F82: the address locks once anything has been derived from it; everything
+ * else stays editable for the life of the job).
+ */
+export const EDIT_JOB_FOOTER_NOTE =
+  "Everything except a locked address stays editable for the life of the job.";
+
+/**
+ * The modal's footer caption, by MODE — not a boolean, not the job object.
+ * F133: a hard-coded string in the component was invisible to every gate, so
+ * nothing noticed when a second mode made it false. The classification lives
+ * HERE, in the pure module, so it is testable — the same rule D25 applies to
+ * notices. The union has exactly two members and both are handled: no default
+ * branch, because a widened parameter with a fallback is how a future third
+ * mode would silently inherit the create-mode sentence.
+ */
+export function jobDialogFooterNote(mode: "create" | "edit"): string {
+  return mode === "edit" ? EDIT_JOB_FOOTER_NOTE : NEW_JOB_FOOTER_NOTE;
+}
+
+/**
  * Which sizing options the modal shows, and which are selectable — the SINGLE
  * source of truth; the component must not re-derive any of this.
  *
