@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import json
+import math
 import os
-from typing import Any, Optional
+from typing import Any, Literal, Optional
 from pydantic import BaseModel
 import sentry_sdk
 from fastapi import APIRouter, HTTPException
@@ -9,6 +11,7 @@ from fastapi import APIRouter, HTTPException
 import battery_optimiser
 import capture
 import generation
+import interval_parser
 import nem_data
 import roof_geometry
 import sizing_engine
@@ -51,8 +54,11 @@ class OptimiseRequest(BaseModel):
     lon: Optional[float] = None
     panel_id: Optional[str] = None
     panel_watts: Optional[float] = None
-    # Load (explicit 8,760, else representative expansion, else load_profiles by job_id)
+    # Load (explicit 8,760, else the job's TRUE Tier-3 series, else representative)
     load_hourly_8760: Optional[list[float]] = None
+    # 3.7: when supplying load_hourly_8760, the CALLER states its provenance —
+    # "tier3_actual" is honoured only when asserted; it is never inferred.
+    load_source: Optional[Literal["tier3_actual", "representative"]] = None
     annual_kwh: Optional[float] = None
     hourly_profile_weights: Optional[list[float]] = None
     # Tariff / network
@@ -119,6 +125,131 @@ def _fetch_panel(client: Any, panel_id: str) -> Optional[dict]:
         return None
 
 
+# ── 3.7 shared helpers: time base + the one load resolver ─────────────────────
+def _time_base(state: Optional[str], flags: list[str]) -> tuple[Optional[float], dict]:
+    """Resolve the site's UTC offset and emit the §4 time-base flags + metadata."""
+    offset = nem_data.get_utc_offset_hours(state)
+    if offset is None:
+        shift = 0
+        rounded = False
+        flags.append(
+            "generation_time_base_unrotated — state unknown, generation left in UTC — is_fallback"
+        )
+    else:
+        shift = int(math.floor(float(offset) + 0.5))
+        rounded = float(offset) != float(shift)
+        if rounded:
+            flags.append(
+                f"generation_time_base_rounded_30min — {state} is UTC+9:30, rotated by {shift} h"
+            )
+    meta = {
+        "convention": "local_standard",
+        "utc_offset_hours_applied": shift,
+        "state": state,
+        "rounded_to_whole_hour": rounded,
+    }
+    return offset, meta
+
+
+def _download_series(client: Any, ref: Any) -> Optional[dict]:
+    """Download + parse a stored interval series document. None on ANY failure.
+
+    `parsed_series_ref` carries the bucket name prefixed
+    (bills/interval/<token>.series.json); Storage download wants the key
+    WITHOUT the leading `bills/` — exactly one prefix is stripped."""
+    if client is None or not isinstance(ref, str) or not ref:
+        return None
+    key = ref[len("bills/"):] if ref.startswith("bills/") else ref
+    if not key:
+        return None
+    try:
+        blob = client.storage.from_("bills").download(key)
+        doc = json.loads(blob)
+        return doc if isinstance(doc, dict) else None
+    except Exception:  # noqa: BLE001 — a missing series is a downgrade, never an error
+        return None
+
+
+def _resolve_load(
+    client: Any, body: Any, flags: list[str]
+) -> tuple[Optional[list[float]], Optional[str], Optional[dict]]:
+    """
+    The ONE load resolver (3.7), used by both the solar and battery blocks.
+    Returns (load_hourly, load_source, error_dict). Preference order:
+
+      1. body.load_hourly_8760 — provenance is whatever the CALLER asserts via
+         body.load_source ("tier3_actual" honoured, never inferred).
+      2. The job's TRUE measured series: interval_data.parsed_series_ref →
+         Storage download → interval_parser.series_to_8760. Success is
+         "tier3_actual". ANY failure falls through — sizing is never blocked.
+      3. Today's representative expansion (unchanged, incl. the existing
+         missing-load error), which is still the Tier 1/2 path.
+    """
+    if body.load_hourly_8760:
+        source = (
+            "tier3_actual" if getattr(body, "load_source", None) == "tier3_actual"
+            else "representative"
+        )
+        return body.load_hourly_8760, source, None
+
+    if body.job_id and client is not None:
+        row = _load_one(
+            client, "interval_data", body.job_id, "parsed_series_ref,coverage_days"
+        )
+        if row and row.get("parsed_series_ref"):
+            doc = _download_series(client, row.get("parsed_series_ref"))
+            if doc is not None:
+                built = interval_parser.series_to_8760(
+                    doc.get("series_by_date"),
+                    doc.get("average_day_kwh"),
+                    doc.get("annual_kwh"),
+                    annualised=bool(
+                        (doc.get("coverage_days") or 0)
+                        < interval_parser.ANNUALISED_THRESHOLD_DAYS
+                    ),
+                )
+                hourly = built.get("hourly") or []
+                if len(hourly) == solar_optimiser.HOURS and sum(hourly) > 0:
+                    flags.append(
+                        f"load_from_tier3_actual_series — {built['days_mapped']} "
+                        "measured days mapped to the calendar year"
+                    )
+                    return hourly, "tier3_actual", None
+            flags.append(
+                "tier3_series_unreadable — fell back to the representative profile — is_fallback"
+            )
+        # A row with a null ref, or no row at all: representative, no error.
+
+    annual_kwh = body.annual_kwh
+    weights = body.hourly_profile_weights
+    tier = None
+    if (annual_kwh is None or weights is None) and body.job_id and client is not None:
+        lp = _load_one(
+            client, "load_profiles", body.job_id,
+            "annual_kwh,daily_avg_kwh,hourly_profile_weights,accuracy_tier",
+        )
+        if lp:
+            if annual_kwh is None:
+                annual_kwh = lp.get("annual_kwh") or (
+                    (lp.get("daily_avg_kwh") or 0) * 365 if lp.get("daily_avg_kwh") else None
+                )
+            if weights is None:
+                weights = lp.get("hourly_profile_weights")
+            tier = lp.get("accuracy_tier")
+    if annual_kwh is None:
+        return None, None, {
+            "error": "No load profile available (pass load_hourly_8760 or annual_kwh+weights, or a job_id with a stored load profile).",
+            "flags": ["missing_load"],
+        }
+    if tier == 3:
+        # KEPT only here: the Tier-3 job whose true series was NOT used. Where
+        # the series IS used this label would be the exact situation 3.7 ended.
+        flags.append("load_from_tier3_representative_weights")
+    load_hourly = solar_optimiser.expand_load_to_8760(float(annual_kwh), weights)
+    flags.append("load_expanded_from_representative_profile")
+    return load_hourly, "representative", None
+
+
 @router.post("/api/sizing/optimise")
 async def optimise_sizing(body: OptimiseRequest):
     try:
@@ -176,30 +307,14 @@ async def optimise_sizing(body: OptimiseRequest):
         if state is None and postcode is not None:
             state = nem_data.postcode_to_state(postcode)
 
-        # ── Resolve the load profile ──
-        load_hourly = body.load_hourly_8760
-        if not load_hourly:
-            annual_kwh = body.annual_kwh
-            weights = body.hourly_profile_weights
-            if (annual_kwh is None or weights is None) and body.job_id and client is not None:
-                lp = _load_one(
-                    client, "load_profiles", body.job_id,
-                    "annual_kwh,daily_avg_kwh,hourly_profile_weights,accuracy_tier",
-                )
-                if lp:
-                    if annual_kwh is None:
-                        annual_kwh = lp.get("annual_kwh") or (
-                            (lp.get("daily_avg_kwh") or 0) * 365 if lp.get("daily_avg_kwh") else None
-                        )
-                    if weights is None:
-                        weights = lp.get("hourly_profile_weights")
-                    if lp.get("accuracy_tier") == 3:
-                        flags.append("load_from_tier3_representative_weights")
-            if annual_kwh is None:
-                return {"error": "No load profile available (pass load_hourly_8760 or annual_kwh+weights, or a job_id with a stored load profile).",
-                        "flags": ["missing_load"]}
-            load_hourly = solar_optimiser.expand_load_to_8760(float(annual_kwh), weights)
-            flags.append("load_expanded_from_representative_profile")
+        # ── 3.7: one declared time base — resolve the offset ONCE, here, right
+        # after the state, because the optimise() call below needs it. ──
+        utc_offset, time_base_meta = _time_base(state, flags)
+
+        # ── Resolve the load profile (3.7: the ONE resolver — true series first) ──
+        load_hourly, load_source, load_error = _resolve_load(client, body, flags)
+        if load_error is not None:
+            return load_error
         if len(load_hourly) != solar_optimiser.HOURS:
             return {"error": f"load profile must be {solar_optimiser.HOURS} hourly values (got {len(load_hourly)}).",
                     "flags": ["bad_load_length"]}
@@ -245,6 +360,7 @@ async def optimise_sizing(body: OptimiseRequest):
         def _run(planes_, configs_, panel_, constraints_, flags_):
             return solar_optimiser.optimise(
                 roof_planes=planes_, candidate_configs=configs_, lat=float(lat), lon=float(lon),
+                utc_offset_hours=utc_offset,
                 panel=panel_, load_hourly=load_hourly, import_rate=float(import_rate), fit=float(fit),
                 export_limit_kw=float(export_limit_kw), objective=body.objective, fin=fin,
                 postcode=postcode, state=state, installer_id=body.installer_id,
@@ -337,6 +453,8 @@ async def optimise_sizing(body: OptimiseRequest):
 
         return {
             "objective": result["objective"],
+            "load_source": load_source,
+            "time_base": time_base_meta,
             "optimal": opt,
             "unconstrained_optimum": unconstrained_optimum,
             "constraint_deltas": constraint_deltas,
@@ -383,6 +501,7 @@ class BatteryRequest(BaseModel):
     panel_watts: Optional[float] = None
     # Load
     load_hourly_8760: Optional[list[float]] = None
+    load_source: Optional[Literal["tier3_actual", "representative"]] = None
     annual_kwh: Optional[float] = None
     hourly_profile_weights: Optional[list[float]] = None
     # Tariff (TOU-aware): explicit 24-h rates, or TOU windows, else flat import_rate
@@ -509,24 +628,13 @@ async def battery_sizing(body: BatteryRequest):
         if state is None and postcode is not None:
             state = nem_data.postcode_to_state(postcode)
 
-        # ── Load profile ──
-        load_hourly = body.load_hourly_8760
-        if not load_hourly:
-            annual_kwh = body.annual_kwh
-            weights = body.hourly_profile_weights
-            if (annual_kwh is None or weights is None) and body.job_id and client is not None:
-                lp = _load_one(client, "load_profiles", body.job_id,
-                               "annual_kwh,daily_avg_kwh,hourly_profile_weights")
-                if lp:
-                    if annual_kwh is None:
-                        annual_kwh = lp.get("annual_kwh") or (
-                            (lp.get("daily_avg_kwh") or 0) * 365 if lp.get("daily_avg_kwh") else None)
-                    if weights is None:
-                        weights = lp.get("hourly_profile_weights")
-            if annual_kwh is None:
-                return {"error": "No load profile available (pass load_hourly_8760 or annual_kwh+weights, or a job_id).",
-                        "flags": ["missing_load"]}
-            load_hourly = solar_optimiser.expand_load_to_8760(float(annual_kwh), weights)
+        # ── 3.7: one declared time base, resolved once (same as the solar block) ──
+        utc_offset, time_base_meta = _time_base(state, flags)
+
+        # ── Load profile (3.7: the ONE resolver — true series first) ──
+        load_hourly, load_source, load_error = _resolve_load(client, body, flags)
+        if load_error is not None:
+            return load_error
         if len(load_hourly) != solar_optimiser.HOURS:
             return {"error": f"load profile must be {solar_optimiser.HOURS} hourly values.", "flags": ["bad_load_length"]}
 
@@ -578,6 +686,7 @@ async def battery_sizing(body: BatteryRequest):
             fl: list[str] = []
             sres = solar_optimiser.optimise(
                 roof_planes=planes_, candidate_configs=configs_, lat=float(lat), lon=float(lon),
+                utc_offset_hours=utc_offset,
                 panel=panel_, load_hourly=load_hourly, import_rate=flat_rate_for_solar, fit=float(fit),
                 export_limit_kw=export_limit_kw, objective=body.objective, fin=fin,
                 postcode=postcode, state=state, installer_id=body.installer_id,
@@ -586,7 +695,7 @@ async def battery_sizing(body: BatteryRequest):
             )
             ch = sres["optimal"]
             watts = float(panel_.get("watts") or 0.0)
-            built = generation.build_plane_profiles(planes_, float(lat), float(lon))
+            built = generation.build_plane_profiles(planes_, float(lat), float(lon), utc_offset)
             net = [{**p, "hourly_kwh_per_kwp": [v * pr for v in p["hourly_kwh_per_kwp"]]} for p in built["planes"]]
             # Per-plane kwp from the chosen panels_per_plane (handles partial-filled planes).
             cfg = [
@@ -723,6 +832,8 @@ async def battery_sizing(body: BatteryRequest):
 
         return {
             "objective": result["objective"],
+            "load_source": load_source,
+            "time_base": time_base_meta,
             "optimal_battery": opt,
             "unconstrained_optimum_battery": unconstrained_optimum_battery,
             "constraint_deltas": constraint_deltas,

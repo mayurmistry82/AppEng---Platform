@@ -222,6 +222,7 @@ def optimise(
     candidate_configs: list[dict],
     lat: float,
     lon: float,
+    utc_offset_hours: Optional[float],
     panel: dict,
     load_hourly: list[float],
     import_rate: float,
@@ -245,6 +246,12 @@ def optimise(
     synthetic best-first config (partial-filling the last plane); inverter_id is passed to
     cost_model. Panel-model constraints are applied UPSTREAM by the route (it re-scales the
     roof and passes the constrained planes + panel here).
+
+    3.7: `utc_offset_hours` is REQUIRED (no default) and passed straight to
+    generation.build_plane_profiles, which rotates PVGIS's UTC series into the site's
+    local standard time — the base `load_hourly` is already in. Netting the two in
+    different bases was the pre-3.7 fault; a default here would let this internal call
+    silently keep receiving UTC.
     """
     flags = flags if flags is not None else []
     pr = fin["performance_ratio_non_temp"]
@@ -253,7 +260,7 @@ def optimise(
     panel_watts = panel.get("watts")
 
     # Per-plane gross profiles (PVGIS, cached), then apply the NON-TEMP performance ratio.
-    built = generation.build_plane_profiles(roof_planes, lat, lon)
+    built = generation.build_plane_profiles(roof_planes, lat, lon, utc_offset_hours)
     if built["failed_planes"]:
         flags.append("partial_plane_failure")
     net_planes = [

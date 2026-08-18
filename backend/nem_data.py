@@ -356,3 +356,34 @@ def battery_rebate_effective_kwh(usable_kwh: Optional[float]) -> float:
         if band > 0:
             eff += band * pct
     return round(eff, 4)
+
+
+# ── Time base (3.7 Part A) ────────────────────────────────────────────────────
+# Local STANDARD time offsets from UTC, by state. Daylight saving is NOT
+# modelled anywhere in the sizing pipeline (see generation.py's convention
+# docstring): meter and bill data are recorded against the local jurisdiction
+# clock, and a declared uniform standard-time base is wrong by at most one hour
+# for part of the year, versus nine and a half hours all year before 3.7.
+STATE_UTC_OFFSET_HOURS: dict[str, float] = {
+    "SA": 9.5,
+    "NT": 9.5,
+    "NSW": 10.0,
+    "ACT": 10.0,
+    "VIC": 10.0,
+    "TAS": 10.0,
+    "QLD": 10.0,
+    "WA": 8.0,
+}
+
+
+def get_utc_offset_hours(state: Optional[str]) -> Optional[float]:
+    """UTC offset for a state's LOCAL STANDARD time, or None when unknown.
+
+    None for an unknown or None state — NEVER a default of 0 or 10: a silent
+    default here reintroduces the UTC/local netting fault for every site whose
+    state failed to derive (routes/job.py's _derive_site legitimately returns
+    None rather than guessing). None must travel as None and surface as the
+    `generation_time_base_unrotated` flag, so the degradation is visible."""
+    if not isinstance(state, str):
+        return None
+    return STATE_UTC_OFFSET_HOURS.get(state.strip().upper())

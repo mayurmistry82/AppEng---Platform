@@ -480,3 +480,155 @@ def _build_from_csv(parsed: dict, flags: list[str]) -> dict:
         multiple_nmis=False,
         flags=flags,
     )
+
+
+# ── 3.7 Part B: the stored series → a calendar-year 8,760 ─────────────────────
+# The threshold interval coverage is annualised under, mirroring the literal in
+# _finalise (line ~341: `annualised = coverage_days < 350`). Named here so
+# callers deciding whether to SCALE a rebuilt series reference one constant
+# rather than re-typing the number; the original line is deliberately untouched.
+ANNUALISED_THRESHOLD_DAYS = 350
+
+# Non-leap month lengths for the reference calendar.
+_REF_MONTH_DAYS = [31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31]
+
+
+def series_to_8760(
+    series_by_date: Any,
+    average_day_kwh: Optional[list],
+    annual_kwh: Optional[float],
+    annualised: bool,
+) -> dict:
+    """
+    Map the stored `series_by_date` document ({"YYYY-MM-DD": [24 floats]}, ALREADY
+    hourly — this function performs no 30-minute arithmetic) onto a 365-day
+    non-leap reference year, index = day*24 + h.
+
+    THE TIME BASE: series_by_date is in the meter's LOCAL CLOCK hours, which is
+    the base generation.py declares (local standard time; DST not modelled). NO
+    rotation is applied to load — only generation is rotated, because only
+    generation arrives in UTC.
+
+    Rules, in order:
+      1. Reference year is non-leap. A 29 February key is DROPPED and flagged.
+      2. Source dates are keyed by (month, day); where several years supply the
+         same month-day (a 372-day file carries 1-7 January twice) the MEAN of
+         those days is used — never the first or last, which would make the
+         result depend on dict ordering.
+      3. A month-day with no data is filled from average_day_kwh when present,
+         else from the mean of all mapped days; counted in days_filled.
+      4. A day whose array is not exactly 24 numbers is treated as missing
+         (DST short/long days land here; the parser flags them upstream).
+      5. SCALING: only when `annualised` is True (the stored annual figure was
+         extrapolated from a partial year). A full-year measured series is THE
+         TRUTH and is never quietly rescaled to match a rounded stored figure —
+         any divergence is recorded in flags instead of hidden.
+      6. Never raises: malformed input returns {"hourly": [], ...} with a flag
+         and the caller falls back to the representative profile.
+
+    Returns {"hourly": [8760 floats], "days_mapped": int, "days_filled": int,
+             "scaled": bool, "scale_factor": float|None, "flags": [str]}.
+    """
+    out = {
+        "hourly": [],
+        "days_mapped": 0,
+        "days_filled": 0,
+        "scaled": False,
+        "scale_factor": None,
+        "flags": [],
+    }
+    try:
+        if not isinstance(series_by_date, dict) or not series_by_date:
+            out["flags"].append("series_by_date missing or empty")
+            return out
+
+        def _day_ok(values: Any) -> Optional[list[float]]:
+            if not isinstance(values, list) or len(values) != 24:
+                return None
+            day: list[float] = []
+            for v in values:
+                if not isinstance(v, (int, float)) or isinstance(v, bool):
+                    return None
+                day.append(float(v))
+            return day
+
+        # Group by (month, day); mean where duplicated.
+        by_monthday: dict[tuple[int, int], list[list[float]]] = {}
+        feb29_dropped = 0
+        bad_days = 0
+        for key, values in series_by_date.items():
+            try:
+                y, m, d = (int(x) for x in str(key).split("-"))
+            except (TypeError, ValueError):
+                bad_days += 1
+                continue
+            if m == 2 and d == 29:
+                feb29_dropped += 1
+                continue
+            day = _day_ok(values)
+            if day is None:
+                bad_days += 1
+                continue
+            by_monthday.setdefault((m, d), []).append(day)
+        if feb29_dropped:
+            out["flags"].append(f"dropped {feb29_dropped} 29-February day(s) — non-leap reference year")
+        if bad_days:
+            out["flags"].append(f"{bad_days} day(s) unusable (bad key or not 24 numbers) — treated as missing")
+
+        means: dict[tuple[int, int], list[float]] = {}
+        duplicates = 0
+        for md, days in by_monthday.items():
+            if len(days) > 1:
+                duplicates += 1
+                means[md] = [sum(day[h] for day in days) / len(days) for h in range(24)]
+            else:
+                means[md] = days[0]
+        if duplicates:
+            out["flags"].append(f"{duplicates} month-day(s) supplied by more than one year — averaged")
+        if not means:
+            out["flags"].append("no usable days — series unusable")
+            return out
+
+        # The fill day: average_day_kwh when valid, else the mean of mapped days.
+        fill = _day_ok(average_day_kwh)
+        if fill is None:
+            n = len(means)
+            fill = [sum(day[h] for day in means.values()) / n for h in range(24)]
+
+        hourly: list[float] = []
+        mapped = filled = 0
+        for month in range(1, 13):
+            for day_of_month in range(1, _REF_MONTH_DAYS[month - 1] + 1):
+                day = means.get((month, day_of_month))
+                if day is None:
+                    day = fill
+                    filled += 1
+                else:
+                    mapped += 1
+                hourly.extend(day)
+
+        total = sum(hourly)
+        if total <= 0:
+            out["flags"].append("series sums to zero or negative — unusable")
+            return out
+
+        if annualised and isinstance(annual_kwh, (int, float)) and annual_kwh > 0:
+            factor = float(annual_kwh) / total
+            hourly = [v * factor for v in hourly]
+            out["scaled"] = True
+            out["scale_factor"] = round(factor, 6)
+        elif isinstance(annual_kwh, (int, float)) and annual_kwh > 0:
+            divergence_pct = (total - float(annual_kwh)) / float(annual_kwh) * 100.0
+            out["flags"].append(
+                f"series total {total:.1f} kWh vs stored annual {float(annual_kwh):.1f} kWh "
+                f"({divergence_pct:+.2f}%) — measured data NOT rescaled"
+            )
+
+        out["hourly"] = hourly
+        out["days_mapped"] = mapped
+        out["days_filled"] = filled
+        return out
+    except Exception as exc:  # noqa: BLE001 — the contract is never-raise
+        out["flags"].append(f"series_to_8760 failed: {exc}")
+        out["hourly"] = []
+        return out

@@ -22,6 +22,7 @@ from pydantic import BaseModel
 
 import capture
 import generation
+import nem_data
 
 router = APIRouter()
 
@@ -149,9 +150,37 @@ async def generation_profiles(body: GenerationRequest):
                 "source": "pvgis",
             }
 
-        built = generation.build_plane_profiles(raw_planes, float(lat), float(lon))
+        # ── 3.7: resolve the site's state (job row only — this route carries no
+        # state field) and rotate generation into local standard time. ──
+        state: Optional[str] = None
+        if body.job_id:
+            client = _client()
+            if client is not None:
+                try:
+                    jr = (
+                        client.table("jobs").select("site_state")
+                        .eq("job_id", body.job_id).limit(1).execute()
+                    )
+                    if jr.data:
+                        state = jr.data[0].get("site_state")
+                except Exception:  # noqa: BLE001 — unknown state degrades, never blocks
+                    state = None
+        utc_offset = nem_data.get_utc_offset_hours(state)
+
+        built = generation.build_plane_profiles(
+            raw_planes, float(lat), float(lon), utc_offset
+        )
         planes = built["planes"]
         flags: list[str] = []
+        if utc_offset is None:
+            flags.append(
+                "generation_time_base_unrotated — state unknown, generation left in UTC — is_fallback"
+            )
+        elif built.get("time_base_rounded"):
+            flags.append(
+                f"generation_time_base_rounded_30min — {state} is UTC+9:30, "
+                f"rotated by {built.get('time_base_rotated_hours')} h"
+            )
         if built["failed_planes"]:
             flags.append("partial_plane_failure")
 

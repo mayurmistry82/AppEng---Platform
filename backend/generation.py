@@ -9,6 +9,28 @@ plane_profile). Energy is additive: profiles are SUMMED, never averaged.
 This is the generation layer the solar optimiser (D1) consumes. PVGIS is the source today;
 Solcast (F1) will slot behind the same interface later. No Google Solar energy figures are
 ever used — generation comes only from PVGIS.
+
+THE TIME-BASE CONVENTION (3.7 Part A), declared once, here:
+
+    Hour index h in 0..8759 means hour h of a 365-day non-leap year in the SITE'S LOCAL
+    STANDARD TIME, starting at local midnight on 1 January. Load, tariff and generation
+    are all in this base. Daylight saving is NOT modelled.
+
+Local STANDARD time, not clock time, deliberately: load series and TOU windows come from
+meter and bill data recorded against the local jurisdiction clock, and modelling DST
+correctly would require knowing which convention each retailer used. A uniform declared
+standard-time base is wrong by at most one hour for part of the year; the pre-3.7 state
+was wrong by nine and a half hours all year (PVGIS seriescalc returns UTC, and it was
+netted against local-clock load index-for-index).
+
+`pvgis_cache` KEEPS RAW UTC and is never migrated or invalidated: the cache stores what
+the vendor returned, and the rotation below is a per-site INTERPRETATION applied
+downstream of both the cache-hit and cache-miss paths. A cache holding half-rotated rows
+would be unfixable. `annual_kwh_per_kwp` is rotation-invariant and is not recomputed;
+`monthly_kwh_per_kwp` shifts by a few hours at each month boundary under rotation, an
+error smaller than the figure's own precision, and is likewise left as stored. Rotation
+wraps the final `shift` hours of 31 December onto the start of 1 January — night hours in
+every Australian state, so the wrapped values are approximately zero.
 """
 
 from __future__ import annotations
@@ -125,15 +147,53 @@ def normalise_planes(raw_planes: list[dict]) -> list[dict]:
     return out
 
 
+# ── Time-base rotation (3.7 Part A) ───────────────────────────────────────────
+def rotate_utc_to_local(
+    hourly_utc: list[float], utc_offset_hours: Optional[float]
+) -> tuple[list[float], bool]:
+    """Rotate a UTC-indexed hourly series into the site's local standard time.
+
+    Returns (rotated, rounded). With offset None the INPUT IS RETURNED
+    UNCHANGED and rounded=False — an unknown state must surface as the
+    `generation_time_base_unrotated` flag upstream, never as a silent guess.
+
+    The shift is the offset rounded HALF-UP to whole hours (9.5 -> 10), and
+    `rounded` is True whenever the offset was not already whole. Direction:
+    local_hour = utc_hour + offset, so the value PVGIS reports at UTC index u
+    belongs at local index (u + shift) — equivalently
+    rotated[i] = hourly_utc[(i - shift) % n]. The direction is pinned
+    empirically by verify_sizing_time_base.py against the real cached Adelaide
+    profile (wrong direction puts the solar peak near 17:00, not midday)."""
+    if utc_offset_hours is None:
+        return hourly_utc, False
+    import math
+
+    shift = int(math.floor(float(utc_offset_hours) + 0.5))
+    rounded = float(utc_offset_hours) != float(shift)
+    n = len(hourly_utc)
+    if n == 0 or shift % n == 0:
+        return list(hourly_utc), rounded
+    return [hourly_utc[(i - shift) % n] for i in range(n)], rounded
+
+
 # ── Build per-plane profiles ──────────────────────────────────────────────────
-def build_plane_profiles(planes: list[dict], lat: float, lon: float) -> dict:
+def build_plane_profiles(
+    planes: list[dict], lat: float, lon: float, utc_offset_hours: Optional[float]
+) -> dict:
     """
     Fetch (cached) a normalised 8,760 profile for each plane. One plane failing never aborts
     the batch — it's recorded in failed_planes and the rest proceed.
 
+    3.7: `utc_offset_hours` is REQUIRED with no default, deliberately — a default is how a
+    future caller silently gets UTC back. The rotation to local standard time (module
+    docstring) is applied AFTER the cache-hit and cache-miss branches converge, so both
+    paths get identical treatment; the cache itself keeps raw UTC. Pass None only when the
+    site's state is genuinely unknown, and flag it upstream.
+
     Returns {planes:[...], cache_hits, cache_misses, failed_planes:[...], lat_cell, lon_cell,
-             cache_persist_failed}. Each plane: {plane_index, tilt, azimuth_google, aspect,
-             kwp, annual_kwh_per_kwp, monthly_kwh_per_kwp, hourly_kwh_per_kwp, flags}.
+             cache_persist_failed, time_base_rotated_hours: int|None, time_base_rounded: bool}.
+    Each plane: {plane_index, tilt, azimuth_google, aspect, kwp, annual_kwh_per_kwp,
+    monthly_kwh_per_kwp, hourly_kwh_per_kwp, flags}.
     """
     client = _client()
     lat_cell, lon_cell = _grid(lat), _grid(lon)
@@ -178,6 +238,10 @@ def build_plane_profiles(planes: list[dict], lat: float, lon: float) -> dict:
             if not _cache_put(client, lat_cell, lon_cell, tilt_key, aspect_key, prof):
                 persist_failed = True
 
+        # THE ROTATION — after the hit/miss branches converge, so both paths
+        # are treated identically. The cache row (raw UTC) is never mutated.
+        hourly, _rot_rounded = rotate_utc_to_local(hourly, utc_offset_hours)
+
         results.append(
             {
                 "plane_index": idx,
@@ -192,6 +256,13 @@ def build_plane_profiles(planes: list[dict], lat: float, lon: float) -> dict:
             }
         )
 
+    import math
+
+    shift = (
+        None
+        if utc_offset_hours is None
+        else int(math.floor(float(utc_offset_hours) + 0.5))
+    )
     return {
         "planes": results,
         "cache_hits": hits,
@@ -200,6 +271,10 @@ def build_plane_profiles(planes: list[dict], lat: float, lon: float) -> dict:
         "lat_cell": lat_cell,
         "lon_cell": lon_cell,
         "cache_persist_failed": persist_failed,
+        "time_base_rotated_hours": shift,
+        "time_base_rounded": (
+            utc_offset_hours is not None and float(utc_offset_hours) != float(shift)
+        ),
     }
 
 
