@@ -44,10 +44,12 @@ import os
 import tempfile
 import uuid
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, Literal, Optional
 
 import sentry_sdk
+from datetime import datetime, timezone
 from fastapi import APIRouter, Depends, File, HTTPException, UploadFile
+from pydantic import BaseModel, Field
 
 import bill_parser
 import capture
@@ -284,5 +286,130 @@ async def characterise_demand(
         "survey_saved": survey_saved,
         "load_profile_saved": load_profile_saved,
         "accuracy_tier_written": accuracy_tier_written,
+        "warnings": warnings,
+    }
+
+
+# ── 3.8: the tariff envelope writer ──────────────────────────────────────────
+
+_TIME_HHMM = r"^([01]?\d|2[0-4]):[0-5]\d$"
+
+
+class TariffWindowIn(BaseModel):
+    """One TOU window, in the SAME "HH:MM" shape bill_parser emits — one stored
+    shape for one idea: whatever writes a window, _build_rate_24 reads it the
+    same way. An unreadable time is a 422 HERE, not a skipped window later."""
+
+    label: Literal["peak", "shoulder", "offpeak", "flat"]
+    rate: float = Field(ge=0, le=5)
+    start: str = Field(pattern=_TIME_HHMM)
+    end: str = Field(pattern=_TIME_HHMM)
+    days: Literal["weekday", "weekend", "all"] = "all"
+
+
+class TariffSaveRequest(BaseModel):
+    tariff_type: Literal["flat", "tou"]
+    import_rate: Optional[float] = Field(default=None, ge=0, le=5)
+    tou_windows: Optional[list[TariffWindowIn]] = None
+    supply_charge: Optional[float] = Field(default=None, ge=0, le=20)
+    fit_aud_per_kwh: Optional[float] = Field(default=None, ge=0, le=5)
+    export_limit_kw: Optional[float] = Field(default=None, ge=0, le=100)
+    source: Literal["installer", "bill", "default"] = "installer"
+
+
+# The SAME four-table rule routes/job.py's address lock uses (its
+# _ADDRESS_LOCK_TABLES) — derived here, never hardcoded to true, and job.py is
+# deliberately not modified to share it.
+_ADDRESS_LOCKING_TABLES = ("roof_geometry", "sizing_results", "tariffs", "interval_data")
+
+
+def _address_locked_now(client: Any, job_id: str) -> bool:
+    for table in _ADDRESS_LOCKING_TABLES:
+        try:
+            res = (
+                client.table(table).select("job_id").eq("job_id", job_id)
+                .limit(1).execute()
+            )
+            if getattr(res, "data", None):
+                return True
+        except Exception:  # noqa: BLE001 — unknowable reads as not-provably-locked
+            continue
+    return False
+
+
+@router.post("/api/job/{job_id}/tariff")
+async def save_job_tariff(
+    job_id: str,
+    body: TariffSaveRequest,
+    caller: Caller = Depends(require_company),
+):
+    """Store the job's ONE tariff envelope (upsert on job_id). Ownership first;
+    absent and foreign jobs answer the identical 404, unknowable answers 503 —
+    all from require_company_job."""
+    client = _client()
+    require_company_job(client, job_id, caller.company_id)
+
+    # A single window is a flat tariff wearing a costume — bill_parser's
+    # structured_detected test makes the same call, and the two must agree.
+    if body.tariff_type == "tou" and len(body.tou_windows or []) < 2:
+        raise HTTPException(
+            status_code=422,
+            detail="A time-of-use tariff needs at least two windows — with one window it is a flat tariff, so save it as flat.",
+        )
+    if body.tariff_type == "flat" and body.import_rate is None:
+        raise HTTPException(
+            status_code=422,
+            detail="A flat tariff needs its import rate — that number is what this section exists to collect.",
+        )
+
+    warnings: list[str] = []
+    now = datetime.now(timezone.utc).isoformat()
+    tariff_id = capture.save_tariff(
+        {
+            "job_id": job_id,
+            "tariff_type": body.tariff_type,
+            "import_rate": body.import_rate,
+            "tou_windows": (
+                [w.model_dump() for w in body.tou_windows] if body.tou_windows else None
+            ),
+            "supply_charge": body.supply_charge,
+            "fit_aud_per_kwh": body.fit_aud_per_kwh,
+            "export_limit_kw": body.export_limit_kw,
+            "source": body.source,
+            "updated_at": now,
+        }
+    )
+    saved = tariff_id is not None
+
+    tariff_row = None
+    if saved:
+        try:
+            res = (
+                client.table("tariffs").select("*").eq("job_id", job_id)
+                .limit(1).execute()
+            )
+            tariff_row = res.data[0] if res.data else None
+        except Exception as exc:  # noqa: BLE001
+            sentry_sdk.capture_exception(exc)
+            warnings.append("Saved, but the stored row could not be read back.")
+    else:
+        # capture.save_tariff returns None on ANY failure, silently, by design.
+        # That silence must NOT pass through: the section's completeness reads
+        # the DATABASE, so a false success here is the worst possible outcome
+        # (the 3.6 lesson).
+        warnings.append(
+            "The tariff could not be saved — nothing was stored. Try again in a moment."
+        )
+
+    address_now_locked = saved and _address_locked_now(client, job_id)
+    if address_now_locked:
+        warnings.append("This job's address is now locked — the tariff follows from it.")
+
+    return {
+        "ok": True,
+        "tariff_id": tariff_id,
+        "saved": saved,
+        "tariff": tariff_row,
+        "address_now_locked": address_now_locked,
         "warnings": warnings,
     }

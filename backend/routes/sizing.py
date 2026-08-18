@@ -250,6 +250,163 @@ def _resolve_load(
     return load_hourly, "representative", None
 
 
+def _read_tariff_row(client: Any, job_id: Optional[str], flags: list[str]) -> Optional[dict]:
+    """The job's stored tariff envelope, or None. A read FAILURE (as opposed to
+    absence) is flagged — the resolver then falls through to the bill/defaults;
+    it never raises and never blocks sizing."""
+    if not job_id or client is None:
+        return None
+    try:
+        res = (
+            client.table("tariffs")
+            .select("tariff_type,supply_charge,tou_windows,import_rate,"
+                    "fit_aud_per_kwh,export_limit_kw,source")
+            .eq("job_id", job_id)
+            .order("created_at", desc=True)
+            .limit(1)
+            .execute()
+        )
+        return res.data[0] if res.data else None
+    except Exception:  # noqa: BLE001
+        flags.append("stored tariff could not be read — fell back to bill/defaults — is_fallback")
+        return None
+
+
+def _resolve_tariff(
+    client: Any, body: Any, state: Optional[str], postcode: Optional[str],
+    flags: list[str],
+) -> dict:
+    """
+    THE ONE tariff resolver (3.8), used by both sizing endpoints — the 3.7
+    _resolve_load pattern. Resolution order, most specific first, per FIELD:
+
+      1. explicit request fields (import_rates_24, tou_windows, import_rate,
+         fit, export_limit_kw)
+      2. the job's stored tariffs row (the envelope this row exists to hold)
+      3. the job's newest bill (parsed_json.tariff_structured, .tariff_rate,
+         bills.feed_in_tariff) — exactly the reads the endpoints did before
+      4. defaults: DEFAULT_IMPORT_RATE, get_default_fit, get_export_limit —
+         every one flagged is_fallback
+
+    THE NO-REGRESSION RULE: on a job with NO tariffs row, import_rate, fit,
+    fit_is_fallback, export_limit_kw and export_meta are IDENTICAL to what the
+    endpoints computed before 3.8. import_rate is the bill's SCALAR
+    tariff_rate, never sum(rate_24)/24 — the solar numbers must not move.
+
+    TOU windows are LOCAL CLOCK HOURS and are never rotated, offset or
+    converted — generation is the only rotated series (3.7), and that happens
+    nowhere near this function.
+    """
+    import_rate = body.import_rate
+    fit = body.fit
+    explicit_windows = bool(getattr(body, "import_rates_24", None)) or bool(
+        getattr(body, "tou_windows", None)
+    )
+    source: Optional[str] = (
+        "request" if (import_rate is not None or explicit_windows) else None
+    )
+
+    stored = _read_tariff_row(client, body.job_id, flags)
+    tariff_type = stored.get("tariff_type") if stored else None
+    supply_charge = stored.get("supply_charge") if stored else None
+    stored_windows = None
+    if stored and isinstance(stored.get("tou_windows"), list) and stored["tou_windows"]:
+        stored_windows = stored["tou_windows"]
+
+    if import_rate is None and stored and stored.get("import_rate") is not None:
+        try:
+            import_rate = float(stored["import_rate"])
+            source = source or (stored.get("source") or "installer")
+        except (TypeError, ValueError):
+            pass
+    if fit is None and stored and stored.get("fit_aud_per_kwh") is not None:
+        try:
+            fit = float(stored["fit_aud_per_kwh"])
+        except (TypeError, ValueError):
+            pass
+    export_limit_kw = body.export_limit_kw
+    export_given: Optional[str] = "request" if export_limit_kw is not None else None
+    if export_limit_kw is None and stored and stored.get("export_limit_kw") is not None:
+        try:
+            export_limit_kw = float(stored["export_limit_kw"])
+            export_given = "installer"
+        except (TypeError, ValueError):
+            pass
+
+    structured: Optional[dict] = None
+    if (
+        (import_rate is None or fit is None
+         or (not explicit_windows and stored_windows is None))
+        and body.job_id and client is not None
+    ):
+        bill = _load_one(client, "bills", body.job_id, "parsed_json,feed_in_tariff")
+        if bill:
+            pj = bill.get("parsed_json") or {}
+            structured = (
+                pj.get("tariff_structured")
+                if isinstance(pj.get("tariff_structured"), dict) else None
+            )
+            if tariff_type is None and structured:
+                tariff_type = structured.get("tariff_type")
+            if supply_charge is None and structured:
+                supply_charge = structured.get("supply_charge")
+            if import_rate is None and pj.get("tariff_rate") is not None:
+                import_rate = float(pj["tariff_rate"])
+                source = source or "bill"
+            if fit is None:
+                bf = bill.get("feed_in_tariff")
+                if bf is None:
+                    bf = pj.get("feed_in_tariff")
+                if bf is not None:
+                    fit = float(bf)
+
+    if import_rate is None:
+        import_rate = solar_optimiser.DEFAULT_IMPORT_RATE
+        source = source or "default"
+        flags.append(
+            f"import_rate fallback ${import_rate:.2f}/kWh (no bill rate) — is_fallback"
+        )
+    if source is None:
+        source = "default"
+
+    fit_is_fallback = False
+    if fit is None:
+        fd = nem_data.get_default_fit(state)
+        fit = fd["fit_aud_per_kwh"]
+        fit_is_fallback = True
+        flags.append(f"fit fallback {fit}/kWh ({fd.get('scheme')}) — is_fallback")
+
+    if export_given is not None and export_limit_kw is not None:
+        export_meta: dict = {"export_limit_kw": float(export_limit_kw),
+                             "source": export_given}
+        export_limit_kw = float(export_limit_kw)
+    else:
+        export_meta = nem_data.get_export_limit(state=state, postcode=postcode)
+        export_limit_kw = export_meta["export_limit_kw"]
+        if export_meta.get("is_default"):
+            flags.append("export_limit defaulted (state/postcode not recognised)")
+
+    windows_for_rate = getattr(body, "tou_windows", None) or stored_windows
+    rate_24, is_tou = _build_rate_24(
+        getattr(body, "import_rates_24", None), windows_for_rate, structured,
+        float(import_rate), flags,
+    )
+
+    return {
+        "import_rate": float(import_rate),
+        "rate_24": rate_24,
+        "is_tou": is_tou,
+        "fit": float(fit),
+        "fit_is_fallback": fit_is_fallback,
+        "export_limit_kw": float(export_limit_kw),
+        "export_meta": export_meta,
+        "tariff_type": tariff_type,
+        "supply_charge": supply_charge,
+        "source": source,
+        "flat_rate_for_solar": sum(rate_24) / 24.0,
+    }
+
+
 @router.post("/api/sizing/optimise")
 async def optimise_sizing(body: OptimiseRequest):
     try:
@@ -319,40 +476,14 @@ async def optimise_sizing(body: OptimiseRequest):
             return {"error": f"load profile must be {solar_optimiser.HOURS} hourly values (got {len(load_hourly)}).",
                     "flags": ["bad_load_length"]}
 
-        # ── Resolve tariff (import rate + FiT) ──
-        import_rate = body.import_rate
-        fit = body.fit
-        fit_is_fallback = False
-        if (import_rate is None or fit is None) and body.job_id and client is not None:
-            bill = _load_one(client, "bills", body.job_id, "parsed_json,feed_in_tariff")
-            if bill:
-                pj = bill.get("parsed_json") or {}
-                if import_rate is None and pj.get("tariff_rate") is not None:
-                    import_rate = float(pj["tariff_rate"])
-                if fit is None:
-                    bf = bill.get("feed_in_tariff")
-                    if bf is None:
-                        bf = pj.get("feed_in_tariff")
-                    if bf is not None:
-                        fit = float(bf)
-        if import_rate is None:
-            import_rate = solar_optimiser.DEFAULT_IMPORT_RATE
-            flags.append(f"import_rate fallback ${import_rate:.2f}/kWh (no bill rate) — is_fallback")
-        if fit is None:
-            fd = nem_data.get_default_fit(state)
-            fit = fd["fit_aud_per_kwh"]
-            fit_is_fallback = True
-            flags.append(f"fit fallback {fit}/kWh ({fd.get('scheme')}) — is_fallback")
-
-        # ── Resolve export limit ──
-        if body.export_limit_kw is not None:
-            export_limit_kw = float(body.export_limit_kw)
-            export_meta = {"export_limit_kw": export_limit_kw, "source": "request"}
-        else:
-            export_meta = nem_data.get_export_limit(state=state, postcode=postcode)
-            export_limit_kw = export_meta["export_limit_kw"]
-            if export_meta.get("is_default"):
-                flags.append("export_limit defaulted (state/postcode not recognised)")
+        # ── Tariff + export limit: the ONE resolver (3.8). The solar optimiser
+        # keeps taking the SCALAR import_rate — never sum(rate_24)/24. ──
+        tariff = _resolve_tariff(client, body, state, postcode, flags)
+        import_rate = tariff["import_rate"]
+        fit = tariff["fit"]
+        fit_is_fallback = tariff["fit_is_fallback"]
+        export_limit_kw = tariff["export_limit_kw"]
+        export_meta = tariff["export_meta"]
 
         # ── Financial params ──
         fin = solar_optimiser.load_financial_params(flags)
@@ -462,6 +593,8 @@ async def optimise_sizing(body: OptimiseRequest):
             "assumptions": {
                 "engine_version": solar_optimiser.ENGINE_VERSION,
                 "import_rate": import_rate,
+                "tariff_source": tariff["source"],
+                "tariff_type": tariff["tariff_type"],
                 "fit": fit,
                 "fit_is_fallback": fit_is_fallback,
                 "export_limit_kw": export_limit_kw,
@@ -523,6 +656,37 @@ class BatteryRequest(BaseModel):
     constraints: Optional[dict] = None
 
 
+def _window_hour(value: Any) -> Optional[int]:
+    """Coerce a TOU window time to an integer hour. None = unreadable; NEVER raises.
+
+    Accepts int/float, "6"/"06"/"6.0", and the parser's canonical "HH:MM"
+    ("24:00" -> 24, preserved deliberately: 24 %% 24 == 0 drives the wrap branch
+    that turns the parser's flat 00:00-24:00 window into all 24 hours). Minutes
+    are DISCARDED — rate_24 has one slot per hour — and the caller flags any
+    non-zero minutes rather than dropping them silently."""
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, (int, float)):
+        try:
+            return int(value)
+        except (ValueError, OverflowError):
+            return None
+    if isinstance(value, str):
+        text = value.strip()
+        if not text:
+            return None
+        if ":" in text:
+            try:
+                return int(text.split(":", 1)[0])
+            except ValueError:
+                return None
+        try:
+            return int(float(text))
+        except (ValueError, OverflowError):
+            return None
+    return None
+
+
 def _build_rate_24(
     import_rates_24: Optional[list],
     tou_windows: Optional[list],
@@ -546,27 +710,99 @@ def _build_rate_24(
 
     if windows:
         rate = [None] * 24
+        minutes_rounded = False
+        day_specific = False
+        hours_partial = False
         for w in windows:
             if not isinstance(w, dict):
                 continue
+            if w.get("days") not in (None, "all"):
+                day_specific = True
             r = w.get("rate", w.get("rate_aud_per_kwh", w.get("import_rate")))
             if r is None:
                 continue
-            r = float(r)
+            # 3.8b: float() had no guard either. A rate the parser could not
+            # reduce to a number raised straight through the endpoint's
+            # catch-all. bool is a subclass of int, so True must NOT become a
+            # $1.00/kWh tariff; a numeric string ("0.45") is legitimate input
+            # and is still accepted.
+            if isinstance(r, bool):
+                r_num = None
+            else:
+                try:
+                    r_num = float(r)
+                except (TypeError, ValueError):
+                    r_num = None
+                else:
+                    # NaN/inf parse but are not rates; the contract is 24
+                    # FINITE floats. Written without math.isfinite so this
+                    # function depends on no module global but _window_hour.
+                    if r_num != r_num or r_num in (float("inf"), float("-inf")):
+                        r_num = None
+            if r_num is None:
+                flags.append(
+                    f"A TOU window had an unreadable rate and was ignored: {w!r}"
+                )
+                continue
+            r = r_num
             hours = w.get("hours")
             if hours:
+                # 3.8b: int(h) raised on "06:00" and on junk. _window_hour is
+                # THE one coercion rule for an hour anywhere in this function —
+                # two rules for one idea is how the halves drift apart.
+                applied_any = False
+                skipped_any = False
                 for h in hours:
-                    if 0 <= int(h) < 24:
-                        rate[int(h)] = r
+                    hv = _window_hour(h)
+                    if hv is None or not (0 <= hv < 24):
+                        skipped_any = True
+                        continue
+                    rate[hv] = r
+                    applied_any = True
+                if not applied_any:
+                    flags.append(
+                        f"A TOU window had an unreadable hours list and was ignored: {w!r}"
+                    )
+                elif skipped_any:
+                    hours_partial = True
             else:
-                sh = w.get("start_hour", w.get("start"))
-                eh = w.get("end_hour", w.get("end"))
+                sh_raw = w.get("start_hour", w.get("start"))
+                eh_raw = w.get("end_hour", w.get("end"))
+                # 3.8: bill_parser's canonical window times are "HH:MM" strings
+                # (its flat fallback is 00:00-24:00). int("06:00") raised
+                # ValueError straight through to the endpoint's catch-all —
+                # every bill-derived tariff crashed the battery optimiser.
+                sh = _window_hour(sh_raw)
+                eh = _window_hour(eh_raw)
                 if sh is None or eh is None:
+                    flags.append(
+                        f"A TOU window had unreadable times and was ignored: {w!r}"
+                    )
                     continue
-                sh, eh = int(sh) % 24, int(eh) % 24
+                for raw in (sh_raw, eh_raw):
+                    if (isinstance(raw, str) and ":" in raw
+                            and raw.strip().split(":", 1)[1] not in ("00", "0")):
+                        minutes_rounded = True
+                # %% 24 after coercion is load-bearing: "24:00" -> 24 -> 0, so
+                # sh == eh for the flat window and the wrap branch yields all
+                # 24 hours. Asserted in verify_tariff_contract.py.
+                sh, eh = sh % 24, eh % 24
                 hrs = range(sh, eh) if sh < eh else list(range(sh, 24)) + list(range(0, eh))
                 for h in hrs:
                     rate[h] = r
+        if minutes_rounded:
+            flags.append(
+                "TOU window times were rounded down to the hour — rate_24 has one slot per hour."
+            )
+        if day_specific:
+            flags.append(
+                "This tariff has weekday/weekend-specific rates; the model applies one "
+                "24-hour rate profile to every day of the year."
+            )
+        if hours_partial:
+            flags.append(
+                "Some hours in a TOU window were unreadable and were skipped."
+            )
         if any(r is not None for r in rate):
             filled = [r if r is not None else flat_rate for r in rate]
             if any(r is None for r in rate):
@@ -590,7 +826,6 @@ async def battery_sizing(body: BatteryRequest):
         lat, lon = body.lat, body.lon
         panel = {"id": body.panel_id, "watts": body.panel_watts} if body.panel_id else None
         postcode, state = body.postcode, body.state
-        structured_tariff: Optional[dict] = None
 
         # ── Roof model (chosen solar comes from D1 on this roof) ──
         if (planes is None or candidate_configs is None) and body.job_id and client is not None:
@@ -638,44 +873,16 @@ async def battery_sizing(body: BatteryRequest):
         if len(load_hourly) != solar_optimiser.HOURS:
             return {"error": f"load profile must be {solar_optimiser.HOURS} hourly values.", "flags": ["bad_load_length"]}
 
-        # ── Tariff: import (flat) + FiT, and structured TOU if available ──
-        import_rate = body.import_rate
-        fit = body.fit
-        fit_is_fallback = False
-        if (import_rate is None or fit is None or body.tou_windows is None) and body.job_id and client is not None:
-            bill = _load_one(client, "bills", body.job_id, "parsed_json,feed_in_tariff")
-            if bill:
-                pj = bill.get("parsed_json") or {}
-                structured_tariff = pj.get("tariff_structured") if isinstance(pj.get("tariff_structured"), dict) else None
-                if import_rate is None and pj.get("tariff_rate") is not None:
-                    import_rate = float(pj["tariff_rate"])
-                if fit is None:
-                    bf = bill.get("feed_in_tariff")
-                    if bf is None:
-                        bf = pj.get("feed_in_tariff")
-                    if bf is not None:
-                        fit = float(bf)
-        if import_rate is None:
-            import_rate = solar_optimiser.DEFAULT_IMPORT_RATE
-            flags.append(f"import_rate fallback ${import_rate:.2f}/kWh — is_fallback")
-        if fit is None:
-            fd = nem_data.get_default_fit(state)
-            fit = fd["fit_aud_per_kwh"]
-            fit_is_fallback = True
-            flags.append(f"fit fallback {fit}/kWh ({fd.get('scheme')}) — is_fallback")
-
-        rate_24, is_tou = _build_rate_24(
-            body.import_rates_24, body.tou_windows, structured_tariff, float(import_rate), flags
-        )
-        flat_rate_for_solar = sum(rate_24) / 24.0
-
-        # ── Export limit ──
-        if body.export_limit_kw is not None:
-            export_limit_kw = float(body.export_limit_kw)
-            export_meta = {"export_limit_kw": export_limit_kw, "source": "request"}
-        else:
-            export_meta = nem_data.get_export_limit(state=state, postcode=postcode)
-            export_limit_kw = export_meta["export_limit_kw"]
+        # ── Tariff + rate_24 + export limit: the ONE resolver (3.8) ──
+        tariff = _resolve_tariff(client, body, state, postcode, flags)
+        import_rate = tariff["import_rate"]
+        fit = tariff["fit"]
+        fit_is_fallback = tariff["fit_is_fallback"]
+        rate_24 = tariff["rate_24"]
+        is_tou = tariff["is_tou"]
+        flat_rate_for_solar = tariff["flat_rate_for_solar"]
+        export_limit_kw = tariff["export_limit_kw"]
+        export_meta = tariff["export_meta"]
 
         # ── Financial params ──
         fin = solar_optimiser.load_financial_params(flags)
@@ -851,6 +1058,8 @@ async def battery_sizing(body: BatteryRequest):
             "assumptions": {
                 "engine_version": battery_optimiser.ENGINE_VERSION,
                 "is_tou": is_tou,
+                "tariff_source": tariff["source"],
+                "tariff_type": tariff["tariff_type"],
                 "import_rates_24": rate_24,
                 "fit": fit,
                 "fit_is_fallback": fit_is_fallback,

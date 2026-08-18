@@ -10,6 +10,9 @@
  */
 import { test } from "node:test";
 import assert from "node:assert/strict";
+import { readFileSync } from "node:fs";
+import { fileURLToPath } from "node:url";
+import path from "node:path";
 
 import {
   DISABLED_PATH_REASON,
@@ -647,4 +650,93 @@ test("F133 1d: EDIT_JOB_FOOTER_NOTE does not contain the false create-mode phras
   // is the fault itself, not a proxy for it: it directly re-tests the exact
   // false claim ("editable later in the worksheet") that F133 was raised over.
   assert.ok(!EDIT_JOB_FOOTER_NOTE.includes("later in the worksheet"));
+});
+
+// ── Jobs list — the metric treatment follows the figure, not the placeholder ─
+// Found by Mayur on screen: the Result cell always carried metric-sm (18px/600),
+// which is correct for a real headline figure and wrong for the "— not yet
+// sized" placeholder — an em dash and four words is not a figure, and with
+// every job in the database currently unsized, the emptiest cell in every row
+// was the loudest thing on screen. resultEmphasis carries that decision from
+// the SAME fact that already drives resultMuted (result === NOT_YET_SIZED),
+// derived once and read twice — never re-compared as a second string check.
+
+test("resultEmphasis (a): no sizing at all -> body, muted, the placeholder", () => {
+  const { rows } = summariseJobs(FIXTURE, KPIS);
+  const j04 = rows.find((r) => r.jobId === "j04");
+  assert.equal(j04?.result, NOT_YET_SIZED);
+  assert.equal(j04?.resultMuted, true);
+  assert.equal(j04?.resultEmphasis, "body");
+});
+
+test("resultEmphasis (b): a solar size -> metric, not muted", () => {
+  const { rows } = summariseJobs(FIXTURE, KPIS);
+  const j05 = rows.find((r) => r.jobId === "j05"); // solar 9.2 + battery 10, no payback
+  assert.equal(j05?.result, "9.2 kW + 10 kWh");
+  assert.equal(j05?.resultEmphasis, "metric");
+  assert.equal(j05?.resultMuted, false);
+});
+
+test("resultEmphasis (c): a payback with NO size -> metric — tracks 'is there a figure', not 'is there a solar size'", () => {
+  // No fixture row has this shape (solar null, battery null, payback set), so
+  // it is built directly — the case that proves resultEmphasis is not secretly
+  // "does this row have a solar_kw".
+  const { rows } = summariseJobs(
+    [job({ job_id: "payback-only", headline: { solar_kw: null, battery_kwh: null, payback_years: 4.1 } })],
+    KPIS,
+  );
+  const row = rows[0];
+  assert.equal(row.result, "4.1 yr");
+  assert.equal(row.resultEmphasis, "metric");
+  assert.equal(row.resultMuted, false);
+});
+
+test("resultEmphasis (d): resultMuted's existing assertion is UNCHANGED", () => {
+  // Byte-for-byte the check that already existed at line 276 before this task —
+  // pasted here rather than only trusting the original still runs, since it now
+  // sits beside a field this task added.
+  const { rows } = summariseJobs(FIXTURE, KPIS);
+  const byId = new Map(rows.map((r) => [r.jobId, r]));
+  assert.equal(byId.get("j04")?.resultMuted, true);
+});
+
+test("resultEmphasis (e): the two fields AGREE on every fixture row — recorded, not assumed", () => {
+  // They coincide today (muted <=> body) because both derive from the same
+  // NOT_YET_SIZED check. This test records that coincidence for the CURRENT
+  // fixture; it is not a structural invariant either field is entitled to
+  // assume about the other, which is exactly why they are two fields.
+  const { rows } = summariseJobs(FIXTURE, KPIS);
+  assert.ok(rows.length > 0);
+  for (const row of rows) {
+    assert.equal(
+      row.resultMuted,
+      row.resultEmphasis === "body",
+      `${row.jobId}: resultMuted=${row.resultMuted} but resultEmphasis=${row.resultEmphasis}`,
+    );
+  }
+});
+
+test("resultEmphasis: job-table.tsx applies metric-sm ONCE, and only inside a branch on resultEmphasis", () => {
+  // job-table.tsx has no render harness — verify-worksheet-logic.ts's harness
+  // is not lifted here for one conditional (a second copy is drift). This is
+  // therefore a SOURCE check, not a rendered-attribute check: it proves the
+  // class string is gated in the code, not that the gate evaluates correctly
+  // on screen. The on-screen result is Mayur's check, not this suite's — F109,
+  // a check that cannot be rehearsed needs its mechanism written down.
+  const src = readFileSync(
+    path.join(path.dirname(fileURLToPath(import.meta.url)), "../components/jobs/job-table.tsx"),
+    "utf8",
+  );
+  const quoted = src.match(/"metric-sm"/g) ?? [];
+  assert.equal(quoted.length, 1, `expected exactly one "metric-sm" class string, found ${quoted.length}`);
+  assert.ok(
+    src.includes('row.resultEmphasis === "metric" ? "metric-sm"'),
+    "metric-sm must be applied only inside a branch on row.resultEmphasis",
+  );
+  // Never applied unconditionally — i.e. never sitting bare in a className
+  // template/string outside that ternary.
+  assert.ok(
+    !/className=\{?`?metric-sm[\s`]/.test(src.replace('row.resultEmphasis === "metric" ? "metric-sm" : "text-body"', "")),
+    "metric-sm must not appear unconditionally anywhere else in this file",
+  );
 });

@@ -58,6 +58,15 @@ import {
   typedUsageError,
   usagePlausibilityNotice,
   azimuthLabel,
+  SHOW_CI_TARIFF_ROWS,
+  TARIFF_ADDRESS_LOCK_CAPTION,
+  TARIFF_DEFAULTS_CAPTION,
+  TARIFF_TOU_PROFILE_CAPTION,
+  TARIFF_WINDOWS_UNREADABLE_NOTICE,
+  isTariffTime,
+  tariffBillMismatchNotice,
+  tariffNetworkView,
+  tariffSaveNotices,
   fitZoomForBuilding,
   metresPerPixel,
   panelRectangles,
@@ -3379,4 +3388,656 @@ test("3.3c test 5: postJson === requestJson('POST') across five response shapes"
     const [a, b] = await bothResults(respond);
     assert.deepEqual(a, b, `${label}: the two results must be identical`);
   }
+});
+
+// ── 3.8: Tariff & network ────────────────────────────────────────────────────
+// Every case runs against hand-built job objects. `tariffs` is 0 rows live, so
+// the "has a stored tariff" branch is unreachable in the app today — a live
+// check for it could not fail and would be evidence of nothing (the F39 class).
+
+const EXPORT_DEFAULT_SA = {
+  state: "SA",
+  dnsp: "SA Power Networks",
+  export_limit_kw: 5.0,
+  is_default: false,
+};
+const FIT_DEFAULT_SA = {
+  state: "SA",
+  fit_aud_per_kwh: 0.05,
+  is_fallback: true,
+  source: "AER",
+  scheme: "NEM (market-based)",
+};
+const BOTH_DEFAULTS = { exportLimit: EXPORT_DEFAULT_SA, fit: FIT_DEFAULT_SA };
+
+function jobWithTariff(row: Record<string, unknown> | null) {
+  return {
+    site_state: "SA",
+    site_postcode: "5000",
+    site_dnsp: "SA Power Networks",
+    tariffs: row ? [{ tariff_id: "t1", created_at: "2026-08-18T00:00:00Z", ...row }] : [],
+  };
+}
+
+test("3.8 (a): no stored row — defaults prefill, and the import rate stays EMPTY", () => {
+  const view = tariffNetworkView(jobWithTariff(null), BOTH_DEFAULTS);
+  assert.equal(view.state, "empty");
+  assert.equal(view.exportLimitKw.text, "5");
+  assert.equal(view.fitRate.text, "0.05");
+  // There is deliberately no import-rate default: DEFAULT_IMPORT_RATE is an
+  // engine fallback, and prefilling the form with it would present a guess as
+  // an entered value (F78 in a new costume).
+  assert.equal(view.importRate.text, "");
+  assert.equal(view.supplyCharge.text, "");
+  assert.equal(view.dnsp, "SA Power Networks");
+  assert.equal(view.state_, "SA");
+  assert.equal(view.postcode, "5000");
+});
+
+test("3.8 (b): the STORED import rate beats the default — precedence, per field", () => {
+  const view = tariffNetworkView(
+    jobWithTariff({ tariff_type: "flat", import_rate: 0.42 }),
+    BOTH_DEFAULTS,
+  );
+  assert.equal(view.state, "stored");
+  assert.equal(view.importRate.text, "0.42");
+  assert.equal(view.importRate.raw, 0.42);
+  assert.equal(view.tariffType, "flat");
+});
+
+test("3.8 (c): a PARTIAL row falls back per field, never per row", () => {
+  const view = tariffNetworkView(
+    jobWithTariff({ tariff_type: "flat", import_rate: null, export_limit_kw: 7.5 }),
+    BOTH_DEFAULTS,
+  );
+  assert.equal(view.importRate.text, "");
+  // The stored 7.5 wins over the 5.0 default...
+  assert.equal(view.exportLimitKw.text, "7.5");
+  // ...and the FiT the row does NOT carry still takes the default.
+  assert.equal(view.fitRate.text, "0.05");
+});
+
+test("3.8 (d): both defaults null — every input empty, no source lines, no throw", () => {
+  const view = tariffNetworkView(jobWithTariff(null), { exportLimit: null, fit: null });
+  assert.equal(view.importRate.text, "");
+  assert.equal(view.fitRate.text, "");
+  assert.equal(view.exportLimitKw.text, "");
+  assert.equal(view.supplyCharge.text, "");
+  assert.equal(view.fitSourceLabel, null);
+  assert.equal(view.exportSourceLabel, null);
+});
+
+test("3.8 (e): a TOU window CROSSING MIDNIGHT round-trips unchanged, order kept", () => {
+  const view = tariffNetworkView(
+    jobWithTariff({
+      tariff_type: "tou",
+      tou_windows: [
+        { label: "peak", rate: 0.55, start: "18:00", end: "22:00", days: "all" },
+        { label: "offpeak", rate: 0.22, start: "22:00", end: "06:00", days: "all" },
+      ],
+    }),
+    BOTH_DEFAULTS,
+  );
+  assert.equal(view.tariffType, "tou");
+  assert.equal(view.windows.length, 2);
+  // Local clock time, verbatim — no rotation, no offset, no Date arithmetic.
+  assert.deepEqual(view.windows[0], {
+    label: "peak", rate: "0.55", start: "18:00", end: "22:00", days: "all",
+  });
+  assert.deepEqual(view.windows[1], {
+    label: "offpeak", rate: "0.22", start: "22:00", end: "06:00", days: "all",
+  });
+});
+
+test("3.8 (f): unreadable tou_windows are dropped with a notice, never a throw", () => {
+  for (const bad of ["not an array", [null], [{}], [{ rate: 0.4 }], 42]) {
+    const view = tariffNetworkView(
+      jobWithTariff({ tariff_type: "tou", tou_windows: bad }),
+      BOTH_DEFAULTS,
+    );
+    assert.equal(view.windows.length, 0, `${JSON.stringify(bad)} should drop every row`);
+    assert.ok(
+      view.notices.some((n) => n.title === TARIFF_WINDOWS_UNREADABLE_NOTICE.title),
+      `${JSON.stringify(bad)} should carry the could-not-be-fully-read notice`,
+    );
+  }
+  // A partially readable list keeps what it could read AND still warns.
+  const partial = tariffNetworkView(
+    jobWithTariff({
+      tariff_type: "tou",
+      tou_windows: [
+        { label: "peak", rate: 0.55, start: "18:00", end: "22:00", days: "all" },
+        { label: "offpeak", rate: 0.22 },
+      ],
+    }),
+    BOTH_DEFAULTS,
+  );
+  assert.equal(partial.windows.length, 1);
+  assert.ok(partial.notices.some((n) => n.title === TARIFF_WINDOWS_UNREADABLE_NOTICE.title));
+  // tou_windows absent is NOT unreadable — a flat tariff simply has none.
+  const flat = tariffNetworkView(
+    jobWithTariff({ tariff_type: "flat", import_rate: 0.4 }),
+    BOTH_DEFAULTS,
+  );
+  assert.equal(flat.windows.length, 0);
+  assert.ok(!flat.notices.some((n) => n.title === TARIFF_WINDOWS_UNREADABLE_NOTICE.title));
+});
+
+test("3.8 (g): a stored label outside the list is KEPT, never silently reset", () => {
+  const view = tariffNetworkView(
+    jobWithTariff({
+      tariff_type: "tou",
+      tou_windows: [
+        { label: "super-peak", rate: 0.9, start: "17:00", end: "20:00", days: "sundays" },
+        { label: "offpeak", rate: 0.2, start: "20:00", end: "17:00", days: "all" },
+      ],
+    }),
+    BOTH_DEFAULTS,
+  );
+  // The component turns these into an "(as stored)" option, exactly as
+  // site-details-section does for a roof material outside its list.
+  assert.equal(view.windows[0].label, "super-peak");
+  assert.equal(view.windows[0].days, "sundays");
+});
+
+test("3.8 (h): D25 — every notice classified by LEVEL and exact TITLE", () => {
+  const stored = tariffNetworkView(
+    jobWithTariff({
+      tariff_type: "tou",
+      import_rate: 0.42,
+      tou_windows: [{ label: "peak", rate: 0.5 }],
+    }),
+    BOTH_DEFAULTS,
+  );
+  const byTitle = new Map(stored.notices.map((n) => [n.title, n.level]));
+  assert.equal(byTitle.get("Saving this locks the job's address"), "caption");
+  assert.equal(
+    byTitle.get("The feed-in tariff and export limit are documented defaults"),
+    "caption",
+  );
+  assert.equal(byTitle.get("One rate profile, every day of the year"), "caption");
+  assert.equal(byTitle.get("The stored tariff could not be fully read"), "notice");
+  assert.equal(TARIFF_ADDRESS_LOCK_CAPTION.level, "caption");
+  assert.equal(TARIFF_DEFAULTS_CAPTION.level, "caption");
+  assert.equal(TARIFF_TOU_PROFILE_CAPTION.level, "caption");
+  assert.equal(TARIFF_WINDOWS_UNREADABLE_NOTICE.level, "notice");
+
+  // FINDINGS SORT ABOVE CAPTIONS in the array the component receives.
+  const lastFinding = stored.notices.reduce(
+    (acc, n, i) => (n.level === "notice" ? i : acc), -1);
+  const firstCaption = stored.notices.findIndex((n) => n.level === "caption");
+  assert.ok(lastFinding < firstCaption, "every finding must precede every caption");
+
+  // The TOU caption fires ONLY for a time-of-use tariff.
+  const flat = tariffNetworkView(
+    jobWithTariff({ tariff_type: "flat", import_rate: 0.4 }), BOTH_DEFAULTS);
+  assert.ok(!flat.notices.some((n) => n.title === TARIFF_TOU_PROFILE_CAPTION.title));
+  // The address-lock caption fires BEFORE the first save as well as after.
+  const empty = tariffNetworkView(jobWithTariff(null), BOTH_DEFAULTS);
+  assert.ok(empty.notices.some((n) => n.title === TARIFF_ADDRESS_LOCK_CAPTION.title));
+
+  // The SAVE RESPONSE is classified by MEANING, not by array position: the
+  // address-lock line is a caption even though it arrives in `warnings`
+  // alongside findings. A saved:false NEVER reads as success.
+  const failed = tariffSaveNotices({ ok: true, saved: false, warnings: [] });
+  assert.equal(failed[0].title, "The tariff could not be saved");
+  assert.equal(failed[0].level, "notice");
+  const locked = tariffSaveNotices({
+    ok: true, saved: true,
+    warnings: ["This job's address is now locked — the tariff follows from it."],
+  });
+  assert.equal(locked.length, 1);
+  assert.equal(locked[0].level, "caption");
+  const mixed = tariffSaveNotices({
+    ok: true, saved: true,
+    warnings: ["This job's address is now locked — the tariff follows from it.",
+               "The stored row could not be read back."],
+  });
+  assert.deepEqual(mixed.map((n) => n.level), ["caption", "notice"]);
+
+  // The bill-comparison notice — a FINDING about this job. Unreachable in the
+  // app today (bills is 0 rows), which is why it is asserted here directly.
+  assert.equal(tariffBillMismatchNotice(0.42, 0.42), null);
+  assert.equal(tariffBillMismatchNotice(0.42, null), null);
+  const disagrees = tariffBillMismatchNotice(0.42, 0.30);
+  assert.equal(disagrees?.level, "notice");
+  assert.equal(disagrees?.title, "The saved tariff disagrees with this job's bill");
+});
+
+test("3.8 (i): SHOW_CI_TARIFF_ROWS drives the C&I rows in BOTH directions", () => {
+  // The constant ships false — the rows are absent from the view, so the
+  // component renders nothing at all rather than hiding markup with CSS.
+  assert.equal(SHOW_CI_TARIFF_ROWS, false);
+  const job = jobWithTariff({
+    tariff_type: "flat",
+    import_rate: 0.4,
+    demand_charges: [{ rate: 12.5, threshold_kw: 30, negotiated_export_kw: 25 }],
+  });
+  const off = tariffNetworkView(job, BOTH_DEFAULTS, false);
+  assert.equal(off.ci, null);
+  const offDefault = tariffNetworkView(job, BOTH_DEFAULTS);
+  assert.equal(offDefault.ci, null, "the default argument is the constant");
+
+  // Driven TRUE, the fields exist and are correctly shaped — which is what
+  // makes "present but hidden behind the flag" a fact rather than an intention.
+  const on = tariffNetworkView(job, BOTH_DEFAULTS, true);
+  assert.notEqual(on.ci, null);
+  assert.equal(on.ci?.demandChargeRate.text, "12.5");
+  assert.equal(on.ci?.demandChargeRate.raw, 12.5);
+  assert.equal(on.ci?.demandThresholdKw.text, "30");
+  assert.equal(on.ci?.negotiatedExportKw.text, "25");
+  // With the flag on but nothing stored, the fields are present and empty.
+  const onEmpty = tariffNetworkView(jobWithTariff(null), BOTH_DEFAULTS, true);
+  assert.equal(onEmpty.ci?.demandChargeRate.text, "");
+  assert.equal(onEmpty.ci?.negotiatedExportKw.text, "");
+});
+
+test("3.8: the view is TOTAL — junk in, no throw, never the string 'undefined'", () => {
+  const junk: unknown[] = [
+    null, undefined, 42, "a job", [], {},
+    { tariffs: "not an array" },
+    { tariffs: [null] },
+    { tariffs: [{ import_rate: "0.42" }] },
+    { tariffs: [{ import_rate: {} }], site_state: 7 },
+  ];
+  for (const j of junk) {
+    const view = tariffNetworkView(j, { exportLimit: null, fit: null });
+    assert.ok(Array.isArray(view.windows));
+    assert.ok(Array.isArray(view.notices));
+    for (const text of [view.importRate.text, view.fitRate.text,
+                        view.exportLimitKw.text, view.supplyCharge.text]) {
+      assert.notEqual(text, "undefined");
+      assert.notEqual(text, "null");
+    }
+  }
+  // A numeric STRING from PostgREST is still a number.
+  const asString = tariffNetworkView(
+    { tariffs: [{ import_rate: "0.42", created_at: "2026-08-18T00:00:00Z" }] },
+    { exportLimit: null, fit: null },
+  );
+  assert.equal(asString.importRate.text, "0.42");
+  // And the save classifier tolerates any response shape.
+  for (const r of [null, undefined, 42, "x", {}, { warnings: "no" }, { warnings: [1, 2] }]) {
+    assert.ok(Array.isArray(tariffSaveNotices(r)));
+  }
+});
+
+test("3.8: the HH:MM guard matches the backend's regex, including 24:00", () => {
+  for (const good of ["00:00", "6:30", "06:00", "18:00", "23:59", "24:00"]) {
+    assert.ok(isTariffTime(good), `${good} should be accepted`);
+  }
+  for (const bad of ["25:00", "18:60", "6pm", "", "18", "18:0", null, 18]) {
+    assert.ok(!isTariffTime(bad), `${JSON.stringify(bad)} should be rejected`);
+  }
+});
+
+// ── 3.8-2b: number inputs do not change themselves ───────────────────────────
+// Rendered-attribute checks, on the same instrument as the chart-colour ones
+// above (2N.1): assert what REACHES the element, never the source you intended.
+// The module hooks are already registered by the harness above.
+//
+// WHAT THIS CAN AND CANNOT REACH: renderToStaticMarkup produces static HTML with
+// no DOM and no events, so it CAN prove the class list and the step attribute
+// that ship, and it CANNOT fire a wheel event. The wheel behaviour is proven
+// here only by asserting the handler exists and is gated on type === "number"
+// (test "the critical guard" below); the behaviour itself is MAYUR'S CHECK ON
+// SCREEN, not this suite's. F109 — a check that cannot be rehearsed needs its
+// mechanism written down, and this is that.
+
+const renderInput = await (async () => {
+  const React = (await import("react")).default;
+  const { renderToStaticMarkup } = await import("react-dom/server");
+  const { Input } = await import("../components/ui/input.tsx");
+  return (props: Record<string, unknown>) =>
+    renderToStaticMarkup(React.createElement(Input, props as never));
+})();
+
+const INPUT_SOURCE = await (async () => {
+  const { readFileSync } = await import("node:fs");
+  const { fileURLToPath } = await import("node:url");
+  const path = await import("node:path");
+  const root = path.dirname(path.dirname(fileURLToPath(import.meta.url)));
+  return readFileSync(path.join(root, "components/ui/input.tsx"), "utf8");
+})();
+
+/** The four rules that take the stepper arrows off, WebKit and Firefox both. */
+const APPEARANCE_RULES = [
+  "[&::-webkit-outer-spin-button]:appearance-none",
+  "[&::-webkit-inner-spin-button]:appearance-none",
+  "[&::-webkit-inner-spin-button]:m-0",
+  "[appearance:textfield]",
+];
+
+/** The class attribute as the BROWSER sees it: renderToStaticMarkup escapes the
+    `&` in an arbitrary-variant class to `&amp;`, and the HTML parser decodes it
+    straight back. Comparing the undecoded form would fail on a working rule. */
+function decodedMarkup(markup: string): string {
+  return markup.replace(/&amp;/g, "&").replace(/&quot;/g, '"').replace(/&#x27;/g, "'");
+}
+
+test("3.8-2b (a): a number Input RENDERS all four stepper-hiding rules", () => {
+  const markup = decodedMarkup(renderInput({ type: "number" }));
+  for (const rule of APPEARANCE_RULES) {
+    // Named individually so a failure says WHICH rule went missing.
+    assert.ok(
+      markup.includes(rule),
+      `the rendered class string must carry ${rule} — got: ${markup}`,
+    );
+  }
+});
+
+test("3.8-2b (b): a TEXT Input still renders and keeps its base styling", () => {
+  const markup = renderInput({ type: "text", placeholder: "Search jobs" });
+  assert.ok(markup.includes('type="text"'));
+  assert.ok(markup.includes("h-9"), "the 36px control height must survive");
+  assert.ok(markup.includes("rounded-md"));
+  assert.ok(markup.includes("border-input"));
+  assert.ok(markup.includes("focus-visible:ring-ring"));
+  assert.ok(markup.includes("placeholder:text-muted-foreground"));
+  // The address box and the jobs filter go through this same component; the
+  // wheel guard must never reach them. Proven from source in the guard test.
+  assert.ok(markup.includes('placeholder="Search jobs"'));
+});
+
+test("3.8-2b (d): a caller's className still lands AFTER the base classes", () => {
+  const markup = renderInput({ type: "number", className: "w-[130px]" });
+  const base = markup.indexOf("flex h-9");
+  const caller = markup.indexOf("w-[130px]");
+  assert.ok(base !== -1 && caller !== -1, markup);
+  assert.ok(caller > base, "the caller's class must come last so it can override");
+});
+
+// (c) THE ELEVEN SOURCE ELEMENTS, which render NINETEEN distinct fields — two
+// helpers serve several fields each (site-details' numberField serves four,
+// energy-data's correction row serves three). Every field named individually.
+const STEP_TABLE: [string, string, string][] = [
+  // [field, unit, step]
+  ["Import rate", "$/kWh", "0.01"],
+  ["Supply charge", "$/day", "0.01"],
+  ["Feed-in tariff", "$/kWh", "0.01"],
+  ["Export limit", "kW", "0.1"],
+  ["TOU window rate", "$/kWh", "0.01"],
+  ["C&I demand charge", "$/kVA", "0.01"],
+  ["C&I demand threshold", "kW", "0.1"],
+  ["C&I negotiated export", "kW", "0.1"],
+  ["Storeys", "count", "1"],
+  ["Year built", "year", "1"],
+  ["Bedrooms", "count", "1"],
+  ["Floor area", "m²", "1"],
+  ["Bill correction — total kWh", "kWh", "1"],
+  ["Bill correction — days", "days", "1"],
+  ["Bill correction — daily average", "kWh/day", "0.1"],
+  ["Typed annual usage", "kWh/yr", "1"],
+  ["Roof plane exact degrees", "degrees", "0.1"],
+  ["Roof plane pitch", "degrees", "1"],
+  ["Roof plane area", "m²", "1"],
+];
+
+for (const [field, unit, step] of STEP_TABLE) {
+  test(`3.8-2b (c): "${field}" (${unit}) ships step="${step}"`, () => {
+    const markup = renderInput({ type: "number", inputMode: "decimal", step });
+    assert.ok(
+      markup.includes(`step="${step}"`),
+      `${field} must reach the element with step="${step}" — got: ${markup}`,
+    );
+  });
+}
+
+test("3.8-2b (c): every call site passes the step its field's row claims", async () => {
+  // The render above proves Input FORWARDS a step; this proves each call site
+  // SUPPLIES the one in the table. Both halves are needed — neither alone shows
+  // the right number reaching the right field.
+  const { readFileSync } = await import("node:fs");
+  const { fileURLToPath } = await import("node:url");
+  const path = await import("node:path");
+  const root = path.dirname(path.dirname(fileURLToPath(import.meta.url)));
+  const read = (p: string) => readFileSync(path.join(root, p), "utf8");
+
+  const tariff = read("components/worksheet/tariff-network-section.tsx");
+  assert.ok(tariff.includes('"$/kWh",\n            "0.01",'), "Import rate → 0.01");
+  assert.ok(tariff.includes('"$/day",\n            "0.01",'), "Supply charge (flat) → 0.01");
+  assert.ok(tariff.includes('"$/day",\n              "0.01",'), "Supply charge (TOU) → 0.01");
+  assert.ok(tariff.includes('"$/kWh",\n          "0.01",'), "Feed-in tariff → 0.01");
+  assert.ok(tariff.includes('"kW",\n          "0.1",'), "Export limit → 0.1");
+  assert.ok(tariff.includes('step="0.01"\n                    placeholder="e.g. 0.55"'),
+    "TOU window rate → 0.01");
+  assert.ok(tariff.includes('step="0.01"\n              placeholder="e.g. 12.50"'),
+    "C&I demand charge → 0.01");
+  assert.equal((tariff.match(/step="0\.1"/g) ?? []).length, 2,
+    "C&I threshold and negotiated export → 0.1 each");
+
+  const site = read("components/worksheet/site-details-section.tsx");
+  assert.ok(site.includes('"storeys", "1"'), "Storeys → 1");
+  assert.ok(site.includes('"yearBuilt", "1"'), "Year built → 1");
+  assert.ok(site.includes('"bedrooms", "1"'), "Bedrooms → 1");
+  assert.ok(site.includes('"floorAreaM2", "1"'), "Floor area → 1");
+  assert.ok(site.includes("step={step}"), "the shared helper forwards its step");
+
+  const energy = read("components/worksheet/energy-data-section.tsx");
+  assert.ok(energy.includes('["totalKwh", "Total kWh", "1"]'), "Total kWh → 1");
+  assert.ok(energy.includes('["periodDays", "Days", "1"]'), "Days → 1");
+  assert.ok(energy.includes('["dailyAvgKwh", "Daily average kWh", "0.1"]'),
+    "Daily average → 0.1");
+  assert.ok(energy.includes('id="typed-annual"\n                  step="1"'),
+    "Typed annual usage → 1");
+
+  const roof = read("components/worksheet/address-roof-section.tsx");
+  assert.ok(roof.includes('id={`plane-deg-${i}`}\n                step="0.1"'),
+    "Roof plane exact degrees → 0.1");
+  assert.ok(roof.includes('id={`plane-pitch-${i}`}\n              step="1"'),
+    "Roof plane pitch → 1");
+  assert.ok(roof.includes('id={`plane-area-${i}`}\n              step="1"'),
+    "Roof plane area → 1");
+  // The three pre-existing steps are LEFT ALONE.
+  assert.ok(roof.includes('step="0.05"'), "the usability factor keeps its 0.05");
+});
+
+test("3.8-2b: THE CRITICAL GUARD — the wheel blur is gated on type === 'number'", () => {
+  // With this condition gone, EVERY text field in the app loses focus on scroll,
+  // including the address autocomplete — and nothing else in this suite would
+  // notice. That is why it is asserted on its own.
+  assert.ok(INPUT_SOURCE.includes("onWheel"), "the wheel handler must exist");
+  assert.ok(
+    INPUT_SOURCE.includes('if (type !== "number") return;'),
+    "the blur MUST be gated on type === 'number' — text inputs must never blur on scroll",
+  );
+  assert.ok(INPUT_SOURCE.includes(".blur()"), "the handler must blur the field");
+  // Blur, never preventDefault — stopping the page scrolling is the worse bug.
+  assert.ok(
+    !/event\.preventDefault\(\)/.test(INPUT_SOURCE),
+    "the wheel handler must NOT preventDefault — the page must keep scrolling",
+  );
+  // The caller's handler is composed, not clobbered.
+  assert.ok(INPUT_SOURCE.includes("onWheel?.(event)"), "a caller's onWheel must still run");
+  assert.ok(
+    INPUT_SOURCE.includes("if (event.defaultPrevented) return;"),
+    "a caller that preventDefaults must be able to opt out",
+  );
+  // The arrow KEYS stay working — an accessibility affordance, deliberately not
+  // blocked. Nothing may intercept keydown.
+  assert.ok(!/onKeyDown/.test(INPUT_SOURCE), "the keyboard arrows must not be blocked");
+});
+
+// ── Type roles survive the class merge ───────────────────────────────────────
+// THE FAULT: `cn` was twMerge(clsx(...)) with no configuration. tailwind-merge
+// knows nothing about this project's fontSize keys, and its default text-color
+// group accepts ANY text-* value — so `text-body` was filed as a COLOUR,
+// collided with the real colour beside it, and the earlier class was dropped.
+// The role always lost, because the role is always written first. Twelve
+// correctly-written call sites rendered at the browser's 16px instead of their
+// specified size, on every render, and the colour-token gate passed throughout
+// because it reads token VALUES and never the class string that ships (F47).
+
+// Loaded through the transpiling module hooks registered by the render harness
+// above — lib/utils.ts is TypeScript and `cn` is the thing under test.
+const utils = await import("../lib/utils.ts");
+const cn = utils.cn;
+const CN_ROLES: readonly string[] = utils.TYPE_ROLES;
+
+// (c) THE ANTI-DRIFT CHECK reads the real config file at test time.
+//
+// HOW, and why not simply import it: tailwind.config.ts ends with
+// `plugins: [require("tailwindcss-animate")]`, and `require` is not defined in
+// ES module scope — importing it throws before any key can be read. So the file
+// is PARSED with the TypeScript compiler (already a dependency, already used by
+// the render harness above) and the fontSize keys are taken off the AST. That
+// reads the config exactly as written and executes none of it.
+const CONFIG_FONT_SIZES = await (async () => {
+  const ts = (await import("typescript")).default;
+  const { readFileSync } = await import("node:fs");
+  const { fileURLToPath } = await import("node:url");
+  const path = await import("node:path");
+  const root = path.dirname(path.dirname(fileURLToPath(import.meta.url)));
+  const file = path.join(root, "tailwind.config.ts");
+  const source = ts.createSourceFile(
+    file,
+    readFileSync(file, "utf8"),
+    ts.ScriptTarget.Latest,
+    true,
+  );
+  const keys: string[] = [];
+  const visit = (node: import("typescript").Node): void => {
+    if (
+      ts.isPropertyAssignment(node) &&
+      (ts.isIdentifier(node.name) || ts.isStringLiteral(node.name)) &&
+      node.name.text === "fontSize" &&
+      ts.isObjectLiteralExpression(node.initializer)
+    ) {
+      for (const prop of node.initializer.properties) {
+        if (
+          ts.isPropertyAssignment(prop) &&
+          (ts.isIdentifier(prop.name) || ts.isStringLiteral(prop.name))
+        ) {
+          keys.push(prop.name.text);
+        }
+      }
+    }
+    ts.forEachChild(node, visit);
+  };
+  visit(source);
+  return keys;
+})();
+
+// (a) Every role, named individually — a failing role must say which it is.
+for (const role of [
+  "hero-xl", "hero", "hero-sub", "display", "h1", "h2", "h3",
+  "body-lg", "body", "body-medium", "label", "button", "nav",
+  "caption", "overline", "eyebrow", "metric-lg", "metric-sm",
+]) {
+  test(`type roles (a): cn("text-${role} text-foreground") keeps BOTH`, () => {
+    const out = cn(`text-${role} text-foreground`).split(" ");
+    assert.ok(
+      out.includes(`text-${role}`),
+      `text-${role} was dropped — it is being filed as a colour, not a size`,
+    );
+    assert.ok(out.includes("text-foreground"), "the colour must survive too");
+  });
+}
+
+test("type roles (b): the REVERSE order also keeps both", () => {
+  for (const role of CN_ROLES) {
+    const out = cn(`text-foreground text-${role}`).split(" ");
+    assert.ok(out.includes(`text-${role}`), `text-${role} dropped when written second`);
+    assert.ok(out.includes("text-foreground"), `the colour dropped for text-${role}`);
+  }
+});
+
+test("type roles (c): the merge list EQUALS tailwind.config.ts's fontSize keys", () => {
+  // A role added to the config and not here would silently go back to rendering
+  // at 16px. This is the check that stops that being possible.
+  assert.equal(CONFIG_FONT_SIZES.length, 18, "the config's fontSize key count");
+  assert.deepEqual(
+    [...CN_ROLES].sort(),
+    [...CONFIG_FONT_SIZES].sort(),
+    "lib/utils.ts's TYPE_ROLES must be exactly tailwind.config.ts's fontSize keys",
+  );
+  for (const key of CONFIG_FONT_SIZES) {
+    assert.ok(CN_ROLES.includes(key), `config role "${key}" is missing from TYPE_ROLES`);
+  }
+  for (const role of CN_ROLES) {
+    assert.ok(CONFIG_FONT_SIZES.includes(role), `TYPE_ROLES has "${role}", the config does not`);
+  }
+});
+
+test("type roles (d): GENUINE overrides still work, both groups", () => {
+  // Two SIZES do conflict — the caller must still win.
+  assert.equal(cn("text-body", "text-caption"), "text-caption");
+  assert.equal(cn("text-h1", "text-h3"), "text-h3");
+  // Two COLOURS still conflict exactly as before.
+  assert.equal(cn("text-foreground", "text-muted-foreground"), "text-muted-foreground");
+  // A size and a colour are now INDEPENDENT — overriding one leaves the other.
+  assert.equal(cn("text-body text-foreground", "text-caption"), "text-foreground text-caption");
+  assert.equal(
+    cn("text-body text-foreground", "text-muted-foreground"),
+    "text-body text-muted-foreground",
+  );
+  // Tailwind's own scale is untouched — this ADDED knowledge, it removed none.
+  assert.equal(cn("text-sm", "text-lg"), "text-lg");
+  assert.equal(cn("text-body", "text-[13px]"), "text-[13px]");
+  assert.equal(cn("text-[13px]", "text-body"), "text-body");
+  // A modified class lives in its own namespace and never collided anyway.
+  assert.equal(
+    cn("text-body focus:text-accent-foreground"),
+    "text-body focus:text-accent-foreground",
+  );
+});
+
+// (e) THE RENDERED ARTIFACT — the only evidence that counts, and the thing the
+// token gate structurally cannot see. Assert on the string reaching the element.
+const renderRole = await (async () => {
+  const React = (await import("react")).default;
+  const { renderToStaticMarkup } = await import("react-dom/server");
+  const { Input } = await import("../components/ui/input.tsx");
+  const { TableHead, TableCaption } = await import("../components/ui/table.tsx");
+  const { StatusPill } = await import("../components/ui/status-pill.tsx");
+  return {
+    input: () => renderToStaticMarkup(React.createElement(Input, { type: "number" } as never)),
+    tableHead: () => renderToStaticMarkup(React.createElement(TableHead, {} as never)),
+    tableCaption: () => renderToStaticMarkup(React.createElement(TableCaption, {} as never)),
+    statusPill: () =>
+      renderToStaticMarkup(React.createElement(StatusPill, { status: "draft" } as never)),
+  };
+})();
+
+/**
+ * The rendered class attribute as a LIST of exact class names.
+ *
+ * Substring matching is not good enough here and the negative proof proved it:
+ * input.tsx also carries `file:text-body`, so `markup.includes("text-body")`
+ * stayed true with the bare role dropped, and the check passed while the thing
+ * it guards was broken. Exact membership is the only assertion that moves.
+ * `&amp;` is decoded because renderToStaticMarkup escapes the `&` in an
+ * arbitrary-variant class and the HTML parser decodes it straight back.
+ */
+function renderedClasses(markup: string): string[] {
+  const match = markup.match(/class="([^"]*)"/);
+  if (!match) return [];
+  return match[1].replace(/&amp;/g, "&").split(/\s+/).filter(Boolean);
+}
+
+test("type roles (e): the rendered Input carries text-body AND text-foreground", () => {
+  const classes = renderedClasses(renderRole.input());
+  assert.ok(classes.includes("text-body"), `text-body never reached the element: ${classes}`);
+  assert.ok(classes.includes("text-foreground"), String(classes));
+});
+
+test("type roles (e): the rendered TableHead carries text-label AND its colour", () => {
+  const classes = renderedClasses(renderRole.tableHead());
+  assert.ok(classes.includes("text-label"), `text-label never reached the element: ${classes}`);
+  assert.ok(classes.includes("text-muted-foreground"), String(classes));
+});
+
+test("type roles (e): the rendered TableCaption carries text-caption AND its colour", () => {
+  const classes = renderedClasses(renderRole.tableCaption());
+  assert.ok(classes.includes("text-caption"), `text-caption never reached: ${classes}`);
+  assert.ok(classes.includes("text-muted-foreground"), String(classes));
+});
+
+test("type roles (e): StatusPill keeps text-caption beside a DYNAMIC colour", () => {
+  // The hardest of the twelve: its colour arrives through a variable
+  // (STATUS_STYLES[status].label), so no static scan of the source can see the
+  // collision — only the rendered string can.
+  const classes = renderedClasses(renderRole.statusPill());
+  assert.ok(classes.includes("text-caption"), `text-caption never reached: ${classes}`);
+  assert.ok(classes.includes("text-status-draft-foreground"), String(classes));
 });

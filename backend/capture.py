@@ -92,6 +92,9 @@ _ALLOWED: dict[str, set[str]] = {
     "tariffs": {
         "tariff_id", "job_id", "bill_id", "tariff_type", "supply_charge", "fit_tiers",
         "tou_windows", "demand_charges", "controlled_load", "block_tiers",
+        # 3.8 — the tariff envelope: the scalar rate, the single FiT, the export
+        # cap, the provenance, and the writer-set updated_at (no triggers exist).
+        "import_rate", "fit_aud_per_kwh", "export_limit_kw", "source", "updated_at",
     },
     "surveys": {
         "survey_id", "job_id", "household_size", "occupancy_pattern", "hot_water_type",
@@ -129,7 +132,12 @@ _ALLOWED: dict[str, set[str]] = {
 _CONFLICT: dict[str, str] = {
     "jobs": "job_id",
     "bills": "bill_id",
-    "tariffs": "tariff_id",
+    # 3.8: job_id, not tariff_id — ONE envelope per job. An upsert keyed on a
+    # generated tariff_id INSERTS every time (no id is ever supplied), so each
+    # re-save appended a row. Correct only together with the unique index
+    # tariffs_job_id_key added in the same change. _PK below is unchanged:
+    # tariff_id is still what the caller gets back.
+    "tariffs": "job_id",
     "surveys": "job_id",            # one survey per job (unique job_id)
     "load_profiles": "job_id",      # one profile per job
     "solar_resources": "job_id",    # one resource per job

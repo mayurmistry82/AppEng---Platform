@@ -54,10 +54,23 @@ export function JobTable({ rows }: { rows: readonly JobRowView[] }) {
               <StatusPill status={row.status} />
             </TableCell>
             <TableCell>
+              {/* The metric treatment (metric-sm, 18px/600) is for a REAL
+                  FIGURE — the row's headline number, the same emphasis the
+                  KPI tiles use. The "— not yet sized" placeholder is not a
+                  figure and renders at the table's own body size instead.
+                  resultEmphasis carries that decision from the logic layer
+                  (lib/jobs.ts) — this component owns the CSS, not the
+                  classification. text-body is stated explicitly rather than
+                  left to inherit from the table root: a size beside a colour
+                  now survives the class merge (lib/utils.ts), so stating it
+                  here is both safe and makes the placeholder's size a fact
+                  readable at the call site instead of an inherited default
+                  three components away. resultMuted is UNCHANGED — it still
+                  owns colour alone. */}
               <span
-                className={`metric-sm ${
-                  row.resultMuted ? "text-muted-foreground" : "text-foreground"
-                }`}
+                className={`${
+                  row.resultEmphasis === "metric" ? "metric-sm" : "text-body"
+                } ${row.resultMuted ? "text-muted-foreground" : "text-foreground"}`}
               >
                 {row.result}
               </span>

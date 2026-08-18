@@ -633,6 +633,7 @@ export function AddressRoofSection({
               </label>
               <Input
                 id={`plane-deg-${i}`}
+                step="0.1"
                 className="mt-1 w-[110px]"
                 type="number"
                 inputMode="decimal"
@@ -654,6 +655,7 @@ export function AddressRoofSection({
             </label>
             <Input
               id={`plane-pitch-${i}`}
+              step="1"
               className="mt-1 w-[110px]"
               type="number"
               inputMode="decimal"
@@ -672,6 +674,7 @@ export function AddressRoofSection({
             </label>
             <Input
               id={`plane-area-${i}`}
+              step="1"
               className="mt-1 w-[110px]"
               type="number"
               inputMode="decimal"

@@ -6,6 +6,7 @@ import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Notice } from "@/components/ui/notice";
 import { NoticeCaption } from "@/components/ui/notice-caption";
+import { NoticeStack } from "@/components/ui/notice-stack";
 import { HoverHelp } from "@/components/ui/tooltip";
 import {
   Select,
@@ -95,26 +96,6 @@ function uploadErrorCopy(kind: ApiErrorKind, status: number, message: string) {
     return { heading: "The engine needs more than this", body: message };
   }
   return clientActionErrorCopy(kind, status);
-}
-
-/** Findings first, then the quiet captions — D25's ordering, in every section. */
-function NoticeStack({ items }: { items: readonly RoofNoticeView[] }) {
-  const findings = items.filter((n) => n.level === "notice");
-  const captions = items.filter((n) => n.level === "caption");
-  return (
-    <>
-      {findings.map((n, i) => (
-        <Notice key={`n-${i}`} tone={n.tone} title={n.title}>
-          {n.body}
-        </Notice>
-      ))}
-      {captions.map((n, i) => (
-        <NoticeCaption key={`c-${i}`} icon={n.icon ?? "info"}>
-          {n.body}
-        </NoticeCaption>
-      ))}
-    </>
-  );
 }
 
 /**
@@ -743,11 +724,11 @@ export function EnergyDataSection({
                   <div className="flex flex-wrap items-end gap-2">
                     {(
                       [
-                        ["totalKwh", "Total kWh"],
-                        ["periodDays", "Days"],
-                        ["dailyAvgKwh", "Daily average kWh"],
+                        ["totalKwh", "Total kWh", "1"],
+                        ["periodDays", "Days", "1"],
+                        ["dailyAvgKwh", "Daily average kWh", "0.1"],
                       ] as const
-                    ).map(([key, label]) => (
+                    ).map(([key, label, step]) => (
                       <div key={key}>
                         <label
                           className="text-caption text-muted-foreground"
@@ -760,6 +741,7 @@ export function EnergyDataSection({
                           className="mt-1 w-[130px]"
                           type="number"
                           inputMode="decimal"
+                          step={step}
                           value={corr[key]}
                           onChange={(e) =>
                             setCorr((c) => ({ ...c, [key]: e.target.value }))
@@ -783,6 +765,7 @@ export function EnergyDataSection({
                 </label>
                 <Input
                   id="typed-annual"
+                  step="1"
                   className="mt-1 w-[140px]"
                   type="number"
                   inputMode="decimal"

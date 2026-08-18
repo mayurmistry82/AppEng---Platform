@@ -478,6 +478,18 @@ export interface JobRowView {
   status: string;
   result: string;
   resultMuted: boolean;
+  /**
+   * "metric" gets the row's headline-figure treatment (the metric-sm utility,
+   * 18px/600 — the same emphasis the KPI tiles use); "body" renders at the
+   * table's own text. A SEPARATE field from resultMuted rather than the
+   * component branching on resultMuted for both colour and size: colour and
+   * emphasis are two different decisions that happen to coincide today (an
+   * unsized row is both muted AND small), and naming them separately means a
+   * later change to one — e.g. a muted-but-emphasised state — cannot silently
+   * move the other. D25's precedent: the classification lives in the logic
+   * layer so a gate can see it, never inside the component.
+   */
+  resultEmphasis: "metric" | "body";
   tierLabel: string;
   tierLow: boolean;
   notes: string | null;
@@ -538,6 +550,12 @@ export function summariseJobs(
       status: job.status,
       result,
       resultMuted: result === NOT_YET_SIZED,
+      // One derivation, read twice (resultMuted above, resultEmphasis here) —
+      // never re-compared as a second string check. Anything OTHER than the
+      // placeholder gets "metric": an unrecognised or unexpected value is a
+      // real result and should be emphasised, because failing quiet on a
+      // genuine figure is the worse error than over-emphasising an edge case.
+      resultEmphasis: result === NOT_YET_SIZED ? "body" : "metric",
       tierLabel: tier.label,
       tierLow: tier.low,
       notes: job.notes && job.notes.trim() ? job.notes : null,

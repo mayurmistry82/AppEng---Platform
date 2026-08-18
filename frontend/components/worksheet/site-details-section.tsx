@@ -227,6 +227,7 @@ export function SiteDetailsSection({
     id: string,
     label: string,
     key: keyof FormState,
+    step: string, // from the field's own unit and its BOUNDS entry above
     placeholder: string, // every numeric placeholder carries "e.g." (F78)
   ) => (
     <div>
@@ -238,6 +239,7 @@ export function SiteDetailsSection({
         className="mt-1 w-[130px]"
         type="number"
         inputMode="decimal"
+        step={step}
         placeholder={placeholder}
         value={form[key]}
         onChange={(e) => set(key, e.target.value)}
@@ -263,11 +265,11 @@ export function SiteDetailsSection({
           "dwellingType",
           DWELLING_OPTIONS,
         )}
-        {numberField("site-storeys", "Storeys", "storeys", "e.g. 1")}
+        {numberField("site-storeys", "Storeys", "storeys", "1", "e.g. 1")}
         {selectField("site-roof-material", "Roof material", "roofMaterial", roofOptions)}
-        {numberField("site-year", "Year built", "yearBuilt", "e.g. 1995")}
-        {numberField("site-bedrooms", "Bedrooms", "bedrooms", "e.g. 3")}
-        {numberField("site-floor-area", "Floor area (m²)", "floorAreaM2", "e.g. 180")}
+        {numberField("site-year", "Year built", "yearBuilt", "1", "e.g. 1995")}
+        {numberField("site-bedrooms", "Bedrooms", "bedrooms", "1", "e.g. 3")}
+        {numberField("site-floor-area", "Floor area (m²)", "floorAreaM2", "1", "e.g. 180")}
         {selectField(
           "site-phase",
           "Electrical phase",

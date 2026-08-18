@@ -2949,3 +2949,419 @@ export function tierMismatchNotice(
     body: `The engine recorded Tier ${recorded}, but from what is on screen this should be Tier ${predicted}. The recorded tier is the one that counts — report this mismatch.`,
   };
 }
+
+// ── Tariff & network (3.8) ───────────────────────────────────────────────────
+
+/**
+ * The financial envelope: what power costs, what export earns, and how much the
+ * network lets this house send back. A pure view over the STORED tariffs row
+ * plus the two nem lookups, built the same way addressRoofView and
+ * energyDataView are — total, tolerant of any shape, never throwing.
+ *
+ * PRECEDENCE, per field and never per row: the STORED value wins; with no
+ * stored value the DEFAULT prefills the input; with neither the input is empty.
+ * A stored value is NEVER overwritten by a default — that is what stops a saved
+ * 7.5 kW export limit reverting to the network's 5.0 kW on the next page load.
+ *
+ * THE HOUR CONVENTION: window start and end are the SITE'S LOCAL CLOCK TIME as
+ * "HH:MM", stored and displayed unchanged. No rotation, no offset, no timezone
+ * conversion, and no Date object used for arithmetic on them anywhere in this
+ * file. The engine's 24-hour rate vector is indexed by local clock hour;
+ * generation is the only rotated series and that is backend (3.7). A window
+ * crossing midnight (22:00 → 06:00) is valid and round-trips unchanged.
+ *
+ * The D25 notice/caption classification lives HERE, never in the component.
+ */
+
+/** GET /api/nem/export-limit, as the backend returns it. Every field unknown:
+    this crosses a network boundary, so nothing about it is guaranteed. */
+export interface ExportLimitDefault {
+  state?: unknown;
+  dnsp?: unknown;
+  export_limit_kw?: unknown;
+  is_default?: unknown;
+}
+
+/** GET /api/nem/fit, as the backend returns it. `note` is WA/NT only. */
+export interface FitDefault {
+  state?: unknown;
+  fit_aud_per_kwh?: unknown;
+  is_fallback?: unknown;
+  source?: unknown;
+  scheme?: unknown;
+  last_updated?: unknown;
+  note?: unknown;
+}
+
+export interface TariffDefaults {
+  exportLimit: ExportLimitDefault | null;
+  fit: FitDefault | null;
+}
+
+/**
+ * One row of the TOU window form. ALL STRINGS, exactly like PlaneFormRow and
+ * for the same reason: these populate controlled inputs. `label` and `days` are
+ * the RAW stored strings — a value outside the accepted list is preserved so
+ * the component can offer it as "(as stored)" rather than silently resetting it.
+ */
+export interface TariffWindowFormRow {
+  label: string;
+  rate: string;
+  start: string;
+  end: string;
+  days: string;
+}
+
+export const EMPTY_TARIFF_WINDOW_ROW: TariffWindowFormRow = {
+  label: "",
+  rate: "",
+  start: "",
+  end: "",
+  days: "all",
+};
+
+/**
+ * C&I rows — "present but hidden behind the flag" (row 3.8; 10.5 un-hides them).
+ * There is no `segment` column on `jobs` (42 columns, F84), so there is nothing
+ * to store per job and no per-job flag: this is one module-level constant.
+ *
+ * THE TRAP THIS AVOIDS: a constant that is always false makes the code behind it
+ * unreachable and untestable — a feature that only claims to exist (the F39
+ * class). So tariffNetworkView takes the flag as an ARGUMENT defaulting to this
+ * constant, and verify-worksheet-logic.ts drives it BOTH ways.
+ */
+export const SHOW_CI_TARIFF_ROWS = false;
+
+export interface TariffCiView {
+  /** $/kVA or $/kW of billed demand, from the stored demand_charges jsonb. */
+  demandChargeRate: SiteFieldView<number>;
+  /** The demand threshold the charge applies above, kW. */
+  demandThresholdKw: SiteFieldView<number>;
+  /** A separately negotiated export limit, kW — C&I sites are not on the
+      standard residential limit. */
+  negotiatedExportKw: SiteFieldView<number>;
+}
+
+export interface TariffNetworkView {
+  /** "stored" means a tariffs row exists for this job. */
+  state: "empty" | "stored";
+  tariffType: "flat" | "tou" | null;
+  importRate: SiteFieldView<number>;
+  supplyCharge: SiteFieldView<number>;
+  fitRate: SiteFieldView<number>;
+  exportLimitKw: SiteFieldView<number>;
+  windows: TariffWindowFormRow[];
+  /** jobs.site_dnsp — READ ONLY on this screen. */
+  dnsp: string | null;
+  /** jobs.site_state. Named with the underscore because `state` above is the
+      view's own discriminant. */
+  state_: string | null;
+  postcode: string | null;
+  fitSourceLabel: string | null;
+  exportSourceLabel: string | null;
+  notices: RoofNoticeView[];
+  /** Null unless the C&I flag is on — absent from the DOM, not hidden by CSS. */
+  ci: TariffCiView | null;
+}
+
+/** The four window labels and three day values the backend accepts. */
+export const TARIFF_WINDOW_LABELS = ["peak", "shoulder", "offpeak", "flat"] as const;
+export const TARIFF_DAYS_VALUES = ["all", "weekday", "weekend"] as const;
+
+/**
+ * The client-side bounds. These MIRROR TariffSaveRequest's Field(ge=…, le=…)
+ * exactly; they are a courtesy that catches a typo before a round trip, and the
+ * backend remains the boundary that actually enforces them.
+ */
+export const TARIFF_BOUNDS = {
+  importRate: { min: 0, max: 5, message: "The import rate must be between 0 and 5 $/kWh." },
+  windowRate: { min: 0, max: 5, message: "A window rate must be between 0 and 5 $/kWh." },
+  supplyCharge: { min: 0, max: 20, message: "The supply charge must be between 0 and 20 $/day." },
+  fitRate: { min: 0, max: 5, message: "The feed-in tariff must be between 0 and 5 $/kWh." },
+  exportLimitKw: { min: 0, max: 100, message: "The export limit must be between 0 and 100 kW." },
+} as const;
+
+/** The same shape the backend's regex accepts — routes/demand.py's _TIME_HHMM. */
+export const TARIFF_TIME_PATTERN = /^([01]?\d|2[0-4]):[0-5]\d$/;
+
+export function isTariffTime(value: unknown): boolean {
+  return typeof value === "string" && TARIFF_TIME_PATTERN.test(value.trim());
+}
+
+/**
+ * The job (or any nested blob) as a plain record. JobDetailLike deliberately
+ * names only the keys the other views read, and jobs.site_dnsp / site_state /
+ * site_postcode are not among them — widening that shared interface to reach
+ * three fields would be a bigger change than this local accessor.
+ */
+function asRecord(value: unknown): Record<string, unknown> {
+  return typeof value === "object" && value !== null
+    ? (value as Record<string, unknown>)
+    : {};
+}
+
+/** A number, or a numeric string — PostgREST hands numerics back either way. */
+function tariffNum(value: unknown): number | null {
+  if (typeof value === "number" && Number.isFinite(value)) return value;
+  if (typeof value === "string" && value.trim() !== "") {
+    const n = Number(value);
+    if (Number.isFinite(n)) return n;
+  }
+  return null;
+}
+
+function tariffField(value: number | null): SiteFieldView<number> {
+  return { raw: value, text: value !== null ? String(value) : "" };
+}
+
+/**
+ * Stored windows → form rows. A window missing its rate, start or end cannot
+ * populate the form, so it is DROPPED and counted — the caller turns a non-zero
+ * count into the could-not-be-fully-read notice. Never throws, never yields the
+ * string "undefined".
+ */
+function tariffWindowRows(raw: unknown): {
+  rows: TariffWindowFormRow[];
+  dropped: number;
+} {
+  if (raw === null || raw === undefined) return { rows: [], dropped: 0 };
+  // Anything that is not an array is itself unreadable — one dropped "row".
+  if (!Array.isArray(raw)) return { rows: [], dropped: 1 };
+  const rows: TariffWindowFormRow[] = [];
+  let dropped = 0;
+  for (const entry of raw) {
+    if (typeof entry !== "object" || entry === null) {
+      dropped += 1;
+      continue;
+    }
+    const w = entry as Record<string, unknown>;
+    const rate = tariffNum(w.rate);
+    const start = roofStr(w.start);
+    const end = roofStr(w.end);
+    if (rate === null || start === null || end === null) {
+      dropped += 1;
+      continue;
+    }
+    rows.push({
+      label: roofStr(w.label) ?? "",
+      rate: String(rate),
+      // Verbatim — no parsing, no normalising, no Date. Local clock time.
+      start,
+      end,
+      days: roofStr(w.days) ?? "all",
+    });
+  }
+  return { rows, dropped };
+}
+
+/** Every notice this section can produce, as the titles the gate asserts. */
+export const TARIFF_ADDRESS_LOCK_CAPTION: RoofNoticeView = {
+  tone: "info",
+  level: "caption",
+  title: "Saving this locks the job's address",
+  body: "Saving this locks the job's address, because the network and the tariff both follow from it.",
+};
+
+export const TARIFF_DEFAULTS_CAPTION: RoofNoticeView = {
+  tone: "info",
+  level: "caption",
+  title: "The feed-in tariff and export limit are documented defaults",
+  body: "The feed-in tariff and export limit start from conservative documented defaults, not live retail rates. Type over them with this customer's actual numbers when you have them.",
+};
+
+export const TARIFF_TOU_PROFILE_CAPTION: RoofNoticeView = {
+  tone: "info",
+  level: "caption",
+  title: "One rate profile, every day of the year",
+  body: "The model applies one 24-hour rate profile to every day of the year, so weekday and weekend windows are not modelled separately.",
+};
+
+export const TARIFF_WINDOWS_UNREADABLE_NOTICE: RoofNoticeView = {
+  tone: "caution",
+  level: "notice",
+  title: "The stored tariff could not be fully read",
+  body: "Some stored time-of-use windows were missing a rate or a time and are not shown. Re-enter them before saving, or the next save will drop them.",
+};
+
+/** The bill-comparison threshold, $/kWh. Below this the two numbers are the
+    same number rounded differently; above it they are a real disagreement. */
+export const TARIFF_BILL_TOLERANCE = 0.01;
+
+export function tariffBillMismatchNotice(
+  stored: number | null,
+  billRate: number | null,
+): RoofNoticeView | null {
+  if (stored === null || billRate === null) return null;
+  if (Math.abs(stored - billRate) <= TARIFF_BILL_TOLERANCE) return null;
+  return {
+    tone: "caution",
+    level: "notice",
+    title: "The saved tariff disagrees with this job's bill",
+    body: `The saved import rate is $${stored}/kWh but the bill on this job reads $${billRate}/kWh. The saved rate is the one the engine uses — check which is right.`,
+  };
+}
+
+function tariffFitLabel(
+  fit: FitDefault | null,
+  jobState: string | null,
+  fromStored: boolean,
+): string | null {
+  if (fromStored) return "From the saved tariff.";
+  if (!fit) return null;
+  if (tariffNum(fit.fit_aud_per_kwh) === null) return null;
+  const st = roofStr(fit.state) ?? jobState;
+  const scheme = roofStr(fit.scheme) ?? roofStr(fit.source);
+  const fallback = fit.is_fallback === true;
+  const head = st ? `${st} default` : "Default";
+  const parts = [scheme, fallback ? "a conservative fallback, not a live retail rate" : null]
+    .filter((p): p is string => typeof p === "string" && p !== "")
+    .join(", ");
+  const note = roofStr(fit.note);
+  return `${head}${parts ? ` — ${parts}` : ""}.${note ? ` ${note}` : ""}`;
+}
+
+function tariffExportLabel(
+  limit: ExportLimitDefault | null,
+  fromStored: boolean,
+): string | null {
+  if (fromStored) return "From the saved tariff.";
+  if (!limit) return null;
+  if (tariffNum(limit.export_limit_kw) === null) return null;
+  const dnsp = roofStr(limit.dnsp);
+  if (limit.is_default === true) {
+    return "A conservative default — this network's own published limit was not found.";
+  }
+  return dnsp
+    ? `${dnsp} standard single-phase limit.`
+    : "The standard single-phase limit for this network.";
+}
+
+/**
+ * The C&I fields, read from the stored row's `demand_charges` jsonb — the only
+ * place the schema can hold C&I terms today. They are PREFILL ONLY until 10.5:
+ * TariffSaveRequest's seven fields do not carry them, so the save path leaves
+ * them alone rather than silently dropping them.
+ */
+function tariffCiView(row: Record<string, unknown> | null): TariffCiView {
+  const charges = row ? row.demand_charges : null;
+  const first =
+    Array.isArray(charges) && typeof charges[0] === "object" && charges[0] !== null
+      ? (charges[0] as Record<string, unknown>)
+      : {};
+  return {
+    demandChargeRate: tariffField(tariffNum(first.rate)),
+    demandThresholdKw: tariffField(tariffNum(first.threshold_kw)),
+    negotiatedExportKw: tariffField(tariffNum(first.negotiated_export_kw)),
+  };
+}
+
+export function tariffNetworkView(
+  job: unknown,
+  defaults: TariffDefaults,
+  showCiRows: boolean = SHOW_CI_TARIFF_ROWS,
+): TariffNetworkView {
+  const detail = asRecord(job);
+  // 0 or 1 row now that job_id is unique, but read it as an array anyway —
+  // every other view does, and a defensive read costs nothing.
+  const row = newestByCreatedAt(arr(detail.tariffs));
+  const exportDefault = defaults?.exportLimit ?? null;
+  const fitDefault = defaults?.fit ?? null;
+
+  const storedImport = tariffNum(row?.import_rate);
+  const storedSupply = tariffNum(row?.supply_charge);
+  const storedFit = tariffNum(row?.fit_aud_per_kwh);
+  const storedExport = tariffNum(row?.export_limit_kw);
+
+  // PER FIELD, never per row: a partial row must not blank what it does carry,
+  // and must not blank the fields it does not.
+  const fitValue = storedFit ?? tariffNum(fitDefault?.fit_aud_per_kwh);
+  const exportValue = storedExport ?? tariffNum(exportDefault?.export_limit_kw);
+
+  // There is deliberately NO import-rate default. DEFAULT_IMPORT_RATE is an
+  // engine fallback for a job that never got one; prefilling an installer's
+  // form with it would present a guess as an entered value (F78 in a new
+  // costume). Empty until someone types the real number.
+  const importValue = storedImport;
+
+  const storedType = roofStr(row?.tariff_type);
+  const tariffType =
+    storedType === "flat" || storedType === "tou" ? storedType : null;
+
+  const { rows: windows, dropped } = tariffWindowRows(row?.tou_windows);
+
+  const notices: RoofNoticeView[] = [];
+  if (dropped > 0) notices.push(TARIFF_WINDOWS_UNREADABLE_NOTICE);
+  // Unreachable today — `bills` is 0 rows — but the classification is declared
+  // so the branch is a fact rather than an intention.
+  const bill = newestByCreatedAt(arr(detail.bills));
+  const billRate = tariffNum(asRecord(bill?.parsed_json).tariff_rate);
+  const mismatch = tariffBillMismatchNotice(storedImport, billRate);
+  if (mismatch) notices.push(mismatch);
+  // Always true of every job, so it can never NOT fire — a caption, and shown
+  // BEFORE the first save as well as after.
+  notices.push(TARIFF_ADDRESS_LOCK_CAPTION);
+  notices.push(TARIFF_DEFAULTS_CAPTION);
+  if (tariffType === "tou") notices.push(TARIFF_TOU_PROFILE_CAPTION);
+
+  return {
+    state: row ? "stored" : "empty",
+    tariffType,
+    importRate: tariffField(importValue),
+    supplyCharge: tariffField(storedSupply),
+    fitRate: tariffField(fitValue),
+    exportLimitKw: tariffField(exportValue),
+    windows,
+    dnsp: roofStr(detail.site_dnsp),
+    state_: roofStr(detail.site_state),
+    postcode: roofStr(detail.site_postcode),
+    fitSourceLabel: tariffFitLabel(fitDefault, roofStr(detail.site_state), storedFit !== null),
+    exportSourceLabel: tariffExportLabel(exportDefault, storedExport !== null),
+    notices,
+    ci: showCiRows ? tariffCiView(row) : null,
+  };
+}
+
+/**
+ * The save response, classified by MEANING rather than by position in the
+ * `warnings` array — the array mixes two different kinds of thing and rendering
+ * it as a uniform list is the mistake this function exists to prevent.
+ *
+ * A `saved: false` response must NEVER read as success: the section's
+ * completeness predicate reads the DATABASE, so a false success is the worst
+ * outcome available here (the 3.6 lesson, and why the endpoint surfaces the
+ * boolean at all).
+ */
+export function tariffSaveNotices(response: unknown): RoofNoticeView[] {
+  const body = asRecord(response);
+  const out: RoofNoticeView[] = [];
+  if (body.saved === false) {
+    out.push({
+      tone: "problem",
+      level: "notice",
+      title: "The tariff could not be saved",
+      body: "The engine accepted the numbers but the row did not reach the database, so this section is not complete. Try saving again.",
+    });
+  }
+  for (const warning of asArrayOfStrings(body.warnings)) {
+    // The address-lock line is a FACT that fires on every successful save — a
+    // caption. Anything else the endpoint chose to warn about is a FINDING
+    // about this attempt.
+    const isLock = warning.toLowerCase().includes("address is now locked");
+    if (isLock) {
+      out.push({ ...TARIFF_ADDRESS_LOCK_CAPTION, body: warning });
+    } else if (body.saved !== false) {
+      out.push({
+        tone: "caution",
+        level: "notice",
+        title: "Saved, with something to check",
+        body: warning,
+      });
+    }
+  }
+  return out;
+}
+
+function asArrayOfStrings(value: unknown): string[] {
+  if (!Array.isArray(value)) return [];
+  return value.filter((v): v is string => typeof v === "string" && v !== "");
+}

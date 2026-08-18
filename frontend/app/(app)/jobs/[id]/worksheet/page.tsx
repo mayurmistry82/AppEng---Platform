@@ -2,6 +2,7 @@ import Link from "next/link";
 import { AlertTriangle } from "lucide-react";
 import { ResultsBar } from "@/components/worksheet/results-bar";
 import { WorksheetBody } from "@/components/worksheet/worksheet-body";
+import { apiGet } from "@/lib/api-server";
 import { getJob } from "@/lib/job-server";
 import {
   addressRoofView,
@@ -11,7 +12,10 @@ import {
   roofDiagramView,
   sectionStates,
   siteDetailsView,
+  tariffNetworkView,
   worksheetErrorCopy,
+  type ExportLimitDefault,
+  type FitDefault,
 } from "@/lib/worksheet";
 
 /**
@@ -63,6 +67,31 @@ export default async function Page({
   }
 
   const job = result.data;
+  // 3.8 — the two nem lookups that prefill the tariff section. Both are total
+  // and never raise upstream; a failure here yields a NULL default, the input
+  // starts empty and the section still renders. It must never block the page.
+  const site = job as {
+    site_state?: unknown;
+    site_postcode?: unknown;
+  };
+  const siteState = typeof site.site_state === "string" ? site.site_state : "";
+  const sitePostcode =
+    typeof site.site_postcode === "string" ? site.site_postcode : "";
+  const [exportLimitResult, fitResult] = await Promise.all([
+    siteState
+      ? apiGet<ExportLimitDefault>(
+          "/api/nem/export-limit",
+          new URLSearchParams({ state: siteState, postcode: sitePostcode }),
+        )
+      : Promise.resolve(null),
+    siteState
+      ? apiGet<FitDefault>("/api/nem/fit", new URLSearchParams({ state: siteState }))
+      : Promise.resolve(null),
+  ]);
+  const tariffDefaults = {
+    exportLimit: exportLimitResult?.ok ? exportLimitResult.data : null,
+    fit: fitResult?.ok ? fitResult.data : null,
+  };
   // The section specs carry predicate functions — strip to the serialisable
   // fields before crossing into the client component. `phase` travels with
   // them (3.3a fix 5) so the body can group without importing SECTIONS and
@@ -87,6 +116,7 @@ export default async function Page({
         siteDetails={siteDetailsView(job)}
         roofDiagram={roofDiagramView(job)}
         energyData={energyDataView(job)}
+        tariffNetwork={tariffNetworkView(job, tariffDefaults)}
         jobId={id}
       />
     </div>
