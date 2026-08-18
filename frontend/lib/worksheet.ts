@@ -1998,6 +1998,10 @@ export interface EnergyDataView {
   address: string | null;
   /** The stored profile's 24 weights when valid, for the preview strip. */
   profileWeights: number[] | null;
+  /** 3.6b: how much this house uses — from load_profiles, the figures every
+   *  downstream calculation depends on and which appeared nowhere on screen. */
+  annualKwh: number | null;
+  dailyAvgKwh: number | null;
   /** Pre-filled survey answers from the stored surveys row. */
   survey: SurveyAnswers;
 }
@@ -2026,6 +2030,8 @@ export function energyDataView(job: unknown): EnergyDataView {
     notices: [],
     address: null,
     profileWeights: null,
+    annualKwh: null,
+    dailyAvgKwh: null,
     survey: { ...EMPTY_SURVEY_ANSWERS },
   };
   view.survey = surveyView(detail);
@@ -2036,6 +2042,8 @@ export function energyDataView(job: unknown): EnergyDataView {
   const profile = newestByCreatedAt(arr(detail.load_profiles));
   view.tier = profile ? intTier(profile.accuracy_tier) : null;
   if (profile) {
+    view.annualKwh = qualityNum(profile.annual_kwh);
+    view.dailyAvgKwh = qualityNum(profile.daily_avg_kwh);
     const weights = profile.hourly_profile_weights;
     if (
       Array.isArray(weights) &&
@@ -2519,6 +2527,85 @@ export function surveyPayload(
  */
 export const FLAT_PROFILE_TOLERANCE = 0.15;
 
+export interface LoadPreviewView {
+  ok: boolean;
+  /** 24 heights normalised 0..1 for drawing. Empty when not drawable. */
+  bars: number[];
+  flat: boolean;
+  /** Inclusive hour window, or NULL — always null on a flat profile. */
+  peak: { startHour: number; endHour: number; label: string } | null;
+  /** States the shape in words — the strip's aria-label. */
+  ariaLabel: string;
+  /**
+   * 3.6b: the average day in real kWh, or null when the units assumption does
+   * not hold. NEVER a fabricated axis — a plausible axis computed from a
+   * broken assumption is worse than no axis.
+   */
+  kwhPerHour: number[] | null;
+  maxKwh: number | null;
+  /** false = draw the unitless shape, with NO axis and NO kWh figures. */
+  unitsOk: boolean;
+  /** The flat-profile line, TIER-AWARE (D27.3). Null when not flat. */
+  flatMessage: RoofNoticeView | null;
+}
+
+/**
+ * How far `sum(weights)` may sit from 24 and still be trusted for the kWh
+ * reconstruction. Named and exported so the assumption is VISIBLE and testable
+ * rather than buried in a comparison.
+ *
+ * THE ASSUMPTION, verified in both producers before this was built:
+ * interval_parser._normalise_weights uses `f = 24.0 / total`, and
+ * routes/load.py._normalise uses `factor = 24.0 / total`. So the weights sum to
+ * 24 for all three tiers and
+ *     kwh[h] = weights[h] * daily_avg_kwh / 24
+ * is exact. The parser ROUNDS each weight to 6dp, so a real file lands on
+ * 24.000001 — which is why this tolerance exists at all.
+ */
+export const WEIGHT_SUM_TOLERANCE = 0.01;
+
+function hourLabel(hour: number): string {
+  const h = ((hour % 24) + 24) % 24;
+  if (h === 0) return "12am";
+  if (h === 12) return "12pm";
+  return h < 12 ? `${h}am` : `${h - 12}pm`;
+}
+
+/**
+ * The flat-profile message, TIER-AWARE (D27.3). At Tier 1 the profile IS a flat
+ * national archetype, so the existing wording is right and it is a method fact
+ * — a quiet caption. At Tier 3 a near-flat MEASURED profile is a FINDING: it
+ * usually means the wrong channel or a synthetic file, and calling measured
+ * data a "national-average estimate" would be false. A flat Tier 2 is
+ * impossible by construction (a blended archetype is never flat), so if it
+ * happens something is wrong and it is treated as the Tier-3 case.
+ */
+function flatMessageFor(tier: 1 | 2 | 3 | null): RoofNoticeView {
+  if (tier === 1) {
+    return {
+      tone: "info",
+      level: "caption",
+      title: "",
+      body: "No daily shape — this is a national-average estimate.",
+    };
+  }
+  if (tier === 2 || tier === 3) {
+    return {
+      tone: "caution",
+      level: "notice",
+      title: "This meter data shows almost no daily variation",
+      body: "A home's usage normally rises and falls across the day. A flat measured profile usually means the wrong channel was read, or the file is synthetic. Check the file before relying on it.",
+    };
+  }
+  // Tier unknown: say what is true and claim nothing about where it came from.
+  return {
+    tone: "info",
+    level: "caption",
+    title: "",
+    body: "No daily shape in this profile.",
+  };
+}
+
 export function isFlatProfile(weights: readonly number[]): boolean {
   if (weights.length === 0) return true;
   let min = weights[0];
@@ -2530,37 +2617,28 @@ export function isFlatProfile(weights: readonly number[]): boolean {
   return max - min <= FLAT_PROFILE_TOLERANCE;
 }
 
-function hourLabel(hour: number): string {
-  const h = ((hour % 24) + 24) % 24;
-  if (h === 0) return "12am";
-  if (h === 12) return "12pm";
-  return h < 12 ? `${h}am` : `${h - 12}pm`;
-}
-
-export interface LoadPreviewView {
-  ok: boolean;
-  /** 24 heights normalised 0..1 for drawing. Empty when not drawable. */
-  bars: number[];
-  flat: boolean;
-  /** Inclusive hour window, or NULL — always null on a flat profile. */
-  peak: { startHour: number; endHour: number; label: string } | null;
-  /** States the shape in words — the strip's aria-label. */
-  ariaLabel: string;
-}
-
 /**
  * The 24-bar preview. Accepts the weights array itself or an object carrying
- * `hourly_profile_weights`. A profile with the wrong length or a non-numeric
- * entry renders NOTHING (ok:false) — a malformed chart must degrade to absent,
- * never to a misleading picture.
+ * `hourly_profile_weights`, plus the profile's `daily_avg_kwh` and its tier.
+ * A profile with the wrong length or a non-numeric entry renders NOTHING
+ * (ok:false) — a malformed chart must degrade to absent, never to a misleading
+ * picture.
  *
- * THE FLAT-PROFILE CASE IS THE ONE THAT MATTERS: Tier 1's weights are
- * [1.0] x 24, and a peak finder run over that would print a confident,
- * invented "peak" for a national-average estimate. Flat -> peak is NULL and
- * the words say there is no daily shape.
+ * THE FLAT-PROFILE CASE: Tier 1's weights are [1.0] x 24, and a peak finder run
+ * over that would print a confident, invented "peak" for a national-average
+ * estimate. Flat -> peak is NULL and the words say there is no daily shape.
+ * Flatness and unit-validity are INDEPENDENT: a flat Tier-1 profile with a real
+ * daily average still gets a real kWh axis (every hour equal).
  */
-export function loadPreviewView(profile: unknown): LoadPreviewView {
-  const none: LoadPreviewView = { ok: false, bars: [], flat: false, peak: null, ariaLabel: "" };
+export function loadPreviewView(
+  profile: unknown,
+  dailyAvgKwh?: unknown,
+  tier?: unknown,
+): LoadPreviewView {
+  const none: LoadPreviewView = {
+    ok: false, bars: [], flat: false, peak: null, ariaLabel: "",
+    kwhPerHour: null, maxKwh: null, unitsOk: false, flatMessage: null,
+  };
   const raw = Array.isArray(profile)
     ? profile
     : typeof profile === "object" && profile !== null
@@ -2574,6 +2652,22 @@ export function loadPreviewView(profile: unknown): LoadPreviewView {
   }
   const max = Math.max(...weights);
   const bars = weights.map((w) => (max > 0 ? w / max : 0));
+  const knownTier = tier === 1 || tier === 2 || tier === 3 ? tier : null;
+
+  // THE UNITS ASSERTION — never assumed. Both the sum and the daily average
+  // must hold up, or the chart falls back to the unitless shape with no axis.
+  const daily =
+    typeof dailyAvgKwh === "number" && Number.isFinite(dailyAvgKwh) && dailyAvgKwh > 0
+      ? dailyAvgKwh
+      : null;
+  const sum = weights.reduce((a, b) => a + b, 0);
+  const sumOk = Math.abs(sum - 24) <= WEIGHT_SUM_TOLERANCE;
+  const unitsOk = daily !== null && sumOk;
+  const kwhPerHour = unitsOk
+    ? weights.map((w) => (w * (daily as number)) / 24)
+    : null;
+  const maxKwh = kwhPerHour !== null ? Math.max(...kwhPerHour) : null;
+
   const flat = isFlatProfile(weights);
   if (flat) {
     return {
@@ -2582,7 +2676,11 @@ export function loadPreviewView(profile: unknown): LoadPreviewView {
       flat: true,
       peak: null,
       ariaLabel:
-        "Hourly load profile: no daily shape — a flat national-average estimate.",
+        "Average day across the year: no daily shape — usage is level through the day.",
+      kwhPerHour,
+      maxKwh,
+      unitsOk,
+      flatMessage: flatMessageFor(knownTier),
     };
   }
   // Peak: the contiguous run of hours around the maximum holding at least 80%
@@ -2599,8 +2697,32 @@ export function loadPreviewView(profile: unknown): LoadPreviewView {
     bars,
     flat: false,
     peak: { startHour: start, endHour: end, label },
-    ariaLabel: `Hourly load profile: highest use ${label}.`,
+    ariaLabel: `Average day across the year: highest use ${label}.`,
+    kwhPerHour,
+    maxKwh,
+    unitsOk,
+    flatMessage: null,
   };
+}
+
+/** The peak window as a headline figure — "Evening peak" / "Peak use". */
+export function peakHeadline(peak: LoadPreviewView["peak"]): string | null {
+  if (!peak) return null;
+  return peak.startHour >= 17 ? "Evening peak" : "Peak use";
+}
+
+/** en-AU formatting for the two headline figures. A missing figure is OMITTED. */
+export function formatAnnualKwh(value: number | null): string | null {
+  if (typeof value !== "number" || !Number.isFinite(value) || value <= 0) return null;
+  return `${Math.round(value).toLocaleString("en-AU")} kWh`;
+}
+
+export function formatDailyKwh(value: number | null): string | null {
+  if (typeof value !== "number" || !Number.isFinite(value) || value <= 0) return null;
+  return `${value.toLocaleString("en-AU", {
+    minimumFractionDigits: 1,
+    maximumFractionDigits: 1,
+  })} kWh`;
 }
 
 // ── The tier model (D26 — the engine is the fact) ────────────────────────────

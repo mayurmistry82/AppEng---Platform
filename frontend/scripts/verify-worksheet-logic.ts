@@ -34,6 +34,10 @@ import {
   TILE_W,
   FLAT_PROFILE_TOLERANCE,
   SURVEY_OPTIONS,
+  WEIGHT_SUM_TOLERANCE,
+  formatAnnualKwh,
+  formatDailyKwh,
+  peakHeadline,
   addressRoofView,
   billAddressCheck,
   billAddressNotice,
@@ -2869,4 +2873,356 @@ test("readout check 12: negative and non-numeric values are MISSING, not zero", 
       `${column}=${String(value)} must read as missing`,
     );
   }
+});
+
+// ── 3.6b: the average day in real kWh, and the tier-aware flat case ─────────
+//
+// The arithmetic, verified in BOTH producers before anything was built on it:
+// interval_parser._normalise_weights uses `f = 24.0 / total` and
+// routes/load.py._normalise uses `factor = 24.0 / total`, so the weights sum to
+// 24 and kwh[h] = weights[h] * daily_avg_kwh / 24 exactly. The parser rounds to
+// 6dp, so a real file lands on 24.000001 — hence WEIGHT_SUM_TOLERANCE.
+
+/**
+ * The REAL average-day weights nem12-good.csv produces, copied from the
+ * generator's printed output (and confirmed against the Python parser:
+ * sum(w) = 24.000000, peak hour 19, daily average 15.069 kWh). This is what
+ * ties the picture to the data.
+ */
+const SHAPED_WEIGHTS = [
+  0.435, 0.404, 0.383, 0.38, 0.401, 0.468, 0.797, 1.206, 1.113, 0.761, 0.662,
+  0.649, 0.695, 0.669, 0.708, 0.745, 0.887, 2.188, 2.44, 2.629, 2.259, 1.559,
+  0.952, 0.611,
+];
+const SHAPED_DAILY_KWH = 15.069;
+
+/** Weights that sum to exactly 24, scaled from an arbitrary shape. */
+function weightsSummingTo24(shape: number[]): number[] {
+  const total = shape.reduce((a, b) => a + b, 0);
+  return shape.map((v) => (v * 24) / total);
+}
+
+test("3.6b check 1: the kWh reconstruction round-trips to the daily average", () => {
+  const weights = weightsSummingTo24(SHAPED_WEIGHTS);
+  const view = loadPreviewView(weights, SHAPED_DAILY_KWH, 3);
+  assert.equal(view.unitsOk, true);
+  assert.ok(view.kwhPerHour !== null);
+  // FORWARD: each hour is weights[h] * daily / 24.
+  for (let h = 0; h < 24; h++) {
+    assert.ok(
+      Math.abs(view.kwhPerHour[h] - (weights[h] * SHAPED_DAILY_KWH) / 24) < 1e-9,
+      `hour ${h}`,
+    );
+  }
+  // ROUND TRIP: the reconstructed hours sum back to the daily average. This is
+  // the assertion that catches a dropped divide-by-24 — the obvious misreading.
+  const sum = view.kwhPerHour.reduce((a, b) => a + b, 0);
+  assert.ok(
+    Math.abs(sum - SHAPED_DAILY_KWH) < 1e-6,
+    `reconstructed day sums to ${sum}, expected ${SHAPED_DAILY_KWH}`,
+  );
+  assert.ok(view.maxKwh !== null && Math.abs(view.maxKwh - Math.max(...view.kwhPerHour)) < 1e-12);
+});
+
+test("3.6b check 2: weights summing to 23 or 25 -> unitsOk false, bars still drawn", () => {
+  for (const target of [23, 25]) {
+    const weights = weightsSummingTo24(SHAPED_WEIGHTS).map((w) => (w * target) / 24);
+    const view = loadPreviewView(weights, SHAPED_DAILY_KWH, 3);
+    assert.equal(view.ok, true, `sum ${target}: still drawable`);
+    assert.equal(view.unitsOk, false, `sum ${target}: no axis`);
+    assert.equal(view.kwhPerHour, null);
+    assert.equal(view.maxKwh, null);
+    assert.equal(view.bars.length, 24, "the unitless shape is still drawn");
+  }
+  // And just inside the tolerance still works.
+  const nudged = weightsSummingTo24(SHAPED_WEIGHTS).map(
+    (w, i) => (i === 0 ? w + WEIGHT_SUM_TOLERANCE * 0.5 : w),
+  );
+  assert.equal(loadPreviewView(nudged, SHAPED_DAILY_KWH, 3).unitsOk, true);
+});
+
+test("3.6b check 3: a bad daily average -> unitsOk false every time", () => {
+  const weights = weightsSummingTo24(SHAPED_WEIGHTS);
+  for (const bad of [null, undefined, 0, -5, "15.07", NaN, Infinity]) {
+    const view = loadPreviewView(weights, bad, 3);
+    assert.equal(view.unitsOk, false, `daily=${String(bad)}`);
+    assert.equal(view.kwhPerHour, null, `daily=${String(bad)}`);
+    assert.equal(view.ok, true, "the shape is still drawn");
+  }
+});
+
+test("3.6b check 4: flatness and unit-validity are INDEPENDENT", () => {
+  // A real Tier-1 profile with a real daily average: flat AND unit-valid.
+  const view = loadPreviewView(Array.from({ length: 24 }, () => 1), 12, 1);
+  assert.equal(view.flat, true);
+  assert.equal(view.unitsOk, true, "a flat profile still gets a real axis");
+  assert.ok(view.kwhPerHour !== null);
+  for (const kwh of view.kwhPerHour) {
+    assert.ok(Math.abs(kwh - 0.5) < 1e-12, "every hour equal: 12 kWh / 24");
+  }
+  assert.equal(view.peak, null, "flat still names no peak");
+});
+
+test("3.6b check 5: the flat caption is TIER-AWARE (D27.3)", () => {
+  const flat = Array.from({ length: 24 }, () => 1);
+  const tier1 = loadPreviewView(flat, 12, 1);
+  assert.equal(tier1.flatMessage?.level, "caption", "Tier 1 flat is a method fact");
+  assert.ok(
+    tier1.flatMessage.body.includes("national-average"),
+    "the Tier-1 wording is correct and stays",
+  );
+
+  const tier3 = loadPreviewView(flat, 12, 3);
+  assert.equal(tier3.flatMessage?.level, "notice", "flat MEASURED data is a finding");
+  assert.equal(tier3.flatMessage.tone, "caution");
+  assert.ok(
+    !tier3.flatMessage.body.includes("national-average"),
+    "measured data must NEVER be called a national-average estimate",
+  );
+  assert.ok(tier3.flatMessage.title.length > 0, "a notice needs a real title");
+
+  const tier2 = loadPreviewView(flat, 12, 2);
+  assert.deepEqual(
+    tier2.flatMessage,
+    tier3.flatMessage,
+    "a flat Tier 2 is impossible by construction — treated as the Tier-3 case",
+  );
+
+  // A shaped profile raises no flat message at all.
+  assert.equal(loadPreviewView(SHAPED_WEIGHTS, SHAPED_DAILY_KWH, 3).flatMessage, null);
+});
+
+test("3.6b check 6: energyDataView surfaces the two headline figures", () => {
+  const full = energyDataView(
+    emptyJob({
+      interval_data: [intervalRow({ coverage_days: 372, interval_minutes: 30 })],
+      load_profiles: [
+        { job_id: "j", accuracy_tier: 3, annual_kwh: 5500, daily_avg_kwh: 15.069 },
+      ],
+    }),
+  );
+  assert.equal(full.annualKwh, 5500);
+  assert.equal(full.dailyAvgKwh, 15.069);
+
+  // No row at all -> both null.
+  const none = energyDataView(emptyJob({ interval_data: [intervalRow()] }));
+  assert.equal(none.annualKwh, null);
+  assert.equal(none.dailyAvgKwh, null);
+
+  // Non-numeric and negative read as MISSING, never zero.
+  for (const bad of ["5500", -1, null]) {
+    const view = energyDataView(
+      emptyJob({
+        load_profiles: [{ job_id: "j", annual_kwh: bad, daily_avg_kwh: bad }],
+      }),
+    );
+    assert.equal(view.annualKwh, null, `annual_kwh=${String(bad)}`);
+    assert.equal(view.dailyAvgKwh, null, `daily_avg_kwh=${String(bad)}`);
+  }
+});
+
+test("3.6b check 7: the peak from the SHAPED fixture matches what the generator printed", () => {
+  // The generator printed "peak window 5pm to 9pm" for nem12-good.csv, and the
+  // Python parser put the maximum at hour 19. This ties the picture to the data.
+  const view = loadPreviewView(SHAPED_WEIGHTS, SHAPED_DAILY_KWH, 3);
+  assert.equal(view.flat, false, "the shaped fixture must NOT be flat");
+  assert.ok(view.peak !== null);
+  assert.equal(view.peak.startHour, 17);
+  assert.equal(view.peak.endHour, 20);
+  assert.equal(view.peak.label, "5pm to 9pm");
+  assert.equal(peakHeadline(view.peak), "Evening peak");
+  // The maximum really is the evening, not 3am.
+  assert.equal(SHAPED_WEIGHTS.indexOf(Math.max(...SHAPED_WEIGHTS)), 19);
+});
+
+test("3.6b check 8: every new message sets level explicitly, over the input space", () => {
+  const produced = [
+    loadPreviewView(Array.from({ length: 24 }, () => 1), 12, 1).flatMessage,
+    loadPreviewView(Array.from({ length: 24 }, () => 1), 12, 2).flatMessage,
+    loadPreviewView(Array.from({ length: 24 }, () => 1), 12, 3).flatMessage,
+    loadPreviewView(Array.from({ length: 24 }, () => 1), 12, null).flatMessage,
+    loadPreviewView(Array.from({ length: 24 }, () => 1)).flatMessage,
+  ].filter((m) => m !== null);
+  assert.equal(produced.length, 5);
+  for (const m of produced) {
+    assert.ok(m.level === "notice" || m.level === "caption", JSON.stringify(m));
+    assert.ok(typeof m.body === "string" && m.body.length > 0);
+  }
+});
+
+test("3.6b check 9: en-AU formatting, and a missing figure renders nothing", () => {
+  assert.equal(formatAnnualKwh(5500), "5,500 kWh");
+  assert.equal(formatAnnualKwh(12345.6), "12,346 kWh");
+  assert.equal(formatDailyKwh(15.069), "15.1 kWh");
+  assert.equal(formatDailyKwh(8), "8.0 kWh");
+  for (const bad of [null, 0, -1, NaN, Infinity]) {
+    assert.equal(formatAnnualKwh(bad), null, `annual ${String(bad)}`);
+    assert.equal(formatDailyKwh(bad), null, `daily ${String(bad)}`);
+  }
+  assert.equal(peakHeadline(null), null);
+  assert.equal(peakHeadline({ startHour: 7, endHour: 8, label: "7am to 9am" }), "Peak use");
+});
+
+test("3.6b: malformed profiles still degrade to absent, with the new fields null", () => {
+  for (const bad of [Array.from({ length: 23 }, () => 1), null, undefined, "x", 42]) {
+    const view = loadPreviewView(bad, 15, 3);
+    assert.equal(view.ok, false);
+    assert.equal(view.kwhPerHour, null);
+    assert.equal(view.maxKwh, null);
+    assert.equal(view.unitsOk, false);
+    assert.equal(view.flatMessage, null);
+  }
+});
+
+// ── The chart RENDERS its colour (3.6b fix) ─────────────────────────────────
+//
+// THE BUG THIS EXISTS TO CATCH: useChartTokens already returns usable colour
+// strings ("hsl(210 70.9% 54.1%)"), and the strip wrapped them AGAIN, emitting
+// fill="hsl(hsl(210 70.9% 54.1%))" — not a colour, so SVG painted the bars
+// BLACK. It shipped because the contrast check measured the TOKEN VALUE, the
+// colour we intended, and never the attribute that actually reached the DOM. A
+// calculation on the intended colour is structurally incapable of detecting a
+// colour that never arrives (the F47 shape).
+//
+// So these checks render the real component and read the real attributes. The
+// harness uses typescript's transpiler and react-dom/server — BOTH already
+// dependencies; no package was added for it.
+
+const rendered = await (async () => {
+  const { registerHooks } = await import("node:module");
+  const ts = (await import("typescript")).default;
+  const { readFileSync, existsSync } = await import("node:fs");
+  const { fileURLToPath, pathToFileURL } = await import("node:url");
+  const path = await import("node:path");
+
+  const root = path.dirname(path.dirname(fileURLToPath(import.meta.url)));
+  const exts = ["", ".tsx", ".ts", "/index.tsx", "/index.ts"];
+
+  registerHooks({
+    resolve(specifier, context, nextResolve) {
+      // The "@/..." alias plus extensionless relative imports — the two things
+      // Node cannot resolve on its own but tsconfig/Next can.
+      let target: string | null = null;
+      if (specifier.startsWith("@/")) {
+        target = path.join(root, specifier.slice(2));
+      } else if (specifier.startsWith(".") && context.parentURL?.startsWith("file:")) {
+        target = path.resolve(path.dirname(fileURLToPath(context.parentURL)), specifier);
+      }
+      if (target !== null) {
+        for (const ext of exts) {
+          if (existsSync(target + ext) && !existsSync(target + ext + "/")) {
+            return { url: pathToFileURL(target + ext).href, shortCircuit: true };
+          }
+        }
+      }
+      return nextResolve(specifier, context);
+    },
+    load(url, context, nextLoad) {
+      if (url.startsWith("file:") && /\.tsx?$/.test(url)) {
+        const source = readFileSync(fileURLToPath(url), "utf8");
+        const out = ts.transpileModule(source, {
+          compilerOptions: {
+            target: ts.ScriptTarget.ES2022,
+            module: ts.ModuleKind.ESNext,
+            jsx: ts.JsxEmit.ReactJSX,
+            verbatimModuleSyntax: false,
+          },
+        });
+        return { format: "module", source: out.outputText, shortCircuit: true };
+      }
+      return nextLoad(url, context);
+    },
+  });
+
+  const React = (await import("react")).default;
+  const { renderToStaticMarkup } = await import("react-dom/server");
+  const { LoadPreviewStrip } = await import(
+    "../components/worksheet/load-preview-strip.tsx"
+  );
+  return (view: unknown) =>
+    renderToStaticMarkup(
+      React.createElement(LoadPreviewStrip, { view } as never),
+    );
+})();
+
+/** Every fill= / stroke= attribute value in a rendered markup string. */
+function colourAttrs(markup: string): string[] {
+  return [...markup.matchAll(/(?:fill|stroke)="([^"]*)"/g)].map((m) => m[1]);
+}
+
+/**
+ * A value a browser would actually accept as a colour.
+ *
+ * `currentColor` and `none` are legitimate and appear on the lucide icons
+ * inside the captions — the first version of this predicate rejected them and
+ * failed the component for something correct. Which is itself worth noting:
+ * the harness really is reading every attribute in the subtree, icons included.
+ */
+function isRenderableColour(value: string): boolean {
+  if (value === "none" || value === "currentColor") return true;
+  // hsl(...) with exactly ONE set of parentheses, or hsl(var(--name)).
+  if (/^hsl\(var\(--[a-z0-9-]+\)\)$/.test(value)) return true;
+  return /^hsl\([^()]*\)$/.test(value);
+}
+
+const SHAPED_VIEW = loadPreviewView(SHAPED_WEIGHTS, SHAPED_DAILY_KWH, 3);
+
+test("colour check 1: the rendered markup contains NO 'hsl(hsl' — the whole bug", () => {
+  const markup = rendered(SHAPED_VIEW);
+  assert.ok(markup.includes("<rect"), "the chart actually rendered");
+  assert.ok(
+    !markup.includes("hsl(hsl"),
+    `double-wrapped colour in the DOM: ${markup.match(/[a-z]+="hsl\(hsl[^"]*"/)?.[0]}`,
+  );
+});
+
+test("colour check 2: every fill/stroke is a colour a browser would accept", () => {
+  const attrs = colourAttrs(rendered(SHAPED_VIEW));
+  assert.ok(attrs.length >= 25, `only ${attrs.length} colour attributes found`);
+  for (const value of attrs) {
+    assert.ok(value !== "" && value !== "undefined", `empty/undefined colour: "${value}"`);
+    assert.ok(isRenderableColour(value), `not a renderable colour: "${value}"`);
+  }
+});
+
+test("colour check 3: it holds in the flat, units-not-ok and no-peak states too", () => {
+  const flatWeights = Array.from({ length: 24 }, () => 1);
+  const states: [string, unknown][] = [
+    ["flat tier 1", loadPreviewView(flatWeights, 12, 1)],
+    ["flat tier 3", loadPreviewView(flatWeights, 12, 3)],
+    ["units not ok", loadPreviewView(SHAPED_WEIGHTS, null, 3)],
+    ["no peak (flat)", loadPreviewView(flatWeights, null, 1)],
+  ];
+  for (const [label, view] of states) {
+    const markup = rendered(view);
+    assert.ok(!markup.includes("hsl(hsl"), `${label}: double-wrapped colour`);
+    for (const value of colourAttrs(markup)) {
+      assert.ok(isRenderableColour(value), `${label}: bad colour "${value}"`);
+    }
+  }
+});
+
+test("colour check 4: the peak marker renders with a peak and not without one", () => {
+  const withPeak = rendered(SHAPED_VIEW);
+  assert.ok(SHAPED_VIEW.peak !== null, "the fixture has a peak");
+  assert.ok(
+    withPeak.includes("Peak use, 5pm to 9pm"),
+    "the peak marker and its title must render",
+  );
+  const flat = loadPreviewView(Array.from({ length: 24 }, () => 1), 12, 1);
+  assert.equal(flat.peak, null);
+  assert.ok(
+    !rendered(flat).includes("Peak use,"),
+    "no peak means no marker — never an invented one",
+  );
+});
+
+test("colour check 5: no reduced fill-opacity survives on any bar", () => {
+  const markup = rendered(SHAPED_VIEW);
+  const opacities = [...markup.matchAll(/fill-opacity="([^"]*)"/g)].map((m) => m[1]);
+  assert.deepEqual(
+    opacities,
+    [],
+    `opacity cannot carry the peak distinction at an accessible contrast — found ${opacities.join(", ")}`,
+  );
 });

@@ -307,14 +307,30 @@ export default function StyleGuidePage() {
         title="Load preview strip"
         note="3.6 prompt 3 — 24 hand-drawn SVG bars from the profile's own weights, chart tokens only, no chart library (F47). The flat case names NO peak: deriving a peak from Tier 1's [1.0]×24 would be a confident fabrication. aria-label states the shape in words."
       >
-        <div className="flex max-w-xl flex-col gap-4">
+        <div className="flex max-w-2xl flex-col gap-6">
+          {/* The real average-day weights the shaped fixture produces, with its
+              real daily average — so the style guide shows the same chart the
+              worksheet does, units and all. */}
           <LoadPreviewStrip
-            view={loadPreviewView([
-              0.3, 0.3, 0.3, 0.3, 0.3, 0.3, 0.9, 1.3, 1.1, 1.1, 1.1, 1.1,
-              1.2, 1.2, 0.9, 0.9, 0.9, 1.2, 1.8, 2.0, 1.8, 1.4, 0.6, 0.6,
-            ])}
+            view={loadPreviewView(
+              [
+                0.435, 0.404, 0.383, 0.38, 0.401, 0.468, 0.797, 1.206, 1.113,
+                0.761, 0.662, 0.649, 0.695, 0.669, 0.708, 0.745, 0.887, 2.188,
+                2.44, 2.629, 2.259, 1.559, 0.952, 0.611,
+              ],
+              15.069,
+              3,
+            )}
           />
-          <LoadPreviewStrip view={loadPreviewView(Array.from({ length: 24 }, () => 1))} />
+          {/* Tier 1: a flat national archetype — the caption is correct. */}
+          <LoadPreviewStrip
+            view={loadPreviewView(Array.from({ length: 24 }, () => 1), 12, 1)}
+          />
+          {/* Tier 3 flat: measured data with no shape is a FINDING, not a
+              method fact — never described as a national average (D27.3). */}
+          <LoadPreviewStrip
+            view={loadPreviewView(Array.from({ length: 24 }, () => 1), 12, 3)}
+          />
         </div>
       </Section>
 

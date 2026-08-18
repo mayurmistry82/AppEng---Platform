@@ -14,6 +14,7 @@ import {
   SelectTrigger,
   SelectValue,
 } from "@/components/ui/select";
+import { KpiTile } from "@/components/ui/kpi-tile";
 import { LoadPreviewStrip } from "@/components/worksheet/load-preview-strip";
 import { postFormData, postJson } from "@/lib/client-api";
 import { clientActionErrorCopy } from "@/lib/jobs";
@@ -24,6 +25,9 @@ import {
   billAddressNotice,
   billParseView,
   demandStatusLine,
+  formatAnnualKwh,
+  formatDailyKwh,
+  peakHeadline,
   intervalUploadView,
   loadPreviewView,
   surveyComplete,
@@ -61,6 +65,13 @@ import type { ApiErrorKind } from "@/lib/jobs";
  * `accuracy_tier_written`, with a loud notice if prediction and record ever
  * disagree.
  */
+
+/** A positive finite number off a response, else null — never a zero stand-in. */
+function readNum(value: unknown): number | null {
+  return typeof value === "number" && Number.isFinite(value) && value > 0
+    ? value
+    : null;
+}
 
 const INTERVAL_ACCEPT = ".csv,.dat,.txt";
 const BILL_ACCEPT = ".pdf,.jpg,.jpeg,.png,.webp";
@@ -106,9 +117,42 @@ function NoticeStack({ items }: { items: readonly RoofNoticeView[] }) {
   );
 }
 
+/**
+ * The three headline figures (3.6b): how much this house uses, which is what
+ * every downstream calculation depends on and appeared nowhere on screen.
+ * KpiTile fits exactly; KpiStrip does NOT — it is a hardcoded 4-column grid and
+ * these are three figures, so the layout is local rather than forcing it.
+ * A figure that cannot be derived is OMITTED, never rendered as zero.
+ */
+function HeadlineFigures({
+  annualKwh,
+  dailyAvgKwh,
+  preview,
+}: {
+  annualKwh: number | null;
+  dailyAvgKwh: number | null;
+  preview: LoadPreviewView;
+}) {
+  const annual = formatAnnualKwh(annualKwh);
+  const daily = formatDailyKwh(dailyAvgKwh);
+  const peakLabel = peakHeadline(preview.peak);
+  if (annual === null && daily === null && peakLabel === null) return null;
+  return (
+    <div className="grid grid-cols-1 gap-3 sm:grid-cols-3">
+      {annual !== null ? <KpiTile label="A year" value={annual} /> : null}
+      {daily !== null ? <KpiTile label="A day" value={daily} /> : null}
+      {peakLabel !== null && preview.peak !== null ? (
+        <KpiTile label={peakLabel} value={preview.peak.label} />
+      ) : null}
+    </div>
+  );
+}
+
 interface DemandRecorded {
   /** The BACKEND's accuracy_tier_written — never what the UI predicted. */
   tier: number | null;
+  annualKwh: number | null;
+  dailyAvgKwh: number | null;
   /** What tierFor predicted at the moment of the call — for the mismatch notice. */
   predicted: number | null;
   preview: LoadPreviewView;
@@ -176,13 +220,19 @@ export function EnergyDataSection({
         const data = result.data as Record<string, unknown>;
         setRecorded({
           tier: parsed.tier,
+          annualKwh: readNum((data.load as Record<string, unknown> | undefined)?.annual_kwh),
+          dailyAvgKwh: readNum((data.load as Record<string, unknown> | undefined)?.daily_avg_kwh),
           predicted: tierFor({
             hasIntervalProfile: true,
             usageKwh: null,
             usageSource: "interval",
             surveyComplete: false,
           }),
-          preview: loadPreviewView(data.load),
+          preview: loadPreviewView(
+            data.load,
+            (data.load as Record<string, unknown> | undefined)?.daily_avg_kwh,
+            parsed.tier,
+          ),
           warnings: [],
           surveySaved: null,
           loadProfileSaved: parsed.loadProfileSaved,
@@ -317,8 +367,14 @@ export function EnergyDataSection({
       setRecorded({
         tier:
           typeof tierRaw === "number" && Number.isInteger(tierRaw) ? tierRaw : null,
+        annualKwh: readNum(data.annual_kwh),
+        dailyAvgKwh: readNum(data.daily_avg_kwh),
         predicted,
-        preview: loadPreviewView(data),
+        preview: loadPreviewView(
+          data,
+          data.daily_avg_kwh,
+          typeof tierRaw === "number" ? tierRaw : null,
+        ),
         warnings,
         surveySaved: typeof data.survey_saved === "boolean" ? data.survey_saved : null,
         loadProfileSaved:
@@ -439,7 +495,11 @@ export function EnergyDataSection({
     ...(view.tier === null ? ["Tier not recorded"] : []),
   ].filter((p): p is string => p !== null);
 
-  const storedPreview = loadPreviewView(view.profileWeights);
+  const storedPreview = loadPreviewView(
+    view.profileWeights,
+    view.dailyAvgKwh,
+    view.tier,
+  );
   const edited = corrEdited();
   const mismatch = recorded
     ? tierMismatchNotice(recorded.predicted, recorded.tier)
@@ -465,6 +525,11 @@ export function EnergyDataSection({
               {mismatch.body}
             </Notice>
           ) : null}
+          <HeadlineFigures
+            annualKwh={recorded.annualKwh}
+            dailyAvgKwh={recorded.dailyAvgKwh}
+            preview={recorded.preview}
+          />
           {recorded.preview.ok ? <LoadPreviewStrip view={recorded.preview} /> : null}
           {recorded.warnings.map((w, i) => (
             <Notice key={`w-${i}`} tone="caution" title="Not fully saved">
@@ -522,6 +587,11 @@ export function EnergyDataSection({
               : storedParts
             ).join(" · ")}
           </p>
+          <HeadlineFigures
+            annualKwh={view.annualKwh}
+            dailyAvgKwh={view.dailyAvgKwh}
+            preview={storedPreview}
+          />
           {storedPreview.ok ? <LoadPreviewStrip view={storedPreview} /> : null}
           <NoticeStack
             items={[...(haveFreshInterval ? upload.notices : []), ...view.notices]}
