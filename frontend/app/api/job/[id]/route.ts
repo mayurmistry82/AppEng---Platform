@@ -5,12 +5,13 @@ import { createClient } from "@/lib/supabase/server";
  * Job-field update hop (3.4b) — forwards to PATCH /api/job/{id}, the backend's
  * ONE job-field writer. Same pattern as app/api/job/create/route.ts: session
  * token from the server Supabase client, 401 when absent, explicit whitelist of
- * the same seven fields, upstream status passed through, token never logged.
+ * the same sixteen fields the backend accepts, upstream status passed through,
+ * token never logged.
  *
  * ABSENT vs NULL is preserved through the whitelist: a key is forwarded only
  * when the client actually sent it, and an explicit null travels as null — the
- * backend clears that column. Forwarding all seven unconditionally would turn
- * every partial save into a seven-field wipe.
+ * backend clears that column. Forwarding all sixteen unconditionally would
+ * turn every partial save into a sixteen-field wipe.
  *
  * The dynamic segment is the job id — validated non-empty and forwarded, no
  * further: the backend does the ownership check (404 absent/foreign, F88 503).
@@ -39,6 +40,10 @@ const FIELDS = [
   "existing_inverter_kw",
   "intent",
   "address",
+  // 3.9 — the optimisation inputs. Same absent-vs-null rule as the rest.
+  "objective",
+  "custom_weight",
+  "budget_aud",
 ] as const;
 
 async function forward(

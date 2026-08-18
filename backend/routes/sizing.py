@@ -68,9 +68,12 @@ class OptimiseRequest(BaseModel):
     postcode: Optional[str] = None
     state: Optional[str] = None
     installer_id: Optional[str] = None
-    # Objective
-    objective: str = "max_npv"
-    custom_weight: Optional[float] = 0.5
+    # Objective — None means "the caller did not choose", which is a DIFFERENT
+    # fact from choosing max_npv. 3.9: _resolve_objective's top precedence rule
+    # is "explicit request field wins", which cannot be written against a
+    # non-None default. The documented defaults now live in the resolver.
+    objective: Optional[str] = None
+    custom_weight: Optional[float] = None
     budget: Optional[float] = None
     # Optional installer constraints (additive; absent/empty ⇒ behaves exactly as today)
     constraints: Optional[dict] = None
@@ -407,14 +410,146 @@ def _resolve_tariff(
     }
 
 
+def _read_job_objective(client: Any, job_id: Optional[str], flags: list[str]) -> Optional[dict]:
+    """The job's stored optimisation inputs, or None. Mirrors _read_tariff_row:
+    a read FAILURE (a different fact from absence) is flagged and the resolver
+    falls through to the defaults — it never raises and never blocks sizing."""
+    if not job_id or client is None:
+        return None
+    try:
+        res = (
+            client.table("jobs")
+            .select("objective,custom_weight,budget_aud")
+            .eq("job_id", job_id)
+            .order("created_at", desc=True)
+            .limit(1)
+            .execute()
+        )
+        return res.data[0] if res.data else None
+    except Exception:  # noqa: BLE001
+        flags.append("stored objective could not be read — sized with the defaults — is_fallback")
+        return None
+
+
+def _objective_num(value: Any) -> Optional[float]:
+    """A finite number or None — never a bool, never NaN/inf, never a raise.
+    The same coercion rule tariffNum/_num use elsewhere: a number, or a numeric
+    string, or nothing."""
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, (int, float)):
+        f = float(value)
+    elif isinstance(value, str) and value.strip():
+        try:
+            f = float(value)
+        except ValueError:
+            return None
+    else:
+        return None
+    return f if f == f and f not in (float("inf"), float("-inf")) else None
+
+
+def _resolve_objective(client: Any, body: Any, flags: list[str]) -> dict:
+    """ONE resolver for the optimisation inputs, read by BOTH sizing endpoints.
+
+    Returns {"objective": str, "custom_weight": float, "budget": Optional[float]}.
+    Precedence per field, most specific first (the _resolve_tariff /
+    _resolve_load pattern):
+      1. the explicit request field, when not None
+      2. the job's stored jobs row (objective / custom_weight / budget_aud)
+      3. the documented defaults: "max_npv", 0.5, None (no cap)
+
+    NO-REGRESSION: on a job with no stored objective, and on any request that
+    supplies one explicitly, all three resolved values are IDENTICAL to what
+    the endpoints used before 3.9 — the solar and battery numbers do not move.
+
+    A STORED objective outside VALID_OBJECTIVES (reachable only by a raw DB
+    edit — the PATCH Literal guards the write) falls back to max_npv with a
+    loud flag, never an error: sizing is not blocked by a data quirk (D24). An
+    objective supplied in the REQUEST passes through untouched — the endpoint's
+    own validity check stays the loud path for caller mistakes.
+
+    KNOWN LIMITATION, deliberate and pinned by the gate (5c): `budget` arrives
+    as None both when the caller omitted it and when the caller means "no
+    cap", so a None request budget resolves to the STORED cap when one exists.
+    A caller wanting a genuinely uncapped run on a job that stores a cap
+    cannot express that today. 3.11 is the only caller and passes through;
+    changing this later must be a deliberate change, not a drive-by.
+    """
+    job_id = getattr(body, "job_id", None)
+    stored = _read_job_objective(client, job_id, flags) or {}
+
+    objective = getattr(body, "objective", None)
+    if objective is None:
+        stored_obj = stored.get("objective")
+        if isinstance(stored_obj, str) and stored_obj in solar_optimiser.VALID_OBJECTIVES:
+            objective = stored_obj
+        else:
+            if stored_obj:
+                flags.append(
+                    f"stored objective {stored_obj!r} is not one the engine knows — "
+                    "sized for maximum NPV instead"
+                )
+            elif job_id:
+                # A job was named and nobody has chosen — say so, so an
+                # installer reading the flags learns the objective was
+                # nobody's decision. A stateless call (no job_id) appends
+                # nothing: a caller supplying nothing is the API working,
+                # not a fallback.
+                flags.append(
+                    "no objective chosen for this job — sized for maximum NPV (the default)"
+                )
+            objective = "max_npv"
+
+    custom_weight = getattr(body, "custom_weight", None)
+    if custom_weight is None:
+        raw = stored.get("custom_weight")
+        num = _objective_num(raw)
+        if num is not None and 0.0 <= num <= 1.0:
+            custom_weight = num
+        else:
+            if raw is not None:
+                flags.append(
+                    "stored custom_weight could not be read as a 0..1 number — "
+                    "used the engine default 0.5"
+                )
+            custom_weight = 0.5
+    else:
+        custom_weight = float(custom_weight)
+
+    budget = getattr(body, "budget", None)
+    if budget is None:
+        raw = stored.get("budget_aud")
+        num = _objective_num(raw)
+        if num is not None and num > 0:
+            budget = num
+        elif raw is not None:
+            # An unreadable cap must never become a cap of ZERO — that would
+            # return the cheapest possible system and look like a considered
+            # answer. Unreadable = NO cap, flagged.
+            flags.append(
+                "stored budget could not be read as a positive dollar amount — "
+                "sized with no cap"
+            )
+    return {"objective": objective, "custom_weight": custom_weight, "budget": budget}
+
+
 @router.post("/api/sizing/optimise")
 async def optimise_sizing(body: OptimiseRequest):
     try:
         flags: list[str] = []
-        if body.objective not in solar_optimiser.VALID_OBJECTIVES:
-            return {"error": f"invalid objective '{body.objective}'", "valid": sorted(solar_optimiser.VALID_OBJECTIVES)}
-
         client = _sb()
+        # 3.9 — the ONE resolver, called BEFORE the roof block. Ordering is
+        # part of the contract: an invalid objective must keep erroring ahead
+        # of the "no roof geometry" error, so the validity check operates on
+        # the RESOLVED objective right here.
+        resolved = _resolve_objective(client, body, flags)
+        objective = resolved["objective"]
+        custom_weight = resolved["custom_weight"]
+        budget = resolved["budget"]
+        if objective not in solar_optimiser.VALID_OBJECTIVES:
+            return {"error": f"invalid objective '{objective}'", "valid": sorted(solar_optimiser.VALID_OBJECTIVES)}
+
         planes = body.planes
         candidate_configs = body.candidate_configs
         lat, lon = body.lat, body.lon
@@ -493,10 +628,10 @@ async def optimise_sizing(body: OptimiseRequest):
                 roof_planes=planes_, candidate_configs=configs_, lat=float(lat), lon=float(lon),
                 utc_offset_hours=utc_offset,
                 panel=panel_, load_hourly=load_hourly, import_rate=float(import_rate), fit=float(fit),
-                export_limit_kw=float(export_limit_kw), objective=body.objective, fin=fin,
+                export_limit_kw=float(export_limit_kw), objective=objective, fin=fin,
                 postcode=postcode, state=state, installer_id=body.installer_id,
-                custom_weight=body.custom_weight if body.custom_weight is not None else 0.5,
-                budget=body.budget, constraints=constraints_, flags=flags_,
+                custom_weight=custom_weight,
+                budget=budget, constraints=constraints_, flags=flags_,
             )
 
         # ── Resolve solar constraints (panel-model re-scale is LOCAL — no Google call) ──
@@ -573,7 +708,7 @@ async def optimise_sizing(body: OptimiseRequest):
                         "annual_solar_generation_kwh": opt["annual_generation_kwh"],
                         "within_budget": opt.get("within_budget", True),
                         "engine_version": solar_optimiser.ENGINE_VERSION,
-                        "objective_used": body.objective,
+                        "objective_used": objective,
                     }
                 )
                 persisted = bool(sid)
@@ -610,7 +745,7 @@ async def optimise_sizing(body: OptimiseRequest):
                 "n_configs_evaluated": result["n_configs_evaluated"],
                 "cache_hits": result["cache_hits"],
                 "cache_misses": result["cache_misses"],
-                "custom_weight": body.custom_weight if body.objective == "custom" else None,
+                "custom_weight": custom_weight if objective == "custom" else None,
                 "constraints_applied": constraints_applied,
             },
             "failed_planes": result["failed_planes"],
@@ -648,8 +783,10 @@ class BatteryRequest(BaseModel):
     installer_id: Optional[str] = None
     # Candidates / objective
     battery_ids: Optional[list[str]] = None
-    objective: str = "max_npv"
-    custom_weight: Optional[float] = 0.5
+    # None = "the caller did not choose" — see OptimiseRequest; resolved by
+    # _resolve_objective (3.9).
+    objective: Optional[str] = None
+    custom_weight: Optional[float] = None
     budget: Optional[float] = None
     resolution: str = "representative_days"
     # Optional installer constraints (additive; absent/empty ⇒ behaves exactly as today)
@@ -817,10 +954,15 @@ def _build_rate_24(
 async def battery_sizing(body: BatteryRequest):
     try:
         flags: list[str] = []
-        if body.objective not in solar_optimiser.VALID_OBJECTIVES:
-            return {"error": f"invalid objective '{body.objective}'", "valid": sorted(solar_optimiser.VALID_OBJECTIVES)}
-
         client = _sb()
+        # 3.9 — the ONE resolver, before the roof block; see optimise_sizing.
+        resolved = _resolve_objective(client, body, flags)
+        objective = resolved["objective"]
+        custom_weight = resolved["custom_weight"]
+        budget = resolved["budget"]
+        if objective not in solar_optimiser.VALID_OBJECTIVES:
+            return {"error": f"invalid objective '{objective}'", "valid": sorted(solar_optimiser.VALID_OBJECTIVES)}
+
         planes = body.planes
         candidate_configs = body.candidate_configs
         lat, lon = body.lat, body.lon
@@ -895,9 +1037,9 @@ async def battery_sizing(body: BatteryRequest):
                 roof_planes=planes_, candidate_configs=configs_, lat=float(lat), lon=float(lon),
                 utc_offset_hours=utc_offset,
                 panel=panel_, load_hourly=load_hourly, import_rate=flat_rate_for_solar, fit=float(fit),
-                export_limit_kw=export_limit_kw, objective=body.objective, fin=fin,
+                export_limit_kw=export_limit_kw, objective=objective, fin=fin,
                 postcode=postcode, state=state, installer_id=body.installer_id,
-                custom_weight=body.custom_weight if body.custom_weight is not None else 0.5,
+                custom_weight=custom_weight,
                 budget=None, constraints=sconstraints_, flags=fl,
             )
             ch = sres["optimal"]
@@ -921,9 +1063,9 @@ async def battery_sizing(body: BatteryRequest):
                 export_limit_kw=export_limit_kw, battery_rows=rows_, fin=fin,
                 solar_kw=chosen_["solar_kw"], panel_id=panel_.get("id"), panel_count=chosen_.get("panel_count"),
                 solar_only_net_cost=chosen_["system_cost"], postcode=postcode, state=state,
-                installer_id=body.installer_id, objective=body.objective,
-                custom_weight=body.custom_weight if body.custom_weight is not None else 0.5,
-                budget=body.budget, resolution=body.resolution,
+                installer_id=body.installer_id, objective=objective,
+                custom_weight=custom_weight,
+                budget=budget, resolution=body.resolution,
                 fix_battery_kwh=fix_kwh_, force_no_battery=force_nb_, flags=flags_,
             )
 
@@ -1027,9 +1169,9 @@ async def battery_sizing(body: BatteryRequest):
                     "self_consumption_ratio": self_cons_ratio,
                     "system_cost": round(chosen_solar["system_cost"] + opt.get("battery_cost", 0), 2),
                     "annual_solar_generation_kwh": gen_annual,
-                    "within_budget": (body.budget is None) or (opt.get("battery_cost", 0) <= body.budget),
+                    "within_budget": (budget is None) or (opt.get("battery_cost", 0) <= budget),
                     "engine_version": battery_optimiser.ENGINE_VERSION,
-                    "objective_used": body.objective,
+                    "objective_used": objective,
                 })
                 persisted = bool(sid)
             except Exception as exc:  # noqa: BLE001
@@ -1073,7 +1215,7 @@ async def battery_sizing(body: BatteryRequest):
                 "resolution": result["resolution"],
                 "total_load_kwh": round(sum(load_hourly), 1),
                 "panel": used_panel,
-                "custom_weight": body.custom_weight if body.objective == "custom" else None,
+                "custom_weight": custom_weight if objective == "custom" else None,
                 "constraints_applied": constraints_applied,
             },
             "persisted": persisted,

@@ -7,6 +7,7 @@ import { getJob } from "@/lib/job-server";
 import {
   addressRoofView,
   energyDataView,
+  objectiveBudgetView,
   phaseStates,
   resultsBarView,
   roofDiagramView,
@@ -117,6 +118,7 @@ export default async function Page({
         roofDiagram={roofDiagramView(job)}
         energyData={energyDataView(job)}
         tariffNetwork={tariffNetworkView(job, tariffDefaults)}
+        objectiveBudget={objectiveBudgetView(job)}
         jobId={id}
       />
     </div>

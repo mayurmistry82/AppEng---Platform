@@ -153,15 +153,17 @@ def run_patch(stub, payload, job_id="j1"):
 def main() -> int:
     print("verify_job_patch.py — PATCH /api/job/{id} contract (offline)\n")
 
-    print("1. the whitelist: exactly thirteen fields, everything else DROPPED silently")
-    # 3.3c grew the seven site fields by the six job-bar-edit fields — one
-    # whitelist that grows, never a second implementation (D2).
+    print("1. the whitelist: exactly sixteen fields, everything else DROPPED silently")
+    # 3.3c grew the seven site fields by the six job-bar-edit fields; 3.9 grew
+    # them again by the three optimisation inputs — one whitelist that grows,
+    # never a second implementation (D2).
     fields = set(job_route.JobSitePatch.model_fields.keys())
-    check("model has exactly the thirteen fields",
+    check("model has exactly the sixteen fields",
           fields == {"storeys", "roof_material", "dwelling_type", "year_built",
                      "bedrooms", "floor_area_m2", "electrical_phase",
                      "customer_name", "has_existing_solar", "existing_solar_kw",
-                     "existing_inverter_kw", "intent", "address"}, str(fields))
+                     "existing_inverter_kw", "intent", "address",
+                     "objective", "custom_weight", "budget_aud"}, str(fields))
     stub = StubClient()
     smuggle = {"storeys": 2, "company_id": "co-EVIL", "installer_id": "x",
                "path": "F", "status": "won", "address": "1 Evil St"}
@@ -200,6 +202,12 @@ def main() -> int:
         ("floor_area_m2", 0), ("floor_area_m2", 2001),
         ("dwelling_type", "apartment"), ("dwelling_type", "duplex"),
         ("electrical_phase", "two"),
+        # 3.9 — the optimisation inputs' bounds. budget_aud 0 is a typo, never
+        # an instruction (gt=0); "backup" rejected is the check that fails the
+        # day someone adds backup to the model without adding it to the engine.
+        ("budget_aud", 0), ("budget_aud", 500001),
+        ("custom_weight", -0.1), ("custom_weight", 1.1),
+        ("objective", "backup"),
     ]
     for field, value in bad:
         try:
@@ -211,7 +219,10 @@ def main() -> int:
     for field, value in [("storeys", 1), ("storeys", 5), ("year_built", 1800),
                          ("year_built", 2100), ("bedrooms", 0), ("bedrooms", 20),
                          ("floor_area_m2", 2000), ("dwelling_type", "unit"),
-                         ("electrical_phase", "three")]:
+                         ("electrical_phase", "three"),
+                         ("budget_aud", 1), ("budget_aud", 500000),
+                         ("custom_weight", 0), ("custom_weight", 1),
+                         ("objective", "custom")]:
         try:
             job_route.JobSitePatch(**{field: value})
             check(f"boundary {field}={value!r} accepted", True)

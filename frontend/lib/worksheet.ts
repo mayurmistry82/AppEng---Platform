@@ -46,6 +46,10 @@ export interface JobDetailLike {
   interval_data?: unknown;
   actuals?: unknown;
   roof_geometry?: unknown;
+  // 3.9 — optimisation inputs, columns on jobs (nullable, no defaults).
+  objective?: string | null;
+  custom_weight?: number | null;
+  budget_aud?: number | null;
 }
 
 /** A child key as a real array — [] for anything that is not an array. */
@@ -155,8 +159,14 @@ export const SECTIONS: readonly WorksheetSectionSpec[] = [
     title: "Objective & budget",
     phase: "optimise",
     builtAt: "3.9",
-    // ALWAYS FALSE — no objective/budget column exists yet; lands at 3.9.
-    complete: () => false,
+    // 3.9 — complete when a KNOWN objective is stored. A budget is NOT
+    // required: "no cap" is a real answer, and demanding a number would make
+    // installers invent one. A stored string the engine does not recognise
+    // does NOT complete it, deliberately — the engine would silently size for
+    // max_npv instead, so the section's work is not done.
+    complete: (job) =>
+      typeof job.objective === "string" &&
+      (VALID_OBJECTIVES as readonly string[]).includes(job.objective),
   },
   {
     id: "equipment-specs",
@@ -3364,4 +3374,169 @@ export function tariffSaveNotices(response: unknown): RoofNoticeView[] {
 function asArrayOfStrings(value: unknown): string[] {
   if (!Array.isArray(value)) return [];
   return value.filter((v): v is string => typeof v === "string" && v !== "");
+}
+
+// ── Objective & budget (3.9) ─────────────────────────────────────────────────
+
+/**
+ * THE ENGINE'S FOUR OBJECTIVES — a plain literal, and THIS EXACT EXPORT NAME IS
+ * LOAD-BEARING: backend/scripts/verify_objective_contract.py Test 7 imports it
+ * by name over node and asserts set equality with solar_optimiser
+ * .VALID_OBJECTIVES in BOTH directions. Do not rename it, compose it at
+ * runtime, or import it from anywhere — a member added to either side alone
+ * fails the two-sided gate. "backup" is deliberately absent until 4.5 teaches
+ * the ENGINE the word (D29: a control that stores a choice and changes no
+ * number was rejected outright).
+ */
+export const VALID_OBJECTIVES = [
+  "max_npv",
+  "max_self_sufficiency",
+  "min_payback",
+  "custom",
+] as const;
+
+/**
+ * The on-screen labels, in display order. Plain English only — "max_npv" never
+ * appears in the UI. The value set must EQUAL VALID_OBJECTIVES (asserted by
+ * the suite in both directions), so a label added without an engine objective
+ * fails a gate rather than a customer.
+ */
+export const OBJECTIVE_OPTIONS: readonly { value: string; label: string }[] = [
+  { value: "min_payback", label: "Fastest payback" },
+  { value: "max_npv", label: "Best 25-year return" },
+  { value: "max_self_sufficiency", label: "Most self-sufficient" },
+  { value: "custom", label: "Custom blend" },
+];
+
+/**
+ * Client-side bounds, mirroring routes/job.py's Field() bounds EXACTLY
+ * (custom_weight ge=0 le=1; budget_aud gt=0 le=500000). A courtesy that
+ * catches a typo before a round trip — the backend remains the boundary that
+ * actually enforces them.
+ */
+export const OBJECTIVE_BOUNDS = {
+  customWeight: {
+    min: 0,
+    max: 1,
+    message: "The blend must be between 0 and 1.",
+  },
+  budgetAud: {
+    min: 0,
+    minExclusive: true,
+    max: 500000,
+    message: "A budget cap must be more than $0. Leave it empty for no cap.",
+  },
+} as const;
+
+export interface ObjectiveBudgetView {
+  /** "stored" when any of the three columns holds a value. */
+  state: "empty" | "stored";
+  /** The RAW stored objective, even when the engine does not know it — never
+      silently reset to a default. */
+  objective: string | null;
+  /** Is it one of VALID_OBJECTIVES — drives the caution notice and the
+      "(as stored)" Select option. */
+  objectiveIsKnown: boolean;
+  customWeight: SiteFieldView<number>;
+  budgetAud: SiteFieldView<number>;
+  notices: RoofNoticeView[];
+}
+
+/** The one-sentence blend explainer — a CAPTION: a fact about how the tool
+    works, true of every custom job (D25). */
+export const OBJECTIVE_BLEND_CAPTION: RoofNoticeView = {
+  tone: "info",
+  level: "caption",
+  title: "How the blend works",
+  body: "The blend weighs financial return against self-sufficiency: 1 is all financial return, 0 is all self-sufficiency.",
+};
+
+/**
+ * A pure view over the job's three optimisation columns. Total, tolerant of
+ * any input, never throws. The D25 classification lives HERE, never in the
+ * component. An empty section raises NO notice — quiet, because "nothing
+ * chosen yet" and "no cap" are legitimate answers, not warnings (F149).
+ */
+export function objectiveBudgetView(job: unknown): ObjectiveBudgetView {
+  const detail = asRecord(job);
+  const objective = roofStr(detail.objective);
+  const objectiveIsKnown =
+    objective !== null && (VALID_OBJECTIVES as readonly string[]).includes(objective);
+
+  // PostgREST hands numerics back as a number OR a numeric string — tariffNum
+  // takes both. A view that only accepted typeof === "number" would silently
+  // show an empty budget on a job that has one.
+  const weightRaw = tariffNum(detail.custom_weight);
+  const weight = weightRaw !== null && weightRaw >= 0 && weightRaw <= 1 ? weightRaw : null;
+  const budgetRaw = tariffNum(detail.budget_aud);
+  const budget = budgetRaw !== null && budgetRaw > 0 ? budgetRaw : null;
+
+  const notices: RoofNoticeView[] = [];
+  if (objective !== null && !objectiveIsKnown) {
+    // A finding about THIS job, and it matters: the engine will size for
+    // maximum NPV and say so in its flags, which is not what the screen would
+    // otherwise imply.
+    notices.push({
+      tone: "caution",
+      level: "notice",
+      title: "This objective is not one the engine knows",
+      body: `The stored objective "${objective}" is not one the engine can size for, so it will size for the best 25-year return (its default) instead. Choose one of the listed objectives and save.`,
+    });
+  }
+  if (objective === "custom" && objectiveIsKnown) {
+    notices.push(OBJECTIVE_BLEND_CAPTION);
+  }
+
+  return {
+    state: objective !== null || weight !== null || budget !== null ? "stored" : "empty",
+    objective,
+    objectiveIsKnown,
+    // The slider shows what the engine will actually use — its documented
+    // default 0.5 — rather than a misleading 0. Stored-but-unreadable (out of
+    // 0..1, garbage) is treated as absent.
+    customWeight: { raw: weight, text: weight !== null ? String(weight) : "0.5" },
+    budgetAud: { raw: budget, text: budget !== null ? String(budget) : "" },
+    notices,
+  };
+}
+
+/**
+ * THE ROUND-TRIP CHECK. PATCH /api/job/{id} returns the UPDATED JOB ROW, not a
+ * { saved } envelope — there is no flag to read, and a silent write failure
+ * would look identical to a success. So the check is: what was sent must be
+ * what came back. COERCED values are compared, never raw ones — budget_aud
+ * sent as the number 20000 comes back as the STRING "20000" from PostgREST,
+ * and a naive === would raise a false alarm on every single save.
+ *
+ * Returns ONE "problem" notice naming every field that disagrees, or [].
+ */
+export function objectiveSaveNotices(sent: unknown, response: unknown): RoofNoticeView[] {
+  const payload = asRecord(sent);
+  const row = asRecord(response);
+  const disagree: string[] = [];
+
+  if (Object.prototype.hasOwnProperty.call(payload, "objective")) {
+    const sentObj = typeof payload.objective === "string" ? payload.objective.trim() : null;
+    const gotObj = typeof row.objective === "string" ? row.objective.trim() : null;
+    if (sentObj !== gotObj) disagree.push("objective");
+  }
+  if (Object.prototype.hasOwnProperty.call(payload, "custom_weight")) {
+    if (tariffNum(payload.custom_weight) !== tariffNum(row.custom_weight)) {
+      disagree.push("blend");
+    }
+  }
+  if (Object.prototype.hasOwnProperty.call(payload, "budget_aud")) {
+    if (tariffNum(payload.budget_aud) !== tariffNum(row.budget_aud)) {
+      disagree.push("budget cap");
+    }
+  }
+  if (disagree.length === 0) return [];
+  return [
+    {
+      tone: "problem",
+      level: "notice",
+      title: "The save did not take",
+      body: `The job that came back does not carry what was sent (${disagree.join(", ")}). Nothing shown here is confirmed saved — try again.`,
+    },
+  ];
 }

@@ -58,6 +58,10 @@ import {
   typedUsageError,
   usagePlausibilityNotice,
   azimuthLabel,
+  OBJECTIVE_OPTIONS,
+  VALID_OBJECTIVES,
+  objectiveBudgetView,
+  objectiveSaveNotices,
   SHOW_CI_TARIFF_ROWS,
   TARIFF_ADDRESS_LOCK_CAPTION,
   TARIFF_DEFAULTS_CAPTION,
@@ -237,18 +241,20 @@ test("all predicates true: 11 complete, phases all done", () => {
     sizing_results: [{ solar_kw: 6.6, battery_kwh: 12.8 }],
     financial_results: [{ payback_years: 4.2 }],
   });
-  // objective-budget / equipment-specs / incentives are () => false by design
-  // (no columns exist until 3.9 / 3.10 / 3.13b), so "all true" means: force
-  // them true to test the aggregate rule, not the schema.
+  // equipment-specs / incentives are () => false by design (no columns exist
+  // until 3.10 / 3.13b), so "all true" means: force those two true to test the
+  // aggregate rule, not the schema. objective-budget left this list at 3.9 —
+  // its predicate is real now, so the fixture satisfies it with a stored
+  // objective instead of a patch.
   const patched = SECTIONS.map((s) =>
-    ["objective-budget", "equipment-specs", "incentives"].includes(s.id)
+    ["equipment-specs", "incentives"].includes(s.id)
       ? { ...s, complete: () => true }
       : s,
   );
-  const done = patched.map((s) => s.complete(job));
+  const done = patched.map((s) => s.complete({ ...job, objective: "max_npv" }));
   assert.ok(done.every(Boolean), `not all predicates true: ${JSON.stringify(done)}`);
-  // The three always-false ones really are always false against ANY job:
-  for (const id of ["objective-budget", "equipment-specs", "incentives"]) {
+  // The two still-hardcoded ones really are always false against ANY job:
+  for (const id of ["equipment-specs", "incentives"]) {
     const spec = SECTIONS.find((s) => s.id === id);
     assert.equal(spec?.complete(job), false, `${id} must be false until its row lands`);
   }
@@ -553,17 +559,13 @@ test("sectionStates: path C KEEPS solar-sizing and pins it", () => {
 
 // h. A phase must not wait on a hidden section.
 //
-// LIMITATION, MEASURED NOT ASSUMED (reported with 3.3b): the prompt asked for a
-// fixture where all three of path E's Optimise sections are complete, so that
-// Optimise reads "done". That fixture CANNOT be built today — Optimise contains
-// `objective-budget` and `equipment-specs`, both hardcoded `() => false` until
-// 3.9/3.10, on every one of the six paths. Optimise therefore cannot read "done"
-// for any job, and swapping phaseStates to count the full catalogue instead of
-// the visible list produces IDENTICAL verdicts on every path (verified by
-// experiment — the suite stayed green under that mutation). The visible-list
-// dependency inside phaseStates is therefore not observable through its public
-// behaviour yet; it becomes a real regression test the moment 3.9 lands and
-// objective-budget becomes satisfiable.
+// LIMITATION, MEASURED NOT ASSUMED (reported with 3.3b, narrowed at 3.9): the
+// prompt asked for a fixture where all three of path E's Optimise sections are
+// complete, so that Optimise reads "done". That fixture STILL cannot be built —
+// Optimise contains `equipment-specs`, hardcoded `() => false` until 3.10, on
+// every one of the six paths. objective-budget stopped being the blocker at
+// 3.9 (its predicate reads jobs.objective now, and the movement test below
+// exercises it); 3.10 is the row that closes this limitation for good.
 //
 // What IS asserted here, and does break: path E's Optimise composition (a wrong
 // PATH_RULES entry fails it), that the done-rule works on the phases that CAN
@@ -4040,4 +4042,164 @@ test("type roles (e): StatusPill keeps text-caption beside a DYNAMIC colour", ()
   const classes = renderedClasses(renderRole.statusPill());
   assert.ok(classes.includes("text-caption"), `text-caption never reached: ${classes}`);
   assert.ok(classes.includes("text-status-draft-foreground"), String(classes));
+});
+
+// ── 3.9: Objective & budget ──────────────────────────────────────────────────
+// The three jobs columns are live (all NULL on every real job). Everything
+// here runs against hand-built objects; the section's completeness finally has
+// observable behaviour, which is what 1c below exercises.
+
+const OBJ_SPEC = SECTIONS.find((s) => s.id === "objective-budget");
+
+test("3.9 (1c): the active section MOVES when an objective lands — the newly observable behaviour", () => {
+  // The path-E fixture from the phaseStates test: roof + site + bill + tariff,
+  // no objective. objective-budget must be the active section...
+  const base = emptyJob({
+    path: "E",
+    roof_geometry: [{ created_at: "2026-08-01T00:00:00Z", found: true, planes: [{ panel_count: 12 }] }],
+    storeys: 1,
+    roof_material: "tile",
+    dwelling_type: "house",
+    electrical_phase: "single",
+    bills: [{ bill_id: "b1" }],
+    tariffs: [{ tariff_id: "t1" }],
+  });
+  const before = sectionStates(base).filter((s) => s.state === "active");
+  assert.equal(before.length, 1);
+  assert.equal(before[0].id, "objective-budget");
+
+  // ...and the SAME fixture plus a stored objective advances it. With the old
+  // () => false predicate the section can never complete, the active section
+  // never moves, and this second assertion fails — the exact thing that could
+  // not be tested before today.
+  const after = sectionStates({ ...base, objective: "max_npv" }).filter(
+    (s) => s.state === "active",
+  );
+  assert.equal(after.length, 1);
+  assert.equal(after[0].id, "equipment-specs");
+});
+
+test("3.9 (1d): complete() — true for each of the four, false for everything else", () => {
+  for (const objective of VALID_OBJECTIVES) {
+    assert.equal(OBJ_SPEC?.complete(emptyJob({ objective })), true,
+      `${objective} must complete the section`);
+  }
+  for (const bad of ["", null, 7, undefined, "backup"] as const) {
+    const job = bad === undefined ? emptyJob({}) : emptyJob({ objective: bad as never });
+    assert.equal(OBJ_SPEC?.complete(job), false,
+      `${String(bad)} must NOT complete the section`);
+  }
+  // "backup" is the case that fails the day someone adds it to the UI without
+  // adding it to the engine — it is D29'd out until 4.5 does both in one change.
+});
+
+test("3.9 (1e): a budget alone does not complete; an objective alone does", () => {
+  assert.equal(OBJ_SPEC?.complete(emptyJob({ budget_aud: 20000 })), false,
+    "a budget with no objective is not a finished section");
+  assert.equal(OBJ_SPEC?.complete(emptyJob({ objective: "min_payback" })), true,
+    "no cap is a real answer — an objective with no budget completes");
+});
+
+test("3.9 (1f): OBJECTIVE_OPTIONS' value set equals VALID_OBJECTIVES, both directions", () => {
+  const optionValues = new Set(OBJECTIVE_OPTIONS.map((o) => o.value));
+  const engine = new Set<string>(VALID_OBJECTIVES);
+  for (const v of engine) {
+    assert.ok(optionValues.has(v), `engine objective ${v} has no on-screen option`);
+  }
+  for (const v of optionValues) {
+    assert.ok(engine.has(v), `option ${v} names no engine objective`);
+  }
+  assert.equal(OBJECTIVE_OPTIONS.length, VALID_OBJECTIVES.length);
+  // Plain English on screen — no engine identifier leaks into a label.
+  for (const o of OBJECTIVE_OPTIONS) {
+    assert.ok(!o.label.includes("_"), `label "${o.label}" reads as an identifier`);
+  }
+});
+
+test("3.9 (1g): objectiveBudgetView across the stored shapes", () => {
+  // Empty job — quiet: no notices, empty state, weight text shows the
+  // engine's real default so the slider means what it says.
+  const empty = objectiveBudgetView(emptyJob({}));
+  assert.equal(empty.state, "empty");
+  assert.equal(empty.objective, null);
+  assert.equal(empty.objectiveIsKnown, false);
+  assert.equal(empty.customWeight.text, "0.5");
+  assert.equal(empty.budgetAud.text, "");
+  assert.deepEqual(empty.notices, []);
+
+  // Custom with a stored weight — the blend caption (a fact, not a finding).
+  const custom = objectiveBudgetView(emptyJob({ objective: "custom", custom_weight: 0.25 }));
+  assert.equal(custom.state, "stored");
+  assert.equal(custom.objectiveIsKnown, true);
+  assert.equal(custom.customWeight.raw, 0.25);
+  assert.equal(custom.customWeight.text, "0.25");
+  assert.equal(custom.notices.length, 1);
+  assert.equal(custom.notices[0].level, "caption");
+
+  // THE POSTGREST CASE: budget_aud arrives as the STRING "20000" — it must
+  // read 20000, not empty. A view that only accepts typeof === "number"
+  // silently shows an empty budget on a job that has one.
+  const stringBudget = objectiveBudgetView(emptyJob({ budget_aud: "20000" as never }));
+  assert.equal(stringBudget.budgetAud.raw, 20000);
+  assert.equal(stringBudget.budgetAud.text, "20000");
+
+  // A stored weight outside 0..1 is unreadable — text falls back to "0.5".
+  const badWeight = objectiveBudgetView(emptyJob({ objective: "custom", custom_weight: 7 }));
+  assert.equal(badWeight.customWeight.raw, null);
+  assert.equal(badWeight.customWeight.text, "0.5");
+
+  // A stored objective the engine does not know: kept raw, flagged once as a
+  // caution NOTICE, and the section stays incomplete.
+  const banana = objectiveBudgetView(emptyJob({ objective: "banana" }));
+  assert.equal(banana.state, "stored");
+  assert.equal(banana.objective, "banana");
+  assert.equal(banana.objectiveIsKnown, false);
+  assert.equal(banana.notices.length, 1);
+  assert.equal(banana.notices[0].level, "notice");
+  assert.equal(banana.notices[0].tone, "caution");
+  assert.equal(OBJ_SPEC?.complete(emptyJob({ objective: "banana" })), false);
+});
+
+test("3.9 (1h): objectiveSaveNotices — the round-trip check compares COERCED values", () => {
+  // THE COERCION CASE: sent the number 20000, PostgREST returns the string
+  // "20000". A naive === comparison raises a problem notice on every single
+  // save — so this assertion changes exactly when that fault is present.
+  assert.deepEqual(
+    objectiveSaveNotices({ budget_aud: 20000 }, { budget_aud: "20000" }),
+    [],
+  );
+  // A row that actually disagrees IS a problem — one notice.
+  const disagree = objectiveSaveNotices(
+    { objective: "min_payback" },
+    { objective: "max_npv" },
+  );
+  assert.equal(disagree.length, 1);
+  assert.equal(disagree[0].tone, "problem");
+  assert.equal(disagree[0].level, "notice");
+  // A returned row MISSING a sent key is a disagreement, not a pass.
+  const missing = objectiveSaveNotices({ objective: "max_npv" }, {});
+  assert.equal(missing.length, 1);
+  assert.equal(missing[0].tone, "problem");
+  // A cleared budget round-trips: sent null, returned null — no notice.
+  assert.deepEqual(
+    objectiveSaveNotices({ budget_aud: null }, { budget_aud: null }),
+    [],
+  );
+  // Keys NOT sent are not compared — a stale stored custom_weight is
+  // deliberately left alone by the payload rules, never a false alarm.
+  assert.deepEqual(
+    objectiveSaveNotices({ objective: "max_npv" }, { objective: "max_npv", custom_weight: 0.3 }),
+    [],
+  );
+});
+
+test("3.9 (1i): every objective view function survives junk as the whole job", () => {
+  for (const junk of [null, undefined, [], {}, "a job", 42]) {
+    assert.doesNotThrow(() => objectiveBudgetView(junk));
+    assert.doesNotThrow(() => objectiveSaveNotices(junk, junk));
+    const view = objectiveBudgetView(junk);
+    assert.equal(view.state, "empty");
+    assert.notEqual(view.customWeight.text, "undefined");
+    assert.notEqual(view.budgetAud.text, "undefined");
+  }
 });

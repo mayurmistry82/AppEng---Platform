@@ -82,6 +82,14 @@ _ALLOWED: dict[str, set[str]] = {
         "job_outcome", "quoted_solar_kw", "quoted_battery_kwh",
         "installed_solar_kw", "installed_battery_kwh",
         "quoted_panel_id", "quoted_inverter_id", "quoted_battery_id",
+        # 3.9 — optimisation inputs. PATCH /api/job/{id} writes jobs DIRECTLY
+        # and never passes through this allowlist, so adding these changes no
+        # live behaviour today. They are here because this allowlist SILENTLY
+        # DROPS unknown columns: a column absent from it is one the legacy
+        # /api/job/save path and the flywheel writer discard without a word,
+        # and leaving that gap open is how a later task discovers three NULLs
+        # and no error.
+        "objective", "custom_weight", "budget_aud",
     },
     "bills": {
         "bill_id", "job_id", "raw_file_path", "parsed_json", "parser_version",

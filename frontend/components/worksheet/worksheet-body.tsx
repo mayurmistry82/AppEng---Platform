@@ -10,12 +10,14 @@ import {
 import { WorksheetSection } from "@/components/ui/worksheet-section";
 import { AddressRoofSection } from "@/components/worksheet/address-roof-section";
 import { EnergyDataSection } from "@/components/worksheet/energy-data-section";
+import { ObjectiveBudgetSection } from "@/components/worksheet/objective-budget-section";
 import { SiteDetailsSection } from "@/components/worksheet/site-details-section";
 import { TariffNetworkSection } from "@/components/worksheet/tariff-network-section";
 import {
   groupSectionsByPhase,
   type AddressRoofView,
   type EnergyDataView,
+  type ObjectiveBudgetView,
   type RoofDiagramView,
   type SiteDetailsView,
   type TariffNetworkView,
@@ -73,6 +75,7 @@ export function WorksheetBody({
   roofDiagram,
   energyData,
   tariffNetwork,
+  objectiveBudget,
   jobId,
 }: {
   sections: readonly WorksheetBodySection[];
@@ -89,6 +92,8 @@ export function WorksheetBody({
   energyData?: EnergyDataView;
   /** 3.8: the Tariff & network view — the stored row over the nem defaults. */
   tariffNetwork?: TariffNetworkView;
+  /** 3.9: the Objective & budget view — the three jobs columns, no new fetch. */
+  objectiveBudget?: ObjectiveBudgetView;
   jobId?: string;
 }) {
   const [openIds, setOpenIds] = React.useState<Record<string, boolean>>(() => {
@@ -135,6 +140,8 @@ export function WorksheetBody({
         <EnergyDataSection view={energyData} jobId={jobId} />
       ) : section.id === "tariff-network" && tariffNetwork && jobId ? (
         <TariffNetworkSection view={tariffNetwork} jobId={jobId} />
+      ) : section.id === "objective-budget" && objectiveBudget && jobId ? (
+        <ObjectiveBudgetSection view={objectiveBudget} jobId={jobId} />
       ) : (
         <p className="text-caption text-muted-foreground">
           Built at {section.builtAt}

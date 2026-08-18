@@ -503,6 +503,13 @@ class JobSitePatch(BaseModel):
     sections exist. `address` is additionally guarded server-side: once
     anything has been derived from it (roof_geometry, sizing_results, tariffs,
     interval_data) the PATCH answers 409 and writes nothing (F82).
+
+    THE 3.9 TRIO (objective / custom_weight / budget_aud) is a third kind of
+    field again: OPTIMISATION INPUTS. They are not site-visit fields (D5 —
+    nothing here gates anything) and not job identity (3.3c). They steer what
+    the sizing engine optimises FOR, nothing is derived from them, and they
+    take NO part in the address-lock check — changing the objective after a
+    roof is measured is normal, changing the address is not.
     """
 
     storeys: Optional[int] = Field(default=None, ge=1, le=5)
@@ -521,6 +528,18 @@ class JobSitePatch(BaseModel):
     existing_inverter_kw: Optional[float] = Field(default=None, ge=0, le=1000)
     intent: Optional[Literal["solar", "battery", "both"]] = None
     address: Optional[str] = Field(default=None, min_length=1, max_length=500)
+    # ── 3.9 — optimisation inputs. See the docstring: a third field kind.
+    # The Literal is the ONE validation site for objective (no DB CHECK); its
+    # members must stay equal to solar_optimiser.VALID_OBJECTIVES —
+    # verify_objective_contract.py asserts that equality in both directions.
+    # "backup" is deliberately absent until 4.5 teaches the ENGINE the word.
+    objective: Optional[Literal["max_npv", "max_self_sufficiency",
+                                "min_payback", "custom"]] = None
+    custom_weight: Optional[float] = Field(default=None, ge=0, le=1)
+    # gt=0, not ge=0: a zero budget is a typo, never an instruction — NULL
+    # already means "no cap". le=500000 catches a stray zero on a residential
+    # job while leaving headroom for the C&I segment 10.5 un-hides.
+    budget_aud: Optional[float] = Field(default=None, gt=0, le=500000)
 
 
 # Where each JobSitePatch field is WRITTEN (3.3c). jobs has NO address and NO
@@ -533,6 +552,7 @@ _JOBS_PATCH_FIELDS = {
     "storeys", "roof_material", "dwelling_type", "year_built", "bedrooms",
     "floor_area_m2", "electrical_phase",
     "has_existing_solar", "existing_solar_kw", "existing_inverter_kw", "intent",
+    "objective", "custom_weight", "budget_aud",
 }
 _CUSTOMER_PATCH_FIELDS = {
     "customer_name": "customer_name",
