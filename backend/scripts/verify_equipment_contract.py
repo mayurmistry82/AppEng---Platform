@@ -65,6 +65,11 @@ class _Query:
         self._filters: list[tuple[str, str]] = []
         self._ors: list[str] = []
         self._cols = "*"
+        self._insert_payload = None
+
+    def insert(self, payload):
+        self._insert_payload = payload
+        return self
 
     def select(self, cols="*", *_a, **_k):
         self._cols = cols
@@ -86,6 +91,15 @@ class _Query:
         return self
 
     def execute(self):
+        if self._insert_payload is not None:
+            if self._c.insert_raises is not None:
+                raise self._c.insert_raises
+            row = dict(self._insert_payload)
+            self._c.insert_seq += 1
+            row.setdefault("id", f"new-{self._c.insert_seq}")
+            self._c.inserts.append((self._t, dict(row)))
+            self._c.tables.setdefault(self._t, []).append(dict(row))
+            return _Result([dict(row)])
         self._c.queries.append({"table": self._t, "filters": list(self._filters),
                                 "ors": list(self._ors), "cols": self._cols})
         if self._c.raise_on and self._t in self._c.raise_on:
@@ -113,11 +127,14 @@ class _Query:
 
 
 class StubClient:
-    def __init__(self, tables=None, raise_on=None):
+    def __init__(self, tables=None, raise_on=None, insert_raises=None):
         self.tables = dict(tables or {})
         self.raise_on = set(raise_on or [])
+        self.insert_raises = insert_raises
         self.queries: list[dict] = []
         self.selects: list[tuple[str, str]] = []
+        self.inserts: list[tuple[str, dict]] = []
+        self.insert_seq = 0
 
     def table(self, name):
         return _Query(self, name)
@@ -434,6 +451,325 @@ def t6_junk() -> None:
             check(f"(6) {label}: no raise, documented shape", False, f"raised {exc!r}")
 
 
+
+# ═════════════════════════════════════════════════════════════════════════════
+# CHECK 7 (3.10 prompt 2) — the "Other / New" write path.
+# ═════════════════════════════════════════════════════════════════════════════
+
+VALID_PANEL = {"brand": "Acme", "model": "P1", "rated_power_w": 440,
+               "length_mm": 1762, "width_mm": 1134}
+VALID_INVERTER = {"brand": "Acme", "model": "I1", "inverter_type": "hybrid",
+                  "phases": "single", "rated_ac_power_kw": 5.0}
+VALID_BATTERY = {"brand": "Acme", "model": "B1", "usable_capacity_kwh": 12.8,
+                 "cost_aud": 8000}
+
+
+def run_post(client, kind, body, caller=CALLER_A):
+    """(response, exception) — exactly one is None."""
+    original = equipment._svc
+    equipment._svc = lambda: client
+    try:
+        return asyncio.run(equipment.create_equipment(kind, body, caller)), None
+    except Exception as exc:  # noqa: BLE001
+        return None, exc
+    finally:
+        equipment._svc = original
+
+
+def t7_write_path() -> int:
+    """Returns the number of loudly-skipped (uncounted) checks."""
+    print("\nCHECK 7 — POST /api/equipment/{kind}")
+    skipped = 0
+
+    # 7a — 2Q.1: two places that must agree, compared by RUNNING the GET.
+    res = run_endpoint(None)
+    get_keys = set(res) - {"flags"}
+    check("(7a) POST kinds == GET response keys (both directions)",
+          set(equipment.EQUIPMENT_KINDS) == get_keys,
+          f"POST-only={set(equipment.EQUIPMENT_KINDS) - get_keys} "
+          f"GET-only={get_keys - set(equipment.EQUIPMENT_KINDS)}")
+    _res, exc = run_post(StubClient(), "gadgets", dict(VALID_BATTERY))
+    check("(7a) an unknown kind is 404, not 422 (not a bad body — a missing path)",
+          getattr(exc, "status_code", None) == 404, repr(exc))
+
+    # 7b — DB-derived mandatory fields: 422 AND zero writes. A 422 that still
+    # wrote is the failure worth catching.
+    for kind, valid, mandatory in [
+        ("panels", VALID_PANEL, ("brand", "model", "rated_power_w")),
+        ("inverters", VALID_INVERTER,
+         ("brand", "model", "inverter_type", "phases", "rated_ac_power_kw")),
+        ("batteries", VALID_BATTERY, ("brand", "model", "usable_capacity_kwh")),
+    ]:
+        for field in mandatory:
+            body = {k: v for k, v in valid.items() if k != field}
+            stub = StubClient()
+            _res, exc = run_post(stub, kind, body)
+            check(f"(7b) {kind} without {field}: 422 and ZERO inserts",
+                  getattr(exc, "status_code", None) == 422 and stub.inserts == [],
+                  f"exc={exc!r} inserts={stub.inserts}")
+
+    # 7d — server-fixed fields survive a smuggling payload.
+    smuggle = {**VALID_BATTERY, "origin": "catalogue", "owner_company_id": "co-EVIL",
+               "verified": True, "status": "archived", "promoted_from": "x",
+               "id": "evil-id", "created_at": "2020-01-01"}
+    stub = StubClient()
+    res, exc = run_post(stub, "batteries", smuggle)
+    check("(7d) a smuggling payload is accepted without error", exc is None, repr(exc))
+    sent = stub.inserts[0][1] if stub.inserts else {}
+    check("(7d) origin='user_defined', not the smuggled 'catalogue'",
+          sent.get("origin") == "user_defined", str(sent.get("origin")))
+    check("(7d) owner is the CALLER's company, not the smuggled one",
+          sent.get("owner_company_id") == "co-A", str(sent.get("owner_company_id")))
+    check("(7d) verified=False, status='active', promoted_from=None",
+          sent.get("verified") is False and sent.get("status") == "active"
+          and sent.get("promoted_from") is None,
+          f"verified={sent.get('verified')} status={sent.get('status')}")
+    check("(7d) the smuggled id did not survive",
+          sent.get("id") != "evil-id" and res is not None and res["id"] != "evil-id",
+          f"row id={sent.get('id')} resp id={res['id'] if res else None}")
+
+    # 7e — THE ENGINE-READABILITY REFUSAL. Mechanism: battery_specs returns
+    # None without cost_aud ("price cannot be assumed 0"), and that return is
+    # the ONLY thing the endpoint consults; same for _panel_from_row without
+    # length_mm.
+    stub = StubClient()
+    _res, exc = run_post(stub, "batteries",
+                         {k: v for k, v in VALID_BATTERY.items() if k != "cost_aud"})
+    check("(7e) battery without cost_aud: 422 (battery_specs -> None), zero writes",
+          getattr(exc, "status_code", None) == 422 and stub.inserts == [],
+          f"exc={exc!r} inserts={len(stub.inserts)}")
+    stub = StubClient()
+    res, exc = run_post(stub, "batteries", dict(VALID_BATTERY))
+    check("(7e) the SAME body with cost_aud saves", exc is None and len(stub.inserts) == 1,
+          f"exc={exc!r}")
+    stub = StubClient()
+    _res, exc = run_post(stub, "panels",
+                         {k: v for k, v in VALID_PANEL.items() if k != "length_mm"})
+    check("(7e) panel without length_mm: 422 (_panel_from_row -> None), zero writes "
+          "— the alternative is a silent fall-back to the DEFAULT panel: a wrong roof",
+          getattr(exc, "status_code", None) == 422 and stub.inserts == [],
+          f"exc={exc!r} inserts={len(stub.inserts)}")
+    stub = StubClient()
+    res, exc = run_post(stub, "panels", dict(VALID_PANEL))
+    check("(7e) the SAME panel with length_mm saves", exc is None and len(stub.inserts) == 1,
+          f"exc={exc!r}")
+
+    # 7f — THE ROW'S OWN TEST: equal battery_specs dicts mean an identical LP,
+    # because the LP consumes NOTHING but this dict. Proven offline; the
+    # on-screen end-to-end is Mayur's at prompt 3.
+    numbers = {"brand": "Acme", "model": "B1", "usable_capacity_kwh": 12.8,
+               "cost_aud": 8000, "depth_of_discharge_pct": 100.0,
+               "round_trip_efficiency_pct": 96.0, "max_continuous_charge_kw": 6.6,
+               "max_continuous_discharge_kw": 6.6, "warranty_cycles": 6000,
+               "warranty_years": 10}
+    cat_row = {**numbers, "id": "cat-1", "origin": "catalogue",
+               "owner_company_id": None, "verified": True}
+    usr_row = {**numbers, "id": "usr-1", "origin": "user_defined",
+               "owner_company_id": "co-A", "verified": False}
+    f1: list[str] = []
+    f2: list[str] = []
+    s1 = battery_optimiser.battery_specs(cat_row, f1)
+    s2 = battery_optimiser.battery_specs(usr_row, f2)
+    stripped1 = {k: v for k, v in (s1 or {}).items() if k != "id"}
+    stripped2 = {k: v for k, v in (s2 or {}).items() if k != "id"}
+    check("(7f) custom battery drives the LP IDENTICALLY to a catalogue unit: "
+          "battery_specs dicts equal on every key except id (the LP reads nothing else)",
+          s1 is not None and s2 is not None and stripped1 == stripped2 and f1 == f2,
+          f"{stripped1} vs {stripped2}")
+
+    # 7g — engine_assumptions VERBATIM: measure what ships, because a re-worded
+    # copy would drift from the engine's own wording and nothing would notice.
+    body = {"brand": "Acme", "model": "AX1", "usable_capacity_kwh": 10.0,
+            "cost_aud": 7000}
+    expected_row = equipment.BatteryIn.model_validate(body).model_dump(exclude_none=True)
+    expected_flags: list[str] = []
+    battery_optimiser.battery_specs(dict(expected_row), expected_flags)
+    stub = StubClient()
+    res, exc = run_post(stub, "batteries", dict(body))
+    check("(7g) engine_assumptions is battery_specs' flag list BYTE-IDENTICAL",
+          exc is None and res["engine_assumptions"] == expected_flags,
+          f"resp={res['engine_assumptions'] if res else None} vs engine={expected_flags}")
+    check("(7g) ...and it is non-empty for this sparse body (the check can bite)",
+          bool(expected_flags), str(expected_flags))
+
+    # 7h — THE PRIVACY BOUNDARY, asserted on the FULL SERIALISED RESPONSE:
+    # a leak in a flag or a detail message would pass a list-only check.
+    import json as _json
+    dup_tables = {"batteries": [
+        {"id": "cat-1", "brand": "Sungrow", "model": "SBR128", "series": None,
+         "status": "active", "origin": "catalogue", "owner_company_id": None,
+         "verified": True, "usable_capacity_kwh": "12.8", "cost_aud": "8000"},
+        {"id": "mine-1", "brand": "Sungrow", "model": "SBR128", "series": "v1",
+         "status": "active", "origin": "user_defined", "owner_company_id": "co-A",
+         "verified": False, "usable_capacity_kwh": 13.0, "cost_aud": 8200},
+        {"id": "theirs-1", "brand": "Sungrow", "model": "SBR128", "series": None,
+         "status": "active", "origin": "user_defined", "owner_company_id": "co-B",
+         "verified": False, "usable_capacity_kwh": 12.8, "cost_aud": 7900},
+    ]}
+    stub = StubClient(dict(dup_tables))
+    res, exc = run_post(stub, "batteries",
+                        {"brand": "Sungrow", "model": "SBR128",
+                         "usable_capacity_kwh": 13.5, "cost_aud": 8500})
+    dup_ids = {d["id"] for d in (res or {}).get("duplicates", [])}
+    check("(7h) duplicates = the catalogue row and OUR row exactly",
+          exc is None and dup_ids == {"cat-1", "mine-1"}, str(dup_ids))
+    serialised = _json.dumps(res)
+    check("(7h) company B's id appears NOWHERE in the serialised response",
+          "theirs-1" not in serialised and "co-B" not in serialised,
+          serialised[:200])
+    check("(7h) no count or message reveals a third match exists",
+          len((res or {}).get("duplicates", [])) == 2 and (res or {}).get("flags") == [],
+          str(res)[:200])
+
+    # 7i — coercion: PostgREST numerics arrive as STRINGS. Without coercion the
+    # endpoint reports every field of every duplicate as differing.
+    cat_dup = next(d for d in res["duplicates"] if d["id"] == "cat-1")
+    diff_fields = {d["field"] for d in cat_dup["differences"]}
+    check("(7i) stored \"8000\" (string) vs submitted 8500: IS a difference",
+          "cost_aud" in diff_fields, str(cat_dup["differences"]))
+    check("(7i) stored \"12.8\" vs 13.5: IS a difference; and usable 13.5 vs \"12.8\" "
+          "differs while equal-valued strings do not",
+          "usable_capacity_kwh" in diff_fields, str(diff_fields))
+    stub2 = StubClient(dict(dup_tables))
+    res2, _exc2 = run_post(stub2, "batteries",
+                           {"brand": "Sungrow", "model": "SBR128",
+                            "usable_capacity_kwh": 12.8, "cost_aud": 8000})
+    cat_dup2 = next(d for d in res2["duplicates"] if d["id"] == "cat-1")
+    check("(7i) stored \"12.8\"/\"8000\" strings vs submitted 12.8/8000 numbers: "
+          "NOT differences (coerced comparison)",
+          not {d["field"] for d in cat_dup2["differences"]}
+          & {"usable_capacity_kwh", "cost_aud"},
+          str(cat_dup2["differences"]))
+
+    # 7j — case-insensitive matching, DELIBERATELY broader than the
+    # case-sensitive DB constraint: the comparison should catch MORE than the
+    # constraint refuses, never less.
+    stub3 = StubClient(dict(dup_tables))
+    res3, _exc3 = run_post(stub3, "batteries",
+                           {"brand": "sungrow", "model": "sbr128",
+                            "usable_capacity_kwh": 12.8, "cost_aud": 8000})
+    check("(7j) 'sungrow'/'sbr128' matches 'Sungrow'/'SBR128' (case-insensitive, "
+          "broader than the case-sensitive unique constraint — deliberate)",
+          {d["id"] for d in (res3 or {}).get("duplicates", [])} >= {"cat-1"},
+          str(res3.get("duplicates") if res3 else None))
+
+    # 7k — 23505 SPECIFICALLY is 409; anything else stays 500.
+    dup_exc = RuntimeError("duplicate key value violates unique constraint")
+    dup_exc.code = "23505"
+    _res, exc = run_post(StubClient(insert_raises=dup_exc), "batteries", dict(VALID_BATTERY))
+    check("(7k) a 23505 from the insert is 409 with a plain-English detail",
+          getattr(exc, "status_code", None) == 409
+          and "already added" in str(getattr(exc, "detail", "")),
+          repr(exc))
+    _res, exc = run_post(StubClient(insert_raises=RuntimeError("disk on fire")),
+                         "batteries", dict(VALID_BATTERY))
+    check("(7k) any OTHER insert error is 500, never dressed up as 409",
+          getattr(exc, "status_code", None) == 500, repr(exc))
+    _res, exc = run_post(None, "batteries", dict(VALID_BATTERY))
+    check("(7k) no client: 503, never a 200 with a fabricated id (the 3.6 rule)",
+          getattr(exc, "status_code", None) == 503, repr(exc))
+
+    # 7l — total under junk: every outcome is a documented HTTP refusal, never
+    # an unhandled raise.
+    for label, body in [("None", None), ("a string", "x"), ("a list", [1, 2]),
+                        ("empty dict", {}),
+                        ("every-value-null", {k: None for k in VALID_BATTERY})]:
+        _res, exc = run_post(StubClient(), "batteries", body)
+        check(f"(7l) junk body ({label}): clean 4xx, no unhandled raise",
+              getattr(exc, "status_code", None) in (404, 422), repr(exc)[:120])
+
+    # 7m — caller counts re-derived, signatures unchanged.
+    hits_bs, hits_pfr = [], []
+    for root, dirs, files in os.walk(BACKEND_DIR):
+        dirs[:] = [d for d in dirs if d not in ("__pycache__", "scripts", "_legacy")]
+        for fn in files:
+            if not fn.endswith(".py"):
+                continue
+            path = os.path.join(root, fn)
+            rel = os.path.relpath(path, BACKEND_DIR)
+            for i, line in enumerate(open(path), 1):
+                if line.lstrip().startswith("#"):
+                    continue  # a comment NAMING the function is not a caller
+                if "battery_specs(" in line:
+                    hits_bs.append(f"{rel}:{i}")
+                if "_panel_from_row(" in line:
+                    hits_pfr.append(f"{rel}:{i}")
+    print(f"        battery_specs   : {hits_bs}")
+    print(f"        _panel_from_row : {hits_pfr}")
+    check("(7m) battery_specs: 1 definition + 2 callers (optimiser + this POST)",
+          len(hits_bs) == 3, str(hits_bs))
+    check("(7m) _panel_from_row: 1 definition + 3 callers (2 in roof_geometry + this POST)",
+          len(hits_pfr) == 4, str(hits_pfr))
+    import inspect
+    # `from __future__ import annotations` makes inspect render annotations as
+    # quoted strings — strip the quotes before comparing.
+    sig_bs = str(inspect.signature(battery_optimiser.battery_specs)).replace("'", "")
+    sig_pfr = str(inspect.signature(roof_geometry._panel_from_row)).replace("'", "")
+    check("(7m) battery_specs' signature is unchanged",
+          sig_bs == "(row: dict, flags: list[str]) -> Optional[dict]", sig_bs)
+    check("(7m) _panel_from_row's signature is unchanged",
+          sig_pfr == "(row: dict) -> Optional[dict]", sig_pfr)
+
+    # 7c — LIVE enum check, LOUD SKIP construction (2Q.1). pg_constraint is a
+    # system catalog PostgREST does not expose, so the service-role REST client
+    # CANNOT read it — this check needs a direct Postgres connection
+    # (SUPABASE_DB_URL + psycopg2). Without one it SKIPS LOUDLY, printed and
+    # uncounted; WITH one, any error other than absence FAILS so the bridge
+    # cannot rot silently.
+    db_url = os.getenv("SUPABASE_DB_URL")
+    try:
+        import psycopg2  # noqa: PLC0415
+    except ImportError:
+        psycopg2 = None
+    if not db_url or psycopg2 is None:
+        print("  SKIP  (7c) live enum-vs-CHECK-constraint comparison — needs a direct "
+              "Postgres connection (SUPABASE_DB_URL + psycopg2); the REST client cannot "
+              "see pg_constraint. NOT counted as a pass. The pydantic Literals were "
+              "transcribed from pg_constraint output pasted in this task's transcript.")
+        skipped += 1
+    else:
+        try:
+            conn = psycopg2.connect(db_url)
+            cur = conn.cursor()
+            cur.execute(
+                "select conrelid::regclass::text, conname, pg_get_constraintdef(oid) "
+                "from pg_constraint where conrelid::regclass::text in "
+                "('panels','inverters','batteries') and contype='c'")
+            defs = {(t, n): d for t, n, d in cur.fetchall()}
+            conn.close()
+
+            def members(table, name):
+                import re as _re
+                return set(_re.findall(r"'([a-z_]+)'::text", defs.get((table, name), "")))
+
+            pairs = [
+                ("panels", "panels_cell_technology_check",
+                 equipment.PanelIn.model_fields["cell_technology"]),
+                ("inverters", "inverters_inverter_type_check",
+                 equipment.InverterIn.model_fields["inverter_type"]),
+                ("inverters", "inverters_phases_check",
+                 equipment.InverterIn.model_fields["phases"]),
+                ("batteries", "batteries_chemistry_check",
+                 equipment.BatteryIn.model_fields["chemistry"]),
+                ("batteries", "batteries_coupling_check",
+                 equipment.BatteryIn.model_fields["coupling"]),
+            ]
+            import typing as _t
+            for table, cname, field in pairs:
+                lits: set = set()
+                for arg in _t.get_args(field.annotation) or (field.annotation,):
+                    lits |= {a for a in _t.get_args(arg) if isinstance(a, str)}
+                    if isinstance(arg, str):
+                        lits.add(arg)
+                db_members = members(table, cname)
+                check(f"(7c) {cname} members == the pydantic Literal (both directions)",
+                      lits == db_members,
+                      f"literal-only={lits - db_members} db-only={db_members - lits}")
+        except Exception as exc:  # noqa: BLE001
+            check("(7c) live enum comparison ran", False, f"errored (not skipped): {exc!r}")
+    return skipped
+
+
 def main_() -> int:
     print("verify_equipment_contract.py — 3.10 prompt 1 (offline, writes nothing)\n")
     t1_write_path()
@@ -442,13 +778,15 @@ def main_() -> int:
     t4_autopick_scoping()
     t5_caller_counts()
     t6_junk()
+    skipped = t7_write_path()
     print(f"\n{'-' * 60}")
     if FAILURES:
         print(f"FAIL: {len(FAILURES)} of {CHECKS_RUN} checks failed:")
         for name in FAILURES:
             print(f"  - {name}")
         return 1
-    print(f"OK: all {CHECKS_RUN} checks passed")
+    tail = f" ({skipped} skipped, not counted)" if skipped else ""
+    print(f"OK: all {CHECKS_RUN} checks passed{tail}")
     return 0
 
 
