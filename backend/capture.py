@@ -141,17 +141,43 @@ _ALLOWED: dict[str, set[str]] = {
         # the legacy routes/job.py capture path simply never sends them.
         "roof_geometry_id", "roof_low_confidence",
         "roof_needs_manual_confirmation", "roof_flags", "roof_reason",
+        # 3.11b — the run log. run_kind = what the run COVERED, engine_mode =
+        # which engine produced it (D33), evaluated_options = the candidate set
+        # the engine actually scored. Absent from this allowlist a column is
+        # SILENTLY DROPPED by _filtered, which is the whole reason these are
+        # here. Vocabularies: RUN_KINDS / ENGINE_MODES below.
+        "run_kind", "engine_mode", "evaluated_options",
     },
     "financial_results": {
         "financial_result_id", "job_id", "system_capex", "annual_savings",
         "annual_bill_reduction", "payback_years", "npv_25_year", "roi_percent",
         "current_annual_spend", "projected_annual_spend",
+        # 3.11b — the run-log link: a financial result names the sizing result
+        # it was computed from. pricing_basis is 4.12's modelled-versus-
+        # installer-priced distinction (D6) — pricing_basis, NOT basis, which
+        # already means measurement basis in the frontend roof section.
+        "sizing_result_id", "pricing_basis",
     },
     "corrections": {
         "correction_id", "job_id", "source_module", "field_path", "original_value",
         "corrected_value", "value_type", "corrected_by", "corrected_at",
     },
 }
+
+# ── Run-log label vocabularies (3.11b) ───────────────────────────────────────
+# These two sets are THE ONLY definition of either vocabulary anywhere — the
+# database columns deliberately carry no CHECK constraint (D33: a label must be
+# able to gain a value without a migration each time), save_sizing_result
+# refuses an unknown label at write time, and verify_sizing_result_storage.py
+# compares these constants against what is actually stored.
+#
+# RUN_KINDS — what a stored run COVERED. Expected to grow: path E (battery
+# retrofit onto existing solar) needs a battery-only run_kind when it is built.
+RUN_KINDS: frozenset[str] = frozenset({"solar", "solar_battery"})
+# ENGINE_MODES — which engine produced the run. Expected to grow: row 4.0 adds
+# 'combined' (the joint solar+battery optimiser), and the comparison that
+# decides that row happens between engine_modes on the same real job (D33).
+ENGINE_MODES: frozenset[str] = frozenset({"sequential"})
 
 # Conflict key (idempotency) and returned pk per table.
 _CONFLICT: dict[str, str] = {
@@ -166,8 +192,15 @@ _CONFLICT: dict[str, str] = {
     "surveys": "job_id",            # one survey per job (unique job_id)
     "load_profiles": "job_id",      # one profile per job
     "solar_resources": "job_id",    # one resource per job
-    "sizing_results": "job_id",     # one sizing result per job
-    "financial_results": "job_id",  # one financial result per job
+    # 3.11b — the run log: an APPEND-ONLY table has no natural conflict key, so
+    # both use the corrections pattern — upsert on the pk, which no caller ever
+    # supplies, so every write INSERTS a new row. This flip is the atomic
+    # partner of migration 20260819125216 dropping the two UNIQUE (job_id)
+    # constraints: with the constraint gone, on_conflict="job_id" ERRORS (and
+    # capture being best-effort would swallow it — sizing_result_not_persisted
+    # on every run, silently). Neither half may ship without the other.
+    "sizing_results": "sizing_result_id",
+    "financial_results": "financial_result_id",
     "corrections": "correction_id",
 }
 _PK: dict[str, str] = {
@@ -392,7 +425,30 @@ def save_solar_resource(payload: dict) -> Optional[str]:
 
 
 def save_sizing_result(payload: dict) -> Optional[str]:
-    """Persist the sizing_engine.py output. Returns sizing_result_id or None."""
+    """Persist one sizing run into the append-only run log. Returns sizing_result_id or None.
+
+    REFUSES a payload whose run_kind / engine_mode is outside RUN_KINDS /
+    ENGINE_MODES — loudly in the log, safely at runtime (None, which both
+    endpoints already handle by appending sizing_result_not_persisted). Never
+    raises. Never coerces. A row with a label nobody recognises is invisible to
+    the engine comparison that decides row 4.0, which is the entire point of
+    the column. None itself is legal — it means "not recorded" (legacy shape).
+    """
+    if isinstance(payload, dict):
+        run_kind = payload.get("run_kind")
+        if run_kind is not None and run_kind not in RUN_KINDS:
+            logger.error(
+                "capture: sizing_results REFUSED — unknown run_kind %r (known: %s).",
+                run_kind, sorted(RUN_KINDS),
+            )
+            return None
+        engine_mode = payload.get("engine_mode")
+        if engine_mode is not None and engine_mode not in ENGINE_MODES:
+            logger.error(
+                "capture: sizing_results REFUSED — unknown engine_mode %r (known: %s).",
+                engine_mode, sorted(ENGINE_MODES),
+            )
+            return None
     return _write("sizing_results", payload)
 
 

@@ -177,10 +177,24 @@ async def save_job(req: JobSaveRequest):
             capture.save_load_profile({**req.load_profile, "job_id": job_id})
         if req.solar_resource:
             capture.save_solar_resource({**req.solar_resource, "job_id": job_id})
+        # 3.11b (answer 6) — the legacy result writes are GATED OFF. Until now
+        # this path UPSERTED, replacing the row; under the run log's flipped
+        # conflict key it would INSERT, injecting unauthenticated, unlabelled,
+        # heuristic-era rows into the very log that decides the engine
+        # comparison (4.0). The request model and response shape are unchanged
+        # — the payload is accepted and DISCARDED, and the attempt is recorded
+        # so a still-live caller is visible rather than silent. The whole
+        # surface dies at 3.16.
         if req.sizing_result:
-            capture.save_sizing_result({**req.sizing_result, "job_id": job_id})
+            sentry_sdk.capture_message(
+                f"[job/save] legacy sizing_result write DISCARDED for job {job_id} "
+                "— the run log accepts only the sizing endpoints (3.11b)."
+            )
         if req.financial_result:
-            capture.save_financial_result({**req.financial_result, "job_id": job_id})
+            sentry_sdk.capture_message(
+                f"[job/save] legacy financial_result write DISCARDED for job {job_id} "
+                "— the run log accepts only the sizing endpoints (3.11b)."
+            )
         if req.customer:
             _save_job_customer(job_id, req.customer)
         if req.interval:

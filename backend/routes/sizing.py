@@ -810,6 +810,10 @@ async def optimise_sizing(
         roof_conf = _roof_confidence(roof, flags)
 
         # ── Persist the CONSTRAINED (chosen) result to sizing_results (capture) ──
+        # system_cost is THE TOTAL UP-FRONT NET COST OF EVERYTHING THIS ROW
+        # RECOMMENDS — a run_kind='solar' row recommends solar only, so this is
+        # the solar system's cost. The battery writer satisfies the same
+        # sentence for its solar+battery recommendation; run_kind says which.
         persisted = False
         if body.job_id:
             try:
@@ -834,6 +838,20 @@ async def optimise_sizing(
                         "roof_needs_manual_confirmation": roof_conf["roof_needs_manual_confirmation"],
                         "roof_flags": roof_conf["roof_flags"],
                         "roof_reason": roof_conf["roof_reason"],
+                        # 3.11b — the run log. This run covered solar only,
+                        # produced by the sequential engine. evaluated_options
+                        # stores what the endpoint already computed, VERBATIM
+                        # (never re-derived, re-sorted or re-rounded);
+                        # dimension_keys names which keys of each point are
+                        # CHOICES rather than outcomes (D33 part ii — a
+                        # combined engine sets ["solar_kw", "battery_id"]
+                        # with no migration).
+                        "run_kind": "solar",
+                        "engine_mode": "sequential",
+                        "evaluated_options": {
+                            "dimension_keys": ["solar_kw"],
+                            "points": score_curve,
+                        },
                     }
                 )
                 persisted = bool(sid)
@@ -1314,6 +1332,11 @@ async def battery_sizing(
         roof_conf = _roof_confidence(roof, flags)
 
         # ── Persist chosen solar + battery to sizing_results ──
+        # system_cost is THE TOTAL UP-FRONT NET COST OF EVERYTHING THIS ROW
+        # RECOMMENDS — a run_kind='solar_battery' row recommends solar AND a
+        # battery, so this is their combined cost. The solar writer satisfies
+        # the same sentence for its solar-only recommendation; run_kind says
+        # which.
         persisted = False
         if body.job_id:
             gen_annual = round(sum(solar_8760), 1)
@@ -1338,6 +1361,16 @@ async def battery_sizing(
                     "roof_needs_manual_confirmation": roof_conf["roof_needs_manual_confirmation"],
                     "roof_flags": roof_conf["roof_flags"],
                     "roof_reason": roof_conf["roof_reason"],
+                    # 3.11b — the run log: this run covered solar AND battery,
+                    # produced by the sequential engine. The candidate list is
+                    # stored VERBATIM (the same list the response returns);
+                    # dimension_keys names the CHOICE key of each point (D33).
+                    "run_kind": "solar_battery",
+                    "engine_mode": "sequential",
+                    "evaluated_options": {
+                        "dimension_keys": ["battery_id"],
+                        "points": result["candidates"],
+                    },
                 })
                 persisted = bool(sid)
             except Exception as exc:  # noqa: BLE001

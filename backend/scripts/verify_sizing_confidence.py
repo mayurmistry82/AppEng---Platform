@@ -206,15 +206,50 @@ def t3_run_the_writers(client) -> tuple[dict, dict]:
 
 
 def t4_allowlist() -> None:
-    print("\nT4. the allowlist really grew (10 -> 15)")
+    print("\nT4. the allowlist vs the REAL column list — both directions, live")
     payload = {k: "x" for k in ROOF_KEYS}
     payload.update({"job_id": "j", "solar_kw": 1})
     out = capture._filtered("sizing_results", payload)
     check("(4) _filtered keeps all five new keys",
           set(ROOF_KEYS) <= set(out), str(set(ROOF_KEYS) - set(out)))
-    check("(4) the allowlist holds exactly 15 names",
-          len(capture._ALLOWED["sizing_results"]) == 15,
-          str(sorted(capture._ALLOWED["sizing_results"])))
+    # 3.11b replaced the absolute count ("the allowlist holds exactly N names")
+    # — an enumeration of a set that is EXPECTED to grow, a shape that has gone
+    # stale three times in this project — with a comparison that cannot: the
+    # real column list, read LIVE, against _ALLOWED, in BOTH directions. This
+    # catches the failure that actually happens: a column added to the database
+    # and forgotten in the allowlist, which _filtered then drops in silence.
+    #
+    # Source of the live column list: the PostgREST OpenAPI root (GET /rest/v1/).
+    # PostgREST does not expose information_schema to REST clients, but its
+    # OpenAPI document is generated from that same schema on every reload and
+    # lists every column of every table — so this is the live column list the
+    # service-role key CAN read, not a transcription.
+    import httpx  # noqa: PLC0415 — scoped to the one check that needs it
+    base = (os.getenv("SUPABASE_URL") or "").rstrip("/")
+    api_key = (os.getenv("SUPABASE_SERVICE_ROLE_KEY")
+               or os.getenv("SUPABASE_ANON_KEY") or "")
+    if not base or not api_key:
+        check("(4) live column list readable (SUPABASE_URL + key set)", False,
+              "env not configured")
+        return
+    resp = httpx.get(f"{base}/rest/v1/",
+                     headers={"apikey": api_key,
+                              "Authorization": f"Bearer {api_key}"},
+                     timeout=30)
+    check("(4) the PostgREST OpenAPI root answered 200", resp.status_code == 200,
+          str(resp.status_code))
+    definitions = (resp.json() or {}).get("definitions") or {}
+    for table in ("sizing_results", "financial_results"):
+        columns = set((definitions.get(table) or {}).get("properties") or {})
+        allowed = capture._ALLOWED[table]
+        print(f"        {table} columns : {sorted(columns)}")
+        print(f"        {table} _ALLOWED: {sorted(allowed)}")
+        check(f"(4) {table}: (columns - _ALLOWED) == {{'created_at'}} — the only "
+              "intended exception, database-set and deliberately not writable",
+              (columns - allowed) == {"created_at"},
+              f"unexpected diff: {sorted(columns - allowed)}")
+        check(f"(4) {table}: (_ALLOWED - columns) == set() — no phantom names",
+              not (allowed - columns), f"phantom: {sorted(allowed - columns)}")
 
 
 def t5_legacy() -> None:
