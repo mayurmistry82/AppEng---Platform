@@ -17,6 +17,7 @@ import {
   PATH_RULES,
   SECTIONS,
   clampResultsBarHeight,
+  currentSizingResult,
   groupSectionsByPhase,
   jobBarView,
   parseResultsBarPreference,
@@ -4760,4 +4761,203 @@ test("3.11: SOLAR_SIZING_REQUEST_KEYS — the D29 restraint, held locally too", 
     assert.ok(!(SOLAR_SIZING_REQUEST_KEYS as readonly string[]).includes(forbidden),
       `${forbidden} is stored on the job and must never travel from the browser`);
   }
+});
+
+// ── 3.11b prompt 1 — the readers are newest-aware BEFORE the constraint drops ─
+//
+// Today `sizing_results` still carries UNIQUE (job_id) and capture._write
+// upserts on it, so every fixture in this file above is single-row and
+// `rows[rows.length - 1]` was accidentally correct. Prompt 2 drops that
+// constraint and hydration (routes/job.py, select("*") with NO ORDER BY) will
+// return two rows in unspecified physical order.
+//
+// IN EVERY TWO-ROW FIXTURE BELOW THE ARRAY ORDER IS DELIBERATELY THE REVERSE OF
+// THE created_at ORDER — the OLDER row is placed LAST. That is what makes these
+// assertions able to move: a surviving last-element reader returns the last
+// element, which is the older row, and reports the older run's figures; the
+// newest-by-created_at rule returns the first. The two answers differ by
+// construction, so these cannot pass by accident.
+
+const NEWER_SOLAR_ONLY = {
+  created_at: "2026-08-19T05:00:00Z",
+  solar_kw: 10.12,
+  battery_kwh: null,
+};
+const OLDER_WITH_BATTERY = {
+  created_at: "2026-08-19T04:00:00Z",
+  solar_kw: 6.6,
+  battery_kwh: 13.5,
+};
+
+function completeOf(id: string, job: JobDetailLike): boolean | undefined {
+  return SECTIONS.find((s) => s.id === id)?.complete(job);
+}
+
+test("3.11b: two sizing rows, newest FIRST in the array — the newest run wins", () => {
+  const job = emptyJob({
+    sizing_results: [NEWER_SOLAR_ONLY, OLDER_WITH_BATTERY],
+  });
+  assert.deepEqual(resultsBarView(job), {
+    sized: true,
+    solarKw: 10.12,
+    batteryKwh: null,
+    paybackYears: null,
+    npv: null,
+  });
+  assert.equal(completeOf("solar-sizing", job), true);
+  // THE HONEST UN-TICK — row 3.11b, answer 1, decided by Mayur 2026-08-19. A
+  // newer solar-only run supersedes the battery run, so the CURRENT
+  // recommendation contains no battery and the section is not complete. The
+  // battery row still exists; it is simply no longer the recommendation.
+  assert.equal(completeOf("battery-sizing", job), false,
+    "a superseded battery run must not keep Battery sizing ticked");
+  const view = solarSizingView(job);
+  assert.equal(view.storedSolarKw, 10.12);
+  assert.equal(view.alreadySized, true);
+});
+
+test("3.11b: the same two rows with the BATTERY run newest — battery ticks", () => {
+  const job = emptyJob({
+    sizing_results: [OLDER_WITH_BATTERY, NEWER_SOLAR_ONLY].map((r, i) =>
+      // Swap the timestamps, keep the array order: the battery row is newest.
+      i === 0
+        ? { ...r, created_at: "2026-08-19T06:00:00Z" }
+        : { ...r, created_at: "2026-08-19T05:00:00Z" },
+    ),
+  });
+  const bar = resultsBarView(job);
+  assert.equal(bar.sized, true);
+  assert.equal(bar.sized && bar.batteryKwh, 13.5);
+  assert.equal(bar.sized && bar.solarKw, 6.6);
+  assert.equal(completeOf("battery-sizing", job), true);
+  assert.equal(completeOf("solar-sizing", job), true);
+  assert.equal(solarSizingView(job).storedSolarKw, 6.6);
+});
+
+test("3.11b: two financial rows, newest FIRST — payback and NPV come from the newer", () => {
+  const job = emptyJob({
+    sizing_results: [NEWER_SOLAR_ONLY],
+    financial_results: [
+      { created_at: "2026-08-19T05:00:00Z", payback_years: 4.2, npv_25_year: 31000 },
+      { created_at: "2026-08-19T04:00:00Z", payback_years: 9.9, npv_25_year: 12000 },
+    ],
+  });
+  const bar = resultsBarView(job);
+  assert.equal(bar.sized && bar.paybackYears, 4.2, "9.9 is the superseded run");
+  assert.equal(bar.sized && bar.npv, 31000);
+});
+
+test("3.11b: three sizing rows in scrambled order — the newest wins regardless of position", () => {
+  const a = { created_at: "2026-08-19T01:00:00Z", solar_kw: 3.3, battery_kwh: null };
+  const b = { created_at: "2026-08-19T09:00:00Z", solar_kw: 13.2, battery_kwh: 5 };
+  const c = { created_at: "2026-08-19T05:00:00Z", solar_kw: 6.6, battery_kwh: null };
+  for (const order of [[a, b, c], [c, a, b], [b, c, a], [a, c, b]]) {
+    const job = emptyJob({ sizing_results: order });
+    assert.equal(currentSizingResult(job)?.solar_kw, 13.2,
+      `order ${order.map((r) => r.solar_kw).join(",")}`);
+    const bar = resultsBarView(job);
+    assert.equal(bar.sized && bar.solarKw, 13.2);
+    assert.equal(bar.sized && bar.batteryKwh, 5);
+    assert.equal(solarSizingView(job).storedSolarKw, 13.2);
+  }
+});
+
+// The tie and degenerate rules, pinned so they are deliberate rather than
+// whatever newestByCreatedAt happens to do this week.
+test("3.11b: ties and missing timestamps — dateless sorts oldest, first element wins a full tie", () => {
+  // Neither row dated: both score -Infinity, the comparison is strict `>`, so
+  // the FIRST array element wins. Every pre-3.11b fixture in this file is this
+  // shape with one row, which is why none of them moved.
+  const bothDateless = emptyJob({
+    sizing_results: [{ solar_kw: 10.12 }, { solar_kw: 6.6 }],
+  });
+  assert.equal(currentSizingResult(bothDateless)?.solar_kw, 10.12);
+
+  // One dated, one not — the timestamped row wins from EITHER position.
+  const dated = { created_at: "2026-08-19T05:00:00Z", solar_kw: 10.12 };
+  for (const order of [[dated, { solar_kw: 6.6 }], [{ solar_kw: 6.6 }, dated]]) {
+    assert.equal(
+      currentSizingResult(emptyJob({ sizing_results: order }))?.solar_kw,
+      10.12,
+    );
+  }
+
+  // Unparseable / empty / null created_at sorts oldest and never throws.
+  for (const junk of ["", "not-a-date", null, 12345, {}]) {
+    const job = emptyJob({
+      sizing_results: [{ created_at: junk, solar_kw: 6.6 }, dated],
+    });
+    assert.doesNotThrow(() => currentSizingResult(job));
+    assert.equal(currentSizingResult(job)?.solar_kw, 10.12, String(junk));
+  }
+
+  // A dateless row is never DISCARDED — it wins when it is the only row, which
+  // is exactly the legacy /api/job/save row's shape.
+  assert.equal(
+    currentSizingResult(emptyJob({ sizing_results: [{ solar_kw: 6.6 }] }))?.solar_kw,
+    6.6,
+  );
+});
+
+test("3.11b: currentSizingResult is total — junk in, null out, never a throw", () => {
+  for (const junk of [null, undefined, 42, "rows", [], {}, { sizing_results: null },
+                      { sizing_results: "nope" }, { sizing_results: [null, null] }]) {
+    assert.doesNotThrow(() => currentSizingResult(junk));
+    assert.equal(currentSizingResult(junk), null, JSON.stringify(junk) ?? "undefined");
+  }
+  // ...and the readers built on it stay in the unsized state.
+  const noRows = emptyJob({ sizing_results: [] });
+  assert.deepEqual(resultsBarView(noRows), { sized: false });
+  assert.equal(completeOf("solar-sizing", noRows), false);
+  assert.equal(completeOf("battery-sizing", noRows), false);
+  assert.equal(solarSizingView(noRows).alreadySized, false);
+  assert.equal(solarSizingView(noRows).storedSolarKw, null);
+});
+
+test("3.11b: a current row with both figures null is UNSIZED, never '0 kW'", () => {
+  // And the older row DOES carry figures — proving the discriminant is read off
+  // the current row, not off "any row that ever had a number".
+  const job = emptyJob({
+    sizing_results: [
+      { created_at: "2026-08-19T05:00:00Z", solar_kw: null, battery_kwh: null },
+      { created_at: "2026-08-19T04:00:00Z", solar_kw: 6.6, battery_kwh: 13.5 },
+    ],
+  });
+  assert.deepEqual(resultsBarView(job), { sized: false });
+  assert.equal(completeOf("solar-sizing", job), false);
+  assert.equal(completeOf("battery-sizing", job), false);
+  assert.equal(solarSizingView(job).alreadySized, false);
+});
+
+test("3.11b: the section predicate and solarSizingView agree on the same current row", () => {
+  // Reader 1 and reader 4 are the same rule; a job where they disagreed would
+  // tick the rail while the section said "not sized yet".
+  for (const rows of [
+    [NEWER_SOLAR_ONLY, OLDER_WITH_BATTERY],
+    [OLDER_WITH_BATTERY, NEWER_SOLAR_ONLY],
+    [{ created_at: "2026-08-19T05:00:00Z", solar_kw: null, battery_kwh: 9 }],
+    [],
+  ]) {
+    const job = emptyJob({ sizing_results: rows });
+    assert.equal(
+      completeOf("solar-sizing", job),
+      solarSizingView(job).alreadySized,
+      JSON.stringify(rows),
+    );
+  }
+});
+
+test("3.11b: the Results section rule is DELIBERATELY unchanged — financial existence, not linkage", () => {
+  // The correct rule is "a financial result exists FOR THE CURRENT SIZING
+  // RESULT", and the column that expresses it (financial_results.
+  // sizing_result_id) does not exist until prompt 2, with nothing writing
+  // financials until 3.13. Half of it now is the shape D29 rejects. This test
+  // pins the current rule so the omission is recorded, not forgotten.
+  const job = emptyJob({
+    sizing_results: [NEWER_SOLAR_ONLY],
+    financial_results: [{ created_at: "2026-08-19T04:00:00Z", payback_years: 9.9 }],
+  });
+  assert.equal(completeOf("results", job), true,
+    "existence only — linkage to the current sizing run lands with prompt 2 + 3.13");
+  assert.equal(completeOf("results", emptyJob()), false);
 });

@@ -75,6 +75,34 @@ function asObject(value: unknown): JobDetailLike {
     : {};
 }
 
+/**
+ * THE CURRENT SIZING RESULT (3.11b prompt 1) — the newest `sizing_results` row
+ * by created_at, or null when there are none. One definition for the whole
+ * frontend: every reader of a sizing figure calls this, none re-derives it
+ * (2R.1 — delete the second copy rather than gate two copies).
+ *
+ * WHY THIS EXISTS BEFORE IT IS NEEDED. `sizing_results` still carries
+ * UNIQUE (job_id) and capture._write upserts on it, so there is exactly one row
+ * per job today and `rows[rows.length - 1]` was accidentally correct. Prompt 2
+ * drops that constraint; hydration (routes/job.py, `select("*")` with NO ORDER
+ * BY) then returns two rows in unspecified physical order and a last-element
+ * reader silently returns the OLDER run. The readers must be right BEFORE the
+ * constraint goes, never after. Newest-of-one is the one, so today nothing moves.
+ *
+ * Tie semantics are inherited from `newestByCreatedAt` and deliberately NOT
+ * redefined here: a row with an absent or unparseable created_at scores
+ * -Infinity, the comparison is strict `>`, so among rows that all tie the FIRST
+ * array element wins, and a dateless row can never beat a dated one. It is
+ * never discarded — it still wins when it is the only row, which is the shape
+ * the legacy /api/job/save row has.
+ *
+ * Total: never throws for any input — non-array, null, a string, an array of
+ * nulls all yield null via the existing arr()/asObject() tolerance.
+ */
+export function currentSizingResult(job: unknown): Record<string, unknown> | null {
+  return newestByCreatedAt(arr(asObject(job).sizing_results));
+}
+
 // ── Sections ─────────────────────────────────────────────────────────────────
 
 export type WorksheetPhase = "site" | "demand" | "optimise" | "resolve";
@@ -198,15 +226,28 @@ export const SECTIONS: readonly WorksheetSectionSpec[] = [
     title: "Solar sizing",
     phase: "optimise",
     builtAt: "3.11",
-    complete: (job) => arr(job.sizing_results).some((r) => r.solar_kw != null),
+    // The CURRENT result carries a solar figure — not "some row ever did".
+    // Under append-only, `.some(...)` can never un-tick, which is exactly how a
+    // stale tick outlives the run that earned it.
+    complete: (job) => {
+      const row = currentSizingResult(job);
+      return row !== null && row.solar_kw != null;
+    },
   },
   {
     id: "battery-sizing",
     title: "Battery sizing",
     phase: "optimise",
     builtAt: "3.12",
-    complete: (job) =>
-      arr(job.sizing_results).some((r) => r.battery_kwh != null),
+    // THE HONEST UN-TICK, and it is deliberate (row 3.11b, answer 1, decided by
+    // Mayur 2026-08-19). When a newer solar-only run supersedes a battery run,
+    // the current recommendation genuinely contains no battery, so the section
+    // un-ticks. The battery row still EXISTS — destruction is what prompt 2
+    // ends. This is NOT "the newest row that happens to have a battery".
+    complete: (job) => {
+      const row = currentSizingResult(job);
+      return row !== null && row.battery_kwh != null;
+    },
   },
   {
     id: "results",
@@ -615,15 +656,17 @@ export type ResultsBarView =
  */
 export function resultsBarView(job: unknown): ResultsBarView {
   const detail = asObject(job);
-  const rows = arr(detail.sizing_results);
-  const sized = rows.filter(
-    (r) => r.solar_kw != null || r.battery_kwh != null,
-  );
-  if (sized.length === 0) return { sized: false };
+  // The CURRENT result, never the last array element (3.11b prompt 1). The
+  // discriminant itself is unchanged — it is simply evaluated against the
+  // current row: no row at all, or a row whose figures are both null, is
+  // `sized: false` and renders the unsized state, never "0 kW".
+  const latest = currentSizingResult(job);
+  if (latest === null) return { sized: false };
+  if (latest.solar_kw == null && latest.battery_kwh == null) {
+    return { sized: false };
+  }
 
-  const latest = sized[sized.length - 1];
-  const fin = arr(detail.financial_results);
-  const latestFin = fin.length > 0 ? fin[fin.length - 1] : undefined;
+  const latestFin = newestByCreatedAt(arr(detail.financial_results));
   const num = (v: unknown): number | null =>
     typeof v === "number" && Number.isFinite(v) ? v : null;
   return {
@@ -4189,8 +4232,11 @@ export function solarSizingView(job: unknown): SolarSizingView {
   const existingSolarKw = existingRaw !== null && existingRaw > 0 ? existingRaw : null;
   const canPin = solarMode === "pinned" && existingSolarKw !== null;
 
-  const sized = arr(detail.sizing_results).filter((r) => tariffNum(r.solar_kw) !== null);
-  const latest = sized.length > 0 ? sized[sized.length - 1] : null;
+  // "Already sized" means the CURRENT result carries a solar figure — not that
+  // some row ever did (3.11b prompt 1). Same rule as the solar-sizing section
+  // predicate, and it must agree with it.
+  const latest = currentSizingResult(job);
+  const storedSolarKw = latest ? tariffNum(latest.solar_kw) : null;
 
   const notices: RoofNoticeView[] = [];
   if (solarMode === "pinned" && existingSolarKw === null) {
@@ -4200,8 +4246,8 @@ export function solarSizingView(job: unknown): SolarSizingView {
     solarMode,
     existingSolarKw,
     canPin,
-    storedSolarKw: latest ? tariffNum(latest.solar_kw) : null,
-    alreadySized: latest !== null,
+    storedSolarKw,
+    alreadySized: storedSolarKw !== null,
     notices,
   };
 }
