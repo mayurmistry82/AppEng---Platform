@@ -107,6 +107,88 @@ def _load_one(client: Any, table: str, job_id: str, cols: str) -> Optional[dict]
         return None
 
 
+# 3.11 (F93) — ONE roof reader, not two widened copies (2R.1). The literal
+# column list exists exactly once in this file; verify_sizing_confidence.py
+# asserts that as a source-text check. The five confidence-bearing names plus
+# the row's own primary key are the only additions over the pre-3.11 list.
+_ROOF_COLUMNS = (
+    "roof_geometry_id,planes,candidate_configs,lat,lng,selected_panel,"
+    "found,manual_entry_required,low_confidence,needs_manual_confirmation,flags,reason"
+)
+
+
+def _load_roof(client: Any, job_id: str) -> Optional[dict]:
+    return _load_one(client, "roof_geometry", job_id, _ROOF_COLUMNS)
+
+
+def _roof_confidence(roof: Optional[dict], flags: list[str]) -> dict:
+    """The roof's confidence state, as one object used by BOTH the response and
+    the persisted row — same dict by construction, so no gate has to compare
+    the two (F93). Pure, no I/O, never raises.
+
+    NULL vs FALSE IS A REAL DISTINCTION: False means "we read the roof and it
+    was clean"; None means "we never read a roof row" (a stateless call with
+    explicit planes). They are never collapsed — a result that never looked at
+    a roof must not claim a clean one. roof_confidence_read is the one-boolean
+    way to tell them apart.
+
+    THERE IS DELIBERATELY NO CONFIRMATION FIELD HERE. D24 says 3.11 reads
+    whether the installer CONFIRMED the roof — but roof_geometry has no such
+    column today; checklist 3.4c builds it, and 3.4c runs AFTER this row
+    (§J seq 12 vs seq 7). Inventing a roof_confirmed key now would create the
+    second copy that drifts. roof_geometry_id is how the confirmation state is
+    reached later: 3.15 joins the stored result back to the exact roof row it
+    was sized from and reads the column 3.4c will add. One fact, one place.
+
+    THE DOUBT TRAVELS; IT DOES NOT STOP THE WORK (D24, Mayur 2026-08-14): the
+    caller appends flags from here but never gates on them.
+    """
+    if not isinstance(roof, dict):
+        return {
+            "roof_geometry_id": None,
+            "roof_low_confidence": None,
+            "roof_needs_manual_confirmation": None,
+            "roof_flags": [],
+            "roof_reason": None,
+            "roof_confidence_read": False,
+        }
+    low = roof.get("low_confidence")
+    needs = roof.get("needs_manual_confirmation")
+    raw_flags = roof.get("flags")
+    roof_flags: list[str] = []
+    flags_unreadable = False
+    if isinstance(raw_flags, list):
+        for item in raw_flags:
+            if isinstance(item, str):
+                roof_flags.append(item)
+            else:
+                # Keep the readable part, drop the junk element, and say so —
+                # never str() it into a fake warning.
+                flags_unreadable = True
+    elif raw_flags is not None:
+        flags_unreadable = True
+    if low is True:
+        flags.append(
+            "roof_flagged_before_sizing — the roof measurement was flagged for "
+            "checking and was used as it stands, so this sizing is only as good "
+            "as that roof"
+        )
+    if flags_unreadable:
+        flags.append(
+            "roof_flags_unreadable — the roof's own warning list could not be "
+            "read, so this sizing may be missing a caution"
+        )
+    reason = roof.get("reason")
+    return {
+        "roof_geometry_id": roof.get("roof_geometry_id"),
+        "roof_low_confidence": low if isinstance(low, bool) else None,
+        "roof_needs_manual_confirmation": needs if isinstance(needs, bool) else None,
+        "roof_flags": roof_flags,
+        "roof_reason": reason if isinstance(reason, str) else None,
+        "roof_confidence_read": True,
+    }
+
+
 def _fetch_panel(client: Any, panel_id: str) -> Optional[dict]:
     """Fetch a catalogue panel as {id, watts, area_m2} for a panel-model constraint."""
     if client is None or not panel_id:
@@ -557,11 +639,9 @@ async def optimise_sizing(body: OptimiseRequest):
         postcode, state = body.postcode, body.state
 
         # ── Resolve the roof model ──
+        roof = None
         if (planes is None or candidate_configs is None) and body.job_id and client is not None:
-            roof = _load_one(
-                client, "roof_geometry", body.job_id,
-                "planes,candidate_configs,lat,lng,selected_panel,found,manual_entry_required",
-            )
+            roof = _load_roof(client, body.job_id)
             if roof is None:
                 return {"needs_roof_input": True, "flags": ["no_roof_geometry_for_job"],
                         "error": "No roof geometry stored for this job — run /api/roof/geometry first or pass planes."}
@@ -694,6 +774,10 @@ async def optimise_sizing(body: OptimiseRequest):
                 "fix_panel_count": constraints.get("fix_panel_count"),
             }
 
+        # 3.11 — the roof's confidence state, built ONCE and used by BOTH the
+        # persisted row and the response (same dict by construction).
+        roof_conf = _roof_confidence(roof, flags)
+
         # ── Persist the CONSTRAINED (chosen) result to sizing_results (capture) ──
         persisted = False
         if body.job_id:
@@ -702,13 +786,23 @@ async def optimise_sizing(body: OptimiseRequest):
                     {
                         "job_id": body.job_id,
                         "solar_kw": opt["solar_kw"],
-                        "battery_kwh": 0,
+                        # 3.11 (F134's shape): a solar-only run has NO battery
+                        # sized — null, never 0. The worksheet's Battery
+                        # section completes on battery_kwh != null, so 0 would
+                        # tick it complete and show "0 kWh" with no battery
+                        # ever sized.
+                        "battery_kwh": None,
                         "self_consumption_ratio": round(opt["self_consumption_pct"] / 100.0, 4),
                         "system_cost": opt["system_cost"],
                         "annual_solar_generation_kwh": opt["annual_generation_kwh"],
                         "within_budget": opt.get("within_budget", True),
                         "engine_version": solar_optimiser.ENGINE_VERSION,
                         "objective_used": objective,
+                        "roof_geometry_id": roof_conf["roof_geometry_id"],
+                        "roof_low_confidence": roof_conf["roof_low_confidence"],
+                        "roof_needs_manual_confirmation": roof_conf["roof_needs_manual_confirmation"],
+                        "roof_flags": roof_conf["roof_flags"],
+                        "roof_reason": roof_conf["roof_reason"],
                     }
                 )
                 persisted = bool(sid)
@@ -721,6 +815,7 @@ async def optimise_sizing(body: OptimiseRequest):
             "objective": result["objective"],
             "load_source": load_source,
             "time_base": time_base_meta,
+            "roof_confidence": roof_conf,
             "optimal": opt,
             "unconstrained_optimum": unconstrained_optimum,
             "constraint_deltas": constraint_deltas,
@@ -970,11 +1065,9 @@ async def battery_sizing(body: BatteryRequest):
         postcode, state = body.postcode, body.state
 
         # ── Roof model (chosen solar comes from D1 on this roof) ──
+        roof = None
         if (planes is None or candidate_configs is None) and body.job_id and client is not None:
-            roof = _load_one(
-                client, "roof_geometry", body.job_id,
-                "planes,candidate_configs,lat,lng,selected_panel,found,manual_entry_required",
-            )
+            roof = _load_roof(client, body.job_id)
             if roof is None:
                 return {"needs_solar_result": True, "flags": ["no_roof_geometry"],
                         "error": "No roof geometry for this job — run /api/roof/geometry then /api/sizing/optimise (D1) first."}
@@ -1159,6 +1252,9 @@ async def battery_sizing(body: BatteryRequest):
                 "force_no_battery": force_nb,
             }
 
+        # 3.11 — same object into the row and the response; see optimise_sizing.
+        roof_conf = _roof_confidence(roof, flags)
+
         # ── Persist chosen solar + battery to sizing_results ──
         persisted = False
         if body.job_id:
@@ -1179,6 +1275,11 @@ async def battery_sizing(body: BatteryRequest):
                     "within_budget": (budget is None) or (opt.get("battery_cost", 0) <= budget),
                     "engine_version": battery_optimiser.ENGINE_VERSION,
                     "objective_used": objective,
+                    "roof_geometry_id": roof_conf["roof_geometry_id"],
+                    "roof_low_confidence": roof_conf["roof_low_confidence"],
+                    "roof_needs_manual_confirmation": roof_conf["roof_needs_manual_confirmation"],
+                    "roof_flags": roof_conf["roof_flags"],
+                    "roof_reason": roof_conf["roof_reason"],
                 })
                 persisted = bool(sid)
             except Exception as exc:  # noqa: BLE001
@@ -1190,6 +1291,7 @@ async def battery_sizing(body: BatteryRequest):
             "objective": result["objective"],
             "load_source": load_source,
             "time_base": time_base_meta,
+            "roof_confidence": roof_conf,
             "optimal_battery": opt,
             "unconstrained_optimum_battery": unconstrained_optimum_battery,
             "constraint_deltas": constraint_deltas,

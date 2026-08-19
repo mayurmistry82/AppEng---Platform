@@ -475,7 +475,11 @@ def t5_two_modes(client, true_hourly: list[float]) -> None:
     print("\nT5. the two modes differ — in process, persisting NOTHING")
     n0 = (client.table("sizing_results").select("*", count="exact").limit(1)
           .execute()).count
-    check("(5) sizing_results is 0 before", n0 == 0, str(n0))
+    # 3.11: an ABSOLUTE count of a live table only ever goes stale — row 3.11
+    # exists to make this table non-empty (F77, F156). The zero-write guarantee
+    # this protected is preserved below as a DELTA (5f); the count is printed
+    # here so growth stays visible without failing anything.
+    print(f"        sizing_results holds {n0} row(s) before the run")
 
     # ZERO-WRITE GUARANTEE: the roof below maps exactly onto the two cached
     # PVGIS rows (cell -34.93/138.6, tilt 22, aspects -180/-90), so both planes
@@ -546,7 +550,8 @@ def t5_two_modes(client, true_hourly: list[float]) -> None:
 
     n1 = (client.table("sizing_results").select("*", count="exact").limit(1)
           .execute()).count
-    check("(5f) sizing_results is STILL 0 after", n1 == 0, str(n1))
+    check("(5f) sizing_results UNCHANGED by this test (delta zero)", n1 == n0,
+          f"before={n0} after={n1}")
 
 
 def main() -> int:

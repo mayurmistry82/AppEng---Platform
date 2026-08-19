@@ -1,0 +1,260 @@
+#!/usr/bin/env python3
+"""
+verify_sizing_confidence.py — the 3.11 prompt-1 gate (F93): roof doubt travels
+to the sizing result. The live roof read and its created_at-desc ordering, the
+one-reader rule, the persisted payload PROVEN BY RUNNING THE WRITERS (F148),
+the allowlist growth, the legacy path, and the no-number-moved evidence.
+
+READS the live database (the same read-only pattern verify_sizing_time_base
+uses); WRITES NOTHING — capture.save_sizing_result is replaced by a recorder
+for every endpoint run, and generation._cache_put is no-opped as belt and
+braces (this job's roof planes are 76-77 degrees, which are PVGIS cache
+misses, so a real _cache_put would grow pvgis_cache).
+
+Run:  /opt/anaconda3/bin/python3 backend/scripts/verify_sizing_confidence.py
+"""
+from __future__ import annotations
+
+import asyncio
+import json
+import os
+import sys
+import traceback
+
+BACKEND_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if BACKEND_DIR not in sys.path:
+    sys.path.insert(0, BACKEND_DIR)
+
+import capture  # noqa: E402
+import generation  # noqa: E402
+from routes import sizing as sizing_route  # noqa: E402
+
+FAILURES: list[str] = []
+CHECKS_RUN = 0
+
+
+def check(name: str, condition: bool, detail: str = "") -> None:
+    global CHECKS_RUN
+    CHECKS_RUN += 1
+    if condition:
+        print(f"  PASS  {name}")
+    else:
+        print(f"  FAIL  {name}{(' — ' + detail) if detail else ''}")
+        FAILURES.append(name)
+
+
+LIVE_JOB = "456e0242-17f9-4b2a-8faa-f664ddd9eed9"
+NEW_ROOF = "d9a9d4df-5384-4ec6-bc72-6eead7eee5b2"   # 2026-08-14 04:32, flagged
+OLD_ROOF = "8276cbf2-8692-4664-a65e-557e17ba2490"   # 2026-08-14 03:50, clean
+
+ROOF_KEYS = ("roof_geometry_id", "roof_low_confidence",
+             "roof_needs_manual_confirmation", "roof_flags", "roof_reason")
+
+
+def t1_live_read(client) -> None:
+    print("T1. the live roof read AND the created_at-desc ordering, in one assertion")
+    roof = sizing_route._load_roof(client, LIVE_JOB)
+    check("(1) a roof row was read", roof is not None, "None")
+    if roof is None:
+        return
+    print(f"        id={roof.get('roof_geometry_id')} low={roof.get('low_confidence')} "
+          f"needs={roof.get('needs_manual_confirmation')} "
+          f"n_flags={len(roof.get('flags') or [])}")
+    print(f"        reason: {str(roof.get('reason'))[:100]}")
+    check("(1) the NEWER row won: roof_geometry_id is the 04:32 flagged row",
+          roof.get("roof_geometry_id") == NEW_ROOF, str(roof.get("roof_geometry_id")))
+    check("(1) low_confidence True", roof.get("low_confidence") is True,
+          str(roof.get("low_confidence")))
+    check("(1) needs_manual_confirmation True",
+          roof.get("needs_manual_confirmation") is True,
+          str(roof.get("needs_manual_confirmation")))
+    check("(1) len(flags) == 6", len(roof.get("flags") or []) == 6,
+          str(len(roof.get("flags") or [])))
+    check('(1) reason contains "too steep to be a roof"',
+          "too steep to be a roof" in str(roof.get("reason")),
+          str(roof.get("reason"))[:120])
+
+    # THE ORDERING CAN DEMONSTRABLY FAIL: the same query with desc flipped, in
+    # a COPY here (never in _load_one), must return the OLDER clean row — three
+    # of the five values above change with it.
+    res = (
+        client.table("roof_geometry")
+        .select(sizing_route._ROOF_COLUMNS)
+        .eq("job_id", LIVE_JOB)
+        .order("created_at", desc=False)
+        .limit(1)
+        .execute()
+    )
+    older = res.data[0] if res.data else {}
+    print(f"        desc=False returns: id={older.get('roof_geometry_id')} "
+          f"low={older.get('low_confidence')} n_flags={len(older.get('flags') or [])}")
+    check("(1) flipping the ordering returns the OLDER clean row — the ordering is load-bearing",
+          older.get("roof_geometry_id") == OLD_ROOF
+          and older.get("low_confidence") is False
+          and len(older.get("flags") or []) == 2,
+          str(older.get("roof_geometry_id")))
+
+
+def t2_one_reader() -> None:
+    print("\nT2. one reader, not two — A SOURCE-TEXT CHECK (parsed, not run; weaker "
+          "than the node-bridge pattern and named so)")
+    src = open(os.path.join(BACKEND_DIR, "routes", "sizing.py")).read()
+    literal = "found,manual_entry_required,low_confidence,needs_manual_confirmation,flags,reason"
+    check("(2) the roof column list literal appears exactly ONCE (inside _ROOF_COLUMNS)",
+          src.count(literal) == 1, f"{src.count(literal)} occurrences")
+    check('(2) the inline read `"roof_geometry", body.job_id` appears ZERO times',
+          src.count('"roof_geometry", body.job_id') == 0,
+          f"{src.count(chr(34) + 'roof_geometry' + chr(34) + ', body.job_id')} occurrences")
+    check("(2) _load_roof: 1 definition + 2 call sites",
+          src.count("def _load_roof(") == 1
+          and src.count("_load_roof(client, body.job_id)") == 2,
+          f"defs={src.count('def _load_roof(')} calls={src.count('_load_roof(client, body.job_id)')}")
+
+
+def t3_run_the_writers(client) -> tuple[dict, dict]:
+    print("\nT3. the persisted payload, BY RUNNING THE WRITERS (F148) — recorder in "
+          "place, nothing written")
+    recorded: list[dict] = []
+    responses: list[dict] = []
+    original_save = capture.save_sizing_result
+    original_cache = generation._cache_put
+    capture.save_sizing_result = lambda payload: (recorded.append(dict(payload)) or "fake-id")
+    generation._cache_put = lambda *a, **k: None
+    try:
+        solar_res = asyncio.run(
+            sizing_route.optimise_sizing(sizing_route.OptimiseRequest(job_id=LIVE_JOB)))
+        responses.append(solar_res)
+        battery_res = asyncio.run(
+            sizing_route.battery_sizing(sizing_route.BatteryRequest(job_id=LIVE_JOB)))
+        responses.append(battery_res)
+    finally:
+        capture.save_sizing_result = original_save
+        generation._cache_put = original_cache
+
+    check("(3) both endpoints attempted exactly one persist each",
+          len(recorded) == 2, f"{len(recorded)} payloads recorded")
+    if len(recorded) != 2:
+        return {}, {}
+    solar_payload, battery_payload = recorded
+    print("        solar payload  :", json.dumps(solar_payload, default=str))
+    print("        battery payload:", json.dumps(battery_payload, default=str))
+
+    check("(3a) the SOLAR payload's battery_kwh IS None — not 0, not absent",
+          "battery_kwh" in solar_payload and solar_payload["battery_kwh"] is None,
+          str(solar_payload.get("battery_kwh", "<absent>")))
+    check("(3b) the BATTERY payload's battery_kwh is a number",
+          isinstance(battery_payload.get("battery_kwh"), (int, float))
+          and not isinstance(battery_payload.get("battery_kwh"), bool),
+          str(battery_payload.get("battery_kwh")))
+    allow = capture._ALLOWED["sizing_results"]
+    check("(3c) solar payload keys ⊆ the sizing_results allowlist",
+          set(solar_payload) <= allow, str(set(solar_payload) - allow))
+    check("(3c) battery payload keys ⊆ the sizing_results allowlist",
+          set(battery_payload) <= allow, str(set(battery_payload) - allow))
+    check("(3d) solar payload carries all five roof keys",
+          set(ROOF_KEYS) <= set(solar_payload), str(set(ROOF_KEYS) - set(solar_payload)))
+    check("(3d) battery payload carries all five roof keys",
+          set(ROOF_KEYS) <= set(battery_payload), str(set(ROOF_KEYS) - set(battery_payload)))
+
+    # (3e) THE 2Q.1 INSTRUMENT: the five persisted roof keys vs the five
+    # confidence-bearing names inside _ROOF_COLUMNS, as SETS, both directions.
+    persisted_roof = {k for k in solar_payload if k.startswith("roof_")}
+    source_cols = {c for c in sizing_route._ROOF_COLUMNS.split(",")
+                   if c in ("low_confidence", "needs_manual_confirmation",
+                            "flags", "reason", "roof_geometry_id")}
+    mapped = {("roof_" + c) if not c.startswith("roof_") else c for c in source_cols}
+    print(f"        persisted roof keys: {sorted(persisted_roof)}")
+    print(f"        _ROOF_COLUMNS confidence names (mapped): {sorted(mapped)}")
+    check("(3e) persisted roof keys == the confidence names read from the roof "
+          "(both directions)",
+          persisted_roof == mapped,
+          f"persisted-only={persisted_roof - mapped} read-only={mapped - persisted_roof}")
+
+    # (3f) same object by construction — response vs payload.
+    rc = responses[0].get("roof_confidence") or {}
+    same = all(solar_payload.get(k) == rc.get(k) for k in ROOF_KEYS)
+    check("(3f) the solar response's roof_confidence EQUALS the persisted roof values",
+          same, f"response={rc} payload={ {k: solar_payload.get(k) for k in ROOF_KEYS} }")
+    check("(3f) roof_confidence_read is True on this run (a roof row was read)",
+          rc.get("roof_confidence_read") is True, str(rc))
+    check("(3) the flagged-roof flag is in the solar response's flags, exactly once",
+          sum(1 for f in responses[0].get("flags", [])
+              if f.startswith("roof_flagged_before_sizing")) == 1,
+          str(responses[0].get("flags")))
+    check("(3) ...and in the battery response's flags, exactly once",
+          sum(1 for f in responses[1].get("flags", [])
+              if f.startswith("roof_flagged_before_sizing")) == 1,
+          str(responses[1].get("flags")))
+    check("(3) roof_confidence sits in both responses",
+          "roof_confidence" in responses[0] and "roof_confidence" in responses[1], "")
+    return solar_payload, responses[0]
+
+
+def t4_allowlist() -> None:
+    print("\nT4. the allowlist really grew (10 -> 15)")
+    payload = {k: "x" for k in ROOF_KEYS}
+    payload.update({"job_id": "j", "solar_kw": 1})
+    out = capture._filtered("sizing_results", payload)
+    check("(4) _filtered keeps all five new keys",
+          set(ROOF_KEYS) <= set(out), str(set(ROOF_KEYS) - set(out)))
+    check("(4) the allowlist holds exactly 15 names",
+          len(capture._ALLOWED["sizing_results"]) == 15,
+          str(sorted(capture._ALLOWED["sizing_results"])))
+
+
+def t5_legacy() -> None:
+    print("\nT5. the legacy routes/job.py capture shape is unharmed")
+    old_payload = {
+        "job_id": "j", "solar_kw": 6.6, "battery_kwh": 13.5,
+        "self_consumption_ratio": 0.64, "system_cost": 12000,
+        "annual_solar_generation_kwh": 9000, "within_budget": True,
+        "engine_version": "x", "objective_used": "max_npv",
+        "sizing_result_id": "sr-1",
+    }
+    out = capture._filtered("sizing_results", old_payload)
+    check("(5) the exact 10-key legacy shape passes through complete, nothing added",
+          set(out) == set(old_payload), f"diff={set(out) ^ set(old_payload)}")
+
+
+def t6_numbers(solar_response: dict) -> None:
+    print("\nT6. no number moved — the five optimal figures, printed for the "
+          "before/after comparison performed at build time (3.11 prompt 1)")
+    opt = solar_response.get("optimal") or {}
+    for key in ("solar_kw", "system_cost", "npv_25yr",
+                "annual_generation_kwh", "self_sufficiency_pct"):
+        value = opt.get(key)
+        print(f"        {key} = {value}")
+        check(f"(6) optimal.{key} present and finite",
+              isinstance(value, (int, float)) and value == value, str(value))
+
+
+def main() -> int:
+    print("verify_sizing_confidence.py — 3.11 prompt 1 (reads live, WRITES NOTHING)\n")
+    client = sizing_route._sb()
+    if client is None:
+        check("(live) Supabase client available", False, "env not configured")
+    else:
+        t1_live_read(client)
+        t2_one_reader()
+        _payload, solar_response = t3_run_the_writers(client)
+        t4_allowlist()
+        t5_legacy()
+        if solar_response:
+            t6_numbers(solar_response)
+    print(f"\n{'-' * 60}")
+    if FAILURES:
+        print(f"FAIL: {len(FAILURES)} of {CHECKS_RUN} checks failed:")
+        for name in FAILURES:
+            print(f"  - {name}")
+        return 1
+    print(f"OK: all {CHECKS_RUN} checks passed")
+    return 0
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main())
+    except Exception:  # noqa: BLE001
+        traceback.print_exc()
+        print("\nFAIL: the verifier itself crashed")
+        sys.exit(2)

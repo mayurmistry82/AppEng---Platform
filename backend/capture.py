@@ -135,6 +135,12 @@ _ALLOWED: dict[str, set[str]] = {
         "sizing_result_id", "job_id", "solar_kw", "battery_kwh",
         "self_consumption_ratio", "system_cost", "annual_solar_generation_kwh",
         "within_budget", "engine_version", "objective_used",
+        # 3.11 (F93) — the roof's confidence state, carried onto the result at
+        # write time so a result sized from a doubted roof is never
+        # indistinguishable from a clean one. All five nullable in the schema;
+        # the legacy routes/job.py capture path simply never sends them.
+        "roof_geometry_id", "roof_low_confidence",
+        "roof_needs_manual_confirmation", "roof_flags", "roof_reason",
     },
     "financial_results": {
         "financial_result_id", "job_id", "system_capex", "annual_savings",
