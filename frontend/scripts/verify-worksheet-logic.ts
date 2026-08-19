@@ -58,12 +58,14 @@ import {
   typedUsageError,
   usagePlausibilityNotice,
   azimuthLabel,
+  CUSTOM_EQUIPMENT_FIELDS,
   EQUIPMENT_AUTO_CAPTION,
   EQUIPMENT_CATALOGUE_PROBLEM,
   EQUIPMENT_KINDS,
   EQUIPMENT_MISSING_NOTICE,
   EQUIPMENT_UNVERIFIED_NOTICE,
   SPEC_NOT_STATED,
+  customUnitNotices,
   equipmentSaveNotices,
   equipmentSpecsView,
   OBJECTIVE_OPTIONS,
@@ -4491,4 +4493,116 @@ test("3.10 (4i): EQUIPMENT_KINDS has exactly three members and matches the catal
   // The view exposes exactly these three kind views.
   const view = equipmentSpecsView(emptyJob({}), FULL_CATALOGUE);
   for (const k of EQUIPMENT_KINDS) assert.equal(view[k].kind, k);
+});
+
+// ── 3.10 prompt 5: the "Other / new" drawer's field table and notices ────────
+
+test("3.10 (5a): CUSTOM_EQUIPMENT_FIELDS — three kinds, complete rows, no duplicate names", () => {
+  const kinds = Object.keys(CUSTOM_EQUIPMENT_FIELDS).sort();
+  assert.deepEqual(kinds, ["batteries", "inverters", "panels"]);
+  for (const kind of EQUIPMENT_KINDS) {
+    const fields = CUSTOM_EQUIPMENT_FIELDS[kind];
+    assert.ok(fields.length > 0, `${kind} has fields`);
+    const names = fields.map((f) => f.name);
+    assert.equal(new Set(names).size, names.length,
+      `${kind}: duplicate field names would double-write on the wire`);
+    for (const f of fields) {
+      assert.ok(f.name.length > 0 && f.label.length > 0, `${kind}.${f.name}`);
+      if (f.type === "enum") {
+        assert.ok((f.options ?? []).length > 0, `${kind}.${f.name} enum needs options`);
+        for (const o of f.options ?? []) {
+          assert.ok(o.value.length > 0 && o.label.length > 0, `${kind}.${f.name} option`);
+        }
+      }
+    }
+  }
+});
+
+test("3.10 (5b): customUnitNotices across the response shapes", () => {
+  // Assumptions only.
+  const withAssumptions = customUnitNotices({
+    id: "x", engine_assumptions: ["Acme AX1: warranty_cycles missing — assumed 6000 cycles for replacement modelling."],
+    duplicates: [], flags: [],
+  });
+  assert.ok(withAssumptions.some((n) => n.tone === "caution" && n.level === "notice"));
+
+  // Duplicates with differences → one caution PER duplicate, naming both numbers.
+  const withDiffs = customUnitNotices({
+    id: "x", engine_assumptions: [], flags: [],
+    duplicates: [{
+      id: "cat-1", origin: "catalogue", brand: "Sungrow", model: "SBR128",
+      differences: [{ field: "usable_capacity_kwh", existing: 12.8, submitted: 13.5 }],
+    }],
+  });
+  const diffNotice = withDiffs.find((n) => n.level === "notice");
+  assert.ok(diffNotice, String(withDiffs));
+  assert.ok(diffNotice!.title.includes("Sungrow SBR128"), diffNotice!.title);
+  assert.ok(diffNotice!.body.includes("12.8") && diffNotice!.body.includes("13.5"), diffNotice!.body);
+
+  // A duplicate with NO differences → one quiet info caption.
+  const exact = customUnitNotices({
+    id: "x", engine_assumptions: [], flags: [],
+    duplicates: [{ id: "cat-1", brand: "Sungrow", model: "SBR128", differences: [] }],
+  });
+  assert.equal(exact.length, 1);
+  assert.equal(exact[0].level, "caption");
+  assert.equal(exact[0].tone, "info");
+
+  // Junk as the whole response.
+  for (const junk of [null, undefined, "x", 42, [], {}]) {
+    assert.doesNotThrow(() => customUnitNotices(junk));
+    assert.ok(Array.isArray(customUnitNotices(junk)));
+  }
+});
+
+test("3.10 (5c): THE VERBATIM RULE — the engine's sentence survives byte-for-byte", () => {
+  // Any re-wording, re-ordering or summarising changes the string and this
+  // fails: prompt 4's "no second copy of the engine's words" one layer out.
+  const sentence = "Acme AX1: round-trip efficiency missing — assumed 90%.";
+  const notices = customUnitNotices({
+    id: "x", engine_assumptions: [sentence], duplicates: [], flags: [],
+  });
+  const assumption = notices.find((n) => n.level === "notice");
+  assert.ok(assumption, "an assumptions notice must exist");
+  assert.ok(assumption!.body.includes(sentence),
+    `the body must contain the engine's sentence exactly: ${assumption!.body}`);
+});
+
+test("3.10 (5d): absent, empty, and check-unavailable duplicates are THREE different outputs", () => {
+  const absent = customUnitNotices({ id: "x", engine_assumptions: [], flags: [] });
+  const empty = customUnitNotices({ id: "x", engine_assumptions: [], flags: [], duplicates: [] });
+  const unavailable = customUnitNotices({
+    id: "x", engine_assumptions: [], flags: ["duplicate_check_unavailable"], duplicates: [],
+  });
+  // Absent: the outcome is unknown — silence.
+  assert.deepEqual(absent, []);
+  // Present-and-empty: the check RAN — a quiet caption says so.
+  assert.equal(empty.length, 1);
+  assert.equal(empty[0].level, "caption");
+  // Unavailable: the check DID NOT RUN — a caution notice, never "no duplicates".
+  assert.equal(unavailable.length, 1);
+  assert.equal(unavailable[0].level, "notice");
+  assert.equal(unavailable[0].tone, "caution");
+  // All three differ from each other.
+  assert.notDeepEqual(absent, empty);
+  assert.notDeepEqual(empty, unavailable);
+  assert.notDeepEqual(absent, unavailable);
+});
+
+test("3.10 (5e): the required sets are the DERIVED ones — and inverters do NOT require a cost", () => {
+  // A "tidied" uniform rule changes one of these sets and fails here. The
+  // asymmetry is the backend's: no battery price → the LP skips the unit; no
+  // panel dimensions → the roof reader falls back to the default panel; no
+  // inverter price → the cost model excludes it WITH A FLAG and sizing runs.
+  const required = (kind: (typeof EQUIPMENT_KINDS)[number]) =>
+    CUSTOM_EQUIPMENT_FIELDS[kind].filter((f) => f.required).map((f) => f.name).sort();
+  assert.deepEqual(required("panels"),
+    ["brand", "length_mm", "model", "rated_power_w", "width_mm"]);
+  assert.deepEqual(required("inverters"),
+    ["brand", "inverter_type", "model", "phases", "rated_ac_power_kw"]);
+  assert.deepEqual(required("batteries"),
+    ["brand", "cost_aud", "model", "usable_capacity_kwh"]);
+  const inverterCost = CUSTOM_EQUIPMENT_FIELDS.inverters.find((f) => f.name === "cost_aud");
+  assert.ok(inverterCost, "inverters still OFFER a cost field");
+  assert.equal(inverterCost!.required, false, "an unpriced inverter is accepted — do not tidy this");
 });

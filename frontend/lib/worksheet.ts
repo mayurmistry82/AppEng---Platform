@@ -3872,3 +3872,214 @@ export function equipmentSaveNotices(sent: unknown, response: unknown): RoofNoti
     },
   ];
 }
+
+// ── Custom "Other / new" equipment (3.10 prompt 5) ───────────────────────────
+
+/**
+ * One form field of the custom-equipment drawer. `name` is THE EXACT backend
+ * pydantic field name — it is the string that goes on the wire, and the
+ * browser proxy forwards the body with no whitelist because the backend
+ * models ARE the whitelist. pydantic DROPS unknown keys silently, so a field
+ * named even slightly differently ("rte_pct") would produce a 201, a saved
+ * unit, and a missing spec the engine then quietly defaults. The form and the
+ * models are two places that must agree — verify_equipment_contract.py check 9
+ * imports this table over node and asserts set equality with the models.
+ */
+export interface CustomFieldSpec {
+  /** The exact backend model field name — load-bearing, on the wire. */
+  name: string;
+  label: string;
+  type: "text" | "number" | "enum" | "boolean";
+  /** Required ON THE FORM. Deliberately NOT pydantic's required-ness: the
+      engine-mandatory fields (battery cost, panel dimensions) are Optional in
+      pydantic on purpose — the refusal comes from RUNNING the engine reader —
+      so the honest cross-check is "the backend refuses a body without this",
+      which the gate performs by posting one. */
+  required: boolean;
+  unit?: string;
+  /** Enum VALUES are the backend Literal members exactly; labels are UI-only. */
+  options?: readonly { value: string; label: string }[];
+  min?: number;
+  max?: number;
+  step?: string;
+}
+
+/**
+ * THIS EXPORT NAME IS LOAD-BEARING — verify_equipment_contract.py check 9 runs
+ * it over node (both sides RUN, neither is parsed) and asserts set equality
+ * with the backend models. Do not rename it, compose it at runtime, or build
+ * it from another module: the same rule VALID_OBJECTIVES carries.
+ *
+ * The required sets are DERIVED, not chosen, and deliberately asymmetric:
+ * a battery with no price is refused because the LP skips an unpriced unit; a
+ * panel with no dimensions is refused because the roof reader would silently
+ * fall back to the default panel; an inverter with no price is ACCEPTED
+ * because the cost model excludes it with a flag and sizing still runs.
+ */
+export const CUSTOM_EQUIPMENT_FIELDS: Record<EquipmentKind, readonly CustomFieldSpec[]> = {
+  panels: [
+    { name: "brand", label: "Brand", type: "text", required: true },
+    { name: "model", label: "Model", type: "text", required: true },
+    { name: "series", label: "Series", type: "text", required: false },
+    { name: "rated_power_w", label: "Rated power", type: "number", required: true, unit: "W", min: 0, max: 1000, step: "5" },
+    { name: "length_mm", label: "Length", type: "number", required: true, unit: "mm", min: 0, max: 5000, step: "1" },
+    { name: "width_mm", label: "Width", type: "number", required: true, unit: "mm", min: 0, max: 5000, step: "1" },
+    {
+      name: "cell_technology", label: "Cell technology", type: "enum", required: false,
+      options: [
+        { value: "mono_perc", label: "Mono PERC" },
+        { value: "n_type_topcon", label: "N-type TOPCon" },
+        { value: "hjt", label: "HJT" },
+        { value: "ibc", label: "IBC" },
+        { value: "hpbc", label: "HPBC" },
+        { value: "abc", label: "ABC" },
+      ],
+    },
+    { name: "module_efficiency_pct", label: "Module efficiency", type: "number", required: false, unit: "%", min: 0, max: 100, step: "0.1" },
+    { name: "cost_aud", label: "Indicative cost", type: "number", required: false, unit: "$", min: 0, max: 1000000, step: "1" },
+  ],
+  inverters: [
+    { name: "brand", label: "Brand", type: "text", required: true },
+    { name: "model", label: "Model", type: "text", required: true },
+    { name: "series", label: "Series", type: "text", required: false },
+    {
+      name: "inverter_type", label: "Inverter type", type: "enum", required: true,
+      options: [
+        { value: "string", label: "String" },
+        { value: "hybrid", label: "Hybrid" },
+        { value: "microinverter", label: "Microinverter" },
+      ],
+    },
+    {
+      name: "phases", label: "Phases", type: "enum", required: true,
+      options: [
+        { value: "single", label: "Single phase" },
+        { value: "three", label: "Three phase" },
+      ],
+    },
+    { name: "rated_ac_power_kw", label: "Rated AC power", type: "number", required: true, unit: "kW", min: 0, max: 1000, step: "0.1" },
+    { name: "battery_ready", label: "Battery ready", type: "boolean", required: false },
+    { name: "max_efficiency_pct", label: "Max efficiency", type: "number", required: false, unit: "%", min: 0, max: 100, step: "0.1" },
+    { name: "cost_aud", label: "Indicative cost", type: "number", required: false, unit: "$", min: 0, max: 1000000, step: "1" },
+  ],
+  batteries: [
+    { name: "brand", label: "Brand", type: "text", required: true },
+    { name: "model", label: "Model", type: "text", required: true },
+    { name: "series", label: "Series", type: "text", required: false },
+    {
+      name: "chemistry", label: "Chemistry", type: "enum", required: false,
+      options: [
+        { value: "lfp", label: "LFP" },
+        { value: "nmc", label: "NMC" },
+      ],
+    },
+    {
+      name: "coupling", label: "Coupling", type: "enum", required: false,
+      options: [
+        { value: "ac", label: "AC coupled" },
+        { value: "dc", label: "DC coupled" },
+        { value: "hybrid_paired", label: "Hybrid-paired" },
+        { value: "all_in_one", label: "All-in-one" },
+      ],
+    },
+    { name: "usable_capacity_kwh", label: "Usable capacity", type: "number", required: true, unit: "kWh", min: 0, max: 1000, step: "0.1" },
+    { name: "nominal_capacity_kwh", label: "Nominal capacity", type: "number", required: false, unit: "kWh", min: 0, max: 1000, step: "0.1" },
+    { name: "cost_aud", label: "Indicative cost", type: "number", required: true, unit: "$", min: 0, max: 1000000, step: "1" },
+    { name: "depth_of_discharge_pct", label: "Depth of discharge", type: "number", required: false, unit: "%", min: 0, max: 100, step: "1" },
+    { name: "round_trip_efficiency_pct", label: "Round-trip efficiency", type: "number", required: false, unit: "%", min: 0, max: 100, step: "0.1" },
+    { name: "max_continuous_charge_kw", label: "Max charge", type: "number", required: false, unit: "kW", min: 0, max: 1000, step: "0.1" },
+    { name: "max_continuous_discharge_kw", label: "Max discharge", type: "number", required: false, unit: "kW", min: 0, max: 1000, step: "0.1" },
+    { name: "warranty_cycles", label: "Warranty cycles", type: "number", required: false, min: 1, max: 100000, step: "100" },
+    { name: "warranty_years", label: "Warranty years", type: "number", required: false, min: 1, max: 50, step: "1" },
+  ],
+};
+
+/**
+ * A successful create response → notices, classified HERE (D25), never in the
+ * component. Pure, total, never throws.
+ *
+ * THE VERBATIM RULE: engine_assumptions are the engine's own sentences about
+ * what it had to assume. They are joined, never re-worded, re-ordered or
+ * summarised — a paraphrase here would drift from the engine's wording the
+ * first time either changes, which is prompt 4's "no second copy of the
+ * engine's defaults" rule one layer out.
+ *
+ * THREE DIFFERENT FACTS about duplicates, honoured separately:
+ *   - the key ABSENT            → the check's outcome is unknown: say nothing.
+ *   - present and EMPTY         → the check RAN and found nothing: a quiet
+ *                                 caption, so "checked" is distinguishable
+ *                                 from "unknown".
+ *   - duplicate_check_unavailable flagged → the check DID NOT RUN: a caution
+ *                                 notice. Never rendered as "no duplicates".
+ */
+export function customUnitNotices(response: unknown): RoofNoticeView[] {
+  const body = asRecord(response);
+  const out: RoofNoticeView[] = [];
+
+  const assumptions = Array.isArray(body.engine_assumptions)
+    ? body.engine_assumptions.filter((a): a is string => typeof a === "string" && a !== "")
+    : [];
+  if (assumptions.length > 0) {
+    out.push({
+      tone: "caution",
+      level: "notice",
+      title: "The engine filled some specs with its own assumptions",
+      body: assumptions.join("\n"),
+    });
+  }
+
+  const flags = Array.isArray(body.flags) ? body.flags : [];
+  const checkUnavailable = flags.some((f) => f === "duplicate_check_unavailable");
+  const hasDuplicatesKey = Object.prototype.hasOwnProperty.call(body, "duplicates");
+  const duplicates = Array.isArray(body.duplicates) ? body.duplicates : [];
+
+  if (checkUnavailable) {
+    out.push({
+      tone: "caution",
+      level: "notice",
+      title: "The duplicate check could not run",
+      body: "The unit was saved, but it could not be compared against the units you can already see. That is not the same as no duplicates being found.",
+    });
+    return out;
+  }
+  if (!hasDuplicatesKey || !Array.isArray(body.duplicates)) return out;
+
+  let exactMatch = false;
+  for (const raw of duplicates) {
+    const dup = asRecord(raw);
+    const name = [roofStr(dup.brand), roofStr(dup.model)]
+      .filter((p): p is string => p !== null)
+      .join(" ") || "a unit";
+    const differences = Array.isArray(dup.differences) ? dup.differences : [];
+    if (differences.length === 0) {
+      exactMatch = true;
+      continue;
+    }
+    const lines = differences.map((d) => {
+      const diff = asRecord(d);
+      return `${String(diff.field ?? "a spec")}: on file ${diff.existing ?? "not stated"}, you entered ${diff.submitted ?? "not stated"}`;
+    });
+    out.push({
+      tone: "caution",
+      level: "notice",
+      title: `You may already have ${name} — with different numbers`,
+      body: lines.join("\n"),
+    });
+  }
+  if (exactMatch) {
+    out.push({
+      tone: "info",
+      level: "caption",
+      title: "Already on file",
+      body: "A unit with this brand and model, and the same numbers, is already in the list you can see.",
+    });
+  } else if (duplicates.length === 0) {
+    out.push({
+      tone: "info",
+      level: "caption",
+      title: "Checked against your catalogue",
+      body: "No matching unit was found among the units you can see.",
+    });
+  }
+  return out;
+}

@@ -15,6 +15,7 @@ from __future__ import annotations
 import asyncio
 import os
 import re
+import subprocess
 import sys
 import traceback
 
@@ -884,6 +885,122 @@ def t8_wiring() -> None:
           n_fields == 20 and n_jobs == 18, f"{n_fields} / {n_jobs}")
 
 
+
+# ═════════════════════════════════════════════════════════════════════════════
+# CHECK 9 (3.10 prompt 5) — THE TWO-SIDED FORM GATE: the drawer's field table
+# against the pydantic models. The browser proxy forwards the create body with
+# NO whitelist (correct — the models are the whitelist), and pydantic DROPS
+# unknown keys silently: a field named even slightly differently produces a
+# 201, a saved unit, and a missing spec the engine then quietly defaults. Both
+# sides RUN — the models in Python, the field table over node — neither is
+# parsed (F148).
+#
+# ENUM-CHAIN COVERAGE, so nobody reads one half as the other: this check
+# covers FORM → ENDPOINT (the drawer's options vs the pydantic Literals).
+# Check 7c — ENDPOINT → DATABASE (the Literals vs the pg CHECK constraints) —
+# still cannot run without a direct Postgres connection and still skips
+# loudly. A screen-to-API enum mismatch is now caught; an API-to-database one
+# is not.
+# ═════════════════════════════════════════════════════════════════════════════
+
+
+def t9_form_gate() -> int:
+    """Returns the number of loudly-skipped (uncounted) checks."""
+    print("\nCHECK 9 — the custom-equipment form vs the pydantic models (two-sided)")
+    frontend = os.path.abspath(os.path.join(BACKEND_DIR, "..", "frontend"))
+    script = (
+        'import { CUSTOM_EQUIPMENT_FIELDS, EQUIPMENT_KINDS } from "./lib/worksheet.ts"; '
+        "console.log(JSON.stringify({ kinds: [...EQUIPMENT_KINDS], fields: "
+        "Object.fromEntries(Object.entries(CUSTOM_EQUIPMENT_FIELDS).map(([k, v]) => "
+        "[k, v.map((f) => ({ name: f.name, type: f.type, required: f.required, "
+        "options: (f.options ?? []).map((o) => o.value) }))])) }))"
+    )
+    try:
+        proc = subprocess.run(
+            ["node", "--experimental-strip-types", "--input-type=module", "-e", script],
+            cwd=frontend, capture_output=True, text=True, timeout=120,
+        )
+    except FileNotFoundError:
+        check("(9) node available for the form gate", False, "node not found")
+        return 0
+    if proc.returncode != 0:
+        stderr = proc.stderr or ""
+        if "does not provide an export named" in stderr:
+            print("  SKIP  (9) CUSTOM_EQUIPMENT_FIELDS is not exported yet. NOT counted.")
+            return 1
+        check("(9) node import of lib/worksheet.ts", False, stderr.strip()[:200])
+        return 0
+    import json as _json
+    import typing as _t
+    payload = _json.loads(proc.stdout.strip())
+    form_kinds = set(payload["kinds"])
+    table_kinds = set(payload["fields"].keys())
+
+    # 9c — three sets, both directions: the field table's keys, the frontend
+    # EQUIPMENT_KINDS, and the backend's accepted kinds.
+    backend_kinds = set(equipment.EQUIPMENT_KINDS)
+    check("(9c) frontend EQUIPMENT_KINDS == backend kinds (both directions)",
+          form_kinds == backend_kinds,
+          f"frontend-only={form_kinds - backend_kinds} backend-only={backend_kinds - form_kinds}")
+    check("(9c) CUSTOM_EQUIPMENT_FIELDS keys == backend kinds (both directions)",
+          table_kinds == backend_kinds,
+          f"table-only={table_kinds - backend_kinds} backend-only={backend_kinds - table_kinds}")
+
+    valid_bodies = {"panels": VALID_PANEL, "inverters": VALID_INVERTER,
+                    "batteries": VALID_BATTERY}
+    for kind in sorted(backend_kinds):
+        model = equipment._BODY_MODELS[kind]
+        model_fields = set(model.model_fields.keys())
+        specs = payload["fields"].get(kind, [])
+        form_names = {f["name"] for f in specs}
+        # 9a — a form-only name IS the silent-drop fault: pydantic drops it,
+        # the unit saves without the spec, the engine defaults it, and nothing
+        # errors anywhere.
+        print(f"        {kind}: form={sorted(form_names)}")
+        print(f"        {kind}: model={sorted(model_fields)}")
+        print(f"        {kind}: form-only={sorted(form_names - model_fields)} "
+              f"model-only={sorted(model_fields - form_names)}")
+        check(f"(9a) {kind}: every form field name is a REAL model field "
+              "(a form-only name is the silent drop)",
+              form_names <= model_fields,
+              f"silently dropped on the wire: {sorted(form_names - model_fields)}")
+
+        # 9b — enum options vs Literal members, both directions.
+        for f in specs:
+            if f["type"] != "enum":
+                continue
+            ann = model.model_fields[f["name"]].annotation if f["name"] in model.model_fields else None
+            lits: set = set()
+            for arg in (_t.get_args(ann) or ()):
+                lits |= {a for a in _t.get_args(arg) if isinstance(a, str)}
+                if isinstance(arg, str):
+                    lits.add(arg)
+            check(f"(9b) {kind}.{f['name']}: form options == Literal members (both directions)",
+                  set(f["options"]) == lits,
+                  f"form-only={set(f['options']) - lits} literal-only={lits - set(f['options'])}")
+
+        # 9-required — THE HONEST COMPARISON, and why the naive one is not:
+        # pydantic's required-ness deliberately DIFFERS from the form's (the
+        # engine-mandatory fields are Optional in pydantic so the refusal
+        # comes from RUNNING the engine reader — prompt 2's one-rule design).
+        # So the assertion is behavioural: a body missing a form-required
+        # field must be REFUSED by the endpoint, whichever layer refuses it.
+        form_required = {f["name"] for f in specs if f["required"]}
+        full_body = valid_bodies[kind]
+        check(f"(9r) {kind}: the form's required set is exactly the fields the "
+              "backend refuses without",
+              form_required == set(full_body.keys()),
+              f"form={sorted(form_required)} refused-without={sorted(full_body.keys())}")
+        for name in sorted(form_required):
+            body = {k: v for k, v in full_body.items() if k != name}
+            stub = StubClient()
+            _res, exc = run_post(stub, kind, body)
+            check(f"(9r) {kind} without {name}: 422 and ZERO inserts",
+                  getattr(exc, "status_code", None) == 422 and stub.inserts == [],
+                  f"exc={exc!r} inserts={len(stub.inserts)}")
+    return 0
+
+
 def main_() -> int:
     print("verify_equipment_contract.py — 3.10 prompt 1 (offline, writes nothing)\n")
     t1_write_path()
@@ -894,6 +1011,7 @@ def main_() -> int:
     t6_junk()
     skipped = t7_write_path()
     t8_wiring()
+    skipped += t9_form_gate()
     print(f"\n{'-' * 60}")
     if FAILURES:
         print(f"FAIL: {len(FAILURES)} of {CHECKS_RUN} checks failed:")

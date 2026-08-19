@@ -15,9 +15,17 @@ import {
 } from "@/components/ui/select";
 import { requestJson } from "@/lib/client-api";
 import { clientActionErrorCopy, type ApiErrorKind } from "@/lib/jobs";
+import { Input } from "@/components/ui/input";
+import { OverrideDrawer } from "@/components/ui/override-drawer";
 import {
+  CUSTOM_EQUIPMENT_FIELDS,
+  EQUIPMENT_KINDS,
+  customUnitNotices,
   equipmentSaveNotices,
+  type CustomFieldSpec,
+  type EquipmentKind,
   type EquipmentKindView,
+  type EquipmentOption,
   type EquipmentSpecsView,
   type RoofNoticeView,
 } from "@/lib/worksheet";
@@ -91,6 +99,20 @@ export function EquipmentSpecsSection({
   const [saveNotices, setSaveNotices] = React.useState<readonly RoofNoticeView[]>([]);
   const [savedTick, setSavedTick] = React.useState(false);
 
+  // ── "Other / new" drawer state (prompt 5) — ALONGSIDE the prompt-4 state,
+  // never inside it. draft holds raw strings per backend field name.
+  const [drawerKind, setDrawerKind] = React.useState<EquipmentKind>("batteries");
+  const [draft, setDraft] = React.useState<Record<string, string>>({});
+  const [creating, setCreating] = React.useState(false);
+  const [createError, setCreateError] = React.useState<string | null>(null);
+  const [createNotices, setCreateNotices] = React.useState<readonly RoofNoticeView[]>([]);
+  // Units created THIS visit, present locally so the new option can be
+  // selected before router.refresh() brings the re-read catalogue (which then
+  // contains the same unit — options are deduped by id below).
+  const [extraOptions, setExtraOptions] = React.useState<
+    Record<EquipmentKind, EquipmentOption[]>
+  >({ panels: [], inverters: [], batteries: [] });
+
   const baseline = React.useMemo(() => fromView(view), [view]);
   const dirty =
     form.panels !== baseline.panels ||
@@ -149,6 +171,87 @@ export function EquipmentSpecsSection({
     }
   }
 
+  function setDraftField(name: string, value: string) {
+    setDraft((d) => ({ ...d, [name]: value }));
+    setCreateError(null);
+  }
+
+  async function createUnit() {
+    if (creating || readOnly) return;
+    const fields = CUSTOM_EQUIPMENT_FIELDS[drawerKind];
+    const missingLabels = fields
+      .filter((f) => f.required && !(draft[f.name] ?? "").trim())
+      .map((f) => f.label);
+    if (missingLabels.length > 0) {
+      setCreateError(`Still needed: ${missingLabels.join(", ")}.`);
+      return;
+    }
+    // ONLY fields the installer filled in: an empty optional field is ABSENT
+    // from the body — never null, never "". Numbers travel as NUMBERS: the
+    // string "12.8" would fail pydantic validation with a 422 the installer
+    // cannot act on. Nothing server-fixed (origin, owner, verified, status,
+    // promoted_from, id) is ever sent — the backend ignores them, but sending
+    // them would state an intent this screen does not have.
+    const body: Record<string, unknown> = {};
+    for (const field of fields) {
+      const raw = (draft[field.name] ?? "").trim();
+      if (raw === "") continue;
+      if (field.type === "number") {
+        const n = Number(raw);
+        if (!Number.isFinite(n)) {
+          setCreateError(`${field.label} must be a number.`);
+          return;
+        }
+        body[field.name] = n;
+      } else if (field.type === "boolean") {
+        body[field.name] = raw === "true";
+      } else {
+        body[field.name] = raw;
+      }
+    }
+    setCreating(true);
+    setCreateError(null);
+    setCreateNotices([]);
+    try {
+      const result = await requestJson<Record<string, unknown>>(
+        "POST",
+        `/api/equipment/${encodeURIComponent(drawerKind)}`,
+        body,
+      );
+      if (!result.ok) {
+        // 422/409 details are written for this screen — show them as-is. The
+        // form keeps every typed value: a refusal that empties the form is a
+        // second failure on top of the first.
+        const copy = saveErrorCopy(result.kind, result.status, result.message);
+        setCreateError(copy.body || copy.heading);
+        return;
+      }
+      const newId = typeof result.data.id === "string" ? result.data.id : null;
+      if (!newId) {
+        // A 201 whose body is unreadable is a failure the installer can see —
+        // never invent an id, never select something that might not exist.
+        setCreateError("The unit may not have saved — reload before trying again.");
+        return;
+      }
+      const brand = (draft.brand ?? "").trim();
+      const model = (draft.model ?? "").trim();
+      const label = `${`${brand} ${model}`.trim() || newId} · your own, unverified`;
+      // LOCAL first, so the option exists at the moment it is selected; the
+      // refreshed catalogue then carries the same unit and dedupe-by-id above
+      // keeps it single.
+      setExtraOptions((e) => ({
+        ...e,
+        [drawerKind]: [...e[drawerKind], { id: newId, label, isUserDefined: true }],
+      }));
+      choose(drawerKind, newId);
+      setCreateNotices(customUnitNotices(result.data));
+      setDraft({});
+      router.refresh();
+    } finally {
+      setCreating(false);
+    }
+  }
+
   // Save-attempt notices first, then the view's own — deduped by title;
   // NoticeStack does the D25 ordering (findings above captions).
   const notices: RoofNoticeView[] = [];
@@ -159,13 +262,83 @@ export function EquipmentSpecsSection({
     notices.push(notice);
   }
 
+  function renderDraftField(field: CustomFieldSpec) {
+    const id = `custom-${field.name}`;
+    const value = draft[field.name] ?? "";
+    const label = field.required ? `${field.label} *` : field.label;
+    if (field.type === "enum" || field.type === "boolean") {
+      const options =
+        field.type === "boolean"
+          ? [{ value: "true", label: "Yes" }, { value: "false", label: "No" }]
+          : field.options ?? [];
+      return (
+        <div key={field.name}>
+          <label className="text-caption text-muted-foreground" htmlFor={id}>
+            {label}
+          </label>
+          <div className="mt-1 w-[160px]">
+            <Select
+              value={value}
+              onValueChange={(v) => setDraftField(field.name, v)}
+              disabled={readOnly}
+            >
+              <SelectTrigger id={id} aria-label={field.label}>
+                <SelectValue placeholder="—" />
+              </SelectTrigger>
+              <SelectContent>
+                {options.map((option) => (
+                  <SelectItem key={option.value} value={option.value}>
+                    {option.label}
+                  </SelectItem>
+                ))}
+              </SelectContent>
+            </Select>
+          </div>
+        </div>
+      );
+    }
+    return (
+      <div key={field.name}>
+        <label className="text-caption text-muted-foreground" htmlFor={id}>
+          {label}
+        </label>
+        <div className="mt-1 flex items-center gap-1.5">
+          {field.unit === "$" ? (
+            <span className="text-caption text-muted-foreground">$</span>
+          ) : null}
+          <Input
+            id={id}
+            className={field.type === "number" ? "w-[110px]" : "w-[160px]"}
+            type={field.type === "number" ? "number" : "text"}
+            inputMode={field.type === "number" ? "decimal" : undefined}
+            step={field.type === "number" ? field.step ?? "1" : undefined}
+            value={value}
+            onChange={(e) => setDraftField(field.name, e.target.value)}
+            disabled={readOnly}
+          />
+          {field.unit && field.unit !== "$" ? (
+            <span className="text-caption text-muted-foreground">{field.unit}</span>
+          ) : null}
+        </div>
+      </div>
+    );
+  }
+
   function renderKind(kind: keyof FormState, kindView: EquipmentKindView) {
     const value = form[kind] === "" ? AUTO_VALUE : form[kind];
+    // The catalogue's options plus any unit created this visit — deduped by
+    // id, so the same unit arriving in the refreshed catalogue does not
+    // appear twice.
+    const seen = new Set(kindView.options.map((o) => o.id));
+    const options = [
+      ...kindView.options,
+      ...extraOptions[kind].filter((o) => !seen.has(o.id)),
+    ];
     // A stored id that is not in the visible list is offered as its own
     // option so the Select shows the real choice rather than snapping to
     // Auto — the view keeps it, and so does the control.
     const missing =
-      form[kind] !== "" && !kindView.options.some((o) => o.id === form[kind]);
+      form[kind] !== "" && !options.some((o) => o.id === form[kind]);
     return (
       <div key={kind} className="min-w-[220px] flex-1">
         <label className="text-caption text-muted-foreground" htmlFor={`equipment-${kind}`}>
@@ -188,7 +361,7 @@ export function EquipmentSpecsSection({
                 </SelectItem>
               ) : null}
               {/* Order is the endpoint's — deliberately not re-sorted. */}
-              {kindView.options.map((option) => (
+              {options.map((option) => (
                 <SelectItem key={option.id} value={option.id}>
                   {option.label}
                 </SelectItem>
@@ -232,6 +405,75 @@ export function EquipmentSpecsSection({
         {renderKind("inverters", view.inverters)}
         {renderKind("batteries", view.batteries)}
       </div>
+
+      {/* "Other / new" (prompt 5). The drawer's summary is the shared
+          component's fixed "Advanced options"; the custom-specs wording lives
+          on the first line INSIDE it. Disabled with the dropdowns when the
+          catalogue failed: a duplicate comparison against a list that did not
+          load is not a comparison, and the new unit could not be shown after. */}
+      <OverrideDrawer>
+        <div className="flex flex-col gap-3 pt-1">
+          <div>
+            <p className="text-label text-foreground">
+              Other / new — a unit that is not in the catalogue
+            </p>
+            <p className="mt-0.5 text-caption text-muted-foreground">
+              It is saved to your company only, marked unverified, and can be
+              chosen above.
+            </p>
+          </div>
+
+          <div>
+            <label className="text-caption text-muted-foreground" htmlFor="custom-kind">
+              Kind
+            </label>
+            <div className="mt-1 w-[160px]">
+              <Select
+                value={drawerKind}
+                onValueChange={(v) => {
+                  setDrawerKind(v as EquipmentKind);
+                  setDraft({});
+                  setCreateError(null);
+                  setCreateNotices([]);
+                }}
+                disabled={readOnly}
+              >
+                <SelectTrigger id="custom-kind" aria-label="Kind">
+                  <SelectValue />
+                </SelectTrigger>
+                <SelectContent>
+                  {EQUIPMENT_KINDS.map((k) => (
+                    <SelectItem key={k} value={k}>
+                      {KIND_LABEL[k]}
+                    </SelectItem>
+                  ))}
+                </SelectContent>
+              </Select>
+            </div>
+          </div>
+
+          <div className="flex flex-wrap items-start gap-3">
+            {CUSTOM_EQUIPMENT_FIELDS[drawerKind].map((field) => renderDraftField(field))}
+          </div>
+
+          {createError ? (
+            <p className="max-w-[420px] text-caption text-destructive">{createError}</p>
+          ) : null}
+          <NoticeStack items={createNotices} />
+
+          <div className="flex items-center gap-3">
+            <Button onClick={createUnit} disabled={creating || readOnly}>
+              {creating ? "Adding…" : "Add unit"}
+            </Button>
+            {form[drawerKind] !== baseline[drawerKind] &&
+            extraOptions[drawerKind].some((o) => o.id === form[drawerKind]) ? (
+              <span className="text-caption text-muted-foreground">
+                Added and selected above — press Save to pin it to this job.
+              </span>
+            ) : null}
+          </div>
+        </div>
+      </OverrideDrawer>
 
       <NoticeStack items={notices} />
 
