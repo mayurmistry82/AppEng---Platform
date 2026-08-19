@@ -58,6 +58,14 @@ import {
   typedUsageError,
   usagePlausibilityNotice,
   azimuthLabel,
+  EQUIPMENT_AUTO_CAPTION,
+  EQUIPMENT_CATALOGUE_PROBLEM,
+  EQUIPMENT_KINDS,
+  EQUIPMENT_MISSING_NOTICE,
+  EQUIPMENT_UNVERIFIED_NOTICE,
+  SPEC_NOT_STATED,
+  equipmentSaveNotices,
+  equipmentSpecsView,
   OBJECTIVE_OPTIONS,
   VALID_OBJECTIVES,
   objectiveBudgetView,
@@ -182,11 +190,16 @@ test("fresh job: section 1 active, rest locked, S current", () => {
   const states = sectionStates(emptyJob());
   assert.equal(states[0].state, "active");
   for (let i = 1; i < states.length; i++) {
-    // D5 (2026-08-18): site-details is NON-GATING, so it is "unlocked" rather
-    // than "locked" even here, with the gating section above it still active —
-    // an optional section must always be openable. Every OTHER section locks
+    // D5 (2026-08-18): a NON-GATING section is "unlocked" rather than "locked"
+    // even here, with the gating section above it still active — an optional
+    // section must always be openable. site-details (D5) and, from 3.10,
+    // equipment-specs (D24: Auto is a real answer, so it confirms rather than
+    // requires, and it must not block a quote). Every OTHER section locks
     // exactly as before.
-    const expected = states[i].id === "site-details" ? "unlocked" : "locked";
+    const expected =
+      states[i].id === "site-details" || states[i].id === "equipment-specs"
+        ? "unlocked"
+        : "locked";
     assert.equal(states[i].state, expected, states[i].id);
   }
   assert.deepEqual(phaseStates(emptyJob()), [
@@ -2198,15 +2211,27 @@ test("D5 check 4: every GATING section keeps today's behaviour exactly", () => {
     }));
   }
 
-  // With site-details COMPLETE, it is not first-incomplete under either rule, so
-  // the two must agree on every one of the eleven sections.
+  // The reference rule has NO concept of `gates`, so it can only be expected
+  // to agree on the GATING sections — which is exactly what this test's title
+  // claims and all it should ever have asserted. Comparing non-gating sections
+  // against a gates-unaware reference asserts something false: it demands that
+  // the flag have no effect on the very sections it exists to change. (This
+  // read whole-catalogue while site-details was the only non-gating section
+  // and it happened to be complete in this fixture; 3.10's equipment-specs
+  // made the hidden assumption visible.)
+  const gatingIds = new Set(
+    SECTIONS.filter((s) => s.gates !== false).map((s) => s.id),
+  );
+  const onlyGating = (rows: { id: string; state: string }[]) =>
+    rows.filter((r) => gatingIds.has(r.id));
+
   const filled = liveShapedJob({
     storeys: 1, roof_material: "tile", dwelling_type: "unit", electrical_phase: "single",
   });
   assert.deepEqual(
-    sectionStates(filled).map((s) => ({ id: s.id, state: s.state })),
-    referenceStates(filled),
-    "with the optional section filled in, the new rule and the old rule agree exactly",
+    onlyGating(sectionStates(filled).map((s) => ({ id: s.id, state: s.state }))),
+    onlyGating(referenceStates(filled)),
+    "on every GATING section, the new rule and the old rule agree exactly",
   );
 
   // With it EMPTY, the ONLY differences allowed are site-details itself and the
@@ -2223,7 +2248,9 @@ test("D5 check 4: every GATING section keeps today's behaviour exactly", () => {
       { id: "energy-data", state: "active" },
       { id: "tariff-network", state: "locked" },
       { id: "objective-budget", state: "locked" },
-      { id: "equipment-specs", state: "locked" },
+      // 3.10: non-gating, so unlocked rather than locked — openable early,
+      // and it locks nothing beneath it.
+      { id: "equipment-specs", state: "unlocked" },
       { id: "solar-sizing", state: "locked" },
       { id: "battery-sizing", state: "locked" },
       { id: "results", state: "locked" },
@@ -2231,11 +2258,15 @@ test("D5 check 4: every GATING section keeps today's behaviour exactly", () => {
       { id: "summary-finish", state: "locked" },
     ],
   );
-  // ...and EXACTLY TWO sections differ from the old rule: the optional section
-  // itself (active -> unlocked) and the one that should have been active all
-  // along (locked -> active). Everything below was already locked under both
-  // rules and stays locked, so the change is narrower than it looks: the
-  // sections beneath are unlocked by DOING the work, not by this flag.
+  // ...and EXACTLY THREE sections differ from the old rule, all of them
+  // accounted for: the optional section itself (active -> unlocked), the one
+  // that should have been active all along (locked -> active), and 3.10's
+  // second non-gating section (locked -> unlocked). Everything else was
+  // already locked under both rules and stays locked, so the change is
+  // narrower than it looks: the sections beneath are unlocked by DOING the
+  // work, not by these flags. The reference rule above has no concept of
+  // `gates`, which is exactly why it diverges on precisely the non-gating
+  // sections and nowhere else.
   const before = referenceStates(empty);
   const after = sectionStates(empty).map((s) => ({ id: s.id, state: s.state }));
   const moved = after
@@ -2244,6 +2275,7 @@ test("D5 check 4: every GATING section keeps today's behaviour exactly", () => {
   assert.deepEqual(moved, [
     "site-details: active -> unlocked",
     "energy-data: locked -> active",
+    "equipment-specs: locked -> unlocked",
   ]);
 });
 
@@ -2277,11 +2309,13 @@ test("D5 check 6: `gates` absent means GATING — the default is the safe one", 
   // is first-incomplete -> active, and c locks behind it.
   const gates = specs.map((s) => s.gates !== false);
   assert.deepEqual(gates, [true, true, true]);
-  // And the catalogue itself: exactly ONE section is non-gating.
+  // And the catalogue itself: exactly TWO sections are non-gating — D5's
+  // site-details and, from 3.10, equipment-specs. Every other section must
+  // still gate, which is what makes the permissive default safe.
   const nonGating = SECTIONS.filter((s) => s.gates === false).map((s) => s.id);
-  assert.deepEqual(nonGating, ["site-details"]);
+  assert.deepEqual(nonGating, ["site-details", "equipment-specs"]);
   for (const s of SECTIONS) {
-    if (s.id !== "site-details") {
+    if (s.id !== "site-details" && s.id !== "equipment-specs") {
       assert.notEqual(s.gates, false, `${s.id} must keep gating`);
     }
   }
@@ -4071,12 +4105,23 @@ test("3.9 (1c): the active section MOVES when an objective lands — the newly o
   // ...and the SAME fixture plus a stored objective advances it. With the old
   // () => false predicate the section can never complete, the active section
   // never moves, and this second assertion fails — the exact thing that could
-  // not be tested before today.
+  // not be tested before 3.9.
+  //
+  // 3.10 RETARGET: it now advances PAST equipment-specs to battery-sizing,
+  // because equipment-specs became non-gating (D24 — Auto is a real answer,
+  // so it confirms rather than requires and must not block a quote), and a
+  // non-gating section is never the active one. This assertion therefore
+  // proves BOTH that the objective predicate fires AND that the non-gating
+  // section is skipped in the ordering.
   const after = sectionStates({ ...base, objective: "max_npv" }).filter(
     (s) => s.state === "active",
   );
   assert.equal(after.length, 1);
-  assert.equal(after[0].id, "equipment-specs");
+  assert.equal(after[0].id, "battery-sizing");
+  // ...and equipment-specs is openable rather than locked while that happens.
+  const equip = sectionStates({ ...base, objective: "max_npv" })
+    .find((s) => s.id === "equipment-specs");
+  assert.equal(equip?.state, "unlocked");
 });
 
 test("3.9 (1d): complete() — true for each of the four, false for everything else", () => {
@@ -4202,4 +4247,248 @@ test("3.9 (1i): every objective view function survives junk as the whole job", (
     assert.notEqual(view.customWeight.text, "undefined");
     assert.notEqual(view.budgetAud.text, "undefined");
   }
+});
+
+// ── 3.10: Equipment & specs ──────────────────────────────────────────────────
+// Before this task the section's predicate was () => false, so it could NEVER
+// be complete and the Optimise phase could never read "done". That is the
+// behaviour 4a exercises — it was structurally untestable an hour ago.
+
+const EQUIP_SPEC = SECTIONS.find((s) => s.id === "equipment-specs");
+
+const CAT_PANEL = {
+  id: "p1", brand: "Jinko", model: "Tiger Neo", origin: "catalogue",
+  rated_power_w: 440, module_efficiency_pct: 22.5, length_mm: 1762,
+  width_mm: 1134, cost_aud: 130,
+};
+const CAT_INVERTER = {
+  id: "i1", brand: "Fronius", model: "Primo", origin: "catalogue",
+  inverter_type: "hybrid", phases: "single", rated_ac_power_kw: 5,
+  max_efficiency_pct: 98.2, cost_aud: 1500,
+};
+const CAT_BATTERY = {
+  id: "b1", brand: "Sungrow", model: "SBR128", origin: "catalogue",
+  usable_capacity_kwh: 12.8, depth_of_discharge_pct: 100,
+  round_trip_efficiency_pct: 96, max_continuous_charge_kw: 6.6,
+  max_continuous_discharge_kw: 6.6, warranty_cycles: 6000,
+  warranty_years: 10, cost_aud: 8000,
+};
+const FULL_CATALOGUE = {
+  panels: [CAT_PANEL], inverters: [CAT_INVERTER], batteries: [CAT_BATTERY], flags: [],
+};
+
+test("3.10 (4a): the NEWLY OBSERVABLE behaviour — confirmed ticks the section, and Optimise can finally reach done", () => {
+  // Non-gating, so an unconfirmed section is "unlocked" — never "active"
+  // (it is not what to do next) and never "locked".
+  const unconfirmed = sectionStates(emptyJob({ path: "A", equipment_confirmed: false }));
+  const equipUnconfirmed = unconfirmed.find((s) => s.id === "equipment-specs");
+  assert.equal(equipUnconfirmed?.state, "unlocked");
+  assert.notEqual(equipUnconfirmed?.state, "active");
+  assert.notEqual(equipUnconfirmed?.state, "locked");
+
+  const confirmed = sectionStates(emptyJob({ path: "A", equipment_confirmed: true }));
+  assert.equal(confirmed.find((s) => s.id === "equipment-specs")?.state, "complete");
+
+  // ...and the whole Optimise phase can now read "done", which was
+  // structurally impossible while the predicate was () => false.
+  const optimiseIds = sectionsForPath("A")
+    .filter((s) => s.phase === "optimise")
+    .map((s) => s.id);
+  const doneJob = emptyJob({
+    path: "A",
+    roof_geometry: [{ created_at: "2026-08-01T00:00:00Z", found: true, planes: [{ panel_count: 12 }] }],
+    storeys: 1, roof_material: "tile", dwelling_type: "house", electrical_phase: "single",
+    bills: [{ bill_id: "b1" }], tariffs: [{ tariff_id: "t1" }],
+    objective: "max_npv",
+    equipment_confirmed: true,
+    sizing_results: [{ solar_kw: 6.6, battery_kwh: 13.5 }],
+  });
+  const states = sectionStates(doneJob);
+  for (const id of optimiseIds) {
+    assert.equal(states.find((s) => s.id === id)?.state, "complete",
+      `${id} must be complete for Optimise to read done`);
+  }
+  assert.equal(phaseStates(doneJob)[2], "done");
+});
+
+test("3.10 (4b): complete() is true for boolean true ONLY — a truthy check would tick on the string \"true\"", () => {
+  assert.equal(EQUIP_SPEC?.complete(emptyJob({ equipment_confirmed: true })), true);
+  for (const bad of [false, null, 0, "", "true", {}] as const) {
+    assert.equal(EQUIP_SPEC?.complete(emptyJob({ equipment_confirmed: bad as never })), false,
+      `${JSON.stringify(bad)} must NOT complete the section`);
+  }
+  assert.equal(EQUIP_SPEC?.complete(emptyJob({})), false, "absent must not complete it");
+});
+
+test("3.10 (4c): gates is false on equipment-specs and site-details, and unchanged on every other section", () => {
+  // The full map, both directions — an accidental change to ANY section fails here.
+  const nonGating = new Set(
+    SECTIONS.filter((s) => s.gates === false).map((s) => s.id),
+  );
+  assert.deepEqual([...nonGating].sort(), ["equipment-specs", "site-details"]);
+  for (const section of SECTIONS) {
+    const expected = section.id === "equipment-specs" || section.id === "site-details";
+    assert.equal(section.gates === false, expected,
+      `${section.id}: gates === false should be ${expected}`);
+  }
+});
+
+test("3.10 (4d): equipmentSpecsView across the stored shapes", () => {
+  // Nothing stored — three Autos, catalogue fine.
+  const empty = equipmentSpecsView(emptyJob({}), FULL_CATALOGUE);
+  assert.equal(empty.confirmed, false);
+  assert.equal(empty.catalogueAvailable, true);
+  assert.equal(empty.panels.selectedId, null);
+  assert.equal(empty.panels.options.length, 1);
+  assert.deepEqual(empty.batteries.specs, []);
+
+  // One kind pinned.
+  const onePinned = equipmentSpecsView(emptyJob({ equipment_battery_id: "b1" }), FULL_CATALOGUE);
+  assert.equal(onePinned.batteries.selectedId, "b1");
+  assert.equal(onePinned.batteries.inList, true);
+  assert.equal(onePinned.batteries.selectedLabel, "Sungrow SBR128");
+  assert.ok(onePinned.batteries.specs.length > 0);
+  assert.equal(onePinned.panels.selectedId, null);
+
+  // All three pinned.
+  const allPinned = equipmentSpecsView(
+    emptyJob({ equipment_panel_id: "p1", equipment_inverter_id: "i1", equipment_battery_id: "b1" }),
+    FULL_CATALOGUE);
+  for (const kind of EQUIPMENT_KINDS) {
+    assert.equal(allPinned[kind].inList, true, `${kind} should be in list`);
+    assert.ok(allPinned[kind].specs.length > 0, `${kind} should have specs`);
+  }
+
+  // A stored id absent from the catalogue — KEPT, marked, never reset.
+  const missing = equipmentSpecsView(emptyJob({ equipment_panel_id: "gone-1" }), FULL_CATALOGUE);
+  assert.equal(missing.panels.selectedId, "gone-1", "the stored id must survive");
+  assert.equal(missing.panels.inList, false);
+  assert.equal(missing.panels.selectedLabel, null);
+  assert.ok(missing.notices.some((n) => n.title === EQUIPMENT_MISSING_NOTICE.title));
+
+  // Catalogue missing entirely, and the unavailable flag — both read false.
+  assert.equal(equipmentSpecsView(emptyJob({}), null).catalogueAvailable, false);
+  assert.equal(
+    equipmentSpecsView(emptyJob({}), { ...FULL_CATALOGUE, flags: ["equipment_catalogue_unavailable"] })
+      .catalogueAvailable, false);
+
+  // A user_defined unit chosen.
+  const custom = equipmentSpecsView(
+    emptyJob({ equipment_battery_id: "u1" }),
+    { ...FULL_CATALOGUE, batteries: [{ ...CAT_BATTERY, id: "u1", origin: "user_defined" }] });
+  assert.equal(custom.batteries.selectedIsUserDefined, true);
+  assert.ok(custom.batteries.selectedLabel?.includes("your own, unverified"));
+
+  // An empty kind list is a data gap, not an error.
+  const noInverters = equipmentSpecsView(emptyJob({}), { ...FULL_CATALOGUE, inverters: [] });
+  assert.equal(noInverters.inverters.emptyList, true);
+  assert.equal(noInverters.panels.emptyList, false);
+});
+
+test("3.10 (4e): the spec rows NEVER state an engine default — guarding against a SECOND COPY of battery_optimiser's assumptions", () => {
+  // Every defaultable spec null: the engine would assume 90% RTE, 0.5C,
+  // 6000 cycles and full depth of discharge, and it says so in its OWN flags
+  // where it runs. If someone later puts those numbers in this UI, they
+  // appear in the rendered rows and this test fails.
+  const bare = {
+    id: "b9", brand: "Acme", model: "Bare", origin: "catalogue",
+    usable_capacity_kwh: 10, cost_aud: 7000,
+    depth_of_discharge_pct: null, round_trip_efficiency_pct: null,
+    max_continuous_charge_kw: null, max_continuous_discharge_kw: null,
+    warranty_cycles: null, warranty_years: null,
+  };
+  const view = equipmentSpecsView(
+    emptyJob({ equipment_battery_id: "b9" }),
+    { ...FULL_CATALOGUE, batteries: [bare], flags: [] });
+  const rendered = view.batteries.specs.map((r) => `${r.label} ${r.value}`).join(" | ");
+  assert.ok(rendered.includes(SPEC_NOT_STATED), rendered);
+  for (const forbidden of ["90", "0.5", "6000", "100%"]) {
+    assert.ok(!rendered.includes(forbidden),
+      `the engine's default "${forbidden}" must not appear in the UI: ${rendered}`);
+  }
+  // The specs that ARE stored still show.
+  assert.ok(rendered.includes("10 kWh"), rendered);
+});
+
+test("3.10 (4f): D25 classification — and an empty unconfirmed job is QUIET", () => {
+  assert.equal(EQUIPMENT_AUTO_CAPTION.level, "caption");
+  assert.equal(EQUIPMENT_UNVERIFIED_NOTICE.level, "notice");
+  assert.equal(EQUIPMENT_UNVERIFIED_NOTICE.tone, "caution");
+  assert.equal(EQUIPMENT_MISSING_NOTICE.level, "notice");
+  assert.equal(EQUIPMENT_MISSING_NOTICE.tone, "caution");
+  assert.equal(EQUIPMENT_CATALOGUE_PROBLEM.level, "notice");
+  assert.equal(EQUIPMENT_CATALOGUE_PROBLEM.tone, "problem");
+
+  // Three Autos, nothing confirmed: the Auto caption and NOTHING louder.
+  const quiet = equipmentSpecsView(emptyJob({}), FULL_CATALOGUE);
+  assert.equal(quiet.notices.length, 1);
+  assert.equal(quiet.notices[0].level, "caption");
+  assert.ok(!quiet.notices.some((n) => n.tone === "caution"), "no caution on an empty job");
+  assert.ok(!quiet.notices.some((n) => n.tone === "problem"), "no problem on an empty job");
+
+  // All three pinned to catalogue units: no Auto anywhere, so no Auto caption.
+  const pinned = equipmentSpecsView(
+    emptyJob({ equipment_panel_id: "p1", equipment_inverter_id: "i1", equipment_battery_id: "b1" }),
+    FULL_CATALOGUE);
+  assert.deepEqual(pinned.notices, []);
+});
+
+test("3.10 (4g): equipmentSaveNotices — the round-trip check", () => {
+  // Agreement.
+  assert.deepEqual(
+    equipmentSaveNotices(
+      { equipment_battery_id: "b1", equipment_confirmed: true },
+      { equipment_battery_id: "b1", equipment_confirmed: true }),
+    []);
+  // A disagreeing id.
+  const bad = equipmentSaveNotices(
+    { equipment_battery_id: "b1" }, { equipment_battery_id: "b2" });
+  assert.equal(bad.length, 1);
+  assert.equal(bad[0].tone, "problem");
+  assert.ok(bad[0].body.includes("battery"), bad[0].body);
+  // Confirmation sent true, returned false.
+  const unconfirmed = equipmentSaveNotices(
+    { equipment_confirmed: true }, { equipment_confirmed: false });
+  assert.equal(unconfirmed.length, 1);
+  assert.ok(unconfirmed[0].body.includes("confirmation"), unconfirmed[0].body);
+  // null and "" are the SAME stored value, not a disagreement.
+  assert.deepEqual(
+    equipmentSaveNotices({ equipment_panel_id: null }, { equipment_panel_id: "" }), []);
+  assert.deepEqual(
+    equipmentSaveNotices({ equipment_panel_id: null }, { equipment_panel_id: null }), []);
+  // Keys NOT sent are never compared.
+  assert.deepEqual(
+    equipmentSaveNotices({ equipment_confirmed: true },
+                         { equipment_confirmed: true, equipment_panel_id: "p9" }), []);
+});
+
+test("3.10 (4h): every new export survives junk as the whole job AND as the whole catalogue", () => {
+  for (const junk of [null, undefined, [], {}, "a job", 42]) {
+    for (const cat of [null, undefined, [], {}, "a catalogue", 7]) {
+      assert.doesNotThrow(() => equipmentSpecsView(junk, cat));
+      const view = equipmentSpecsView(junk, cat);
+      assert.equal(view.confirmed, false);
+      assert.equal(view.catalogueAvailable, false);
+      for (const kind of EQUIPMENT_KINDS) {
+        assert.ok(Array.isArray(view[kind].options));
+        assert.ok(Array.isArray(view[kind].specs));
+      }
+    }
+    assert.doesNotThrow(() => equipmentSaveNotices(junk, junk));
+    assert.ok(Array.isArray(equipmentSaveNotices(junk, junk)));
+  }
+  // Rows that are not objects are dropped, not rendered as undefined.
+  const junkRows = equipmentSpecsView(emptyJob({}), { panels: [null, 1, "x"], flags: [] });
+  assert.deepEqual(junkRows.panels.options, []);
+});
+
+test("3.10 (4i): EQUIPMENT_KINDS has exactly three members and matches the catalogue keys, both directions", () => {
+  assert.equal(EQUIPMENT_KINDS.length, 3);
+  const kinds = new Set<string>(EQUIPMENT_KINDS);
+  const catalogueKeys = new Set(Object.keys(FULL_CATALOGUE).filter((k) => k !== "flags"));
+  for (const k of kinds) assert.ok(catalogueKeys.has(k), `${k} missing from the catalogue shape`);
+  for (const k of catalogueKeys) assert.ok(kinds.has(k), `${k} is not a declared kind`);
+  // The view exposes exactly these three kind views.
+  const view = equipmentSpecsView(emptyJob({}), FULL_CATALOGUE);
+  for (const k of EQUIPMENT_KINDS) assert.equal(view[k].kind, k);
 });

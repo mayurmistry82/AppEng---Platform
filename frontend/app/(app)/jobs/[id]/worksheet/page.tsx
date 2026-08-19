@@ -7,6 +7,7 @@ import { getJob } from "@/lib/job-server";
 import {
   addressRoofView,
   energyDataView,
+  equipmentSpecsView,
   objectiveBudgetView,
   phaseStates,
   resultsBarView,
@@ -15,6 +16,7 @@ import {
   siteDetailsView,
   tariffNetworkView,
   worksheetErrorCopy,
+  type EquipmentCatalogue,
   type ExportLimitDefault,
   type FitDefault,
 } from "@/lib/worksheet";
@@ -78,7 +80,11 @@ export default async function Page({
   const siteState = typeof site.site_state === "string" ? site.site_state : "";
   const sitePostcode =
     typeof site.site_postcode === "string" ? site.site_postcode : "";
-  const [exportLimitResult, fitResult] = await Promise.all([
+  // 3.10 — the equipment catalogue rides in the SAME Promise.all as the two
+  // nem lookups, so it costs no extra round trip of latency. A failure yields
+  // null and the view reports catalogueAvailable false; it must NEVER block
+  // the page or throw.
+  const [exportLimitResult, fitResult, catalogueResult] = await Promise.all([
     siteState
       ? apiGet<ExportLimitDefault>(
           "/api/nem/export-limit",
@@ -88,7 +94,9 @@ export default async function Page({
     siteState
       ? apiGet<FitDefault>("/api/nem/fit", new URLSearchParams({ state: siteState }))
       : Promise.resolve(null),
+    apiGet<EquipmentCatalogue>("/api/equipment"),
   ]);
+  const catalogue = catalogueResult.ok ? catalogueResult.data : null;
   const tariffDefaults = {
     exportLimit: exportLimitResult?.ok ? exportLimitResult.data : null,
     fit: fitResult?.ok ? fitResult.data : null,
@@ -119,6 +127,7 @@ export default async function Page({
         energyData={energyDataView(job)}
         tariffNetwork={tariffNetworkView(job, tariffDefaults)}
         objectiveBudget={objectiveBudgetView(job)}
+        equipmentSpecs={equipmentSpecsView(job, catalogue)}
         jobId={id}
       />
     </div>

@@ -50,6 +50,11 @@ export interface JobDetailLike {
   objective?: string | null;
   custom_weight?: number | null;
   budget_aud?: number | null;
+  // 3.10 — equipment constraints (NULL = Auto) and the confirmation flag.
+  equipment_panel_id?: string | null;
+  equipment_inverter_id?: string | null;
+  equipment_battery_id?: string | null;
+  equipment_confirmed?: boolean | null;
 }
 
 /** A child key as a real array — [] for anything that is not an array. */
@@ -173,8 +178,17 @@ export const SECTIONS: readonly WorksheetSectionSpec[] = [
     title: "Equipment & specs",
     phase: "optimise",
     builtAt: "3.10",
-    // ALWAYS FALSE — no equipment-selection column exists yet; lands at 3.10.
-    complete: () => false,
+    // 3.10 — complete when the installer has CONFIRMED, not when something is
+    // pinned. Leaving every component on Auto is a legitimate and probably
+    // common answer, so requiring a pin would make the commonest case
+    // permanently incompletable. This is D24's shape: the machine proposes,
+    // a human confirms. Strictly `=== true` — a truthy check would tick the
+    // section on the string "true" arriving from anywhere.
+    complete: (job) => job.equipment_confirmed === true,
+    // D24: sizing is never blocked, and one unpressed button must not stop a
+    // quote. Non-gating means this section is never "active" and never locks
+    // anything after it — it reports only its own completeness.
+    gates: false,
   },
   {
     id: "solar-sizing",
@@ -3528,6 +3542,324 @@ export function objectiveSaveNotices(sent: unknown, response: unknown): RoofNoti
   if (Object.prototype.hasOwnProperty.call(payload, "budget_aud")) {
     if (tariffNum(payload.budget_aud) !== tariffNum(row.budget_aud)) {
       disagree.push("budget cap");
+    }
+  }
+  if (disagree.length === 0) return [];
+  return [
+    {
+      tone: "problem",
+      level: "notice",
+      title: "The save did not take",
+      body: `The job that came back does not carry what was sent (${disagree.join(", ")}). Nothing shown here is confirmed saved — try again.`,
+    },
+  ];
+}
+
+// ── Equipment & specs (3.10) ─────────────────────────────────────────────────
+
+/**
+ * The three kinds, one literal. Members must equal the kinds the backend
+ * accepts (routes/equipment.py's EQUIPMENT_KINDS, which its own gate asserts
+ * against the GET response); this export is what a later cross-language gate
+ * can compare against.
+ */
+export const EQUIPMENT_KINDS = ["panels", "inverters", "batteries"] as const;
+
+export type EquipmentKind = (typeof EQUIPMENT_KINDS)[number];
+
+/**
+ * GET /api/equipment's response. Rows are typed LOOSELY and read through
+ * coercers: this crosses a network boundary, so nothing about it is
+ * guaranteed — the same rule every other view in this file follows for server
+ * data.
+ */
+export interface EquipmentCatalogue {
+  panels?: unknown;
+  inverters?: unknown;
+  batteries?: unknown;
+  flags?: unknown;
+}
+
+/** One label/value pair under a dropdown. `value` is already formatted. */
+export interface EquipmentSpecRow {
+  label: string;
+  value: string;
+}
+
+export interface EquipmentOption {
+  id: string;
+  /** "Brand Model", plus " · your own, unverified" for a user_defined unit. */
+  label: string;
+  isUserDefined: boolean;
+}
+
+export interface EquipmentKindView {
+  kind: EquipmentKind;
+  /** The RAW stored id — kept even when it is not in the list. */
+  selectedId: string | null;
+  /** Is the stored id among the options the company can see? */
+  inList: boolean;
+  /** The chosen unit's label, or null on Auto / not found. */
+  selectedLabel: string | null;
+  selectedIsUserDefined: boolean;
+  options: EquipmentOption[];
+  /** The engine-driving specs of the STORED choice; [] on Auto. */
+  specs: EquipmentSpecRow[];
+  /**
+   * Specs for EVERY visible unit, by id — so the screen can show the specs of
+   * whatever is selected right now, not only of what was last saved. Without
+   * it the rows would blank the moment an installer changed a dropdown, which
+   * is exactly when they most want to compare.
+   */
+  specsById: Record<string, EquipmentSpecRow[]>;
+  /** True when the catalogue loaded but holds no units of this kind. */
+  emptyList: boolean;
+}
+
+export interface EquipmentSpecsView {
+  panels: EquipmentKindView;
+  inverters: EquipmentKindView;
+  batteries: EquipmentKindView;
+  /** Strictly `job.equipment_confirmed === true`. */
+  confirmed: boolean;
+  /** False when the catalogue is missing, unparseable, or came back with the
+      backend's own equipment_catalogue_unavailable flag. */
+  catalogueAvailable: boolean;
+  notices: RoofNoticeView[];
+}
+
+/** THE ON-SCREEN STATEMENT OF THE SCOPING RULE prompt 1 built into the engine:
+    the automatic pickers are filtered to origin='catalogue', so an automatic
+    recommendation can never reach another company's custom equipment. A
+    caption, not a notice — it is always true of a job with anything on Auto,
+    so it explains rather than warns (D25). */
+export const EQUIPMENT_AUTO_CAPTION: RoofNoticeView = {
+  tone: "info",
+  level: "caption",
+  title: "What Auto means",
+  body: "Auto means EnrgEngine chooses from the shared catalogue. It never chooses another installer's custom equipment.",
+};
+
+export const EQUIPMENT_UNVERIFIED_NOTICE: RoofNoticeView = {
+  tone: "caution",
+  level: "notice",
+  title: "A chosen unit's specs are unverified",
+  body: "One of the units chosen here was entered by an installer and has not been checked against a datasheet. Every number the engine derives from it inherits that.",
+};
+
+export const EQUIPMENT_MISSING_NOTICE: RoofNoticeView = {
+  tone: "caution",
+  level: "notice",
+  title: "A saved unit is not in the catalogue",
+  body: "This job has equipment saved that is no longer in the list you can see, so its specs cannot be shown here. It is still what the engine will use until you change it.",
+};
+
+export const EQUIPMENT_CATALOGUE_PROBLEM: RoofNoticeView = {
+  tone: "problem",
+  level: "notice",
+  title: "The equipment catalogue could not be loaded",
+  body: "The list of panels, inverters and batteries did not load, so the choices below cannot be trusted. This section is read-only until it does — reload the page to try again.",
+};
+
+/** A number formatted for a spec row, or null when it cannot be read. */
+function specNum(value: unknown, digits = 1): string | null {
+  const n = tariffNum(value);
+  if (n === null) return null;
+  const rounded = Number(n.toFixed(digits));
+  return String(rounded);
+}
+
+/**
+ * THE MISSING-SPEC RULE, and it is deliberate: a null spec renders the words
+ * "not stated" and NOTHING ELSE. It does NOT say what the engine will assume
+ * in its place.
+ *
+ * The engine's documented defaults — 90% round-trip, 0.5C charge/discharge,
+ * 6000 cycles, full depth of discharge — live in battery_optimiser.battery_specs,
+ * which emits its own flag text naming each one it applies, and those flags
+ * reach the installer where the engine actually runs. Restating them here
+ * would be a second copy that drifts the first time either changes, with
+ * nothing to notice: exactly the two-places-must-agree fault this row has
+ * already hit twice. verify-worksheet-logic.ts asserts those numbers do not
+ * appear in this output.
+ */
+export const SPEC_NOT_STATED = "not stated";
+
+function specRow(label: string, formatted: string | null): EquipmentSpecRow {
+  return { label, value: formatted ?? SPEC_NOT_STATED };
+}
+
+function panelSpecs(row: Record<string, unknown>): EquipmentSpecRow[] {
+  const length = specNum(row.length_mm, 0);
+  const width = specNum(row.width_mm, 0);
+  return [
+    specRow("Rated power", specNum(row.rated_power_w, 0) ? `${specNum(row.rated_power_w, 0)} W` : null),
+    specRow("Module efficiency", specNum(row.module_efficiency_pct) ? `${specNum(row.module_efficiency_pct)}%` : null),
+    specRow("Dimensions", length && width ? `${length} × ${width} mm` : null),
+    specRow("Indicative cost", specNum(row.cost_aud, 2) ? `$${specNum(row.cost_aud, 2)}` : null),
+  ];
+}
+
+function inverterSpecs(row: Record<string, unknown>): EquipmentSpecRow[] {
+  return [
+    specRow("Type", roofStr(row.inverter_type)),
+    specRow("Phases", roofStr(row.phases)),
+    specRow("Rated AC power", specNum(row.rated_ac_power_kw, 2) ? `${specNum(row.rated_ac_power_kw, 2)} kW` : null),
+    specRow("Max efficiency", specNum(row.max_efficiency_pct) ? `${specNum(row.max_efficiency_pct)}%` : null),
+    specRow("Indicative cost", specNum(row.cost_aud, 2) ? `$${specNum(row.cost_aud, 2)}` : null),
+  ];
+}
+
+function batterySpecRows(row: Record<string, unknown>): EquipmentSpecRow[] {
+  return [
+    specRow("Usable capacity", specNum(row.usable_capacity_kwh, 2) ? `${specNum(row.usable_capacity_kwh, 2)} kWh` : null),
+    specRow("Depth of discharge", specNum(row.depth_of_discharge_pct) ? `${specNum(row.depth_of_discharge_pct)}%` : null),
+    specRow("Round-trip efficiency", specNum(row.round_trip_efficiency_pct) ? `${specNum(row.round_trip_efficiency_pct)}%` : null),
+    specRow("Max continuous charge", specNum(row.max_continuous_charge_kw, 2) ? `${specNum(row.max_continuous_charge_kw, 2)} kW` : null),
+    specRow("Max continuous discharge", specNum(row.max_continuous_discharge_kw, 2) ? `${specNum(row.max_continuous_discharge_kw, 2)} kW` : null),
+    specRow("Warranty cycles", specNum(row.warranty_cycles, 0)),
+    specRow("Warranty years", specNum(row.warranty_years, 0)),
+    specRow("Indicative cost", specNum(row.cost_aud, 2) ? `$${specNum(row.cost_aud, 2)}` : null),
+  ];
+}
+
+const _SPEC_BUILDERS: Record<EquipmentKind, (row: Record<string, unknown>) => EquipmentSpecRow[]> = {
+  panels: panelSpecs,
+  inverters: inverterSpecs,
+  batteries: batterySpecRows,
+};
+
+const _JOB_ID_FIELD: Record<EquipmentKind, string> = {
+  panels: "equipment_panel_id",
+  inverters: "equipment_inverter_id",
+  batteries: "equipment_battery_id",
+};
+
+function equipmentOption(row: Record<string, unknown>): EquipmentOption | null {
+  const id = roofStr(row.id);
+  if (id === null) return null;
+  const brand = roofStr(row.brand) ?? "";
+  const model = roofStr(row.model) ?? "";
+  const name = `${brand} ${model}`.trim() || id;
+  const isUserDefined = roofStr(row.origin) === "user_defined";
+  return {
+    id,
+    // The unverified marker travels in the LABEL so it survives into a native
+    // <option>, which cannot carry markup.
+    label: isUserDefined ? `${name} · your own, unverified` : name,
+    isUserDefined,
+  };
+}
+
+function kindView(
+  kind: EquipmentKind,
+  job: Record<string, unknown>,
+  catalogue: Record<string, unknown>,
+  available: boolean,
+): EquipmentKindView {
+  const raw = catalogue[kind];
+  // Sorted as the endpoint returned them — deliberately NOT re-sorted here.
+  const rows = Array.isArray(raw)
+    ? raw.filter((r): r is Record<string, unknown> => typeof r === "object" && r !== null)
+    : [];
+  const options = rows
+    .map(equipmentOption)
+    .filter((o): o is EquipmentOption => o !== null);
+  const selectedId = roofStr(job[_JOB_ID_FIELD[kind]]);
+  const match = selectedId === null
+    ? null
+    : rows.find((r) => roofStr(r.id) === selectedId) ?? null;
+  const option = selectedId === null
+    ? null
+    : options.find((o) => o.id === selectedId) ?? null;
+  const specsById: Record<string, EquipmentSpecRow[]> = {};
+  for (const row of rows) {
+    const id = roofStr(row.id);
+    if (id !== null) specsById[id] = _SPEC_BUILDERS[kind](row);
+  }
+  return {
+    kind,
+    selectedId,
+    inList: option !== null,
+    selectedLabel: option?.label ?? null,
+    selectedIsUserDefined: option?.isUserDefined ?? false,
+    options,
+    specs: match ? _SPEC_BUILDERS[kind](match) : [],
+    specsById,
+    emptyList: available && options.length === 0,
+  };
+}
+
+/**
+ * A pure view over the job's four equipment columns and the catalogue. Total,
+ * tolerant of any input, never throws.
+ *
+ * A STORED ID NOT IN THE VISIBLE LIST IS NEVER SILENTLY RESET — it is kept,
+ * marked `inList: false`, and raises a notice, the same rule the objective
+ * view follows for an unrecognised objective. Replacing it with null would
+ * destroy a choice the engine is still honouring.
+ *
+ * The D25 classification lives HERE, never in the component.
+ */
+export function equipmentSpecsView(job: unknown, catalogue: unknown): EquipmentSpecsView {
+  const detail = asRecord(job);
+  const cat = asRecord(catalogue);
+  const hasShape = EQUIPMENT_KINDS.some((k) => Array.isArray(cat[k]));
+  const flags = Array.isArray(cat.flags) ? cat.flags : [];
+  const available =
+    hasShape && !flags.some((f) => f === "equipment_catalogue_unavailable");
+
+  const panels = kindView("panels", detail, cat, available);
+  const inverters = kindView("inverters", detail, cat, available);
+  const batteries = kindView("batteries", detail, cat, available);
+  const kinds = [panels, inverters, batteries];
+
+  const notices: RoofNoticeView[] = [];
+  if (!available) notices.push(EQUIPMENT_CATALOGUE_PROBLEM);
+  if (available && kinds.some((k) => k.selectedId !== null && !k.inList)) {
+    notices.push(EQUIPMENT_MISSING_NOTICE);
+  }
+  if (kinds.some((k) => k.selectedIsUserDefined)) {
+    notices.push(EQUIPMENT_UNVERIFIED_NOTICE);
+  }
+  // Fires whenever ANY kind is on Auto — which is the common case, and is why
+  // it is a caption: it can never NOT be true of a job in that state.
+  if (kinds.some((k) => k.selectedId === null)) notices.push(EQUIPMENT_AUTO_CAPTION);
+
+  return {
+    panels,
+    inverters,
+    batteries,
+    confirmed: detail.equipment_confirmed === true,
+    catalogueAvailable: available,
+    notices,
+  };
+}
+
+/**
+ * THE ROUND-TRIP CHECK, the same instrument objectiveSaveNotices is and for
+ * the same reason: PATCH returns the updated row, not a { saved } envelope, so
+ * there is no flag to read and a silent write failure looks identical to a
+ * success. Only keys actually SENT are compared. Ids compare as trimmed
+ * strings with null preserved (so null and "" are the same stored value, not a
+ * disagreement); equipment_confirmed compares as a strict boolean.
+ */
+export function equipmentSaveNotices(sent: unknown, response: unknown): RoofNoticeView[] {
+  const payload = asRecord(sent);
+  const row = asRecord(response);
+  const disagree: string[] = [];
+  const idLabel: Record<string, string> = {
+    equipment_panel_id: "panel",
+    equipment_inverter_id: "inverter",
+    equipment_battery_id: "battery",
+  };
+  for (const [field, label] of Object.entries(idLabel)) {
+    if (!Object.prototype.hasOwnProperty.call(payload, field)) continue;
+    if (roofStr(payload[field]) !== roofStr(row[field])) disagree.push(label);
+  }
+  if (Object.prototype.hasOwnProperty.call(payload, "equipment_confirmed")) {
+    if ((payload.equipment_confirmed === true) !== (row.equipment_confirmed === true)) {
+      disagree.push("confirmation");
     }
   }
   if (disagree.length === 0) return [];
