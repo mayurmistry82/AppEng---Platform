@@ -66,6 +66,11 @@ import {
   EQUIPMENT_UNVERIFIED_NOTICE,
   SPEC_NOT_STATED,
   customUnitNotices,
+  SOLAR_EXISTING_UNRECORDED_NOTICE,
+  SOLAR_SIZING_REQUEST_KEYS,
+  solarRunNotices,
+  solarRunResult,
+  solarSizingView,
   equipmentSaveNotices,
   equipmentSpecsView,
   OBJECTIVE_OPTIONS,
@@ -4605,4 +4610,154 @@ test("3.10 (5e): the required sets are the DERIVED ones — and inverters do NOT
   const inverterCost = CUSTOM_EQUIPMENT_FIELDS.inverters.find((f) => f.name === "cost_aud");
   assert.ok(inverterCost, "inverters still OFFER a cost field");
   assert.equal(inverterCost!.required, false, "an unpriced inverter is accepted — do not tidy this");
+});
+
+// ── 3.11: Solar sizing ───────────────────────────────────────────────────────
+
+test("3.11: solarSizingView across the six paths — solarMode from PATH_RULES, never re-derived", () => {
+  const modes: Record<string, string | null> = {};
+  for (const path of ["A", "B", "C", "D", "E", "F"]) {
+    modes[path] = solarSizingView(emptyJob({ path })).solarMode;
+  }
+  assert.deepEqual(modes, {
+    A: "optimise", B: "optimise", C: "pinned",
+    D: "optimise", E: "none", F: "optimise",
+  });
+  // An unknown or missing path degrades to null, never a throw.
+  assert.equal(solarSizingView(emptyJob({ path: null })).solarMode, null);
+  assert.equal(solarSizingView(emptyJob({ path: "Z" })).solarMode, null);
+});
+
+test("3.11: canPin is true ONLY for pinned mode + a finite positive recorded size", () => {
+  assert.equal(
+    solarSizingView(emptyJob({ path: "C", existing_solar_kw: 6.6 })).canPin, true);
+  // Never invent a size: null, a string, zero, negative, NaN all refuse.
+  for (const bad of [null, "6.6kw", 0, -3, NaN] as const) {
+    const view = solarSizingView(emptyJob({ path: "C", existing_solar_kw: bad as never }));
+    assert.equal(view.canPin, false, `existing_solar_kw=${String(bad)} must not pin`);
+  }
+  // A recorded size on a NON-pinned path does not pin either.
+  assert.equal(
+    solarSizingView(emptyJob({ path: "A", existing_solar_kw: 6.6 })).canPin, false);
+  // The unrecorded-array caution fires ONLY on the pinned-path-no-number case —
+  // a finding about THIS job (D25), absent on a comparable job with the number.
+  const unrecorded = solarSizingView(emptyJob({ path: "C" }));
+  assert.deepEqual(unrecorded.notices.map((n) => n.title),
+    [SOLAR_EXISTING_UNRECORDED_NOTICE.title]);
+  assert.equal(SOLAR_EXISTING_UNRECORDED_NOTICE.level, "notice");
+  assert.deepEqual(
+    solarSizingView(emptyJob({ path: "C", existing_solar_kw: 6.6 })).notices, []);
+});
+
+test("3.11: solarRunNotices — flagged roof is a NOTICE, the method fact a CAPTION (levels read, not counted)", () => {
+  const flagged = solarRunNotices({
+    roof_confidence: {
+      roof_low_confidence: true,
+      roof_reason: "a roof face at 77° is too steep to be a roof",
+    },
+  });
+  const roofNotice = flagged.find((n) => n.level === "notice");
+  assert.ok(roofNotice, "a flagged roof must produce a level:notice");
+  assert.equal(roofNotice!.tone, "caution");
+  assert.ok(roofNotice!.body.includes("too steep to be a roof"),
+    "the roof's own words travel verbatim");
+  const caption = flagged.find((n) => n.level === "caption");
+  assert.ok(caption, "the method fact is a level:caption");
+
+  // A clean roof: caption only, no notice.
+  const clean = solarRunNotices({ roof_confidence: { roof_low_confidence: false } });
+  assert.ok(!clean.some((n) => n.level === "notice"));
+  // roof_confidence ABSENT (older build): no roof notice — absent is not clean.
+  const absent = solarRunNotices({});
+  assert.ok(!absent.some((n) => n.level === "notice"));
+  // Junk never throws.
+  for (const junk of [null, undefined, "x", 42, []]) {
+    assert.doesNotThrow(() => solarRunNotices(junk));
+  }
+});
+
+test("3.11: solarRunResult — null payback reads as words, never a dash or 0", () => {
+  const r = solarRunResult({
+    optimal: {
+      solar_kw: 10.12, panel_count: 23, annual_generation_kwh: 2975.4,
+      system_cost: 6946, simple_payback_years: null, npv_25yr: 2831.59,
+      self_sufficiency_pct: 30.45,
+    },
+    score_curve: [], flags: [],
+  });
+  assert.equal(r.ok, true);
+  assert.equal(r.headline?.payback, "no payback within the analysis period");
+  assert.equal(r.headline?.solarKw, "10.1 kW");        // one decimal, never two
+  assert.equal(r.headline?.systemCost, "$6,946");      // whole dollars, no cents
+  // 30.45 is stored as the double 30.4499…, so one decimal is 30.4 — the
+  // formatter reports what the number actually is, not decimal-string folklore.
+  assert.equal(r.headline?.selfSufficiencyPct, "30.4%");
+  // Empty curve: options hidden entirely, headline kept.
+  assert.deepEqual(r.options, []);
+});
+
+test("3.11: solarRunResult — one-row curve renders, empty row labelled, chosen marked", () => {
+  const r = solarRunResult({
+    optimal: { solar_kw: 10.12, system_cost: 6946, npv_25yr: 2831.59,
+               simple_payback_years: 4.4, self_sufficiency_pct: 30.45,
+               annual_generation_kwh: 2975.4 },
+    score_curve: [
+      { solar_kw: 0, system_cost: 0, npv_25yr: 0, simple_payback_years: null,
+        self_sufficiency_pct: 0 },
+      { solar_kw: 10.12, system_cost: 6946, npv_25yr: 2831.59,
+        simple_payback_years: 4.4, self_sufficiency_pct: 30.45 },
+    ],
+    flags: ["roof_flagged_before_sizing — the roof measurement was flagged"],
+  });
+  assert.equal(r.options.length, 2);
+  assert.equal(r.options[0].label, "No system");   // labelled, never "0 kW"
+  assert.equal(r.options[0].chosen, false);
+  assert.equal(r.options[1].label, "10.1 kW");
+  assert.equal(r.options[1].chosen, true);
+  // The engine's flags travel VERBATIM.
+  assert.deepEqual(r.engineFlags,
+    ["roof_flagged_before_sizing — the roof measurement was flagged"]);
+});
+
+test("3.11: solarRunResult — needs_roof_input and error are BODY branches, not res.ok", () => {
+  const roofless = solarRunResult({ needs_roof_input: true, flags: ["no_roof_geometry_for_job"] });
+  assert.equal(roofless.ok, false);
+  assert.equal(roofless.needsRoofInput, true);
+  assert.equal(roofless.errorMessage, null);
+  assert.equal(roofless.headline, null);
+  const errored = solarRunResult({ error: "invalid objective 'banana'", flags: [] });
+  assert.equal(errored.ok, false);
+  assert.equal(errored.errorMessage, "invalid objective 'banana'");
+  // Junk: a usable empty result, never a throw.
+  for (const junk of [null, undefined, "x", 42, [], {}]) {
+    const out = solarRunResult(junk);
+    assert.equal(out.ok, false);
+    assert.equal(out.headline, null);
+    assert.ok(Array.isArray(out.options));
+  }
+});
+
+test("3.11: the predicates — solar_kw ticks Solar sizing, battery_kwh:null leaves Battery incomplete", () => {
+  const solarOnly = emptyJob({
+    sizing_results: [{ solar_kw: 10.12, battery_kwh: null }],
+  });
+  const solar = SECTIONS.find((s) => s.id === "solar-sizing");
+  const battery = SECTIONS.find((s) => s.id === "battery-sizing");
+  assert.equal(solar?.complete(solarOnly), true);
+  assert.equal(battery?.complete(solarOnly), false,
+    "prompt 1's battery_kwh:null is what keeps Battery sizing honest");
+  // And the old defect's shape would have broken it: battery_kwh 0 ticks it.
+  const withZero = emptyJob({ sizing_results: [{ solar_kw: 10.12, battery_kwh: 0 }] });
+  assert.equal(battery?.complete(withZero), true,
+    "0 is not null — exactly why the writer must send null");
+});
+
+test("3.11: SOLAR_SIZING_REQUEST_KEYS — the D29 restraint, held locally too", () => {
+  assert.deepEqual([...SOLAR_SIZING_REQUEST_KEYS].sort(), ["constraints", "job_id"]);
+  for (const forbidden of ["objective", "custom_weight", "budget",
+                           "equipment_panel_id", "equipment_inverter_id",
+                           "equipment_battery_id", "installer_id"]) {
+    assert.ok(!(SOLAR_SIZING_REQUEST_KEYS as readonly string[]).includes(forbidden),
+      `${forbidden} is stored on the job and must never travel from the browser`);
+  }
 });

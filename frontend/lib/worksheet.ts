@@ -50,6 +50,9 @@ export interface JobDetailLike {
   objective?: string | null;
   custom_weight?: number | null;
   budget_aud?: number | null;
+  // 3.11 — the existing array's recorded size (a 3.3c job-bar field); read
+  // by solarSizingView for the path-C keep-as-is option.
+  existing_solar_kw?: number | null;
   // 3.10 — equipment constraints (NULL = Auto) and the confirmation flag.
   equipment_panel_id?: string | null;
   equipment_inverter_id?: string | null;
@@ -4082,4 +4085,220 @@ export function customUnitNotices(response: unknown): RoofNoticeView[] {
     });
   }
   return out;
+}
+
+// ── Solar sizing (3.11) ──────────────────────────────────────────────────────
+
+/**
+ * THE REQUEST KEYS THE SECTION CAN EVER SEND — a literal, exported because
+ * verify_sizing_request_contract.py runs it over node and asserts (a) every
+ * key is a real OptimiseRequest field and (b) none of the stored-on-the-job
+ * fields (objective, budget, equipment ids, tariff, load, installer_id) is
+ * among them. Those are read server-side by the resolvers; sending them from
+ * the browser would create a second source of truth for values 3.9/3.10 exist
+ * to hold — the exact shape D29 rejected. If a figure looks wrong on screen,
+ * the fix is in the stored value or the resolver, never a key added here.
+ */
+export const SOLAR_SIZING_REQUEST_KEYS = ["job_id", "constraints"] as const;
+
+/** One row of the options table, formatted for reading, not for arithmetic. */
+export interface SolarOptionRow {
+  label: string; // "6.2 kW", or "No system" for the empty reference row
+  cost: string;
+  payback: string;
+  npv: string;
+  selfSufficiency: string;
+  chosen: boolean;
+}
+
+export interface SolarHeadline {
+  solarKw: string;
+  panelCount: string | null;
+  annualGenerationKwh: string;
+  systemCost: string;
+  payback: string; // "no payback within the analysis period" when null
+  npv: string;
+  selfSufficiencyPct: string;
+}
+
+export interface SolarRunResult {
+  ok: boolean;
+  needsRoofInput: boolean;
+  errorMessage: string | null;
+  headline: SolarHeadline | null;
+  options: SolarOptionRow[];
+  /** The engine's own flag strings, VERBATIM (F161) — never paraphrased. */
+  engineFlags: string[];
+}
+
+export interface SolarSizingView {
+  /** From pathRule(job.path): "optimise" | "pinned" | "none" | null. */
+  solarMode: PathRule["solarMode"] | null;
+  existingSolarKw: number | null;
+  /**
+   * ONE boolean, derived here so no component re-derives the rule: pinnable
+   * only when the path pins AND a finite positive size was actually recorded.
+   * A pinned run without a number is not a pinned run — never invent a size.
+   */
+  canPin: boolean;
+  /** The newest stored sizing row's solar_kw, for the revisit case. */
+  storedSolarKw: number | null;
+  alreadySized: boolean;
+  notices: RoofNoticeView[];
+}
+
+const NO_PAYBACK = "no payback within the analysis period";
+
+/** kW to the single decimal the inputs justify; no two-decimal kW. */
+function fmtKw(value: number): string {
+  return `${Number(value.toFixed(1))} kW`;
+}
+
+/** Whole dollars — no cents on a system cost. */
+function fmtAud(value: number): string {
+  return `$${Math.round(value).toLocaleString("en-AU")}`;
+}
+
+function fmtYears(value: unknown): string {
+  const n = tariffNum(value);
+  if (n === null) return NO_PAYBACK;
+  return `${Number(n.toFixed(1))} yr`;
+}
+
+function fmtPct(value: number): string {
+  return `${Number(value.toFixed(1))}%`;
+}
+
+export const SOLAR_EXISTING_UNRECORDED_NOTICE: RoofNoticeView = {
+  tone: "caution",
+  level: "notice",
+  title: "The existing array's size was never recorded",
+  body: "This job has solar on the roof, but its size was not recorded, so the array cannot be kept as-is by number. Re-optimise will size fresh; the existing size can be added in the job details.",
+};
+
+/**
+ * The section's stored-state view. Total, never throws; the D25 classification
+ * lives HERE (the unrecorded-array caution is a FINDING about this job — a
+ * comparable path-C job with the size recorded would not raise it).
+ */
+export function solarSizingView(job: unknown): SolarSizingView {
+  const detail = asRecord(job);
+  const rule = pathRule(detail.path);
+  const solarMode = rule ? rule.solarMode : null;
+  const existingRaw = tariffNum(detail.existing_solar_kw);
+  const existingSolarKw = existingRaw !== null && existingRaw > 0 ? existingRaw : null;
+  const canPin = solarMode === "pinned" && existingSolarKw !== null;
+
+  const sized = arr(detail.sizing_results).filter((r) => tariffNum(r.solar_kw) !== null);
+  const latest = sized.length > 0 ? sized[sized.length - 1] : null;
+
+  const notices: RoofNoticeView[] = [];
+  if (solarMode === "pinned" && existingSolarKw === null) {
+    notices.push(SOLAR_EXISTING_UNRECORDED_NOTICE);
+  }
+  return {
+    solarMode,
+    existingSolarKw,
+    canPin,
+    storedSolarKw: latest ? tariffNum(latest.solar_kw) : null,
+    alreadySized: latest !== null,
+    notices,
+  };
+}
+
+/**
+ * One optimiser response → notices. D25 applied per notice, with the test —
+ * could this ever NOT fire on a job like this one? — answered inline.
+ */
+export function solarRunNotices(response: unknown): RoofNoticeView[] {
+  const body = asRecord(response);
+  const out: RoofNoticeView[] = [];
+
+  // A FLAGGED ROOF: a comparable job with a clean roof raises nothing here, so
+  // this is a FINDING about THIS job -> level "notice". Absent roof_confidence
+  // (an older build's response) raises nothing — absent is not clean.
+  const rc = asRecord(body.roof_confidence);
+  if (rc.roof_low_confidence === true) {
+    const reason = typeof rc.roof_reason === "string" && rc.roof_reason
+      ? rc.roof_reason
+      : "The roof measurement was flagged for checking.";
+    out.push({
+      tone: "caution",
+      level: "notice",
+      title: "Sized from a roof that was flagged for checking",
+      // The roof's own words (F161), then the consequence, plainly. The doubt
+      // travels; it does not stop the work (D24, F93).
+      body: `${reason}\nThese numbers are only as good as that roof — check it before quoting.`,
+    });
+  }
+
+  // THE METHOD FACT: every sizing this engine produces uses the stored
+  // objective, tariff and equipment — true of ANY comparable job, so it is a
+  // CAPTION, not a warning.
+  out.push({
+    tone: "info",
+    level: "caption",
+    title: "What this run used",
+    body: "Sized with the objective, tariff, load and equipment already saved on this job. Change those in their sections and run again.",
+  });
+  return out;
+}
+
+/**
+ * One optimiser response → the figures an installer reads. Every formatter is
+ * here so the suite asserts the exact strings that reach the screen. Total.
+ */
+export function solarRunResult(response: unknown): SolarRunResult {
+  const body = asRecord(response);
+  const errorMessage =
+    typeof body.error === "string" && body.error ? body.error : null;
+  const needsRoofInput = body.needs_roof_input === true;
+  const opt = asRecord(body.optimal);
+  const solarKw = tariffNum(opt.solar_kw);
+
+  const ok = !errorMessage && !needsRoofInput && solarKw !== null;
+  let headline: SolarHeadline | null = null;
+  if (ok && solarKw !== null) {
+    const panels = tariffNum(opt.panel_count);
+    const gen = tariffNum(opt.annual_generation_kwh);
+    const cost = tariffNum(opt.system_cost);
+    const npv = tariffNum(opt.npv_25yr);
+    const self = tariffNum(opt.self_sufficiency_pct);
+    headline = {
+      solarKw: fmtKw(solarKw),
+      panelCount: panels !== null ? `${Math.round(panels)} panels` : null,
+      annualGenerationKwh: gen !== null ? `${Math.round(gen).toLocaleString("en-AU")} kWh` : "—",
+      systemCost: cost !== null ? fmtAud(cost) : "—",
+      payback: fmtYears(opt.simple_payback_years),
+      npv: npv !== null ? fmtAud(npv) : "—",
+      selfSufficiencyPct: self !== null ? fmtPct(self) : "—",
+    };
+  }
+
+  const options: SolarOptionRow[] = [];
+  const curve = Array.isArray(body.score_curve) ? body.score_curve : [];
+  for (const raw of curve) {
+    if (typeof raw !== "object" || raw === null) continue;
+    const row = raw as Record<string, unknown>;
+    const kw = tariffNum(row.solar_kw);
+    if (kw === null) continue;
+    const cost = tariffNum(row.system_cost);
+    const npv = tariffNum(row.npv_25yr);
+    const self = tariffNum(row.self_sufficiency_pct);
+    options.push({
+      // The empty reference row is LABELLED, never shown as 0 kW.
+      label: kw > 0 ? fmtKw(kw) : "No system",
+      cost: cost !== null ? fmtAud(cost) : "—",
+      payback: fmtYears(row.simple_payback_years),
+      npv: npv !== null ? fmtAud(npv) : "—",
+      selfSufficiency: self !== null ? fmtPct(self) : "—",
+      chosen: solarKw !== null && kw === solarKw,
+    });
+  }
+
+  const engineFlags = Array.isArray(body.flags)
+    ? body.flags.filter((f): f is string => typeof f === "string" && f !== "")
+    : [];
+
+  return { ok, needsRoofInput, errorMessage, headline, options, engineFlags };
 }

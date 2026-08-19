@@ -14,6 +14,7 @@ import {
   roofDiagramView,
   sectionStates,
   siteDetailsView,
+  solarSizingView,
   tariffNetworkView,
   worksheetErrorCopy,
   type EquipmentCatalogue,
@@ -128,6 +129,7 @@ export default async function Page({
         tariffNetwork={tariffNetworkView(job, tariffDefaults)}
         objectiveBudget={objectiveBudgetView(job)}
         equipmentSpecs={equipmentSpecsView(job, catalogue)}
+        solarSizing={solarSizingView(job)}
         jobId={id}
       />
     </div>
