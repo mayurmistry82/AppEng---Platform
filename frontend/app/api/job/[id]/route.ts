@@ -5,13 +5,22 @@ import { createClient } from "@/lib/supabase/server";
  * Job-field update hop (3.4b) — forwards to PATCH /api/job/{id}, the backend's
  * ONE job-field writer. Same pattern as app/api/job/create/route.ts: session
  * token from the server Supabase client, 401 when absent, explicit whitelist of
- * the same sixteen fields the backend accepts, upstream status passed through,
+ * the same twenty fields the backend accepts, upstream status passed through,
  * token never logged.
  *
  * ABSENT vs NULL is preserved through the whitelist: a key is forwarded only
  * when the client actually sent it, and an explicit null travels as null — the
- * backend clears that column. Forwarding all sixteen unconditionally would
- * turn every partial save into a sixteen-field wipe.
+ * backend clears that column. Forwarding all twenty unconditionally would
+ * turn every partial save into a twenty-field wipe.
+ *
+ * THE WHITELIST STAYS AN EXPLICIT ARRAY. It is a security boundary, and when
+ * the backend gains a field the fix is to widen this by that name — never to
+ * replace it with a pass-everything forward. It went stale once already: the
+ * 3.10 equipment ids reached the backend with their keys already stripped
+ * here, so the PATCH answered 200 and changed nothing, with no error
+ * anywhere. verify_equipment_contract.py check 8a now compares this array
+ * against JobSitePatch's fields and fails on any name the backend accepts and
+ * this drops.
  *
  * The dynamic segment is the job id — validated non-empty and forwarded, no
  * further: the backend does the ownership check (404 absent/foreign, F88 503).
@@ -44,6 +53,13 @@ const FIELDS = [
   "objective",
   "custom_weight",
   "budget_aud",
+  // 3.10 — the equipment constraints and the confirmation flag. Same
+  // absent-vs-null rule: an explicit null clears an id back to Auto, and an
+  // explicit false un-confirms.
+  "equipment_panel_id",
+  "equipment_inverter_id",
+  "equipment_battery_id",
+  "equipment_confirmed",
 ] as const;
 
 async function forward(

@@ -96,6 +96,11 @@ _ALLOWED: dict[str, set[str]] = {
         # legacy /api/job/save path and the flywheel writer discard without a
         # word. PATCH writes jobs directly and never passes through here.
         "equipment_panel_id", "equipment_inverter_id", "equipment_battery_id",
+        # The confirmation flag (3.10 prompt 3). Same reason as the ids above:
+        # this allowlist SILENTLY DROPS unknown columns, so a name missing here
+        # is one the legacy /api/job/save path and the flywheel writer discard
+        # without a word.
+        "equipment_confirmed",
     },
     "bills": {
         "bill_id", "job_id", "raw_file_path", "parsed_json", "parser_version",

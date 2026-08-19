@@ -550,6 +550,15 @@ class JobSitePatch(BaseModel):
     equipment_panel_id: Optional[str] = None
     equipment_inverter_id: Optional[str] = None
     equipment_battery_id: Optional[str] = None
+    # ── 3.10 prompt 3 — a FIFTH kind of field: a CONFIRMATION. Not a site
+    # fact, not identity, not an optimisation input, not an equipment choice —
+    # a record that the installer LOOKED. Optional[bool] = None so the
+    # absent-vs-null machinery is untouched: absent leaves the column alone,
+    # true confirms, an explicit false un-confirms. Leaving every component on
+    # Auto is a legitimate answer, so this is what lets the section read
+    # complete with nothing pinned (D24's propose-then-confirm shape). It does
+    # NOT gate sizing and takes NO part in the address lock.
+    equipment_confirmed: Optional[bool] = None
 
 
 # Where each JobSitePatch field is WRITTEN (3.3c). jobs has NO address and NO
@@ -564,6 +573,7 @@ _JOBS_PATCH_FIELDS = {
     "has_existing_solar", "existing_solar_kw", "existing_inverter_kw", "intent",
     "objective", "custom_weight", "budget_aud",
     "equipment_panel_id", "equipment_inverter_id", "equipment_battery_id",
+    "equipment_confirmed",
 }
 _CUSTOMER_PATCH_FIELDS = {
     "customer_name": "customer_name",

@@ -105,23 +105,23 @@ def t3_structure() -> None:
                 "customer_name", "has_existing_solar", "existing_solar_kw",
                 "existing_inverter_kw", "intent", "address",
                 "objective", "custom_weight", "budget_aud",
-                # 3.10 — the equipment constraints.
+                # 3.10 — the equipment constraints and the confirm flag.
                 "equipment_panel_id", "equipment_inverter_id",
-                "equipment_battery_id"}
-    check("(3a) JobSitePatch.model_fields is exactly the nineteen names",
+                "equipment_battery_id", "equipment_confirmed"}
+    check("(3a) JobSitePatch.model_fields is exactly the twenty names",
           fields == expected,
           f"extra={fields - expected} missing={expected - fields}")
 
     # 3b — gained exactly the three, lost none.
     check("(3b) _JOBS_PATCH_FIELDS is the eleven 3.4b/3.3c names + the 3.9 three "
-          "+ the 3.10 three (seventeen)",
+          "+ the 3.10 three + equipment_confirmed (eighteen)",
           job_route._JOBS_PATCH_FIELDS == {
               "storeys", "roof_material", "dwelling_type", "year_built",
               "bedrooms", "floor_area_m2", "electrical_phase",
               "has_existing_solar", "existing_solar_kw", "existing_inverter_kw",
               "intent", "objective", "custom_weight", "budget_aud",
               "equipment_panel_id", "equipment_inverter_id",
-              "equipment_battery_id"},
+              "equipment_battery_id", "equipment_confirmed"},
           str(sorted(job_route._JOBS_PATCH_FIELDS)))
 
     # 3c

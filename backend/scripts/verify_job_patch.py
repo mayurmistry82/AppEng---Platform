@@ -153,10 +153,11 @@ def run_patch(stub, payload, job_id="j1"):
 def main() -> int:
     print("verify_job_patch.py — PATCH /api/job/{id} contract (offline)\n")
 
-    print("1. the whitelist: exactly nineteen fields, everything else DROPPED silently")
-    # ONE whitelist that GROWS, never a second implementation (D2). Four growth
+    print("1. the whitelist: exactly twenty fields, everything else DROPPED silently")
+    # ONE whitelist that GROWS, never a second implementation (D2). Five growth
     # events so far: 3.4b seven site fields, 3.3c six job-bar-edit fields, 3.9
-    # three optimisation inputs, 3.10 three equipment constraints.
+    # three optimisation inputs, 3.10 three equipment constraints and then the
+    # equipment_confirmed flag.
     #
     # The assertion stays an ENUMERATION on purpose: it catches an
     # UNAUTHORISED field appearing as well as an authorised one going missing,
@@ -166,14 +167,14 @@ def main() -> int:
     # name above can never quietly drift from reality again.
     fields = set(job_route.JobSitePatch.model_fields.keys())
     print(f"   len(JobSitePatch.model_fields) = {len(fields)}")
-    check("model has exactly the nineteen fields",
+    check("model has exactly the twenty fields",
           fields == {"storeys", "roof_material", "dwelling_type", "year_built",
                      "bedrooms", "floor_area_m2", "electrical_phase",
                      "customer_name", "has_existing_solar", "existing_solar_kw",
                      "existing_inverter_kw", "intent", "address",
                      "objective", "custom_weight", "budget_aud",
                      "equipment_panel_id", "equipment_inverter_id",
-                     "equipment_battery_id"}, str(fields))
+                     "equipment_battery_id", "equipment_confirmed"}, str(fields))
     stub = StubClient()
     smuggle = {"storeys": 2, "company_id": "co-EVIL", "installer_id": "x",
                "path": "F", "status": "won", "address": "1 Evil St"}

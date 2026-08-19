@@ -66,9 +66,14 @@ class _Query:
         self._ors: list[str] = []
         self._cols = "*"
         self._insert_payload = None
+        self._update_payload = None
 
     def insert(self, payload):
         self._insert_payload = payload
+        return self
+
+    def update(self, payload):
+        self._update_payload = payload
         return self
 
     def select(self, cols="*", *_a, **_k):
@@ -91,6 +96,11 @@ class _Query:
         return self
 
     def execute(self):
+        if self._update_payload is not None:
+            self._c.updates.append((self._t, dict(self._update_payload)))
+            rows = self._c.tables.get(self._t, [])
+            merged = {**(rows[0] if rows else {}), **self._update_payload}
+            return _Result([merged])
         if self._insert_payload is not None:
             if self._c.insert_raises is not None:
                 raise self._c.insert_raises
@@ -134,6 +144,7 @@ class StubClient:
         self.queries: list[dict] = []
         self.selects: list[tuple[str, str]] = []
         self.inserts: list[tuple[str, dict]] = []
+        self.updates: list[tuple[str, dict]] = []
         self.insert_seq = 0
 
     def table(self, name):
@@ -188,9 +199,16 @@ def t1_write_path() -> None:
         "has_existing_solar", "existing_solar_kw", "existing_inverter_kw",
         "intent", "objective", "custom_weight", "budget_aud",
     }
-    check("(1d) _JOBS_PATCH_FIELDS == the fourteen pre-3.10 names + exactly the trio (17)",
-          job_route._JOBS_PATCH_FIELDS == pre_310 | set(trio)
-          and len(job_route._JOBS_PATCH_FIELDS) == len(pre_310) + 3,
+    # 3.10 added FOUR names in total: the trio (prompt 1) and the confirmation
+    # flag (prompt 3). Asserted as a DELTA from the enumerated pre-3.10
+    # baseline, so the check states what 3.10 contributed rather than pinning
+    # an absolute that goes stale the next time the whitelist legitimately
+    # grows — which is exactly what happened to this check between prompts.
+    added_by_310 = set(trio) | {"equipment_confirmed"}
+    check("(1d) _JOBS_PATCH_FIELDS == the fourteen pre-3.10 names + exactly the four "
+          "3.10 names (the trio + equipment_confirmed)",
+          job_route._JOBS_PATCH_FIELDS == pre_310 | added_by_310
+          and len(job_route._JOBS_PATCH_FIELDS) == len(pre_310) + 4,
           str(sorted(job_route._JOBS_PATCH_FIELDS)))
 
 
@@ -770,6 +788,102 @@ def t7_write_path() -> int:
     return skipped
 
 
+
+# ═════════════════════════════════════════════════════════════════════════════
+# CHECK 8 (3.10 prompt 3) — the wiring: the confirm flag and the full save path.
+# ═════════════════════════════════════════════════════════════════════════════
+
+FRONTEND_DIR = os.path.join(os.path.dirname(BACKEND_DIR), "frontend")
+JOB_PROXY = os.path.join(FRONTEND_DIR, "app", "api", "job", "[id]", "route.ts")
+EQUIP_PROXY = os.path.join(FRONTEND_DIR, "app", "api", "equipment", "[kind]", "route.ts")
+
+
+def _parse_ts_string_array(path: str, name: str) -> set:
+    """The string literals of a `const <name> = [ ... ]` array, PARSED out of
+    the TypeScript source. Comments inside the array are ignored because only
+    quoted literals are collected."""
+    src = open(path).read()
+    m = re.search(rf"const\s+{name}\s*=\s*\[(.*?)\]", src, re.S)
+    if not m:
+        return set()
+    return set(re.findall(r'"([^"]+)"', m.group(1)))
+
+
+def t8_wiring() -> None:
+    print("\nCHECK 8 — the save path: every whitelist between the browser and the DB")
+
+    # 8a — THE 2Q.1 TWO-SIDED SHAPE: two whitelists that must agree, each
+    # individually correct today. The Python side is DERIVED from the live
+    # model; the TypeScript side is PARSED from the file (a route handler
+    # cannot be executed outside Next, so this is weaker than the objective
+    # gate's node bridge — it is the best available here, and it is stated).
+    backend_fields = set(job_route.JobSitePatch.model_fields.keys())
+    proxy_fields = _parse_ts_string_array(JOB_PROXY, "FIELDS")
+    missing = backend_fields - proxy_fields
+    print(f"        JobSitePatch  ({len(backend_fields)}): {sorted(backend_fields)}")
+    print(f"        proxy FIELDS  ({len(proxy_fields)}): {sorted(proxy_fields)}")
+    print(f"        accepted by the backend but DROPPED by the proxy: {sorted(missing)}")
+    check("(8a) the Next job proxy's FIELDS is a SUPERSET of JobSitePatch's fields "
+          "[TS side PARSED, not executed — a handler cannot run outside Next]",
+          not missing,
+          f"silently dropped in transit: {sorted(missing)}")
+
+    # 8b — the confirm flag, all four places.
+    check("(8b) equipment_confirmed is in JobSitePatch",
+          "equipment_confirmed" in job_route.JobSitePatch.model_fields,
+          str(sorted(job_route.JobSitePatch.model_fields)))
+    check("(8b) equipment_confirmed is in _JOBS_PATCH_FIELDS",
+          "equipment_confirmed" in job_route._JOBS_PATCH_FIELDS,
+          str(sorted(job_route._JOBS_PATCH_FIELDS)))
+    check("(8b) equipment_confirmed is in capture._ALLOWED['jobs']",
+          "equipment_confirmed" in capture._ALLOWED["jobs"], "absent")
+    check("(8b) equipment_confirmed is NOT in _CUSTOMER_PATCH_FIELDS",
+          "equipment_confirmed" not in job_route._CUSTOMER_PATCH_FIELDS, "present")
+
+    # 8c — true AND explicit false both reach the update. A truthiness bug
+    # would drop false silently and un-confirming would stop working.
+    for value in (True, False):
+        stub = StubClient({"jobs": [{"job_id": "j1", "company_id": "co-A", "path": "A"}]})
+        original = job_route._svc
+        job_route._svc = lambda: stub
+        try:
+            body = job_route.JobSitePatch(equipment_confirmed=value)
+            asyncio.run(job_route.patch_job("j1", body, CALLER_A))
+        except Exception as exc:  # noqa: BLE001
+            check(f"(8c) equipment_confirmed={value} reaches the update", False, repr(exc))
+            continue
+        finally:
+            job_route._svc = original
+        sent = stub.updates[0][1] if stub.updates else {}
+        check(f"(8c) equipment_confirmed={value} reaches the jobs update as exactly {value}"
+              + (" (a truthiness bug would DROP false)" if value is False else ""),
+              sent.get("equipment_confirmed") is value, str(sent))
+
+    # 8d — the new proxy: POST only, and its kind guard matches the backend's.
+    exists = os.path.exists(EQUIP_PROXY)
+    check("(8d) frontend/app/api/equipment/[kind]/route.ts exists", exists, EQUIP_PROXY)
+    if exists:
+        src = open(EQUIP_PROXY).read()
+        check("(8d) it exports POST", re.search(r"export\s+async\s+function\s+POST", src)
+              is not None, "no POST export")
+        check("(8d) it does NOT export GET (the catalogue is read server-side via apiGet)",
+              re.search(r"export\s+async\s+function\s+GET", src) is None,
+              "a GET export is present")
+        kinds = _parse_ts_string_array(EQUIP_PROXY, "KINDS")
+        check("(8d) its kind guard == the backend's EQUIPMENT_KINDS (both directions)",
+              kinds == set(equipment.EQUIPMENT_KINDS),
+              f"proxy-only={kinds - set(equipment.EQUIPMENT_KINDS)} "
+              f"backend-only={set(equipment.EQUIPMENT_KINDS) - kinds}")
+
+    # 8e — derived, never copied from a prompt.
+    n_fields = len(job_route.JobSitePatch.model_fields)
+    n_jobs = len(job_route._JOBS_PATCH_FIELDS)
+    print(f"        len(JobSitePatch.model_fields) = {n_fields}")
+    print(f"        len(_JOBS_PATCH_FIELDS)        = {n_jobs}")
+    check("(8e) JobSitePatch holds 20 fields and _JOBS_PATCH_FIELDS holds 18",
+          n_fields == 20 and n_jobs == 18, f"{n_fields} / {n_jobs}")
+
+
 def main_() -> int:
     print("verify_equipment_contract.py — 3.10 prompt 1 (offline, writes nothing)\n")
     t1_write_path()
@@ -779,6 +893,7 @@ def main_() -> int:
     t5_caller_counts()
     t6_junk()
     skipped = t7_write_path()
+    t8_wiring()
     print(f"\n{'-' * 60}")
     if FAILURES:
         print(f"FAIL: {len(FAILURES)} of {CHECKS_RUN} checks failed:")
