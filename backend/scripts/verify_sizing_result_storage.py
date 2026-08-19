@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """
-verify_sizing_result_storage.py — the 3.11b prompt-2 gate: sizing_results and
-financial_results are an APPEND-ONLY RUN LOG.
+verify_sizing_result_storage.py — the 3.11b gate: sizing_results and
+financial_results are an APPEND-ONLY RUN LOG (prompt 2), and GET /api/job/{id}
+hydrates it ORDERED and BOUNDED (prompt 3).
 
   (a) the two UNIQUE (job_id) constraints are GONE            (pg_constraint)
   (b) the replacement (job_id, created_at DESC) indexes exist (pg_indexes)
@@ -11,6 +12,12 @@ financial_results are an APPEND-ONLY RUN LOG.
   (e) save_sizing_result REFUSES an unknown label before _write is reached
   (f) both endpoint payloads carry run_kind / engine_mode / evaluated_options,
       valid and self-describing — PROVEN BY RUNNING THE WRITERS (F148)
+  (g)(1a-1e) hydration orders EVERY child table by created_at DESC and fetches
+      LIMIT+1, returning LIMIT and logging the truncation — against a stub
+      client that records the query chain (no database write)
+  (3)(4) the LIVE read: hydrated counts == the real per-job counts, the run log
+      leads with the F93 row, and the two-row roof_geometry case returns the
+      NEWER (flagged) row first with the redaction applied to every row returned
 
 READS the live database; WRITES NOTHING — capture.save_sizing_result is
 replaced by a recorder for every endpoint run, capture._write by a recorder for
@@ -41,6 +48,8 @@ if BACKEND_DIR not in sys.path:
 import auth  # noqa: E402
 import capture  # noqa: E402
 import generation  # noqa: E402
+import solar_retention  # noqa: E402
+from routes import job as job_route  # noqa: E402
 from routes import sizing as sizing_route  # noqa: E402
 
 FAILURES: list[str] = []
@@ -270,6 +279,204 @@ def t_f_endpoint_payloads(client) -> None:
               f"{json.dumps(selections[0] if selections else {}, default=str)[:200]}")
 
 
+
+# ── 3.11b prompt 3 — hydration is ORDERED and BOUNDED ────────────────────────
+LIVE_ROOF_JOB = LIVE_JOB   # the one live job with two roof_geometry rows
+
+
+class _StubResult:
+    def __init__(self, data):
+        self.data = data
+
+
+class _StubQuery:
+    """Records the chain it was given and answers with canned rows."""
+
+    def __init__(self, recorder, table, rows):
+        self.recorder = recorder
+        self.table_name = table
+        self.rows = rows
+
+    def select(self, *_a, **_k):
+        return self
+
+    def eq(self, *_a, **_k):
+        return self
+
+    def order(self, column, desc=None, **_k):
+        self.recorder.setdefault(self.table_name, {}).setdefault(
+            "order", []).append((column, desc))
+        return self
+
+    def limit(self, n, **_k):
+        self.recorder.setdefault(self.table_name, {}).setdefault(
+            "limit", []).append(n)
+        return self
+
+    def execute(self):
+        return _StubResult(list(self.rows))
+
+
+class _StubClient:
+    """table('jobs') answers the ownership read; every child table answers rows."""
+
+    def __init__(self, recorder, rows, job_id, company_id):
+        self.recorder = recorder
+        self.rows = rows
+        self.job_id = job_id
+        self.company_id = company_id
+
+    def table(self, name):
+        if name == "jobs":
+            return _StubQuery(self.recorder, name,
+                              [{"job_id": self.job_id, "company_id": self.company_id,
+                                "path": None}])
+        return _StubQuery(self.recorder, name, self.rows)
+
+
+def _synthetic_rows(n: int) -> list[dict]:
+    """n rows, NEWEST FIRST — row-00 is the newest, exactly as an ordered query
+    would return them. The assertions name row-00 by id, so a slice taken from
+    the wrong end, or an ordering that was never applied, returns a different id."""
+    return [{"id": f"row-{i:02d}",
+             "created_at": f"2026-08-{19 - i:02d}T00:00:00+00:00"} for i in range(n)]
+
+
+def _run_get_job_with_stub(rows: list[dict]) -> tuple[dict, dict, list[str]]:
+    """Run get_job against the stub. Returns (response, chain recorder, messages)."""
+    recorder: dict = {}
+    messages: list[str] = []
+    caller = auth.Caller(user_id="gate-runner", email="gate@example.com",
+                         company_id="co-gate", role="owner")
+    stub = _StubClient(recorder, rows, LIVE_JOB, "co-gate")
+    original_svc = job_route._require_svc
+    original_capture = job_route.sentry_sdk.capture_message
+    job_route._require_svc = lambda: stub
+    job_route.sentry_sdk.capture_message = lambda msg, *a, **k: messages.append(str(msg))
+    try:
+        response = asyncio.run(job_route.get_job(LIVE_JOB, caller))
+    finally:
+        job_route._require_svc = original_svc
+        job_route.sentry_sdk.capture_message = original_capture
+    return response, recorder, messages
+
+
+def t_g_order_and_limit() -> None:
+    print("\nTg. hydration is ORDERED and BOUNDED — the stub records the chain")
+    check("(g) _HYDRATION_LIMIT is 20", job_route._HYDRATION_LIMIT == 20,
+          str(job_route._HYDRATION_LIMIT))
+
+    # (a)(b)(c)(d) — 21 rows come back, so every table truncates.
+    response, recorder, messages = _run_get_job_with_stub(_synthetic_rows(21))
+    child_tables = [t for _k, t in job_route._CHILD_TABLES]
+    print(f"        twelve child tables: {child_tables}")
+    check("(g) twelve child tables were hydrated", len(child_tables) == 12,
+          str(len(child_tables)))
+
+    missing_order = [t for t in child_tables
+                     if recorder.get(t, {}).get("order") != [("created_at", True)]]
+    check("(1a) EVERY child table ordered by created_at DESC — all twelve, not one",
+          not missing_order,
+          f"wrong/absent order on: {missing_order} "
+          f"(got {[(t, recorder.get(t, {}).get('order')) for t in missing_order][:3]})")
+    bad_limit = [t for t in child_tables if recorder.get(t, {}).get("limit") != [21]]
+    check("(1b) EVERY child table fetched LIMIT+1 = 21, never 20 — the extra row "
+          "is how truncation is detected at all",
+          not bad_limit,
+          f"wrong limit on: {[(t, recorder.get(t, {}).get('limit')) for t in bad_limit][:3]}")
+
+    for key, _table in job_route._CHILD_TABLES:
+        returned = response.get(key)
+        check(f"(1c) {key}: 20 rows returned, newest ('row-00') FIRST",
+              isinstance(returned, list) and len(returned) == 20
+              and returned[0].get("id") == "row-00",
+              f"len={len(returned) if isinstance(returned, list) else returned!r} "
+              f"first={returned[0].get('id') if isinstance(returned, list) and returned else None!r}")
+
+    print(f"        truncation messages: {len(messages)}")
+    if messages:
+        print(f"        sample: {messages[0]}")
+    check("(1d) one truncation message per table, naming the table AND the job id",
+          len(messages) == 12
+          and all(LIVE_JOB in m for m in messages)
+          and all(any(t in m for t in child_tables) for m in messages),
+          f"{len(messages)} messages; sample={messages[:1]}")
+
+    # (e) — exactly 20 rows: full, and SILENT.
+    response20, _rec20, messages20 = _run_get_job_with_stub(_synthetic_rows(20))
+    check("(1e) with exactly 20 rows every table returns 20...",
+          all(len(response20.get(k) or []) == 20 for k, _t in job_route._CHILD_TABLES),
+          str({k: len(response20.get(k) or []) for k, _t in job_route._CHILD_TABLES}))
+    check("(1e) ...and NO truncation message is recorded", not messages20,
+          str(messages20))
+
+
+def t_h_live_hydration(client) -> None:
+    print("\nTh. the LIVE read — hydrated counts vs what the tables actually hold")
+    owner = (client.table("jobs").select("company_id")
+             .eq("job_id", LIVE_JOB).limit(1).execute())
+    company_id = (owner.data or [{}])[0].get("company_id")
+    caller = auth.Caller(user_id="gate-runner", email="gate@example.com",
+                         company_id=company_id, role="owner")
+    messages: list[str] = []
+    original_capture = job_route.sentry_sdk.capture_message
+    job_route.sentry_sdk.capture_message = lambda msg, *a, **k: messages.append(str(msg))
+    try:
+        response = asyncio.run(job_route.get_job(LIVE_JOB, caller))
+    finally:
+        job_route.sentry_sdk.capture_message = original_capture
+
+    # Counted in THIS run from the database, never quoted from the prompt.
+    for key, table in job_route._CHILD_TABLES:
+        actual = (client.table(table).select("*", count="exact")
+                  .eq("job_id", LIVE_JOB).limit(1).execute().count)
+        hydrated = len(response.get(key) or [])
+        print(f"        {key:18s} database={actual:<3} hydrated={hydrated}")
+        check(f"(3) {key}: hydrated count == the database count",
+              hydrated == actual, f"db={actual} hydrated={hydrated}")
+
+    sizing = response.get("sizing_results") or []
+    check("(3) sizing_results[0] is the F93 run 24712cbf…",
+          bool(sizing) and sizing[0].get("sizing_result_id")
+          == "24712cbf-3cff-44bd-86cc-bb7f2018e61b",
+          str(sizing[0].get("sizing_result_id") if sizing else None))
+    check("(3) ...with run_kind 'solar' and engine_mode 'sequential'",
+          bool(sizing) and sizing[0].get("run_kind") == "solar"
+          and sizing[0].get("engine_mode") == "sequential",
+          f"{sizing[0].get('run_kind') if sizing else None!r} / "
+          f"{sizing[0].get('engine_mode') if sizing else None!r}")
+    check("(3) nothing on this job truncated", not messages, str(messages))
+
+    # (4) THE ROOF ORDERING — the one live case with more than one row, and the
+    # one where getting it backwards is a PRODUCT fault: on this job the newer
+    # row is the FLAGGED one, so the wrong order shows a clean roof where the
+    # product should be showing doubt. Which row is newer is DERIVED here.
+    roof = response.get("roof_geometry") or []
+    check("(4) this job holds more than one roof_geometry row", len(roof) >= 2,
+          str(len(roof)))
+    if len(roof) >= 2:
+        newest = max(roof, key=lambda r: str(r.get("created_at") or ""))
+        print(f"        newest roof by created_at: {newest.get('roof_geometry_id')} "
+              f"({newest.get('created_at')}) low_confidence={newest.get('low_confidence')}")
+        print(f"        returned FIRST           : {roof[0].get('roof_geometry_id')} "
+              f"({roof[0].get('created_at')})")
+        check("(4) the FIRST returned roof row IS the newest by created_at",
+              roof[0].get("roof_geometry_id") == newest.get("roof_geometry_id"),
+              f"first={roof[0].get('roof_geometry_id')} newest={newest.get('roof_geometry_id')}")
+        check("(4) ...and it is the FLAGGED one — the wrong order would show a "
+              "clean roof where the product should show doubt",
+              roof[0].get("low_confidence") is True, str(roof[0].get("low_confidence")))
+        # The redaction still ran on every RETURNED row (it is applied after the
+        # slice, so the redacted count matches the returned count).
+        expired = [r for r in roof
+                   if solar_retention.is_solar_data_expired(r)]
+        marked = [r for r in roof if r.get("solar_data_expired") is True]
+        check("(4) redaction ran on every returned row — every expired row is "
+              "marked, and no unexpired row is",
+              len(marked) == len(expired),
+              f"{len(expired)} expired, {len(marked)} marked")
+
+
 def main() -> int:
     print("verify_sizing_result_storage.py — 3.11b prompt 2 (writes nothing)\n")
     client = sizing_route._sb()
@@ -282,6 +489,9 @@ def main() -> int:
     t_e_refusal()
     if client is not None:
         t_f_endpoint_payloads(client)
+    t_g_order_and_limit()
+    if client is not None:
+        t_h_live_hydration(client)
     print(f"\n{'-' * 60}")
     if FAILURES:
         print(f"FAIL: {len(FAILURES)} of {CHECKS_RUN} checks failed:")

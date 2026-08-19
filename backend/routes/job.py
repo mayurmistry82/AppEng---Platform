@@ -264,6 +264,37 @@ _CHILD_TABLES: list[tuple[str, str]] = [
     ("roof_geometry", "roof_geometry"),
 ]
 
+# Rows per child table returned by GET /api/job/{id}. DERIVED, not guessed: the
+# largest number of rows any job holds on any child table today is TWO
+# (roof_geometry, on the jobs where a manual entry followed an auto lookup), so
+# twenty is an order of magnitude of headroom while keeping the payload bounded
+# from day one. sizing_results is now an append-only run log and D33 roughly
+# doubles its volume again once two engines run on the same job, so "bounded
+# from day one" is the point. ONE constant precisely so raising it is a one-line
+# change when 3.14's deliberate runs make it tight.
+_HYDRATION_LIMIT = 20
+
+
+def _note_truncation(job_id: str, table: str) -> None:
+    """Record that a child table was truncated. NEVER raises, never blocks.
+
+    A bounded payload that does not say it is bounded reads as a complete one,
+    and the next person debugging a missing row will look everywhere except
+    here. The signal goes to the LOG, not the response body: nothing consumes a
+    response-body marker, and a field with no consumer is the shape D29 rejects.
+    Its own try/except because it sits inside the hydration loop, whose except
+    yields an EMPTY LIST — a Sentry failure must never blank a child table.
+    """
+    try:
+        sentry_sdk.capture_message(
+            f"[job/get] hydration of {table} TRUNCATED at {_HYDRATION_LIMIT} rows "
+            f"for job {job_id} — the response is not the whole table."
+        )
+        logger.warning("job CRUD: hydration of %s truncated at %d for %s",
+                       table, _HYDRATION_LIMIT, job_id)
+    except Exception:  # noqa: BLE001 — a failed log must not fail the request
+        pass
+
 _NOT_FOUND = HTTPException(status_code=404, detail="Job not found")
 _UNAVAILABLE = HTTPException(status_code=503, detail="Database unavailable")
 
@@ -820,8 +851,28 @@ async def get_job(job_id: str, caller: Caller = Depends(require_company)):
     for key, table in _CHILD_TABLES:
         # A missing/unreadable child table yields an empty list for its key, never a 500.
         try:
-            res = client.table(table).select("*").eq("job_id", job_id).execute()
+            # ORDERED AND BOUNDED, AND THE TWO ARE ONE CHANGE. PostgREST returns
+            # rows in unspecified physical order, so a LIMIT without an ORDER BY
+            # keeps an arbitrary N — which can drop the NEWEST row, the one the
+            # entire frontend now depends on (3.11b prompt 1). Neither ships
+            # without the other. All twelve child tables carry created_at
+            # (information_schema, checked when this was written), which is what
+            # makes one uniform ordering safe rather than a per-table case.
+            #
+            # FETCH LIMIT+1, RETURN LIMIT: the extra row is how truncation is
+            # detected at all, without a second count query.
+            res = (
+                client.table(table)
+                .select("*")
+                .eq("job_id", job_id)
+                .order("created_at", desc=True)
+                .limit(_HYDRATION_LIMIT + 1)
+                .execute()
+            )
             rows = getattr(res, "data", None) or []
+            if len(rows) > _HYDRATION_LIMIT:
+                rows = rows[:_HYDRATION_LIMIT]
+                _note_truncation(job_id, table)
             if key == "roof_geometry":
                 # 3.5b (§20.2) defence in depth: even if the nightly sweep has not
                 # run, expired Google Solar Data never leaves the server. Only this
