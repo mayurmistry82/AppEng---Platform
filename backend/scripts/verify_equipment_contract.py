@@ -370,7 +370,10 @@ def t4_autopick_scoping() -> None:
             load_hourly_8760=[0.5] * 8760,
             import_rate=0.40, fit=0.05, export_limit_kw=5.0,
         )
-        asyncio.run(sizing_route.battery_sizing(body))
+        # 3.11b: the endpoint now requires a Caller — passed EXPLICITLY (the
+        # dependency must never gain a usable default). No job_id in this body,
+        # so the ownership check is skipped and the pool query still runs.
+        asyncio.run(sizing_route.battery_sizing(body, CALLER_A))
     finally:
         sizing_route._sb = original
     pool = [q for q in stub.queries if q["table"] == "batteries"]

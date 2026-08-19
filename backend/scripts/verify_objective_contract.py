@@ -24,10 +24,14 @@ BACKEND_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if BACKEND_DIR not in sys.path:
     sys.path.insert(0, BACKEND_DIR)
 
+import auth  # noqa: E402
 import capture  # noqa: E402
 import solar_optimiser  # noqa: E402
 from routes import job as job_route  # noqa: E402
 from routes import sizing as sizing_route  # noqa: E402
+
+GATE_CALLER = auth.Caller(user_id="u-gate", email="gate@example.com",
+                          company_id="co-gate", role="owner")
 
 FAILURES: list[str] = []
 CHECKS_RUN = 0
@@ -88,8 +92,12 @@ def body(**kw) -> sizing_route.OptimiseRequest:
     return sizing_route.OptimiseRequest(**kw)
 
 
+# 3.11b: the endpoints now REQUIRE a Caller (no usable default, deliberately),
+# and the ownership check reads jobs.company_id — so the stub rows carry the
+# gate Caller's company and the endpoint helper passes it explicitly.
 def jobs_stub(**cols) -> StubClient:
-    row = {"job_id": "j1", "created_at": "2026-08-18T00:00:00Z",
+    row = {"job_id": "j1", "company_id": "co-gate",
+           "created_at": "2026-08-18T00:00:00Z",
            "objective": None, "custom_weight": None, "budget_aud": None}
     row.update(cols)
     return StubClient({"jobs": [row]})
@@ -245,7 +253,7 @@ def _run_endpoint(client: StubClient, **body_kw) -> dict:
     original = sizing_route._sb
     sizing_route._sb = lambda: client
     try:
-        return asyncio.run(sizing_route.optimise_sizing(body(**body_kw)))
+        return asyncio.run(sizing_route.optimise_sizing(body(**body_kw), GATE_CALLER))
     finally:
         sizing_route._sb = original
 

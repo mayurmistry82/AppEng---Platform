@@ -25,6 +25,7 @@ BACKEND_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if BACKEND_DIR not in sys.path:
     sys.path.insert(0, BACKEND_DIR)
 
+import auth  # noqa: E402
 import capture  # noqa: E402
 import generation  # noqa: E402
 from routes import sizing as sizing_route  # noqa: E402
@@ -114,6 +115,18 @@ def t2_one_reader() -> None:
 def t3_run_the_writers(client) -> tuple[dict, dict]:
     print("\nT3. the persisted payload, BY RUNNING THE WRITERS (F148) — recorder in "
           "place, nothing written")
+    # 3.11b: the endpoints require a Caller (no usable default). The gate
+    # constructs one whose company_id is READ FROM THE LIVE DATABASE — never
+    # hardcoded — so it is the company that genuinely owns the live job and
+    # the ownership check passes on truth rather than on a copied constant.
+    owner = (client.table("jobs").select("company_id")
+             .eq("job_id", LIVE_JOB).limit(1).execute())
+    company_id = (owner.data or [{}])[0].get("company_id")
+    check("(3) the live job's owning company was read", bool(company_id),
+          str(company_id))
+    gate_caller = auth.Caller(user_id="gate-runner", email="gate@example.com",
+                              company_id=company_id, role="owner")
+
     recorded: list[dict] = []
     responses: list[dict] = []
     original_save = capture.save_sizing_result
@@ -122,10 +135,12 @@ def t3_run_the_writers(client) -> tuple[dict, dict]:
     generation._cache_put = lambda *a, **k: None
     try:
         solar_res = asyncio.run(
-            sizing_route.optimise_sizing(sizing_route.OptimiseRequest(job_id=LIVE_JOB)))
+            sizing_route.optimise_sizing(
+                sizing_route.OptimiseRequest(job_id=LIVE_JOB), gate_caller))
         responses.append(solar_res)
         battery_res = asyncio.run(
-            sizing_route.battery_sizing(sizing_route.BatteryRequest(job_id=LIVE_JOB)))
+            sizing_route.battery_sizing(
+                sizing_route.BatteryRequest(job_id=LIVE_JOB), gate_caller))
         responses.append(battery_res)
     finally:
         capture.save_sizing_result = original_save

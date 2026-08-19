@@ -6,7 +6,17 @@ import os
 from typing import Any, Literal, Optional
 from pydantic import BaseModel
 import sentry_sdk
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, Depends, HTTPException
+
+from auth import Caller, require_company
+
+# 3.11b — THE OWNERSHIP RULE IS IMPORTED, NOT COPIED, underscore and all.
+# routes/roof.py hand-copied this same contract at 3.4-A because job.py was
+# frozen, and the two have since drifted: job.py answers 404 on a malformed
+# uuid, roof.py answers 503 on the same input. That drift is the cost of the
+# copy. One rule in one place is worth more than a naming convention — do not
+# "fix" this import by copying the function here.
+from routes.job import _get_company_job
 
 import battery_optimiser
 import capture
@@ -617,10 +627,31 @@ def _resolve_objective(client: Any, body: Any, flags: list[str]) -> dict:
 
 
 @router.post("/api/sizing/optimise")
-async def optimise_sizing(body: OptimiseRequest):
+async def optimise_sizing(
+    body: OptimiseRequest, caller: Caller = Depends(require_company)
+):
     try:
         flags: list[str] = []
         client = _sb()
+        # 3.11b — OWNERSHIP BEFORE ANY READ OF THE JOB'S STORED STATE. A
+        # foreign job and an absent job raise the SAME 404 here (existence
+        # never leaks), a transport failure raises 503, and both propagate as
+        # HTTP statuses — never translated into a 200 body, because the proxy
+        # passes status through. Running before _resolve_objective means 404
+        # always wins over invalid-objective. client None = local dev with no
+        # Supabase: nothing to own and nothing to leak — do not "harden" this
+        # skip into a 500 that breaks local development.
+        if body.job_id and client is not None:
+            _get_company_job(client, body.job_id, caller.company_id)
+        # 3.11b — the installer identity comes from the LOGIN, never the body
+        # (the routes/job.py:610 precedent). An attempted assertion is visible,
+        # not silently ignored (F161).
+        if (isinstance(body.installer_id, str) and body.installer_id
+                and body.installer_id != caller.user_id):
+            flags.append(
+                "installer_identity_from_login — this sizing used the pricing "
+                "of the person signed in, not the installer named in the request"
+            )
         # 3.9 — the ONE resolver, called BEFORE the roof block. Ordering is
         # part of the contract: an invalid objective must keep erroring ahead
         # of the "no roof geometry" error, so the validity check operates on
@@ -709,7 +740,7 @@ async def optimise_sizing(body: OptimiseRequest):
                 utc_offset_hours=utc_offset,
                 panel=panel_, load_hourly=load_hourly, import_rate=float(import_rate), fit=float(fit),
                 export_limit_kw=float(export_limit_kw), objective=objective, fin=fin,
-                postcode=postcode, state=state, installer_id=body.installer_id,
+                postcode=postcode, state=state, installer_id=caller.user_id,
                 custom_weight=custom_weight,
                 budget=budget, constraints=constraints_, flags=flags_,
             )
@@ -847,6 +878,12 @@ async def optimise_sizing(body: OptimiseRequest):
             "persisted": persisted,
             "flags": flags,
         }
+    except HTTPException:
+        # 3.11b — an authorisation refusal (404 foreign/absent, 503 transport,
+        # 401/403 from auth) is an HTTP STATUS, never a 200 with a message:
+        # the prompt-2 proxy passes status through, and translating it here
+        # would turn "not yours" into "engine error". Re-raised, not caught.
+        raise
     except Exception as e:  # noqa: BLE001 — never crash the app
         sentry_sdk.capture_exception(e)
         return {"error": "Internal error in the sizing optimiser.", "flags": ["internal_error"]}
@@ -1046,10 +1083,31 @@ def _build_rate_24(
 
 
 @router.post("/api/sizing/battery")
-async def battery_sizing(body: BatteryRequest):
+async def battery_sizing(
+    body: BatteryRequest, caller: Caller = Depends(require_company)
+):
     try:
         flags: list[str] = []
         client = _sb()
+        # 3.11b — OWNERSHIP BEFORE ANY READ OF THE JOB'S STORED STATE. A
+        # foreign job and an absent job raise the SAME 404 here (existence
+        # never leaks), a transport failure raises 503, and both propagate as
+        # HTTP statuses — never translated into a 200 body, because the proxy
+        # passes status through. Running before _resolve_objective means 404
+        # always wins over invalid-objective. client None = local dev with no
+        # Supabase: nothing to own and nothing to leak — do not "harden" this
+        # skip into a 500 that breaks local development.
+        if body.job_id and client is not None:
+            _get_company_job(client, body.job_id, caller.company_id)
+        # 3.11b — the installer identity comes from the LOGIN, never the body
+        # (the routes/job.py:610 precedent). An attempted assertion is visible,
+        # not silently ignored (F161).
+        if (isinstance(body.installer_id, str) and body.installer_id
+                and body.installer_id != caller.user_id):
+            flags.append(
+                "installer_identity_from_login — this sizing used the pricing "
+                "of the person signed in, not the installer named in the request"
+            )
         # 3.9 — the ONE resolver, before the roof block; see optimise_sizing.
         resolved = _resolve_objective(client, body, flags)
         objective = resolved["objective"]
@@ -1131,7 +1189,7 @@ async def battery_sizing(body: BatteryRequest):
                 utc_offset_hours=utc_offset,
                 panel=panel_, load_hourly=load_hourly, import_rate=flat_rate_for_solar, fit=float(fit),
                 export_limit_kw=export_limit_kw, objective=objective, fin=fin,
-                postcode=postcode, state=state, installer_id=body.installer_id,
+                postcode=postcode, state=state, installer_id=caller.user_id,
                 custom_weight=custom_weight,
                 budget=None, constraints=sconstraints_, flags=fl,
             )
@@ -1156,7 +1214,7 @@ async def battery_sizing(body: BatteryRequest):
                 export_limit_kw=export_limit_kw, battery_rows=rows_, fin=fin,
                 solar_kw=chosen_["solar_kw"], panel_id=panel_.get("id"), panel_count=chosen_.get("panel_count"),
                 solar_only_net_cost=chosen_["system_cost"], postcode=postcode, state=state,
-                installer_id=body.installer_id, objective=objective,
+                installer_id=caller.user_id, objective=objective,
                 custom_weight=custom_weight,
                 budget=budget, resolution=body.resolution,
                 fix_battery_kwh=fix_kwh_, force_no_battery=force_nb_, flags=flags_,
@@ -1330,6 +1388,8 @@ async def battery_sizing(body: BatteryRequest):
             "persisted": persisted,
             "flags": flags,
         }
+    except HTTPException:
+        raise  # 3.11b — see optimise_sizing: a status is a status, never a 200.
     except Exception as e:  # noqa: BLE001 — never crash the app
         sentry_sdk.capture_exception(e)
         return {"error": "Internal error in the battery optimiser.", "flags": ["internal_error"]}
