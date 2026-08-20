@@ -209,9 +209,24 @@ def t_f_endpoint_payloads(client) -> None:
                               company_id=company_id, role="owner")
 
     recorded: list[dict] = []
+    fin_recorded: list[dict] = []
+    quote_recorded: list[tuple] = []
+    # 3.13 prompt 2: ALL THREE writers are recorded — the sizing writer, the
+    # financial writer, and the jobs quote update. The faked sizing id must be
+    # UUID-SHAPED: the endpoint refuses to write a financial row linked by a
+    # non-UUID id (the column is a uuid FK), which is also what keeps a gate
+    # whose recorder returns "fake-id" from ever reaching the live tables.
+    FAKE_SID = "00000000-0000-4000-8000-0000000f93f1"
     original_save = capture.save_sizing_result
+    original_fin = capture.save_financial_result
+    original_quote = sizing_route._set_quoted_value
     original_cache = generation._cache_put
-    capture.save_sizing_result = lambda payload: (recorded.append(dict(payload)) or "fake-id")
+    capture.save_sizing_result = lambda payload: (recorded.append(dict(payload)) or FAKE_SID)
+    capture.save_financial_result = lambda payload: (fin_recorded.append(dict(payload)) or "fake-fin-id")
+    sizing_route._set_quoted_value = (
+        lambda client, job_id, company_id, value:
+        (quote_recorded.append((job_id, company_id, value)) or True)
+    )
     generation._cache_put = lambda *a, **k: None
     try:
         asyncio.run(sizing_route.optimise_sizing(
@@ -220,6 +235,8 @@ def t_f_endpoint_payloads(client) -> None:
             sizing_route.BatteryRequest(job_id=LIVE_JOB), gate_caller))
     finally:
         capture.save_sizing_result = original_save
+        capture.save_financial_result = original_fin
+        sizing_route._set_quoted_value = original_quote
         generation._cache_put = original_cache
 
     check("(f) both endpoints attempted exactly one persist each",
@@ -355,6 +372,45 @@ def t_f_endpoint_payloads(client) -> None:
           "the writer stores the engine's own flag now",
           isinstance(recorded[1].get("within_budget"), bool),
           repr(recorded[1].get("within_budget")))
+
+    # 3.13 prompt 2: the SECOND writer call per endpoint — the financial
+    # result linked to the sizing row just written — and the quote update.
+    # WHY THESE MOVE: pre-prompt-2 neither endpoint calls
+    # save_financial_result or updates quoted_value_aud at all, so every
+    # count below is zero and every key check fails on an empty list.
+    check("(f2) each endpoint persisted exactly one financial result",
+          len(fin_recorded) == 2, f"{len(fin_recorded)} payloads")
+    if len(fin_recorded) == 2:
+        for label, fin, siz in (("solar", fin_recorded[0], recorded[0]),
+                                ("battery", fin_recorded[1], recorded[1])):
+            check(f"(f2) {label}: financial row links the sizing row just "
+                  "written (sizing_result_id == the id the writer returned)",
+                  fin.get("sizing_result_id") == FAKE_SID,
+                  repr(fin.get("sizing_result_id")))
+            check(f"(f2) {label}: system_capex == the sizing row's "
+                  "system_cost, exactly — one figure, two rows",
+                  fin.get("system_capex") == siz.get("system_cost"),
+                  f"{fin.get('system_capex')} vs {siz.get('system_cost')}")
+            check(f"(f2) {label}: pricing_basis 'modelled' (in PRICING_BASES) "
+                  "and job_id matches",
+                  fin.get("pricing_basis") == "modelled"
+                  and fin.get("pricing_basis") in capture.PRICING_BASES
+                  and fin.get("job_id") == LIVE_JOB,
+                  f"{fin.get('pricing_basis')!r} / {fin.get('job_id')!r}")
+            check(f"(f2) {label}: roi_percent is None PERMANENTLY (D34) — the "
+                  "three ROI figures are derived at render from the columns "
+                  "beside it",
+                  "roi_percent" in fin and fin.get("roi_percent") is None,
+                  repr(fin.get("roi_percent")))
+    check("(f2) each endpoint set the quote value exactly once, company-"
+          "scoped, to its own system_capex",
+          len(quote_recorded) == 2
+          and all(q[0] == LIVE_JOB and q[1] == gate_caller.company_id
+                  for q in quote_recorded)
+          and len(fin_recorded) == 2
+          and quote_recorded[0][2] == fin_recorded[0].get("system_capex")
+          and quote_recorded[1][2] == fin_recorded[1].get("system_capex"),
+          f"{quote_recorded}")
 
 
 

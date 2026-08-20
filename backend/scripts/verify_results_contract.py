@@ -45,9 +45,34 @@ tests.
   RC  the database delta (F77): fourteen counts read at start, asserted
       unchanged at the end — never an absolute count.
 
-RUNS the code, never parses it (F148) — except R4, which edits and RESTORES
-solar_optimiser.py by design, byte-hash verified, inside a try/finally.
-WRITES NOTHING to the database.
+3.13 PROMPT 2 GREW IT — the run gets a financial result:
+  P1  the composition proof: whole-system NPV from ONE discount loop written
+      inside this gate (raw savings rebuilt from the engines' own building
+      blocks) equals solar npv_25yr + incremental_npv to within one cent.
+  P2  the two-engine agreement (no-battery grid_cost vs the solar engine's
+      energy-only bill, one clock: full_year blocks), with a RED PROOF by
+      perturbing battery_optimiser.baseline in a byte-hashed copy.
+  P3  _payback_years at zero / negative / None savings: None, never a raise,
+      never an infinity.
+  P4  save_financial_result accepts 'modelled' and None, REFUSES 'installer'
+      loudly (returns None, logs, _write never reached).
+  P5  the KPI month on the job's own state's LOCAL STANDARD clock — the three
+      boundary rows, old rule vs new rule, at least one row DIFFERS.
+  P6  a null / unrecognised site_state: counted in UTC, never dropped,
+      nothing raises (list_jobs against a stub).
+  P7  the list pairing: the financial row must MATCH the chosen sizing row;
+      an unmatched newest financial row yields null, never itself.
+  P8  supply_charge_source: a stored charge beside a NULL import rate reads
+      'installer', never 'default' — the exact fixture case that was wrong.
+  P9  roi_percent is None on every payload both endpoints build, and 'D34'
+      stands in the code beside it — the settled never-populate decision
+      (three ROI definitions, all derived at render) leaves a trace.
+
+RUNS the code, never parses it (F148) — except R4 and P2, which edit and
+RESTORE an engine file by design, byte-hash verified, inside a try/finally.
+WRITES NOTHING to the database: all three writers (sizing, financial, the
+jobs quote update) are recorded on every endpoint run, and the faked sizing
+id is deliberately UUID-shaped so the financial branch is observable.
 
 Run:  /opt/anaconda3/bin/python3 backend/scripts/verify_results_contract.py
 """
@@ -56,12 +81,16 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+import math
 import os
 import shutil
 import subprocess
 import sys
 import tempfile
 import traceback
+from datetime import datetime, timezone
+from types import SimpleNamespace
+from typing import Optional
 
 SCRIPTS_DIR = os.path.dirname(os.path.abspath(__file__))
 BACKEND_DIR = os.path.dirname(SCRIPTS_DIR)
@@ -74,6 +103,7 @@ import capture  # noqa: E402
 import generation  # noqa: E402
 import solar_irradiance  # noqa: E402
 import solar_optimiser  # noqa: E402
+from routes import job as job_route  # noqa: E402
 from routes import sizing as sizing_route  # noqa: E402
 
 FAILURES: list[str] = []
@@ -214,6 +244,12 @@ def _counts() -> dict | None:
         out[t] = cur.fetchone()[0]
     cur.execute("select count(*) from storage.objects where bucket_id = 'bills'")
     out["bills bucket"] = cur.fetchone()[0]
+    # 3.13 prompt 2: an UPDATE leaves every row count unchanged, so the quote
+    # values are snapshotted BY VALUE — a gate run that mutated
+    # jobs.quoted_value_aud would pass fourteen count checks and fail here.
+    cur.execute("select job_id::text, coalesce(quoted_value_aud::text, 'NULL') "
+                "from public.jobs order by job_id")
+    out["jobs quoted values"] = tuple(map(tuple, cur.fetchall()))
     conn.close()
     return out
 
@@ -496,7 +532,7 @@ def _wb_arithmetic(label: str, cands: list[dict], budget) -> None:
           f"{len(wrong)} wrong; first: {wrong[0] if wrong else None}")
 
 
-def t_r5_r6(client, opt3: dict) -> None:
+def t_r5_r6(client, opt3: dict) -> Optional[dict]:
     print("\nR5. optimise_battery keeps within_budget and the breakdowns — "
           "job-free fixture that chooses a battery")
     s8760, built = _fixture_solar_8760(opt3)
@@ -512,6 +548,7 @@ def t_r5_r6(client, opt3: dict) -> None:
           len(catalogue) >= 2, f"{len(catalogue)} rows")
 
     r5 = _run_fixture_battery(opt3, s8760, catalogue, budget=None)
+    ctx = {"r5": r5, "s8760": s8760, "catalogue": catalogue}
     opt_b = r5.get("optimal_battery") or {}
     cands = r5.get("candidates") or []
     print(f"        chosen: {opt_b.get('model')!r} "
@@ -546,7 +583,7 @@ def t_r5_r6(client, opt3: dict) -> None:
           "system_costs — a midpoint cap can separate them",
           len(batt_costs) >= 2, f"{batt_costs}")
     if len(batt_costs) < 2:
-        return
+        return ctx
     cap = round((batt_costs[0] + batt_costs[-1]) / 2.0, 2)
     print(f"        derived cap ${cap} between ${batt_costs[0]} and "
           f"${batt_costs[-1]} (never typed)")
@@ -561,6 +598,7 @@ def t_r5_r6(client, opt3: dict) -> None:
     check("(R6) cache_misses == 0 across the fixture's generation build — "
           "this gate can never start calling the network",
           built["cache_misses"] == 0, str(built["cache_misses"]))
+    return ctx
 
 
 # ── R7 / R8: the live endpoints, recorder in place ───────────────────────────
@@ -572,36 +610,131 @@ def _caller_for(client, job_id: str) -> auth.Caller:
                        company_id=company_id, role="owner")
 
 
+# 3.13 prompt 2: the faked sizing id is UUID-SHAPED on purpose — the endpoint
+# refuses to link a financial row to a non-UUID id (uuid FK), so a plain
+# "fake-id" would make the financial branch unobservable here.
+FAKE_SID = "00000000-0000-4000-8000-0000000313f2"
+
+
 def _run_endpoint(coro_fn, request, caller):
+    """Run one endpoint with ALL THREE writers recorded — sizing, financial,
+    and the jobs quote update — restored in a finally. Nothing is written."""
     recorded: list[dict] = []
+    fin_recorded: list[dict] = []
+    quote_recorded: list[tuple] = []
     original_save = capture.save_sizing_result
+    original_fin = capture.save_financial_result
+    original_quote = sizing_route._set_quoted_value
     original_cache = generation._cache_put
-    capture.save_sizing_result = lambda p: (recorded.append(dict(p)) or "fake-id")
+    capture.save_sizing_result = lambda p: (recorded.append(dict(p)) or FAKE_SID)
+    capture.save_financial_result = lambda p: (fin_recorded.append(dict(p)) or "fake-fin-id")
+    sizing_route._set_quoted_value = (
+        lambda client, job_id, company_id, value:
+        (quote_recorded.append((job_id, company_id, value)) or True)
+    )
     generation._cache_put = lambda *a, **k: None
     try:
         resp = asyncio.run(coro_fn(request, caller))
     finally:
         capture.save_sizing_result = original_save
+        capture.save_financial_result = original_fin
+        sizing_route._set_quoted_value = original_quote
         generation._cache_put = original_cache
-    return resp, recorded
+    return resp, recorded, fin_recorded, quote_recorded
 
 
 def t_r7(client) -> dict:
     print("\nR7. BOTH endpoints against the LIVE fixture job — writer "
           "recorded, nothing written")
     caller = _caller_for(client, TOU_JOB)
-    sol, sol_rec = _run_endpoint(sizing_route.optimise_sizing,
-                                 sizing_route.OptimiseRequest(job_id=TOU_JOB),
-                                 caller)
-    bat, bat_rec = _run_endpoint(sizing_route.battery_sizing,
-                                 sizing_route.BatteryRequest(job_id=TOU_JOB),
-                                 caller)
+    sol, sol_rec, sol_fin, sol_quote = _run_endpoint(
+        sizing_route.optimise_sizing,
+        sizing_route.OptimiseRequest(job_id=TOU_JOB), caller)
+    bat, bat_rec, bat_fin, bat_quote = _run_endpoint(
+        sizing_route.battery_sizing,
+        sizing_route.BatteryRequest(job_id=TOU_JOB), caller)
     check("(R7) each endpoint attempted exactly one persist — both "
           "intercepted by the recorder",
           len(sol_rec) == 1 and len(bat_rec) == 1,
           f"{len(sol_rec)} + {len(bat_rec)}")
     if not (sol_rec and bat_rec):
         return {"sol": sol}
+
+    # 3.13 prompt 2: the SECOND writer call per endpoint, and the quote.
+    # WHY THESE MOVE: pre-prompt-2 neither endpoint writes financial_results
+    # or quoted_value_aud at all — every list below would be empty.
+    check("(P/R7) each endpoint persisted exactly one financial result, "
+          "linked to the sizing id the writer returned",
+          len(sol_fin) == 1 and len(bat_fin) == 1
+          and sol_fin[0].get("sizing_result_id") == FAKE_SID
+          and bat_fin[0].get("sizing_result_id") == FAKE_SID,
+          f"{len(sol_fin)} + {len(bat_fin)}")
+    if sol_fin and bat_fin:
+        check("(P/R7) both: system_capex == the sizing row's system_cost, "
+              "exactly — the one derived expectation, both endpoints",
+              sol_fin[0].get("system_capex") == sol_rec[0].get("system_cost")
+              and bat_fin[0].get("system_capex") == bat_rec[0].get("system_cost"),
+              f"solar {sol_fin[0].get('system_capex')} vs {sol_rec[0].get('system_cost')}; "
+              f"battery {bat_fin[0].get('system_capex')} vs {bat_rec[0].get('system_cost')}")
+        check("(P9) both endpoints: pricing_basis 'modelled' and roi_percent "
+              "None PERMANENTLY (D34) — the three ROI definitions are "
+              "derived at render from system_capex / annual_savings / "
+              "npv_25_year, stored beside it",
+              all(f.get("pricing_basis") == "modelled"
+                  and "roi_percent" in f and f.get("roi_percent") is None
+                  for f in (sol_fin[0], bat_fin[0])),
+              f"{sol_fin[0].get('pricing_basis')!r}/{sol_fin[0].get('roi_percent')!r} "
+              f"{bat_fin[0].get('pricing_basis')!r}/{bat_fin[0].get('roi_percent')!r}")
+        # P9's second half: the settled decision leaves a TRACE in the code —
+        # the string "D34" stands beside roi_percent in the one writer both
+        # endpoints share. A settled decision with no trace gets re-litigated
+        # in three weeks.
+        src = open(os.path.join(BACKEND_DIR, "routes", "sizing.py")).read()
+        roi_at = src.find('"roi_percent": None')
+        window = src[max(0, roi_at - 400):roi_at + 100] if roi_at != -1 else ""
+        check("(P9) the string 'D34' appears in the comment beside "
+              "roi_percent in routes/sizing.py",
+              roi_at != -1 and "D34" in window,
+              f"roi_percent found at {roi_at}; window carries D34: "
+              f"{'D34' in window}")
+        # The solar half is read from the SOLAR endpoint's own run on the same
+        # job — both endpoints choose the same solar on the same stored
+        # inputs (the battery gate's AGREE check pins that), so its optimal
+        # carries the same annual_savings / npv_25yr the battery endpoint
+        # composed from internally.
+        _sopt = sol.get("optimal") or {}
+        _bopt = bat.get("optimal_battery") or {}
+        check("(P/R7) battery: the composed figures are the sums — "
+              "annual_savings == solar + incremental and npv == solar + "
+              "incremental, to the cent (if the endpoint re-derived either "
+              "half instead of composing, these sums would drift)",
+              isinstance(bat_fin[0].get("annual_savings"), (int, float))
+              and abs(bat_fin[0]["annual_savings"]
+                      - round(_sopt.get("annual_savings", 0)
+                              + _bopt.get("annual_savings_vs_solar_only", 0), 2))
+              <= 0.01
+              and isinstance(bat_fin[0].get("npv_25_year"), (int, float))
+              and abs(bat_fin[0]["npv_25_year"]
+                      - round(_sopt.get("npv_25yr", 0)
+                              + _bopt.get("incremental_npv", 0), 2)) <= 0.01,
+              f"savings {bat_fin[0].get('annual_savings')} vs "
+              f"{_sopt.get('annual_savings')}+{_bopt.get('annual_savings_vs_solar_only')}; "
+              f"npv {bat_fin[0].get('npv_25_year')} vs "
+              f"{_sopt.get('npv_25yr')}+{_bopt.get('incremental_npv')}")
+        check("(P/R7) each endpoint set the quote once, to its own "
+              "system_capex, company-scoped",
+              len(sol_quote) == 1 and len(bat_quote) == 1
+              and sol_quote[0] == (TOU_JOB, caller.company_id,
+                                   sol_fin[0].get("system_capex"))
+              and bat_quote[0] == (TOU_JOB, caller.company_id,
+                                   bat_fin[0].get("system_capex")),
+              f"{sol_quote} / {bat_quote}")
+        check("(P/R7) both responses say financial_persisted True — the "
+              "recorder accepted, and the response reports it",
+              sol.get("financial_persisted") is True
+              and bat.get("financial_persisted") is True,
+              f"{sol.get('financial_persisted')!r} / "
+              f"{bat.get('financial_persisted')!r}")
 
     sopts = sol_rec[0].get("evaluated_options") or {}
     bopts = bat_rec[0].get("evaluated_options") or {}
@@ -659,10 +792,13 @@ def t_r8(client, sol_tou: dict) -> None:
           isinstance(asm.get("supply_charge_annual"), (int, float))
           and round(asm["supply_charge_annual"], 2) == want_annual,
           f"{asm.get('supply_charge_annual')} vs {want_annual}")
-    check("(R8/known) assumptions.supply_charge_source is a real source, "
-          "not 'not stated'",
-          isinstance(asm.get("supply_charge_source"), str)
-          and asm["supply_charge_source"] != "not stated",
+    # 3.13 prompt 2 (P8, on the live row): this stored tariff has a charge the
+    # installer typed and a NULL import rate — the exact fixture case prompt 1
+    # labelled "default". WHY IT MOVES: pre-prompt-2 the label borrowed
+    # `source`, which only the import-rate resolution ever assigns.
+    check("(R8/known · P8) assumptions.supply_charge_source is 'installer' — "
+          "never 'default', the import rate's provenance",
+          asm.get("supply_charge_source") == "installer",
           repr(asm.get("supply_charge_source")))
     check("(R8/known) the supply_charge_unknown flag does NOT appear",
           not any(str(f).startswith("supply_charge_unknown")
@@ -676,9 +812,9 @@ def t_r8(client, sol_tou: dict) -> None:
           f"{opt.get('annual_supply_charge')}")
 
     caller = _caller_for(client, NULL_JOB)
-    sol_null, rec = _run_endpoint(sizing_route.optimise_sizing,
-                                  sizing_route.OptimiseRequest(job_id=NULL_JOB),
-                                  caller)
+    sol_null, rec, fin_rec, _quotes = _run_endpoint(
+        sizing_route.optimise_sizing,
+        sizing_route.OptimiseRequest(job_id=NULL_JOB), caller)
     check("(R8/unknown) the NULL-charge run attempted exactly one persist — "
           "recorded, never written",
           len(rec) == 1, f"{len(rec)}")
@@ -701,30 +837,454 @@ def t_r8(client, sol_tou: dict) -> None:
           and opt_n.get("annual_supply_charge") is None,
           f"{opt_n.get('bill_includes_supply_charge')} / "
           f"{opt_n.get('annual_supply_charge')}")
+    # 3.13 prompt 2: the financial payload still BUILDS on the unknown branch,
+    # with the energy-only spend figures the optimal dict carries.
+    check("(R8/unknown) the financial payload built anyway, spend figures "
+          "energy-only (== the optimal dict's own bill figures)",
+          len(fin_rec) == 1
+          and fin_rec[0].get("current_annual_spend") == opt_n.get("annual_bill_before")
+          and fin_rec[0].get("projected_annual_spend") == opt_n.get("annual_bill_after")
+          and fin_rec[0].get("pricing_basis") == "modelled",
+          f"{len(fin_rec)} payload(s); "
+          f"{fin_rec[0].get('current_annual_spend') if fin_rec else None} vs "
+          f"{opt_n.get('annual_bill_before')}")
+
+
+# ── P1: the composition proof ─────────────────────────────────────────────────
+def t_p1(opt3: dict, ctx: dict) -> None:
+    print("\nP1. the composition proof — one discount loop, written HERE, "
+          "equals the two engines' sum")
+    r5 = ctx["r5"]
+    chosen = r5.get("optimal_battery") or {}
+    row = next((r for r in ctx["catalogue"]
+                if r.get("id") == chosen.get("battery_id")), None)
+    check("(P1/fixture) the chosen battery's catalogue row is in hand "
+          "(its hardware cost prices the replacement term)",
+          row is not None, repr(chosen.get("battery_id")))
+    if row is None:
+        return
+    bat = battery_optimiser.battery_specs(dict(row), [])
+    load = _fixture_load()
+
+    # RAW savings, rebuilt from the ENGINES' OWN building blocks (never this
+    # gate's arithmetic): the battery's from build_blocks/baseline/
+    # solve_candidate, the solar's from net_config — then pinned to the
+    # candidates' rounded figures so the reconstruction is provably the same
+    # computation and not a lookalike.
+    blocks = battery_optimiser.build_blocks(
+        ctx["s8760"], load, list(FIX_RATE_24), "representative_days")
+    base = battery_optimiser.baseline(blocks, FIX_FIT, FIX_EXPORT_LIMIT_KW)
+    res = battery_optimiser.solve_candidate(blocks, bat, FIX_FIT,
+                                            FIX_EXPORT_LIMIT_KW)
+    check("(P1/fixture) the candidate LP re-solved to optimality",
+          res is not None, "solver failed")
+    if res is None:
+        return
+    sav_b_raw = base["cost"] - res["cost"]
+    netd = solar_optimiser.net_config(ctx["s8760"], load,
+                                      FIX_EXPORT_LIMIT_KW, list(FIX_RATE_24))
+    sav_s_raw = netd["self_consumed_value"] + netd["export"] * FIX_FIT
+    check("(P1/fixture) the rebuilt raw savings ARE the engines' own — both "
+          "round to the candidates' stored figures",
+          round(sav_s_raw, 2) == opt3.get("annual_savings")
+          and round(sav_b_raw, 2) == chosen.get("annual_savings_vs_solar_only"),
+          f"solar {round(sav_s_raw, 2)} vs {opt3.get('annual_savings')}; "
+          f"battery {round(sav_b_raw, 2)} vs "
+          f"{chosen.get('annual_savings_vs_solar_only')}")
+
+    S = opt3["system_cost"]
+    incr = chosen["battery_cost"]
+    deg = FIN["degradation_annual_pct"] / 100.0
+    disc = FIN["discount_rate"]
+    esc = FIN["tariff_escalation_pct"] / 100.0
+    N = FIN["analysis_years"]
+    npv_direct = -(S + incr)
+    for y in range(1, N + 1):
+        npv_direct += ((sav_s_raw + sav_b_raw)
+                       * ((1 - deg) ** y) * ((1 + esc) ** y) / ((1 + disc) ** y))
+    repl = chosen.get("replacement_year")
+    if repl:
+        npv_direct -= bat["cost_aud"] / ((1 + disc) ** repl)
+    engine_sum = opt3["npv_25yr"] + chosen["incremental_npv"]
+    print(f"        direct loop: {npv_direct:.4f}   solar npv + incremental: "
+          f"{engine_sum:.2f}   replacement year: {repl}")
+    check("(P1) whole-system NPV from ONE gate-written discount loop == "
+          "solar npv_25yr + incremental_npv within one cent — this moves the "
+          "moment the two engines discount on different clocks (a different "
+          "fin dict breaks the factor-by-factor identity) or a capex leaks "
+          "into the wrong half",
+          abs(npv_direct - engine_sum) <= 0.011,
+          f"direct {npv_direct:.4f} vs engines {engine_sum:.2f} "
+          f"(diff {npv_direct - engine_sum:+.4f})")
+
+
+# ── P2: the two-engine agreement + its red proof ─────────────────────────────
+def subprocess_probe_p2() -> dict:
+    """One clock (full_year blocks), two engines: the battery engine's
+    no-battery grid cost vs the solar engine's energy-only bill for the same
+    chosen solar. Run in a FRESH interpreter for the sabotage/restore runs."""
+    res3 = _run_fixture_optimise()
+    opt = res3["optimal"]
+    s8760, _built = _fixture_solar_8760(opt)
+    load = _fixture_load()
+    netd = solar_optimiser.net_config(s8760, load, FIX_EXPORT_LIMIT_KW,
+                                      list(FIX_RATE_24))
+    bill_energy = netd["import_value"] - netd["export"] * FIX_FIT
+    blocks = battery_optimiser.build_blocks(s8760, load, list(FIX_RATE_24),
+                                            "full_year")
+    base = battery_optimiser.baseline(blocks, FIX_FIT, FIX_EXPORT_LIMIT_KW)
+    diff = base["cost"] - bill_energy
+    return {"grid_cost": round(base["cost"], 2),
+            "bill_energy": round(bill_energy, 2),
+            "diff": diff, "agree": abs(diff) <= 0.01}
+
+
+def _probe_p2_via_subprocess() -> dict | None:
+    runner = (
+        "import json, sys\n"
+        f"sys.path.insert(0, {SCRIPTS_DIR!r})\n"
+        f"sys.path.insert(0, {BACKEND_DIR!r})\n"
+        "import verify_results_contract as g\n"
+        "print('PROBE:' + json.dumps(g.subprocess_probe_p2()))\n"
+    )
+    proc = subprocess.run([sys.executable, "-c", runner],
+                          capture_output=True, text=True, timeout=600)
+    for line in proc.stdout.splitlines():
+        if line.startswith("PROBE:"):
+            return json.loads(line[len("PROBE:"):])
+    print(f"        probe stdout: {proc.stdout[-400:]!r}")
+    print(f"        probe stderr: {proc.stderr[-400:]!r}")
+    return None
+
+
+_P2_FROM = "            cost += w * (i * r - e * fit)\n"
+_P2_TO = "            cost += w * (i * r - e * fit) + 0.001\n"
+
+
+def t_p2() -> None:
+    print("\nP2. the two-engine agreement, and the proof it can FAIL")
+    healthy = _probe_p2_via_subprocess()
+    print(f"        healthy probe: {healthy}")
+    check("(P2) GREEN: on one clock (full_year blocks) the no-battery "
+          "grid_cost equals the solar engine's energy-only bill within one "
+          "cent — the only comparison of the two engines' pricing arithmetic",
+          isinstance(healthy, dict) and healthy.get("agree") is True,
+          repr(healthy))
+
+    target = os.path.join(BACKEND_DIR, "battery_optimiser.py")
+    original = open(target, "rb").read()
+    original_hash = hashlib.sha256(original).hexdigest()
+    print(f"        original SHA-256: {original_hash}")
+    text = original.decode("utf-8")
+    n = text.count(_P2_FROM)
+    check("(P2) the perturbation line exists EXACTLY once in "
+          "battery_optimiser.py (the baseline's pricing line)",
+          n == 1, f"count={n}")
+    if n != 1:
+        return
+    tmpdir = tempfile.mkdtemp(prefix="p2_")
+    backup = os.path.join(tmpdir, "battery_optimiser.py.bak")
+    shutil.copyfile(target, backup)
+    check("(P2) the byte copy was taken FIRST and matches the original hash",
+          hashlib.sha256(open(backup, "rb").read()).hexdigest()
+          == original_hash, backup)
+    try:
+        with open(target, "w", encoding="utf-8") as fh:
+            fh.write(text.replace(_P2_FROM, _P2_TO))
+        _rm_pycache()
+        red = _probe_p2_via_subprocess()
+        print(f"        perturbed probe: {red}")
+        check("(P2) RED: with the baseline's pricing perturbed by a tenth of "
+              "a cent per hour the agreement FAILS — the check genuinely "
+              "compares the two engines and is not vacuous",
+              isinstance(red, dict) and red.get("agree") is False,
+              repr(red))
+    finally:
+        shutil.copyfile(backup, target)
+        _rm_pycache()
+    restored_hash = hashlib.sha256(open(target, "rb").read()).hexdigest()
+    print(f"        restored SHA-256: {restored_hash}")
+    check("(P2) RESTORED: battery_optimiser.py is byte-identical to the one "
+          "tested (SHA-256 equal, restored from the copy, never from git)",
+          restored_hash == original_hash, restored_hash)
+    green = _probe_p2_via_subprocess()
+    print(f"        restored probe : {green}")
+    check("(P2) GREEN AGAIN after the restore",
+          isinstance(green, dict) and green.get("agree") is True, repr(green))
+    shutil.rmtree(tmpdir, ignore_errors=True)
+
+
+# ── P3 / P4: the payback edge and the pricing_basis vocabulary ───────────────
+def t_p3_p4() -> None:
+    print("\nP3. payback at zero / negative / missing savings")
+    for label, savings in (("exactly 0", 0.0), ("negative", -812.5),
+                           ("None", None)):
+        try:
+            out = sizing_route._payback_years(10000.0, savings)
+            err = None
+        except Exception as ex:  # noqa: BLE001
+            out, err = "RAISED", f"{type(ex).__name__}: {ex}"
+        check(f"(P3) whole_savings {label}: payback is None — never negative, "
+              "never an infinity, no exception",
+              err is None and out is None, f"{out!r} {err or ''}")
+    check("(P3) CONTROL: positive savings still produce a payback "
+          "(10000 / 2500 = 4.0)",
+          sizing_route._payback_years(10000.0, 2500.0) == 4.0,
+          repr(sizing_route._payback_years(10000.0, 2500.0)))
+
+    print("\nP4. save_financial_result: 'modelled' accepted, 'installer' "
+          "REFUSED, None accepted")
+    reached: list = []
+    logs: list = []
+    original_write = capture._write
+    original_error = capture.logger.error
+    capture._write = lambda table, payload: (reached.append(table) or "stub-id")
+    capture.logger.error = lambda msg, *a, **k: logs.append(msg % a if a else msg)
+    try:
+        ok = capture.save_financial_result(
+            {"job_id": "j", "system_capex": 1.0, "pricing_basis": "modelled"})
+        check("(P4) 'modelled' (in PRICING_BASES) reaches _write",
+              ok == "stub-id" and reached == ["financial_results"],
+              f"{ok!r} {reached}")
+        refused = capture.save_financial_result(
+            {"job_id": "j", "system_capex": 1.0, "pricing_basis": "installer"})
+        check("(P4) 'installer' (row 4.12's future value, not yet in the "
+              "vocabulary) is REFUSED: returns None, _write NEVER reached",
+              refused is None and len(reached) == 1,
+              f"{refused!r} {len(reached)} write(s)")
+        check("(P4) ...and the refusal is LOGGED, naming the label and the "
+              "known set",
+              any("pricing_basis" in str(m) and "installer" in str(m)
+                  for m in logs), f"{logs}")
+        ok_none = capture.save_financial_result(
+            {"job_id": "j", "system_capex": 1.0})
+        check("(P4) an ABSENT pricing_basis stays legal ('not recorded') — "
+              "_write reached",
+              ok_none == "stub-id" and len(reached) == 2,
+              f"{ok_none!r} {len(reached)} write(s)")
+    finally:
+        capture._write = original_write
+        capture.logger.error = original_error
+
+
+# ── P5 / P6 / P7: the KPI month and the list pairing ─────────────────────────
+class _LJQuery:
+    def __init__(self, rows):
+        self.rows = rows
+        self._order = None
+        self._desc = True
+
+    def select(self, *_a, **_k):
+        return self
+
+    def eq(self, *_a, **_k):
+        return self
+
+    def in_(self, *_a, **_k):
+        return self
+
+    def order(self, column, desc=None, **_k):
+        self._order, self._desc = column, bool(desc)
+        return self
+
+    def limit(self, *_a, **_k):
+        return self
+
+    def execute(self):
+        rows = list(self.rows)
+        if self._order:
+            rows.sort(key=lambda r: str(r.get(self._order) or ""),
+                      reverse=self._desc)
+        return SimpleNamespace(data=rows)
+
+
+class _LJClient:
+    def __init__(self, tables):
+        self.tables = tables
+
+    def table(self, name):
+        return _LJQuery(self.tables.get(name, []))
+
+
+def _run_list_jobs(tables: dict):
+    caller = auth.Caller(user_id="gate-runner", email="gate@example.com",
+                         company_id="co-gate", role="owner")
+    original_svc = job_route._require_svc
+    job_route._require_svc = lambda: _LJClient(tables)
+    try:
+        return asyncio.run(job_route.list_jobs(
+            caller=caller, status=None, q=None, sort="updated_desc",
+            limit=50, offset=0))
+    finally:
+        job_route._require_svc = original_svc
+
+
+def t_p5_p6() -> None:
+    print("\nP5. the KPI month on the job's own state's local standard clock")
+    # A fixed 'now' mid-March so the boundary rows are decidable: the rule is
+    # (ts key == now key), both sides through _won_month_key on ONE clock.
+    now_fixed = datetime(2026, 3, 15, 0, 0, 0, tzinfo=timezone.utc)
+    rows = [
+        ("SA", datetime(2026, 3, 1, 0, 15, tzinfo=timezone.utc), (2026, 3), (2026, 3)),
+        ("WA", datetime(2026, 3, 1, 0, 15, tzinfo=timezone.utc), (2026, 3), (2026, 3)),
+        ("SA", datetime(2026, 2, 28, 23, 0, tzinfo=timezone.utc), (2026, 3), (2026, 2)),
+    ]
+    differs = 0
+    for state, ts, want_new, want_old in rows:
+        new_key = job_route._won_month_key(ts, state)
+        old_key = (ts.year, ts.month)
+        label = ts.strftime("%Y-%m-%dT%H:%MZ")
+        print(f"        {state} @ {label}: new {new_key}  old {old_key}")
+        check(f"(P5) {state} site @ {label}: lands in {want_new} on the "
+              "local clock",
+              new_key == want_new, str(new_key))
+        check(f"(P5) {state} site @ {label}: the OLD (UTC) rule says "
+              f"{want_old}",
+              old_key == want_old, str(old_key))
+        if new_key != old_key:
+            differs += 1
+    check("(P5) the two rules DIFFER for at least one row — the check is "
+          "testing the fix, not restating UTC (the 23:00Z Feb-28 SA row is "
+          "08:30 on March 1st in Adelaide)",
+          differs >= 1, f"{differs} rows differ")
+    check("(P5) both sides on one clock: now itself moves month under the "
+          "same key for the same state",
+          job_route._won_month_key(now_fixed, "SA") == (2026, 3),
+          str(job_route._won_month_key(now_fixed, "SA")))
+
+    print("\nP6. a null / unrecognised site_state: counted in UTC, never "
+          "dropped, nothing raises")
+    now_iso = datetime.now(timezone.utc).isoformat()
+    jobs = [
+        {"job_id": "p6-null", "company_id": "co-gate", "status": "won",
+         "quoted_value_aud": 1000.0, "updated_at": now_iso,
+         "site_state": None, "path": None},
+        {"job_id": "p6-zz", "company_id": "co-gate", "status": "won",
+         "quoted_value_aud": 500.0, "updated_at": now_iso,
+         "site_state": "ZZ", "path": None},
+    ]
+    try:
+        resp = _run_list_jobs({"jobs": jobs})
+        err = None
+    except Exception as ex:  # noqa: BLE001
+        resp, err = None, f"{type(ex).__name__}: {ex}"
+    check("(P6) list_jobs did not raise", err is None, str(err))
+    if resp is None:
+        return
+    won = (resp.get("kpis") or {}).get("won_this_month") or {}
+    check("(P6) BOTH jobs counted this month (updated_at is now, so UTC and "
+          "any local clock agree) — the unresolvable state falls back to "
+          "UTC and the job is never dropped",
+          won.get("count") == 2 and won.get("value") == 1500.0,
+          f"{won}")
+
+
+def t_p7() -> None:
+    print("\nP7. the list pairing — the financial row must MATCH the chosen "
+          "sizing row")
+    job = {"job_id": "p7", "company_id": "co-gate", "status": "sized",
+           "quoted_value_aud": None, "updated_at": "2026-08-10T00:00:00+00:00",
+           "site_state": "SA", "path": None}
+    s_old = {"job_id": "p7", "sizing_result_id": "s1", "solar_kw": 5.5,
+             "battery_kwh": None, "created_at": "2026-08-01T00:00:00+00:00"}
+    s_new = {"job_id": "p7", "sizing_result_id": "s2", "solar_kw": 9.9,
+             "battery_kwh": None, "created_at": "2026-08-02T00:00:00+00:00"}
+    # The financial rows are DELIBERATELY created in the OPPOSITE order to
+    # their sizing rows: the NEWEST financial row (f-for-s1) belongs to the
+    # OLDER sizing run.
+    f_for_s2 = {"job_id": "p7", "sizing_result_id": "s2", "payback_years": 3.3,
+                "created_at": "2026-08-03T00:00:00+00:00"}
+    f_for_s1 = {"job_id": "p7", "sizing_result_id": "s1", "payback_years": 9.9,
+                "created_at": "2026-08-04T00:00:00+00:00"}
+    resp = _run_list_jobs({"jobs": [job],
+                           "sizing_results": [s_old, s_new],
+                           "financial_results": [f_for_s2, f_for_s1]})
+    row = (resp.get("jobs") or [{}])[0]
+    head = row.get("headline") or {}
+    print(f"        headline: {head}")
+    check("(P7) the chosen sizing row is the newest (solar 9.9 kW from s2)",
+          head.get("solar_kw") == 9.9, repr(head.get("solar_kw")))
+    check("(P7) payback_years is 3.3 — the row MATCHING s2, not the newest "
+          "financial row (9.9, which belongs to the older run s1). WHY IT "
+          "MOVES: the old rule picked newest-per-job independently on both "
+          "tables",
+          head.get("payback_years") == 3.3, repr(head.get("payback_years")))
+
+    # An unmatched newest financial row yields NULL, never itself.
+    f_orphan = {"job_id": "p7", "sizing_result_id": "s0", "payback_years": 7.7,
+                "created_at": "2026-08-05T00:00:00+00:00"}
+    resp2 = _run_list_jobs({"jobs": [job],
+                            "sizing_results": [s_old, s_new],
+                            "financial_results": [f_for_s1, f_orphan]})
+    head2 = ((resp2.get("jobs") or [{}])[0].get("headline")) or {}
+    check("(P7) no financial row matches the chosen sizing row: "
+          "payback_years is NULL — a missing number is honest, a mismatched "
+          "one is not",
+          head2.get("payback_years") is None, repr(head2.get("payback_years")))
+
+
+def t_p8_resolver() -> None:
+    print("\nP8. supply_charge_source at the resolver — the exact fixture "
+          "case that was wrong")
+    stored = {"job_id": "j8", "tariff_type": "tou", "supply_charge": 1.05,
+              "tou_windows": [{"label": "peak", "rate": 0.45,
+                               "start": "00:00", "end": "24:00",
+                               "days": "all"}],
+              "import_rate": None, "fit_aud_per_kwh": 0.05,
+              "export_limit_kw": 5.0, "source": "installer"}
+    body = SimpleNamespace(job_id="j8", import_rate=None, fit=None,
+                           export_limit_kw=None, import_rates_24=None,
+                           tou_windows=None)
+    flags: list[str] = []
+    t = sizing_route._resolve_tariff(
+        _LJClient({"tariffs": [stored], "bills": []}), body, "SA", "5000",
+        flags)
+    check("(P8) a stored charge beside a NULL import rate: "
+          "supply_charge_source is 'installer', not 'default' — prompt 1's "
+          "label borrowed the import rate's provenance and said 'default' "
+          "about a number the installer typed",
+          t.get("supply_charge_source") == "installer"
+          and t.get("source") == "default",
+          f"supply_charge_source={t.get('supply_charge_source')!r} "
+          f"source={t.get('source')!r}")
+    fl: list[str] = []
+    annual, src = sizing_route._annual_supply_charge(t, fl)
+    check("(P8) ...and the annualiser carries it: 383.25 labelled "
+          "'installer'",
+          annual == 383.25 and src == "installer", f"{annual!r} / {src!r}")
 
 
 def main() -> int:
-    print("verify_results_contract.py — 3.13 prompt 1 (writes nothing)\n")
+    print("verify_results_contract.py — 3.13 prompts 1+2 (writes nothing)\n")
     start = _counts()
     if start is not None:
         print(f"        start counts: {start}\n")
 
     t_r1()
     t_r2()
+    t_p3_p4()
+    t_p5_p6()
+    t_p7()
+    t_p8_resolver()
 
     client = sizing_route._sb()
     if client is None:
-        skip("(R3-R8) need the live Supabase env (pvgis_cache, catalogue "
-             "pricing, the two real jobs).")
+        skip("(R3-R8, P1, P2) need the live Supabase env (pvgis_cache, "
+             "catalogue pricing, the two real jobs).")
     else:
         r3 = t_r3()
         t_r4()
         if r3 is not None and isinstance(r3.get("optimal"), dict) \
                 and isinstance(r3["optimal"].get("cost_breakdown"), dict):
-            t_r5_r6(client, r3["optimal"])
+            ctx = t_r5_r6(client, r3["optimal"])
+            if ctx is not None:
+                t_p1(r3["optimal"], ctx)
+            else:
+                skip("(P1) R5/R6 did not produce a usable battery context.")
         else:
-            skip("(R5/R6) R3 did not produce a usable optimum to feed the "
-                 "battery fixture.")
+            skip("(R5/R6, P1) R3 did not produce a usable optimum to feed "
+                 "the battery fixture.")
+        t_p2()
         r7 = t_r7(client)
         t_r8(client, r7.get("sol") or {})
 

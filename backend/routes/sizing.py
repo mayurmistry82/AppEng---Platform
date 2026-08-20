@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import math
 import os
+import uuid
 from typing import Any, Literal, Optional
 from pydantic import BaseModel
 import sentry_sdk
@@ -404,6 +405,12 @@ def _resolve_tariff(
     stored = _read_tariff_row(client, body.job_id, flags)
     tariff_type = stored.get("tariff_type") if stored else None
     supply_charge = stored.get("supply_charge") if stored else None
+    # 3.13 prompt 2 (G): the supply charge's OWN provenance, tracked where the
+    # charge itself is read — the fit_is_fallback pattern, never inferred from
+    # `source`, which is only ever assigned when the IMPORT RATE resolves.
+    # Prompt 1 borrowed `source` and the fixture job answered "default" about
+    # a number the installer typed.
+    supply_charge_source = "installer" if supply_charge is not None else "not stated"
     stored_windows = None
     if stored and isinstance(stored.get("tou_windows"), list) and stored["tou_windows"]:
         stored_windows = stored["tou_windows"]
@@ -445,6 +452,8 @@ def _resolve_tariff(
                 tariff_type = structured.get("tariff_type")
             if supply_charge is None and structured:
                 supply_charge = structured.get("supply_charge")
+                if supply_charge is not None:
+                    supply_charge_source = "bill"
             if import_rate is None and pj.get("tariff_rate") is not None:
                 import_rate = float(pj["tariff_rate"])
                 source = source or "bill"
@@ -512,6 +521,7 @@ def _resolve_tariff(
         "export_meta": export_meta,
         "tariff_type": tariff_type,
         "supply_charge": supply_charge,
+        "supply_charge_source": supply_charge_source,
         "source": source,
         # 3.12: flat_rate_for_solar is GONE. It was sum(rate_24)/24, the
         # battery endpoint's private third meaning of "the import rate", and
@@ -656,15 +666,127 @@ def _annual_supply_charge(
     A charge that is NULL, absent, negative, NaN or unparseable is None — a
     missing charge is a DIFFERENT fact from a zero charge, so it is never
     defaulted to 0; the omission is flagged rather than silent, and the run
-    completes normally with energy-only bill figures."""
+    completes normally with energy-only bill figures.
+
+    3.13 prompt 2 (G): the source is the resolver's supply_charge_source —
+    the charge's OWN provenance — never `source`, which names where the
+    IMPORT RATE came from and said "default" about an installer-typed charge."""
     daily = _objective_num(tariff.get("supply_charge"))
     if daily is not None and daily >= 0:
-        return daily * 365, str(tariff.get("source") or "not stated")
+        return daily * 365, str(tariff.get("supply_charge_source") or "not stated")
     flags.append(
         "supply_charge_unknown — the bill figures below cover energy only, "
         "not the daily supply charge"
     )
     return None, "not stated"
+
+
+def _payback_years(capex: Any, savings: Any) -> Optional[float]:
+    """3.13 prompt 2: simple payback for the composed whole system. None when
+    the savings are zero or negative — never a negative payback, never an
+    infinity, never a division by zero. A None input yields None: a missing
+    figure is a different fact from a zero figure."""
+    if not isinstance(capex, (int, float)) or isinstance(capex, bool):
+        return None
+    if not isinstance(savings, (int, float)) or isinstance(savings, bool):
+        return None
+    if savings <= 0:
+        return None
+    return round(capex / savings, 2)
+
+
+def _set_quoted_value(client: Any, job_id: str, company_id: str, value: Any) -> bool:
+    """3.13 prompt 2: the job's MODELLED quote value — the same net cost the
+    financial result stores as system_capex. Company-scoped exactly like the
+    two update sites routes/job.py already has (the service role bypasses RLS,
+    so the .eq('company_id', ...) filter IS the protection). Direct update,
+    never capture.save_job: that writer UPSERTS, and an upsert with a two-key
+    payload against a live customer table is not a risk this takes.
+
+    DELIBERATELY DOES NOT SET updated_at: nothing on jobs has a trigger, so
+    updated_at moves only when a writer sets it — and the won-this-month KPI
+    counts a won job by its updated_at. Bumping it from a sizing run would
+    move a job that was won in March into this month's won figure. Sizing is
+    not winning.
+
+    Returns True only when the update matched a row. Never raises."""
+    try:
+        resp = (
+            client.table("jobs")
+            .update({"quoted_value_aud": value})
+            .eq("job_id", job_id)
+            .eq("company_id", company_id)
+            .execute()
+        )
+        return bool(getattr(resp, "data", None))
+    except Exception:  # noqa: BLE001 — a stale KPI is recoverable; a 500 is not
+        return False
+
+
+def _persist_financial_and_quote(
+    client: Any, caller: Any, job_id: str, sid: Any, payload: dict,
+    flags: list[str],
+) -> bool:
+    """3.13 prompt 2: persist the financial result linked to the sizing row
+    just written, then set the job's modelled quote value from the SAME
+    system_capex. Returns financial_persisted. Never raises, never blocks.
+
+    ORDER IS DELIBERATE, both gates on purpose:
+      1. No financial row without a REAL sizing_result_id — an unlinked
+         financial row is worse than no row, because the Results section's
+         rule is "a financial result for the CURRENT sizing result". A falsy
+         sid writes nothing and adds NO second alarm (the existing
+         sizing_result_not_persisted flag already names the one cause). A
+         non-UUID sid also writes nothing: sizing_result_id is a uuid FK, so
+         the insert is guaranteed to fail at the database — and every gate
+         that fakes the sizing writer with a recorder returns a non-UUID id,
+         which is what keeps a monkey-patched gate run from ever reaching the
+         live tables through this path.
+      2. No quote value without its stored financial row — quoted_value_aud
+         mirrors a figure whose source of record is the financial_results
+         row; setting the KPI when the row failed to store would put a number
+         on the dashboard that nothing stored can explain.
+
+    roi_percent is NULL PERMANENTLY — settled by D34 (2026-08-20). Return on
+    investment has three definitions — annual return on cost, discounted
+    return, and total 25-year return — and on the one real fixture they are
+    29%, 269% and about 600% for the IDENTICAL system. The platform shows
+    none of them by default, and when an installer turns them on it shows ALL
+    THREE together, never one alone: a control that picks the largest of
+    three is a persuasion lever. All three are DERIVED AT RENDER from
+    system_capex, annual_savings and npv_25_year, which are stored beside
+    this column — storing a fourth number would be a second copy of figures
+    already present, the drift this codebase deletes rather than gates. The
+    column is deliberately never populated. Do not invent a definition."""
+    if not sid:
+        return False
+    try:
+        uuid.UUID(str(sid))
+    except (ValueError, AttributeError, TypeError):
+        flags.append("financial_result_not_persisted")
+        return False
+    financial_persisted = False
+    try:
+        fid = capture.save_financial_result({
+            **payload,
+            "job_id": job_id,
+            "sizing_result_id": sid,
+            # NULL permanently — D34 (2026-08-20): the three ROI definitions
+            # are derived at render from the three columns beside this one;
+            # see this helper's docstring.
+            "roi_percent": None,
+            "pricing_basis": "modelled",
+        })
+        financial_persisted = bool(fid)
+    except Exception as exc:  # noqa: BLE001 — never block the response
+        sentry_sdk.capture_exception(exc)
+    if not financial_persisted:
+        flags.append("financial_result_not_persisted")
+        return False
+    if not _set_quoted_value(client, job_id, caller.company_id,
+                             payload.get("system_capex")):
+        flags.append("quote_value_not_updated")
+    return True
 
 
 @router.post("/api/sizing/optimise")
@@ -865,7 +987,9 @@ async def optimise_sizing(
         # the solar system's cost. The battery writer satisfies the same
         # sentence for its solar+battery recommendation; run_kind says which.
         persisted = False
+        financial_persisted = False
         if body.job_id:
+            sid = None
             try:
                 sid = capture.save_sizing_result(
                     {
@@ -915,6 +1039,28 @@ async def optimise_sizing(
                 sentry_sdk.capture_exception(exc)
             if not persisted:
                 flags.append("sizing_result_not_persisted")
+            # 3.13 prompt 2 (B): the matching financial result, linked by
+            # sizing_result_id, plus the job's modelled quote value. Every
+            # figure is READ from the optimal dict — nothing is recomputed;
+            # annual_bill_reduction is the one derived value and it is a
+            # subtraction of two keys in the same dict.
+            financial_persisted = _persist_financial_and_quote(
+                client, caller, body.job_id, sid,
+                {
+                    "system_capex": opt["system_cost"],
+                    "annual_savings": opt["annual_savings"],
+                    "current_annual_spend": opt["annual_bill_before"],
+                    "projected_annual_spend": opt["annual_bill_after"],
+                    "annual_bill_reduction": (
+                        round(opt["annual_bill_before"] - opt["annual_bill_after"], 2)
+                        if opt.get("annual_bill_before") is not None
+                        and opt.get("annual_bill_after") is not None else None
+                    ),
+                    "payback_years": opt["simple_payback_years"],
+                    "npv_25_year": opt["npv_25yr"],
+                },
+                flags,
+            )
 
         return {
             "objective": result["objective"],
@@ -954,6 +1100,7 @@ async def optimise_sizing(
             },
             "failed_planes": result["failed_planes"],
             "persisted": persisted,
+            "financial_persisted": financial_persisted,
             "flags": flags,
         }
     except HTTPException:
@@ -1435,6 +1582,35 @@ async def battery_sizing(
         # 3.11 — same object into the row and the response; see optimise_sizing.
         roof_conf = _roof_confidence(roof, flags)
 
+        # ── 3.13 prompt 2 (C): THE TWO-ENGINE AGREEMENT, asserted in code.
+        # The no-battery baseline's grid_cost and the chosen solar's
+        # annual_bill_after are two computations of the same year's ENERGY
+        # bill for the same chosen solar, by two different engines — the only
+        # place the suite compares their arithmetic against each other.
+        # annual_bill_after has carried the daily supply charge since 3.13
+        # prompt 1, and grid_cost never has, so the KNOWN charge is removed
+        # before comparing — otherwise the check would flag every job whose
+        # tariff states a charge, about a difference that is not the engines'.
+        # A disagreement names BOTH numbers and the run persists anyway. ──
+        _baseline_grid_cost = (result.get("no_battery_baseline") or {}).get("grid_cost")
+        _bill_after = chosen_solar.get("annual_bill_after")
+        _energy_after = (
+            round(_bill_after - (chosen_solar.get("annual_supply_charge") or 0), 2)
+            if _bill_after is not None
+            and chosen_solar.get("bill_includes_supply_charge") else _bill_after
+        )
+        if (
+            isinstance(_baseline_grid_cost, (int, float))
+            and isinstance(_energy_after, (int, float))
+            and abs(_baseline_grid_cost - _energy_after) > 0.01
+        ):
+            flags.append(
+                f"engine_disagreement — the battery engine's no-battery baseline "
+                f"prices the chosen solar's year at ${_baseline_grid_cost:,.2f} "
+                f"while the solar engine's energy-only bill is "
+                f"${_energy_after:,.2f}"
+            )
+
         # ── Persist chosen solar + battery to sizing_results ──
         # system_cost is THE TOTAL UP-FRONT NET COST OF EVERYTHING THIS ROW
         # RECOMMENDS — a run_kind='solar_battery' row recommends solar AND a
@@ -1442,7 +1618,9 @@ async def battery_sizing(
         # the same sentence for its solar-only recommendation; run_kind says
         # which.
         persisted = False
+        financial_persisted = False
         if body.job_id:
+            sid = None
             gen_annual = round(sum(solar_8760), 1)
             export_opt = opt.get("annual_export_kwh")
             self_cons_ratio = (
@@ -1499,6 +1677,55 @@ async def battery_sizing(
             if not persisted:
                 flags.append("sizing_result_not_persisted")
 
+            # 3.13 prompt 2 (C): the whole system, COMPOSED, not reinvented.
+            # The battery engine returns INCREMENTAL figures; the whole-system
+            # figures compose exactly because both NPV loops use the SAME fin
+            # dict (identical discount factors term by term), the two capex
+            # figures sum to opt["system_cost"], and the solar run's savings
+            # against no system equal the battery run's no-battery baseline
+            # saving against no system. The solar half is read from
+            # chosen_solar — one of the solar optimiser's own evaluated
+            # entries — never re-run.
+            _sol_sav = chosen_solar.get("annual_savings")
+            _inc_sav = opt.get("annual_savings_vs_solar_only")
+            whole_savings = (
+                _sol_sav + _inc_sav
+                if _sol_sav is not None and _inc_sav is not None else None
+            )
+            _sol_npv = chosen_solar.get("npv_25yr")
+            _inc_npv = opt.get("incremental_npv")
+            whole_npv = (
+                _sol_npv + _inc_npv
+                if _sol_npv is not None and _inc_npv is not None else None
+            )
+            _spend_before = chosen_solar.get("annual_bill_before")
+            financial_persisted = _persist_financial_and_quote(
+                client, caller, body.job_id, sid,
+                {
+                    "system_capex": opt["system_cost"],
+                    "annual_savings": (
+                        round(whole_savings, 2) if whole_savings is not None else None
+                    ),
+                    "npv_25_year": (
+                        round(whole_npv, 2) if whole_npv is not None else None
+                    ),
+                    "payback_years": _payback_years(opt["system_cost"], whole_savings),
+                    "current_annual_spend": _spend_before,
+                    # May legitimately EXCEED current spend (negative savings)
+                    # or go NEGATIVE (a system that out-earns the bill) —
+                    # written as it falls out, never clamped or floored.
+                    "projected_annual_spend": (
+                        round(_spend_before - whole_savings, 2)
+                        if _spend_before is not None and whole_savings is not None
+                        else None
+                    ),
+                    "annual_bill_reduction": (
+                        round(whole_savings, 2) if whole_savings is not None else None
+                    ),
+                },
+                flags,
+            )
+
         return {
             "objective": result["objective"],
             "load_source": load_source,
@@ -1547,6 +1774,7 @@ async def battery_sizing(
                 "constraints_applied": constraints_applied,
             },
             "persisted": persisted,
+            "financial_persisted": financial_persisted,
             "flags": flags,
         }
     except HTTPException:

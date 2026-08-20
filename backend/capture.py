@@ -178,6 +178,10 @@ RUN_KINDS: frozenset[str] = frozenset({"solar", "solar_battery"})
 # 'combined' (the joint solar+battery optimiser), and the comparison that
 # decides that row happens between engine_modes on the same real job (D33).
 ENGINE_MODES: frozenset[str] = frozenset({"sequential"})
+# PRICING_BASES — where a financial result's dollars came from (3.13 prompt 2).
+# Expected to grow: row 4.12 adds the installer's own pricing, and D6's
+# modelled-versus-actual distinction is what the column exists for.
+PRICING_BASES: frozenset[str] = frozenset({"modelled"})
 
 # Conflict key (idempotency) and returned pk per table.
 _CONFLICT: dict[str, str] = {
@@ -453,7 +457,22 @@ def save_sizing_result(payload: dict) -> Optional[str]:
 
 
 def save_financial_result(payload: dict) -> Optional[str]:
-    """Persist the financial_model.py output. Returns financial_result_id or None."""
+    """Persist one financial result into the append-only run log. Returns
+    financial_result_id or None.
+
+    REFUSES a payload whose pricing_basis is outside PRICING_BASES — the same
+    rule save_sizing_result applies to run_kind / engine_mode: loudly in the
+    log, safely at runtime (None), never raises, never coerces. None itself is
+    legal and means "not recorded".
+    """
+    if isinstance(payload, dict):
+        pricing_basis = payload.get("pricing_basis")
+        if pricing_basis is not None and pricing_basis not in PRICING_BASES:
+            logger.error(
+                "capture: financial_results REFUSED — unknown pricing_basis %r (known: %s).",
+                pricing_basis, sorted(PRICING_BASES),
+            )
+            return None
     return _write("financial_results", payload)
 
 

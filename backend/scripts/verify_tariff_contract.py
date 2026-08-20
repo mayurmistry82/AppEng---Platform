@@ -603,6 +603,75 @@ def solar_optimiser_default() -> float:
     return solar_optimiser.DEFAULT_IMPORT_RATE
 
 
+def t10_supply_charge_source() -> None:
+    """3.13 prompt 2 (G): the supply charge has its OWN provenance key.
+    WHY THESE MOVE: pre-prompt-2 the resolver returns no supply_charge_source
+    at all (every check fails on a missing key), and the annualiser borrowed
+    `source` — which names where the IMPORT RATE came from — so the exact
+    fixture shape below (a stored charge beside a NULL import rate) answered
+    'default' about a number the installer typed."""
+    print("\nT10. supply_charge_source — the charge's own provenance, "
+          "never the import rate's")
+
+    # (a) THE FIXTURE CASE THAT WAS WRONG: stored charge, NULL import rate.
+    stored = {"job_id": "j1", "tariff_type": "tou", "supply_charge": 1.05,
+              "tou_windows": [{"label": "peak", "rate": 0.45,
+                               "start": "00:00", "end": "24:00", "days": "all"}],
+              "import_rate": None, "fit_aud_per_kwh": 0.05,
+              "export_limit_kw": 5.0, "source": "installer"}
+    flags: list[str] = []
+    t = sizing_route._resolve_tariff(
+        StubClient({"tariffs": [stored], "bills": []}),
+        body_ns(job_id="j1"), "SA", "5000", flags)
+    check("(10a) stored charge + NULL import rate: supply_charge_source is "
+          "'installer'...",
+          t.get("supply_charge_source") == "installer",
+          repr(t.get("supply_charge_source")))
+    check("(10a) ...while `source` (the import rate's) is 'default' — the two "
+          "keys provably answer DIFFERENT questions on this one row",
+          t.get("source") == "default" and t.get("supply_charge_source") != t.get("source"),
+          f"source={t.get('source')!r}")
+
+    # (b) charge from the parsed bill's structured tariff.
+    flags2: list[str] = []
+    t2 = sizing_route._resolve_tariff(
+        StubClient({"tariffs": [], "bills": [BILL_ROW]}),
+        body_ns(job_id="j1"), "SA", "5000", flags2)
+    check("(10b) charge from the bill's tariff_structured: "
+          "supply_charge_source is 'bill'",
+          t2.get("supply_charge") == 1.1
+          and t2.get("supply_charge_source") == "bill",
+          f"{t2.get('supply_charge')!r} / {t2.get('supply_charge_source')!r}")
+
+    # (c) neither supplied it.
+    flags3: list[str] = []
+    t3 = sizing_route._resolve_tariff(
+        StubClient({"tariffs": [], "bills": []}),
+        body_ns(job_id="j1"), "SA", "5000", flags3)
+    check("(10c) no stored row, no bill: supply_charge is None and "
+          "supply_charge_source is 'not stated'",
+          t3.get("supply_charge") is None
+          and t3.get("supply_charge_source") == "not stated",
+          f"{t3.get('supply_charge')!r} / {t3.get('supply_charge_source')!r}")
+
+    # (d) the annualiser consumes the NEW key, not `source`.
+    flags4: list[str] = []
+    annual, src = sizing_route._annual_supply_charge(t, flags4)
+    check("(10d) _annual_supply_charge reads supply_charge_source: "
+          "1.05 $/day -> 383.25/yr labelled 'installer', never 'default'",
+          annual == 383.25 and src == "installer",
+          f"{annual!r} / {src!r}")
+    # Every OTHER key keeps its name, type and value — the annualiser's
+    # unknown branch is unchanged.
+    flags5: list[str] = []
+    annual3, src3 = sizing_route._annual_supply_charge(t3, flags5)
+    check("(10d) the unknown branch is unchanged: None / 'not stated' / "
+          "the supply_charge_unknown flag",
+          annual3 is None and src3 == "not stated"
+          and any(f.startswith("supply_charge_unknown") for f in flags5),
+          f"{annual3!r} / {src3!r} / {flags5}")
+
+
 def main() -> int:
     print("verify_tariff_contract.py — 3.8 prompt 1 (writes nothing)\n")
     t1_structure()
@@ -613,6 +682,7 @@ def main() -> int:
     t7_endpoint()
     t8_never_raises()
     t9_fallback_flag_condition()
+    t10_supply_charge_source()
     print(f"\n{'-' * 60}")
     if FAILURES:
         print(f"FAIL: {len(FAILURES)} of {CHECKS_RUN} checks failed:")

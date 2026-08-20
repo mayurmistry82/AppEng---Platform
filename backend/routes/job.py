@@ -349,6 +349,29 @@ def _parse_ts(v: Any) -> Optional[datetime]:
         return None
 
 
+def _won_month_key(ts: datetime, state: Any) -> tuple[int, int]:
+    """3.13 prompt 2 (D): the (year, month) a timestamp falls in on the job's
+    OWN state's local clock — the won-this-month KPI counts there, not in UTC,
+    where an Adelaide job updated before 09:30 local on the 1st landed in the
+    previous month. Both sides of the month comparison go through this same
+    function with the same state, so they sit on ONE clock.
+
+    DAYLIGHT SAVING IS DELIBERATELY NOT MODELLED: STATE_UTC_OFFSET_HOURS is
+    local STANDARD time by design — the same table the whole sizing time base
+    rests on (3.7) — and introducing a second, DST-aware clock here would
+    create exactly the two-clocks problem this fix exists to remove. The
+    residual error is one hour for part of the year at a month boundary,
+    against nine and a half hours before this fix.
+
+    A state that does not resolve returns the UTC month unchanged — never a
+    defaulted offset of 0 or 10, and the job is never dropped from the count."""
+    offset = nem_data.get_utc_offset_hours(state if isinstance(state, str) else None)
+    if offset is None:
+        return (ts.year, ts.month)
+    local = ts + timedelta(hours=float(offset))
+    return (local.year, local.month)
+
+
 # Postcode / state derivation ---------------------------------------------------
 # Replaces the old "last 4-digit group" extraction, which mistook a street number for a
 # postcode whenever the address had no postcode: "1234 Main North Rd, Adelaide" resolved
@@ -739,20 +762,33 @@ async def list_jobs(
                 customers[r["job_id"]] = r
             for r in (
                 client.table("sizing_results")
-                .select("job_id, solar_kw, battery_kwh, created_at")
+                .select("job_id, solar_kw, battery_kwh, created_at, sizing_result_id")
                 .in_("job_id", job_ids)
                 .order("created_at", desc=True)
                 .execute()
             ).data or []:
                 sizing.setdefault(r["job_id"], r)  # newest first — keep the latest
+            # 3.13 prompt 2 (F): the financial row must MATCH the sizing row
+            # already chosen for its job — the two were picked independently,
+            # which was only accidentally correct while every job had one run.
+            # The run log is append-only, so a job with two runs could show
+            # the newest system's size beside an older system's payback.
+            # Newest-first + setdefault keeps the newest MATCHING row; a job
+            # with no matching financial row reports null, never the newest
+            # unmatched one — a missing number is honest, a mismatched one is
+            # not.
             for r in (
                 client.table("financial_results")
-                .select("job_id, payback_years, created_at")
+                .select("job_id, payback_years, created_at, sizing_result_id")
                 .in_("job_id", job_ids)
                 .order("created_at", desc=True)
                 .execute()
             ).data or []:
-                financial.setdefault(r["job_id"], r)
+                chosen_sizing = sizing.get(r["job_id"])
+                if chosen_sizing and r.get("sizing_result_id") == chosen_sizing.get(
+                    "sizing_result_id"
+                ):
+                    financial.setdefault(r["job_id"], r)
     except Exception as exc:  # noqa: BLE001
         sentry_sdk.capture_exception(exc)
         return JSONResponse(status_code=500, content={"detail": "job list failed"})
@@ -802,7 +838,7 @@ async def list_jobs(
     try:
         all_jobs = (
             client.table("jobs")
-            .select("job_id, status, quoted_value_aud, updated_at")
+            .select("job_id, status, quoted_value_aud, updated_at, site_state")
             .eq("company_id", caller.company_id)
             .execute()
         ).data or []
@@ -823,9 +859,17 @@ async def list_jobs(
     for j in all_jobs:
         ts = _parse_ts(j.get("updated_at"))
         if j.get("status") == "won":
+            # The 90-day win-rate window is a rolling delta, not a calendar
+            # boundary — it is correct in any timezone and stays in UTC.
             if ts and ts >= win_from:
                 won_90 += 1
-            if ts and ts.year == now.year and ts.month == now.month:
+            # 3.13 prompt 2 (D): the calendar month is judged on the job's own
+            # state's local standard clock, BOTH sides through _won_month_key
+            # so the comparison sits on one clock (see its docstring for the
+            # deliberate no-DST decision and the UTC fallback).
+            if ts and _won_month_key(ts, j.get("site_state")) == _won_month_key(
+                now, j.get("site_state")
+            ):
                 won_month_count += 1
                 won_month_value += _num(j.get("quoted_value_aud")) or 0.0
         elif j.get("status") == "lost" and ts and ts >= win_from:
