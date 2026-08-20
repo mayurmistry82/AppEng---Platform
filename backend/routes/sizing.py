@@ -644,6 +644,29 @@ def _resolve_objective(client: Any, body: Any, flags: list[str]) -> dict:
     return {"objective": objective, "custom_weight": custom_weight, "budget": budget}
 
 
+def _annual_supply_charge(
+    tariff: dict, flags: list[str]
+) -> tuple[Optional[float], str]:
+    """3.13: ONE expression for the annual supply charge, used by BOTH sizing
+    endpoints. tariffs.supply_charge is dollars PER DAY (the frontend's own
+    bound message: "The supply charge must be between 0 and 20 $/day");
+    365 is the same non-leap year the declared hour convention uses
+    (HOURS = 8760). Returns (annual_or_None, source_string).
+
+    A charge that is NULL, absent, negative, NaN or unparseable is None — a
+    missing charge is a DIFFERENT fact from a zero charge, so it is never
+    defaulted to 0; the omission is flagged rather than silent, and the run
+    completes normally with energy-only bill figures."""
+    daily = _objective_num(tariff.get("supply_charge"))
+    if daily is not None and daily >= 0:
+        return daily * 365, str(tariff.get("source") or "not stated")
+    flags.append(
+        "supply_charge_unknown — the bill figures below cover energy only, "
+        "not the daily supply charge"
+    )
+    return None, "not stated"
+
+
 @router.post("/api/sizing/optimise")
 async def optimise_sizing(
     body: OptimiseRequest, caller: Caller = Depends(require_company)
@@ -753,6 +776,10 @@ async def optimise_sizing(
         export_limit_kw = tariff["export_limit_kw"]
         export_meta = tariff["export_meta"]
 
+        # ── 3.13: the annual supply charge, computed ONCE from the resolver's
+        # own per-day value and passed into every optimise() call below. ──
+        supply_charge_annual, supply_charge_source = _annual_supply_charge(tariff, flags)
+
         # ── Financial params ──
         fin = solar_optimiser.load_financial_params(flags)
 
@@ -765,6 +792,7 @@ async def optimise_sizing(
                 postcode=postcode, state=state, installer_id=caller.user_id,
                 custom_weight=custom_weight,
                 budget=budget, constraints=constraints_, flags=flags_,
+                supply_charge_annual=supply_charge_annual,
             )
 
         # ── Resolve solar constraints (panel-model re-scale is LOCAL — no Google call) ──
@@ -873,6 +901,12 @@ async def optimise_sizing(
                         "evaluated_options": {
                             "dimension_keys": ["solar_kw"],
                             "points": score_curve,
+                            # 3.13: which point won, and its itemised cost —
+                            # stored VERBATIM (never re-derived, re-sorted or
+                            # re-rounded), so the Results screen can read a
+                            # stored run without re-running the engine.
+                            "chosen_index": result.get("chosen_index"),
+                            "chosen_cost_breakdown": opt.get("cost_breakdown"),
                         },
                     }
                 )
@@ -891,11 +925,15 @@ async def optimise_sizing(
             "unconstrained_optimum": unconstrained_optimum,
             "constraint_deltas": constraint_deltas,
             "score_curve": score_curve,
+            "cost_breakdown": opt.get("cost_breakdown"),
+            "chosen_index": result.get("chosen_index"),
             "assumptions": {
                 "engine_version": solar_optimiser.ENGINE_VERSION,
                 "import_rate": import_rate,
                 "tariff_source": tariff["source"],
                 "tariff_type": tariff["tariff_type"],
+                "supply_charge_annual": supply_charge_annual,
+                "supply_charge_source": supply_charge_source,
                 "fit": fit,
                 "fit_is_fallback": fit_is_fallback,
                 "export_limit_kw": export_limit_kw,
@@ -1234,6 +1272,10 @@ async def battery_sizing(
         export_limit_kw = tariff["export_limit_kw"]
         export_meta = tariff["export_meta"]
 
+        # ── 3.13: the annual supply charge — the SAME one expression the
+        # solar endpoint uses, from the same resolver key. ──
+        supply_charge_annual, supply_charge_source = _annual_supply_charge(tariff, flags)
+
         # ── Financial params ──
         fin = solar_optimiser.load_financial_params(flags)
         pr = fin["performance_ratio_non_temp"]
@@ -1259,6 +1301,7 @@ async def battery_sizing(
                 # optimiser already answers an impossible cap honestly
                 # (budget_too_low + cheapest real config, within_budget false).
                 budget=budget, constraints=sconstraints_, flags=fl,
+                supply_charge_annual=supply_charge_annual,
             )
             ch = sres["optimal"]
             watts = float(panel_.get("watts") or 0.0)
@@ -1280,7 +1323,11 @@ async def battery_sizing(
                 solar_8760=s8760, load_8760=load_hourly, rate_24=rate_24, fit=float(fit),
                 export_limit_kw=export_limit_kw, battery_rows=rows_, fin=fin,
                 solar_kw=chosen_["solar_kw"], panel_id=panel_.get("id"), panel_count=chosen_.get("panel_count"),
-                solar_only_net_cost=chosen_["system_cost"], postcode=postcode, state=state,
+                solar_only_net_cost=chosen_["system_cost"],
+                # 3.13: the no-battery outcome's breakdown IS the solar run's —
+                # passed in, never recomputed here.
+                solar_only_cost_breakdown=chosen_["cost_breakdown"],
+                postcode=postcode, state=state,
                 installer_id=caller.user_id, objective=objective,
                 custom_weight=custom_weight,
                 budget=budget, resolution=body.resolution,
@@ -1402,19 +1449,21 @@ async def battery_sizing(
                 round((gen_annual - export_opt) / gen_annual, 4)
                 if (gen_annual > 0 and export_opt is not None) else None
             )
-            # 3.12 (F152): ONE local for the whole-system cost — the row stores
-            # it AND within_budget is derived from the SAME number. Two
-            # expressions for one idea is how the two halves drifted apart.
-            total_system_cost = round(chosen_solar["system_cost"] + opt.get("battery_cost", 0), 2)
+            # 3.13 (was 3.12/F152): there is now exactly ONE expression for the
+            # whole-system cost — the engine's own system_cost key, which every
+            # candidate carries and the budget filter tests. The row stores it
+            # and within_budget beside it, both from the same candidate dict;
+            # the local re-derivation that duplicated the engine's arithmetic
+            # is DELETED, not kept in step.
             try:
                 sid = capture.save_sizing_result({
                     "job_id": body.job_id,
                     "solar_kw": chosen_solar["solar_kw"],
                     "battery_kwh": opt.get("usable_kwh", 0),
                     "self_consumption_ratio": self_cons_ratio,
-                    "system_cost": total_system_cost,
+                    "system_cost": opt["system_cost"],
                     "annual_solar_generation_kwh": gen_annual,
-                    "within_budget": (budget is None) or (total_system_cost <= budget),
+                    "within_budget": opt["within_budget"],
                     "engine_version": battery_optimiser.ENGINE_VERSION,
                     "objective_used": objective,
                     "roof_geometry_id": roof_conf["roof_geometry_id"],
@@ -1431,6 +1480,17 @@ async def battery_sizing(
                     "evaluated_options": {
                         "dimension_keys": ["battery_id"],
                         "points": result["candidates"],
+                        # 3.13: stored VERBATIM. The battery run's points are
+                        # battery candidates, so the chosen solar layout is
+                        # not otherwise in this payload at all — this is the
+                        # only place it can travel from.
+                        "chosen_cost_breakdown": opt.get("cost_breakdown"),
+                        "chosen_solar": {
+                            "solar_kw": chosen_solar["solar_kw"],
+                            "panel_count": chosen_solar["panel_count"],
+                            "plane_indices": chosen_solar["plane_indices"],
+                            "panels_per_plane": chosen_solar["panels_per_plane"],
+                        },
                     },
                 })
                 persisted = bool(sid)
@@ -1452,17 +1512,24 @@ async def battery_sizing(
             "resolution": result["resolution"],
             "solve_seconds": result["solve_seconds"],
             "not_economic_reason": result["not_economic_reason"],
+            "within_budget": opt["within_budget"],
+            "cost_breakdown": opt.get("cost_breakdown"),
             "chosen_solar": {
                 "solar_kw": chosen_solar["solar_kw"],
                 "annual_generation_kwh": chosen_solar["annual_generation_kwh"],
                 "system_cost_solar_only": chosen_solar["system_cost"],
                 "plane_indices": chosen_solar["plane_indices"],
+                "panel_count": chosen_solar["panel_count"],
+                "panels_per_plane": chosen_solar["panels_per_plane"],
+                "cost_breakdown": chosen_solar["cost_breakdown"],
             },
             "assumptions": {
                 "engine_version": battery_optimiser.ENGINE_VERSION,
                 "is_tou": is_tou,
                 "tariff_source": tariff["source"],
                 "tariff_type": tariff["tariff_type"],
+                "supply_charge_annual": supply_charge_annual,
+                "supply_charge_source": supply_charge_source,
                 "import_rates_24": rate_24,
                 "fit": fit,
                 "fit_is_fallback": fit_is_fallback,

@@ -432,11 +432,37 @@ def t_b1_fixture() -> None:
                          "economic for this job.",
           repr(reason1))
 
+    # 3.13: the response now carries within_budget from the engine's own
+    # candidate — the chosen answer obeys the cap, so it must be True, and it
+    # must agree with recomputing from the response's own numbers.
+    check("(B1/fixture) capped battery response carries within_budget True — "
+          "the chosen answer obeys the cap and says so",
+          bat1.get("within_budget") is True, repr(bat1.get("within_budget")))
+    check("(B1/fixture) uncapped battery response carries within_budget True "
+          "(no cap means no cap)",
+          bat0.get("within_budget") is True, repr(bat0.get("within_budget")))
+    # B2 + within_budget arithmetic on the CAPPED candidate list — the one
+    # list where the truth values are provably MIXED (fixture health above
+    # pinned cap < every battery system_cost, and the downsized solar sits
+    # under the cap), so the equality cannot pass vacuously all-True.
+    _b2_candidates("fixture-capped", bat1.get("candidates") or [],
+                   cs1.get("system_cost_solar_only"), budget=cap)
+    wbs = {bool(c.get("within_budget"))
+           for c in (bat1.get("candidates") or [])
+           if isinstance(c.get("within_budget"), bool)}
+    check("(B1/fixture) the capped candidate list carries BOTH truth values "
+          "of within_budget — the flag is not vacuous",
+          wbs == {True, False}, str(wbs))
 
-def _b2_candidates(label: str, cands: list[dict], solar_only) -> None:
+
+def _b2_candidates(label: str, cands: list[dict], solar_only,
+                   budget=None) -> None:
     """B2's arithmetic, run against whichever candidate list is supplied.
     WHY IT MOVES: without change 1(a) no candidate carries system_cost at all,
-    so every equality below fails on a missing key."""
+    so every equality below fails on a missing key. 3.13 grew it: every
+    candidate must also carry within_budget derived from that SAME system_cost
+    — pre-3.13 no candidate carries the key at all, so the checks fail on a
+    missing key."""
     baselines = [c for c in cands if "battery_id" not in c]
     with_id = [c for c in cands if "battery_id" in c]
     check(f"(B2/{label}) the baseline is the ONLY entry without a battery_id — "
@@ -456,6 +482,21 @@ def _b2_candidates(label: str, cands: list[dict], solar_only) -> None:
           "round(solar_only + battery_cost, 2)",
           len(with_id) > 0 and not bad,
           f"{len(bad)} of {len(with_id)} wrong; first: {bad[0] if bad else None}")
+    # 3.13: within_budget on EVERY candidate (baseline included), equal to
+    # (budget is None) or (system_cost <= budget) — derived from the same
+    # system_cost key the equalities above just tested.
+    missing_wb = [c for c in cands if not isinstance(c.get("within_budget"), bool)]
+    check(f"(B2/{label}) every candidate carries a boolean within_budget",
+          bool(cands) and not missing_wb,
+          f"{len(missing_wb)} of {len(cands)} missing/non-bool")
+    wrong_wb = [c for c in cands
+                if isinstance(c.get("within_budget"), bool)
+                and c["within_budget"] != ((budget is None)
+                                           or (c.get("system_cost", 0) <= budget))]
+    check(f"(B2/{label}) every within_budget == (budget is None) or "
+          f"(system_cost <= budget), recomputed under budget={budget}",
+          bool(cands) and not wrong_wb,
+          f"{len(wrong_wb)} wrong; first: {wrong_wb[0] if wrong_wb else None}")
 
 
 def t_live_endpoints(client) -> None:
@@ -491,6 +532,11 @@ def t_live_endpoints(client) -> None:
           f"{round((S or 0) + (opt.get('battery_cost') or 0), 2)}")
     check("(BL) uncapped: within_budget is true (no cap means no cap)",
           pay0.get("within_budget") is True, repr(pay0.get("within_budget")))
+    check("(BL) 3.13: the response's within_budget IS the persisted one — "
+          "one number, one place, both readers see the same flag",
+          resp0.get("within_budget") == pay0.get("within_budget"),
+          f"response={resp0.get('within_budget')!r} "
+          f"persisted={pay0.get('within_budget')!r}")
 
     # THE WRITER'S within_budget UNDER A CAP THAT BITES. The fixture cannot
     # reach this — a job-free run never enters the persist block — so it is
@@ -513,6 +559,11 @@ def t_live_endpoints(client) -> None:
         check("(BL) ...and it is FALSE here, so the check is not passing "
               "vacuously on an always-true flag",
               wb is False, repr(wb))
+        check("(BL) 3.13: under the biting cap the RESPONSE's within_budget "
+              "is the same False the writer stored",
+              resp1.get("within_budget") is False
+              and resp1.get("within_budget") == wb,
+              f"response={resp1.get('within_budget')!r} persisted={wb!r}")
         check("(BL) ...and the run still RETURNED a result with an honest "
               "budget reason — an impossible cap never becomes an error (D24)",
               "error" not in resp1

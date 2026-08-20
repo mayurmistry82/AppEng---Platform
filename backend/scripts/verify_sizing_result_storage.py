@@ -278,6 +278,84 @@ def t_f_endpoint_payloads(client) -> None:
         print(f"        {label} first SELECTION point: "
               f"{json.dumps(selections[0] if selections else {}, default=str)[:200]}")
 
+        # 3.13: the payload keeps the chosen system's itemised cost. Its
+        # net_cost must round to the row's own system_cost — two views of one
+        # figure, asserted rather than trusted. This holds for BOTH writers:
+        # the solar row's cost is the chosen config's net, and the battery
+        # row's system_cost is round(solar_only + incremental, 2) which IS
+        # round(cost_with.net_cost, 2).
+        breakdown = opts.get("chosen_cost_breakdown")
+        check(f"(f) {label}: evaluated_options carries chosen_cost_breakdown "
+              "as a dict with line_items",
+              isinstance(breakdown, dict)
+              and isinstance(breakdown.get("line_items"), list)
+              and len(breakdown["line_items"]) > 0,
+              f"type={type(breakdown)} keys="
+              f"{sorted(breakdown) if isinstance(breakdown, dict) else None}")
+        check(f"(f) {label}: chosen_cost_breakdown.net_cost rounds to the "
+              "row's persisted system_cost",
+              isinstance(breakdown, dict)
+              and round(breakdown.get("net_cost") or 0, 2)
+              == payload.get("system_cost"),
+              f"net_cost={breakdown.get('net_cost') if isinstance(breakdown, dict) else None} "
+              f"system_cost={payload.get('system_cost')}")
+
+    # 3.13, solar payload: the layout travels with every point, and the
+    # winner is named by index. WHY THESE MOVE: pre-3.13 score_curve is an
+    # eight-key projection (no layout keys) and there is no chosen_index at
+    # all, so every check below fails on a missing key.
+    sopts = recorded[0].get("evaluated_options") or {}
+    spts = sopts.get("points") or []
+    missing_layout = [
+        i for i, p in enumerate(spts)
+        if not (isinstance(p, dict) and "plane_indices" in p
+                and "panels_per_plane" in p and "panel_count" in p)
+    ]
+    check("(f) solar: EVERY stored point carries plane_indices, "
+          "panels_per_plane and panel_count — the layout is no longer "
+          "discarded",
+          bool(spts) and not missing_layout,
+          f"{len(spts)} points, missing on indices {missing_layout[:5]}")
+    cidx = sopts.get("chosen_index")
+    check("(f) solar: chosen_index is an int naming a stored point",
+          isinstance(cidx, int) and not isinstance(cidx, bool)
+          and 0 <= cidx < len(spts), repr(cidx))
+    check("(f) solar: points[chosen_index].solar_kw == the row's solar_kw — "
+          "the index points at the winner, not just at a point",
+          isinstance(cidx, int) and 0 <= cidx < len(spts)
+          and spts[cidx].get("solar_kw") == recorded[0].get("solar_kw"),
+          f"point={spts[cidx].get('solar_kw') if isinstance(cidx, int) and 0 <= cidx < len(spts) else None} "
+          f"row={recorded[0].get('solar_kw')}")
+
+    # 3.13, battery payload: the chosen solar LAYOUT travels — the battery
+    # run's points are battery candidates, so this is the only place the
+    # layout can come from. WHY IT MOVES: pre-3.13 the payload has no
+    # chosen_solar key at all.
+    bopts = recorded[1].get("evaluated_options") or {}
+    bsolar = bopts.get("chosen_solar")
+    check("(f) battery: evaluated_options carries chosen_solar with "
+          "solar_kw, panel_count, plane_indices and panels_per_plane",
+          isinstance(bsolar, dict)
+          and all(k in bsolar for k in
+                  ("solar_kw", "panel_count", "plane_indices",
+                   "panels_per_plane")),
+          f"{sorted(bsolar) if isinstance(bsolar, dict) else bsolar!r}")
+    check("(f) battery: chosen_solar.plane_indices is a NON-EMPTY list — a "
+          "layout with no faces is no layout",
+          isinstance(bsolar, dict)
+          and isinstance(bsolar.get("plane_indices"), list)
+          and len(bsolar["plane_indices"]) > 0,
+          repr(bsolar.get("plane_indices") if isinstance(bsolar, dict) else None))
+    check("(f) battery: chosen_solar.solar_kw == the row's solar_kw",
+          isinstance(bsolar, dict)
+          and bsolar.get("solar_kw") == recorded[1].get("solar_kw"),
+          f"{bsolar.get('solar_kw') if isinstance(bsolar, dict) else None} "
+          f"vs {recorded[1].get('solar_kw')}")
+    check("(f) battery: the row's within_budget is present and boolean — "
+          "the writer stores the engine's own flag now",
+          isinstance(recorded[1].get("within_budget"), bool),
+          repr(recorded[1].get("within_budget")))
+
 
 
 # ── 3.11b prompt 3 — hydration is ORDERED and BOUNDED ────────────────────────

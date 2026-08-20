@@ -268,6 +268,7 @@ def optimise_battery(
     panel_id: Optional[str],
     panel_count: Optional[int],
     solar_only_net_cost: float,
+    solar_only_cost_breakdown: Optional[dict] = None,
     postcode: Optional[str],
     state: Optional[str],
     installer_id: Optional[str],
@@ -323,6 +324,10 @@ def optimise_battery(
         # recommendation — for the no-battery point, the solar alone. The
         # budget filter below tests THIS key, never battery_cost.
         "system_cost": round(solar_only_net_cost, 2),
+        # 3.13: the no-battery outcome's cost IS the solar-only cost, and its
+        # breakdown is produced by the solar run, not here — passed in, never
+        # recomputed. None when the caller had none to pass.
+        "cost_breakdown": solar_only_cost_breakdown,
     }
     candidates: list[dict] = [no_battery]
     solve_seconds = 0.0
@@ -370,7 +375,17 @@ def optimise_battery(
             # 3.12 (F152/D33): whole-system cost — solar plus this battery's
             # incremental net cost. battery_cost keeps its incremental meaning.
             "system_cost": round(solar_only_net_cost + incr_capex, 2),
+            # 3.13: the whole system's itemised breakdown, kept as it came
+            # from cost_model — flags and all, never re-shaped.
+            "cost_breakdown": cost_with,
         })
+
+    # 3.13: within_budget, set from the SAME system_cost key the pool filter
+    # below tests — written the same way solar_optimiser writes its own, so
+    # the two engines express one rule identically. Set on every candidate,
+    # the no-battery baseline included.
+    for c in candidates:
+        c["within_budget"] = (budget is None) or (c["system_cost"] <= budget)
 
     # ── Budget filter + objective selection ──
     # 3.12 (F152, D33): budget_aud caps the WHOLE SYSTEM — the filter tests

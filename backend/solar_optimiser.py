@@ -189,13 +189,29 @@ def financials(
     fit: float,
     system_cost: float,
     fin: dict,
+    supply_charge_annual: Optional[float] = None,
 ) -> dict:
     """3.12: the three AUD amounts arrive already priced hour by hour from
     net_config — there is no import-rate scalar here any more, and no
     total_load (it priced the old scalar arithmetic and nothing else). Export
-    keeps its single feed-in tariff: the FiT is one number by nature."""
-    bill_before = load_value
-    bill_after = import_value - export * fit
+    keeps its single feed-in tariff: the FiT is one number by nature.
+
+    3.13: `supply_charge_annual` joins BOTH bill figures when it is a known
+    finite amount >= 0 — the daily supply charge is paid with or without the
+    system, so it cancels in annual_savings / payback / NPV, which do not
+    move. A missing charge is a DIFFERENT fact from a zero charge: None (or a
+    non-finite / negative value) keeps the bills energy-only, and
+    bill_includes_supply_charge is how each number carries its own meaning."""
+    sc_known = (
+        isinstance(supply_charge_annual, (int, float))
+        and not isinstance(supply_charge_annual, bool)
+        and supply_charge_annual == supply_charge_annual
+        and abs(supply_charge_annual) != float("inf")
+        and supply_charge_annual >= 0
+    )
+    sc = float(supply_charge_annual) if sc_known else 0.0
+    bill_before = load_value + sc
+    bill_after = import_value - export * fit + sc
     annual_savings = self_consumed_value + export * fit
 
     payback = (system_cost / annual_savings) if annual_savings > 0 else None
@@ -214,6 +230,8 @@ def financials(
         "annual_savings": round(annual_savings, 2),
         "simple_payback_years": round(payback, 2) if payback is not None else None,
         "npv_25yr": round(npv, 2),
+        "annual_supply_charge": round(sc, 2) if sc_known else None,
+        "bill_includes_supply_charge": sc_known,
     }
 
 
@@ -269,6 +287,7 @@ def optimise(
     budget: Optional[float] = None,
     constraints: Optional[dict] = None,
     flags: Optional[list[str]] = None,
+    supply_charge_annual: Optional[float] = None,
 ) -> dict:
     """
     Evaluate every feasible config exactly and return the optimum + score curve. Pure compute
@@ -368,6 +387,9 @@ def optimise(
             netd = net_config([0.0] * len(load_hourly), load_hourly,
                               export_limit_kw, rate_24)
             system_cost = 0.0
+            # 3.13: None, never {} — a reader must be able to tell "no system,
+            # so no cost" from "a breakdown that could not be produced".
+            cost_breakdown = None
         else:
             sysgen = generation.system_generation_for_config(net_planes, cfg)
             gen_kwh = sysgen["annual_kwh"]
@@ -382,32 +404,47 @@ def optimise(
                 installer_id=installer_id,
             )
             system_cost = cost["net_cost"]
+            # 3.13: the whole itemised dict is KEPT, not just its net — the
+            # Results screen shows line_items a stored run can no longer
+            # recompute.
+            cost_breakdown = cost
 
         fins = financials(
             netd["self_consumed_value"], netd["load_value"], netd["import_value"],
             netd["export"], fit, system_cost, fin,
+            supply_charge_annual=supply_charge_annual,
         )
         ss_pct = round(netd["self_consumed"] / total_load * 100, 2) if total_load > 0 else 0.0
         sc_pct = round(netd["self_consumed"] / gen_kwh * 100, 2) if gen_kwh > 0 else 0.0
 
-        evaluated.append(
-            {
-                "plane_indices": idxs,
-                "panels_per_plane": panels_per_plane,
-                "panel_count": panel_count_total,
-                "solar_kw": round(solar_kw, 3),
-                "annual_generation_kwh": round(gen_kwh, 1),
-                "annual_self_consumed_kwh": round(netd["self_consumed"], 1),
-                "annual_export_kwh": round(netd["export"], 1),
-                "annual_import_kwh": round(netd["import"], 1),
-                "annual_curtailed_kwh": round(netd["curtailed"], 1),
-                "peak_export_kwh_h": round(netd["peak_export_kwh_h"], 3),
-                "self_consumption_pct": sc_pct,
-                "self_sufficiency_pct": ss_pct,
-                "system_cost": round(system_cost, 2),
-                **fins,
-            }
-        )
+        entry = {
+            "plane_indices": idxs,
+            "panels_per_plane": panels_per_plane,
+            "panel_count": panel_count_total,
+            "solar_kw": round(solar_kw, 3),
+            "annual_generation_kwh": round(gen_kwh, 1),
+            "annual_self_consumed_kwh": round(netd["self_consumed"], 1),
+            "annual_export_kwh": round(netd["export"], 1),
+            "annual_import_kwh": round(netd["import"], 1),
+            "annual_curtailed_kwh": round(netd["curtailed"], 1),
+            "peak_export_kwh_h": round(netd["peak_export_kwh_h"], 3),
+            "self_consumption_pct": sc_pct,
+            "self_sufficiency_pct": ss_pct,
+            "system_cost": round(system_cost, 2),
+            "cost_breakdown": cost_breakdown,
+            **fins,
+        }
+        # 3.13: the kept breakdown must agree with the number already used —
+        # two views of one figure, and the copy is proven not to be a copy.
+        # A disagreement is flagged naming BOTH numbers, never silently
+        # resolved in favour of one of them.
+        if cost_breakdown is not None and round(cost_breakdown["net_cost"], 2) != entry["system_cost"]:
+            flags.append(
+                f"cost_breakdown_disagrees — the kept breakdown's net_cost "
+                f"rounds to {round(cost_breakdown['net_cost'], 2)} but this "
+                f"config's system_cost is {entry['system_cost']}"
+            )
+        evaluated.append(entry)
 
     # ── Scoring ──
     def npv_of(e):
@@ -476,6 +513,7 @@ def optimise(
     for e in evaluated:
         e["within_budget"] = (budget is None) or (e["system_cost"] <= budget)
 
+    sorted_evaluated = sorted(evaluated, key=lambda e: e["solar_kw"])
     score_curve = [
         {
             "solar_kw": e["solar_kw"],
@@ -486,14 +524,33 @@ def optimise(
             "system_cost": e["system_cost"],
             "annual_savings": e["annual_savings"],
             "within_budget": e["within_budget"],
+            # 3.13: the layout keys travel with every point — copied from the
+            # same evaluated entry, never recomputed. Without them nothing
+            # downstream can say which roof faces a config sits on.
+            "plane_indices": e["plane_indices"],
+            "panels_per_plane": e["panels_per_plane"],
+            "panel_count": e["panel_count"],
         }
-        for e in sorted(evaluated, key=lambda e: e["solar_kw"])
+        for e in sorted_evaluated
     ]
+    # 3.13: which score_curve point IS the optimum — found by object IDENTITY
+    # against the sorted list (two configs can tie on solar_kw, so comparing
+    # kW could name the wrong one). Unresolvable = None plus a flag, never a
+    # guessed index.
+    chosen_index = next(
+        (i for i, e in enumerate(sorted_evaluated) if e is optimal), None
+    )
+    if chosen_index is None:
+        flags.append(
+            "chosen_index_unresolved — the optimum could not be matched to a "
+            "score_curve point by identity"
+        )
 
     return {
         "objective": objective,
         "optimal": optimal,
         "score_curve": score_curve,
+        "chosen_index": chosen_index,
         "n_configs_evaluated": len(evaluated),
         "cache_hits": built["cache_hits"],
         "cache_misses": built["cache_misses"],
