@@ -64,7 +64,6 @@ export function ResultsSection({
               ["Payback", h.payback],
               ["25-year NPV", h.npv],
               ["Current annual spend", h.currentSpend],
-              ["Projected annual spend", h.projectedSpend],
               ...(h.selfSufficiency !== null
                 ? [["Self-sufficiency", h.selfSufficiency]]
                 : []),
@@ -75,6 +74,29 @@ export function ResultsSection({
               <p className="metric-sm text-foreground">{value}</p>
             </div>
           ))}
+          {/* 3.13 prompt 4b (C): projected spend through THE SAME
+              bill-eliminated derivation the tab uses (projectedSpendView) —
+              at or below zero the bill is eliminated and the surplus is a
+              positive export income, never "$0" and never a minus sign. */}
+          <div>
+            <p className="text-caption text-muted-foreground">
+              Projected annual spend
+            </p>
+            {view.projected === null ? (
+              <p className="metric-sm text-foreground">—</p>
+            ) : view.projected.kind === "spend" ? (
+              <p className="metric-sm text-foreground">{view.projected.label}</p>
+            ) : (
+              <>
+                <p className="metric-sm text-foreground">Bill eliminated</p>
+                {view.projected.exportIncome ? (
+                  <p className="text-caption text-success">
+                    plus {view.projected.exportIncome}/yr export income
+                  </p>
+                ) : null}
+              </>
+            )}
+          </div>
         </div>
       ) : null}
 

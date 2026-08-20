@@ -854,10 +854,10 @@ def t_r7(client) -> dict:
                   ("solar_kw", "panel_count", "panels_per_plane")),
           repr(bsolar))
     print(f"        battery chosen_solar: {json.dumps(bsolar, default=str)[:200]}")
-    return {"sol": sol}
+    return {"sol": sol, "bat": bat}
 
 
-def t_r8(client, sol_tou: dict) -> None:
+def t_r8(client, sol_tou: dict) -> dict:
     print("\nR8. the two supply-charge branches, on the two REAL jobs, "
           "read-only")
     rows = (client.table("tariffs")
@@ -939,6 +939,7 @@ def t_r8(client, sol_tou: dict) -> None:
           f"{len(fin_rec)} payload(s); "
           f"{fin_rec[0].get('current_annual_spend') if fin_rec else None} vs "
           f"{opt_n.get('annual_bill_before')}")
+    return {"sol_null": sol_null}
 
 
 # ── P1: the composition proof ─────────────────────────────────────────────────
@@ -1490,6 +1491,130 @@ def t_s2_s3(client) -> None:
                if r.get("run_assumptions") is not None]))
 
 
+def t_u_provenance(bat: dict, sol_null: dict) -> None:
+    """3.13 prompt 4b TEST 2 — the defect, proven on the real jobs. NOTE, and
+    it contradicts the prompt: the prompt asserts fit_source == 'default' on
+    the fixture, claiming its tariffs row stores no feed-in figure. The LIVE
+    row stores fit_aud_per_kwh = 0.05 (and every stored run records
+    fit_is_fallback false), so the honest per-field label is 'installer'.
+    Asserting 'default' would re-create the exact misattribution this prompt
+    exists to end, in the other direction. Reported to the inbox."""
+    print("\nU. per-field provenance on the REAL jobs — the defect closed")
+    asm = bat.get("assumptions") or {}
+    four = {k: asm.get(k) for k in ("rate_24_source", "tariff_type_source",
+                                    "supply_charge_source", "fit_source")}
+    print(f"        a57e13f1 (stored TOU windows): {four}")
+    check("(U/tou) rate_24_source 'installer' — the installer typed those "
+          "windows; pre-4b this read 'default' off the scalar's flag",
+          asm.get("rate_24_source") == "installer",
+          repr(asm.get("rate_24_source")))
+    check("(U/tou) tariff_type_source 'installer'",
+          asm.get("tariff_type_source") == "installer",
+          repr(asm.get("tariff_type_source")))
+    check("(U/tou) supply_charge_source 'installer' (unchanged from prompt 2)",
+          asm.get("supply_charge_source") == "installer",
+          repr(asm.get("supply_charge_source")))
+    check("(U/tou) fit_source 'installer' — the LIVE row stores "
+          "fit_aud_per_kwh 0.05 (fit_is_fallback false on every stored run), "
+          "so 'default' would be the misattribution; contradicts the prompt "
+          "and is reported",
+          asm.get("fit_source") == "installer" and asm.get("fit_is_fallback") is False,
+          f"{asm.get('fit_source')!r}/{asm.get('fit_is_fallback')!r}")
+
+    asm_n = sol_null.get("assumptions") or {}
+    four_n = {k: asm_n.get(k) for k in ("rate_24_source", "tariff_type_source",
+                                        "supply_charge_source", "fit_source")}
+    print(f"        456e0242 (flat installer scalar): {four_n}")
+    check("(U/flat) rate_24_source 'installer' — the flat vector is the "
+          "installer's stored scalar tiled",
+          asm_n.get("rate_24_source") == "installer",
+          repr(asm_n.get("rate_24_source")))
+    check("(U/flat) the two jobs DIFFER (supply charge: installer vs not "
+          "stated) — the check tests the fix, not one lucky shape",
+          four != four_n and asm_n.get("supply_charge_source") == "not stated",
+          f"{four} vs {four_n}")
+
+
+def subprocess_probe_u() -> dict:
+    """Fresh interpreter: the battery endpoint's four provenance labels on the
+    fixture job, for the red proof."""
+    client = sizing_route._sb()
+    caller = _caller_for(client, TOU_JOB)
+    bat, _r, _f, _q = _run_endpoint(
+        sizing_route.battery_sizing,
+        sizing_route.BatteryRequest(job_id=TOU_JOB), caller)
+    asm = bat.get("assumptions") or {}
+    return {k: asm.get(k) for k in ("rate_24_source", "tariff_type_source",
+                                    "supply_charge_source", "fit_source")}
+
+
+def _probe_u_via_subprocess() -> dict | None:
+    runner = (
+        "import json, sys\n"
+        f"sys.path.insert(0, {SCRIPTS_DIR!r})\n"
+        f"sys.path.insert(0, {BACKEND_DIR!r})\n"
+        "import verify_results_contract as g\n"
+        "print('PROBE:' + json.dumps(g.subprocess_probe_u()))\n"
+    )
+    proc = subprocess.run([sys.executable, "-c", runner],
+                          capture_output=True, text=True, timeout=600)
+    for line in proc.stdout.splitlines():
+        if line.startswith("PROBE:"):
+            return json.loads(line[len("PROBE:"):])
+    print(f"        probe stdout: {proc.stdout[-400:]!r}")
+    print(f"        probe stderr: {proc.stderr[-400:]!r}")
+    return None
+
+
+_U_FROM = "        rate_24_source = vector_origin\n"
+_U_TO = "        rate_24_source = source\n"
+
+
+def t_u_red() -> None:
+    print("\nU-RED. the provenance check can FAIL — rate_24_source forced "
+          "back to the old single flag in a byte-hashed copy")
+    target = os.path.join(BACKEND_DIR, "routes", "sizing.py")
+    original = open(target, "rb").read()
+    original_hash = hashlib.sha256(original).hexdigest()
+    print(f"        original SHA-256: {original_hash}")
+    text = original.decode("utf-8")
+    n = text.count(_U_FROM)
+    check("(U-RED) the assignment line exists EXACTLY once", n == 1, f"count={n}")
+    if n != 1:
+        return
+    tmpdir = tempfile.mkdtemp(prefix="u_")
+    backup = os.path.join(tmpdir, "sizing.py.bak")
+    shutil.copyfile(target, backup)
+    check("(U-RED) the byte copy was taken FIRST and matches the original hash",
+          hashlib.sha256(open(backup, "rb").read()).hexdigest() == original_hash,
+          backup)
+    try:
+        with open(target, "w", encoding="utf-8") as fh:
+            fh.write(text.replace(_U_FROM, _U_TO))
+        _rm_pycache()
+        red = _probe_u_via_subprocess()
+        print(f"        perturbed probe: {red}")
+        check("(U-RED) RED: with the vector's source falling back to the old "
+              "single flag, the fixture's installer-typed windows read "
+              "'default' again — the U check genuinely bites",
+              isinstance(red, dict) and red.get("rate_24_source") == "default",
+              repr(red))
+    finally:
+        shutil.copyfile(backup, target)
+        _rm_pycache()
+    restored_hash = hashlib.sha256(open(target, "rb").read()).hexdigest()
+    print(f"        restored SHA-256: {restored_hash}")
+    check("(U-RED) RESTORED: routes/sizing.py byte-identical (from the copy, "
+          "never git)",
+          restored_hash == original_hash, restored_hash)
+    green = _probe_u_via_subprocess()
+    print(f"        restored probe : {green}")
+    check("(U-RED) GREEN AGAIN after the restore",
+          isinstance(green, dict) and green.get("rate_24_source") == "installer",
+          repr(green))
+    shutil.rmtree(tmpdir, ignore_errors=True)
+
+
 def t_p10_full_year_blocks() -> None:
     """3.13 prompt 2b (D35): full_year is 365 REAL daily blocks, day-cyclic by
     construction. WHY THESE MOVE: the pre-2b branch returned ONE 8,760-step
@@ -1556,9 +1681,9 @@ def t_p8_resolver() -> None:
           "label borrowed the import rate's provenance and said 'default' "
           "about a number the installer typed",
           t.get("supply_charge_source") == "installer"
-          and t.get("source") == "default",
+          and t.get("import_rate_source") == "default",
           f"supply_charge_source={t.get('supply_charge_source')!r} "
-          f"source={t.get('source')!r}")
+          f"import_rate_source={t.get('import_rate_source')!r}")
     fl: list[str] = []
     annual, src = sizing_route._annual_supply_charge(t, fl)
     check("(P8) ...and the annualiser carries it: 383.25 labelled "
@@ -1599,8 +1724,10 @@ def main() -> int:
                  "the battery fixture.")
         t_p2()
         r7 = t_r7(client)
-        t_r8(client, r7.get("sol") or {})
+        r8 = t_r8(client, r7.get("sol") or {})
+        t_u_provenance(r7.get("bat") or {}, (r8 or {}).get("sol_null") or {})
         t_q1_red()
+        t_u_red()
         t_s2_s3(client)
 
     if start is not None:

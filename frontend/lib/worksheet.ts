@@ -4843,7 +4843,6 @@ export interface ResultsHeadline {
   payback: string;
   npv: string;
   currentSpend: string;
-  projectedSpend: string;
   selfSufficiency: string | null;
 }
 
@@ -4859,6 +4858,10 @@ export interface ResultsView {
    */
   state: "unsized" | "awaiting-financial" | "ready";
   headline: ResultsHeadline | null;
+  /** 3.13 prompt 4b (C): the projected annual spend through THE ONE
+      bill-eliminated derivation (projectedSpendView) — the same object the
+      tab renders, so the two surfaces cannot disagree. */
+  projected: ProjectedSpendView | null;
   /** THE ROOF'S DOUBT (F93), read from the SIZING ROW — the run was built on
       the roof as it stood at the time, never the job's newest roof. */
   roofNotices: RoofNoticeView[];
@@ -4889,6 +4892,7 @@ export function resultsView(job: unknown): ResultsView {
     return {
       state: "unsized",
       headline: null,
+      projected: null,
       roofNotices: [],
       layoutLines: null,
       layoutNote: null,
@@ -5054,7 +5058,6 @@ export function resultsView(job: unknown): ResultsView {
       payback: fmtYears(fin.payback_years),
       npv: money(fin.npv_25_year),
       currentSpend: money(fin.current_annual_spend),
-      projectedSpend: money(fin.projected_annual_spend),
       selfSufficiency: selfSufficiency !== null ? fmtPct(selfSufficiency) : null,
     };
   }
@@ -5062,6 +5065,7 @@ export function resultsView(job: unknown): ResultsView {
   return {
     state,
     headline,
+    projected: fin !== null ? projectedSpendView(fin.projected_annual_spend) : null,
     roofNotices,
     layoutLines,
     layoutNote,
@@ -5142,6 +5146,8 @@ export interface ResultsTabView {
   layoutNote: string | null;
   dispatchResolution: string | null;
   runKind: string | null;
+  /** 3.13 prompt 4b: the score curve's data — rendered only by the tab. */
+  curve: ScoreCurveView;
   split: {
     solar: ResultsSplitColumn;
     battery: ResultsSplitColumn;
@@ -5157,7 +5163,10 @@ export interface ResultsTabView {
 /** Plain-English labels for the known assumption keys, with the block's own
     provenance keys paired as sources. Unknown keys still render — every
     figure traces to an assumption, so nothing stored is hidden. */
-function assumptionRows(ra: Record<string, unknown>): ResultsAssumptionRow[] {
+function assumptionRows(
+  ra: Record<string, unknown>,
+  panelDetail: string | null = null,
+): ResultsAssumptionRow[] {
   const rows: ResultsAssumptionRow[] = [];
   const used = new Set<string>();
   const take = (key: string): unknown => {
@@ -5173,8 +5182,23 @@ function assumptionRows(ra: Record<string, unknown>): ResultsAssumptionRow[] {
           ? String(v)
           : JSON.stringify(v);
 
-  // Provenance keys consumed as SOURCES, not rows of their own.
-  const tariffSource = str(take("tariff_source"));
+  // Provenance keys consumed as SOURCES, not rows of their own. 3.13 prompt
+  // 4b: each value carries its OWN source key; the old single tariff_source
+  // remains as the fallback so rows stored BEFORE the change render what they
+  // recorded — history is not rewritten and not hidden.
+  const legacySource =
+    "tariff_source" in ra ? str(take("tariff_source")) : null;
+  const own = (key: string): string | null => {
+    if (key in ra) {
+      const v = take(key);
+      if (typeof v === "string" && v) return v;
+    }
+    return legacySource;
+  };
+  const importRateSource = own("import_rate_source");
+  const rate24Source = own("rate_24_source");
+  const tariffTypeSource = own("tariff_type_source");
+  const fitOwnSource = own("fit_source");
   const supplySource = str(take("supply_charge_source"));
   const fitFallback = take("fit_is_fallback") === true;
   const exportMeta = asRecord(take("export_limit_source"));
@@ -5192,7 +5216,7 @@ function assumptionRows(ra: Record<string, unknown>): ResultsAssumptionRow[] {
     rows.push({
       label: "Import rate",
       value: `${formatMoneyCents(importRate)}/kWh`,
-      source: tariffSource,
+      source: importRateSource,
     });
   }
   const rates24 = take("import_rates_24");
@@ -5206,22 +5230,39 @@ function assumptionRows(ra: Record<string, unknown>): ResultsAssumptionRow[] {
         nums.length > 0
           ? `${rates24.length} hourly rates, ${formatMoneyCents(Math.min(...nums))}–${formatMoneyCents(Math.max(...nums))}/kWh`
           : "unreadable",
-      source: tariffSource,
+      source: rate24Source,
     });
   } else {
     used.add("import_rates_24");
   }
   if ("tariff_type" in ra) {
-    rows.push({ label: "Tariff type", value: str(take("tariff_type")), source: tariffSource });
+    // Plain words, never the raw database token (3.13-4b step B).
+    const rawType = take("tariff_type");
+    const typeWords: Record<string, string> = {
+      tou: "time of use",
+      flat: "flat rate",
+      demand: "demand",
+      block: "block",
+    };
+    rows.push({
+      label: "Tariff type",
+      value:
+        typeof rawType === "string" && rawType in typeWords
+          ? typeWords[rawType]
+          : str(rawType),
+      source: tariffTypeSource,
+    });
   }
-  if ("is_tou" in ra) {
-    rows.push({ label: "Time-of-use pricing", value: take("is_tou") === true ? "yes" : "no", source: null });
-  }
+  // The separate "Time-of-use pricing: yes" row was REDUNDANT with the
+  // tariff type — two rows stating one fact is how a panel starts
+  // disagreeing with itself. Consumed, not rendered.
+  used.add("is_tou");
   if ("fit" in ra) {
     rows.push({
       label: "Feed-in tariff",
       value: `${formatMoneyCents(take("fit"))}/kWh`,
-      source: fitFallback ? "default (state scheme)" : tariffSource,
+      source:
+        fitOwnSource ?? (fitFallback ? "default (state scheme)" : legacySource),
     });
   }
   if ("supply_charge_annual" in ra) {
@@ -5273,7 +5314,11 @@ function assumptionRows(ra: Record<string, unknown>): ResultsAssumptionRow[] {
     const watts = tariffNum(p.watts);
     rows.push({
       label: "Panel",
-      value: watts !== null ? `${watts} W` : str(panel),
+      // 3.13-4b step B: the SAME description the cost table gives the panel —
+      // brand, model and wattage — one description of one object; wattage
+      // alone only when no cost line carries the fuller name.
+      value:
+        panelDetail ?? (watts !== null ? `${watts} W` : str(panel)),
       source: null,
     });
   }
@@ -5405,7 +5450,11 @@ export function resultsTabView(job: unknown): ResultsTabView {
   if (base.state !== "unsized") {
     const ra = sizing?.run_assumptions;
     if (typeof ra === "object" && ra !== null && !Array.isArray(ra)) {
-      assumptions = assumptionRows(ra as Record<string, unknown>);
+      const panelsLine = cost?.lines.find((l) => l.item === "Panels") ?? null;
+      const panelDetail = panelsLine?.detail
+        ? panelsLine.detail.replace(/^\d+\s*×\s*/, "")
+        : null;
+      assumptions = assumptionRows(ra as Record<string, unknown>, panelDetail);
     } else {
       assumptionsNote =
         "The assumptions were not recorded for this run — runs made before 3.13 prompt 4 did not store them. Re-run the sizing to capture them.";
@@ -5415,17 +5464,212 @@ export function resultsTabView(job: unknown): ResultsTabView {
   return {
     state: base.state,
     headline: base.headline,
-    projected: fin ? projectedSpendView(fin.projected_annual_spend) : null,
+    // The SAME object resultsView built via the ONE derivation (U3).
+    projected: base.projected,
     roofNotices: base.roofNotices,
     layoutLines: base.layoutLines,
     layoutNote: base.layoutNote,
     dispatchResolution: base.dispatchResolution,
     runKind: base.runKind,
+    curve: scoreCurveView(job),
     split,
     splitNote,
     cost,
     costNote,
     assumptions,
     assumptionsNote,
+  };
+}
+
+// ── The score curve (checklist 3.13 prompt 4b) ───────────────────────────────
+
+export interface ScoreCurvePoint {
+  x: number;
+  y: number;
+}
+
+export interface ScoreCurveView {
+  /** null = no chart; `note` says why. Never an empty axis. */
+  points: ScoreCurvePoint[] | null;
+  note: string | null;
+  xLabel: string;
+  /** What the vertical axis is showing — always the metric the run's OWN
+      objective was scored on, never a metric it was not optimising. */
+  yLabel: string;
+  objectiveLabel: string | null;
+  /** x of the chosen point, or null; chosenNote says why when null. */
+  chosenX: number | null;
+  chosenNote: string | null;
+  /** BE HONEST ABOUT FLATNESS: when the best and the runners-up sit within a
+      trivial spread, the words say so beside the chart rather than letting a
+      zoomed axis manufacture a cliff. */
+  flatNote: string | null;
+}
+
+const OBJECTIVE_METRICS: Record<
+  string,
+  {
+    label: string;
+    solarKey: string;
+    batteryKey: string;
+    yLabel: string;
+    lowerIsBetter: boolean;
+    fmt: (v: number) => string;
+  }
+> = {
+  max_npv: {
+    label: "maximum NPV",
+    solarKey: "npv_25yr",
+    batteryKey: "incremental_npv",
+    yLabel: "25-year NPV ($)",
+    lowerIsBetter: false,
+    fmt: (v) => formatMoney(v),
+  },
+  min_payback: {
+    label: "minimum payback",
+    solarKey: "simple_payback_years",
+    batteryKey: "incremental_payback_years",
+    yLabel: "Payback (years)",
+    lowerIsBetter: true,
+    fmt: (v) => formatYears(v),
+  },
+  max_self_sufficiency: {
+    label: "maximum self-sufficiency",
+    solarKey: "self_sufficiency_pct",
+    batteryKey: "self_sufficiency_pct",
+    yLabel: "Self-sufficiency (%)",
+    lowerIsBetter: false,
+    fmt: (v) => formatPct(v),
+  },
+  custom: {
+    label: "the custom blend",
+    solarKey: "score",
+    batteryKey: "score",
+    yLabel: "Blended score",
+    lowerIsBetter: false,
+    fmt: (v) => `${v}`,
+  },
+};
+
+/**
+ * scoreCurveView (3.13 prompt 4b) — the curve's data, from what is already
+ * stored: evaluated_options.points, with dimension_keys saying which run
+ * shape this is (never guessed from the point shape). The vertical axis is
+ * the figure the job's own objective was scored on. Total: never throws;
+ * no points, one point or junk yields points: null plus an honest note.
+ */
+export function scoreCurveView(job: unknown): ScoreCurveView {
+  const none = (note: string): ScoreCurveView => ({
+    points: null,
+    note,
+    xLabel: "",
+    yLabel: "",
+    objectiveLabel: null,
+    chosenX: null,
+    chosenNote: null,
+    flatNote: null,
+  });
+  const sizing = currentSizingResult(job);
+  if (!sizing) return none("This job has not been sized yet.");
+  const eo = asRecord(sizing.evaluated_options);
+  const dims = Array.isArray(eo.dimension_keys) ? eo.dimension_keys : null;
+  const rawPoints = Array.isArray(eo.points) ? eo.points : null;
+  if (!dims || !rawPoints) {
+    return none("The evaluated options were not recorded for this run.");
+  }
+  const isSolar = dims.length === 1 && dims[0] === "solar_kw";
+  const isBattery = dims.length === 1 && dims[0] === "battery_id";
+  if (!isSolar && !isBattery) {
+    return none("The evaluated options were not recorded in a shape this chart knows.");
+  }
+  const objective =
+    typeof sizing.objective_used === "string" ? sizing.objective_used : null;
+  const metric = objective ? OBJECTIVE_METRICS[objective] : undefined;
+  if (!metric) {
+    return none("The objective this run was scored on was not recorded.");
+  }
+  const xKey = isSolar ? "solar_kw" : "usable_kwh";
+  const yKey = isSolar ? metric.solarKey : metric.batteryKey;
+
+  const entries = rawPoints
+    .map((p) => asRecord(p))
+    .map((p) => ({
+      x: tariffNum(p[xKey]),
+      y: tariffNum(p[yKey]),
+      raw: p,
+    }))
+    .filter(
+      (e): e is { x: number; y: number; raw: Record<string, unknown> } =>
+        e.x !== null && e.y !== null,
+    )
+    .sort((a, b) => a.x - b.x);
+  if (entries.length < 2) {
+    return none(
+      entries.length === 0
+        ? "The evaluated options were not recorded for this run."
+        : "Only one option was evaluated — there is no curve to draw.",
+    );
+  }
+
+  // The chosen point: chosen_index names it exactly for a solar run; a
+  // battery run is matched on capacity AND cost, and a tie marks NOTHING.
+  let chosenX: number | null = null;
+  let chosenNote: string | null = null;
+  if (isSolar) {
+    const idx = eo.chosen_index;
+    if (typeof idx === "number" && Number.isInteger(idx) && rawPoints[idx]) {
+      const chosenRaw = asRecord(rawPoints[idx]);
+      const match = entries.find((e) => e.raw === chosenRaw);
+      chosenX = match ? match.x : null;
+    }
+    if (chosenX === null) {
+      chosenNote = "The chosen option could not be matched to a point.";
+    }
+  } else {
+    const rowKwh = tariffNum(sizing.battery_kwh);
+    const rowCost = tariffNum(sizing.system_cost);
+    const matches = entries.filter(
+      (e) =>
+        rowKwh !== null &&
+        rowCost !== null &&
+        tariffNum(e.raw.usable_kwh) === rowKwh &&
+        tariffNum(e.raw.system_cost) === rowCost,
+    );
+    if (matches.length === 1) {
+      chosenX = matches[0].x;
+    } else {
+      chosenNote =
+        matches.length > 1
+          ? "Two evaluated options tie on capacity and cost, so no single chosen point can be marked."
+          : "The chosen option could not be matched to a point.";
+    }
+  }
+
+  // Honest flatness: the spread across the best three (by the objective's own
+  // direction). Trivial relative to the best value -> say so in words.
+  let flatNote: string | null = null;
+  const ranked = [...entries].sort((a, b) =>
+    metric.lowerIsBetter ? a.y - b.y : b.y - a.y,
+  );
+  if (ranked.length >= 3) {
+    const top = ranked.slice(0, 3).map((e) => e.y);
+    const spread = Math.max(...top) - Math.min(...top);
+    const best = Math.abs(ranked[0].y);
+    if (best > 0 && spread / best < 0.01) {
+      flatNote =
+        `The top options sit within ${metric.fmt(Math.round(spread * 100) / 100)} ` +
+        `of each other — the choice among them is fine margin, not a cliff.`;
+    }
+  }
+
+  return {
+    points: entries.map((e) => ({ x: e.x, y: e.y })),
+    note: null,
+    xLabel: isSolar ? "Solar size (kW)" : "Battery size (kWh)",
+    yLabel: metric.yLabel,
+    objectiveLabel: metric.label,
+    chosenX,
+    chosenNote,
+    flatNote,
   };
 }

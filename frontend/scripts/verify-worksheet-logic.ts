@@ -85,6 +85,7 @@ import {
   formatPct,
   formatYears,
   projectedSpendView,
+  scoreCurveView,
   resultsTabView,
   elapsedLabel,
   batterySizingView,
@@ -6219,4 +6220,288 @@ test("T5: totals — junk jsonb, non-array line_items, null financial row", () =
   assert.equal(noFin.state, "awaiting-financial");
   assert.equal(noFin.headline, null);
   assert.equal(noFin.projected, null);
+});
+
+// ── 3.13 prompt 4b: per-field provenance, the one framing, the curve (U1-U4) ─
+
+test("U1: each assumption row carries its OWN source — installer rates beside a default fit", () => {
+  const job = {
+    sizing_results: [{
+      sizing_result_id: "s1", solar_kw: 9.24, run_kind: "solar_battery",
+      run_assumptions: {
+        import_rates_24: [0.2, 0.55], rate_24_source: "installer",
+        import_rate: 0.4, import_rate_source: "default",
+        tariff_type: "tou", tariff_type_source: "installer",
+        fit: 0.04, fit_source: "default", fit_is_fallback: true,
+        supply_charge_annual: 383.25, supply_charge_source: "installer",
+      },
+    }],
+    financial_results: [{ sizing_result_id: "s1", system_capex: 1 }],
+  };
+  const rows = resultsTabView(job).assumptions ?? [];
+  const byLabel = new Map(rows.map((r) => [r.label, r]));
+  assert.equal(byLabel.get("Hourly import rates")?.source, "installer",
+    "the installer's typed windows must never read 'default'");
+  assert.equal(byLabel.get("Import rate")?.source, "default",
+    "the scalar genuinely defaulted — the two answer different questions");
+  assert.equal(byLabel.get("Tariff type")?.source, "installer");
+  assert.equal(byLabel.get("Feed-in tariff")?.source, "default",
+    "a default fit stays a default BESIDE installer rates — per-field, not shared");
+  // A pre-4b stored row renders what it recorded via the legacy fallback.
+  const legacy = resultsTabView({
+    sizing_results: [{ sizing_result_id: "s1", solar_kw: 1,
+      run_assumptions: { import_rate: 0.38, tariff_source: "bill" } }],
+    financial_results: [{ sizing_result_id: "s1" }],
+  }).assumptions ?? [];
+  assert.equal(legacy.find((r) => r.label === "Import rate")?.source, "bill",
+    "history is rendered as recorded, not rewritten and not hidden");
+});
+
+test("U2: the tariff type is plain words and the duplicate TOU row is gone", () => {
+  const job = {
+    sizing_results: [{
+      sizing_result_id: "s1", solar_kw: 9.24,
+      run_assumptions: { tariff_type: "tou", tariff_type_source: "installer",
+        is_tou: true },
+    }],
+    financial_results: [{ sizing_result_id: "s1" }],
+  };
+  const rows = resultsTabView(job).assumptions ?? [];
+  const type = rows.find((r) => r.label === "Tariff type");
+  assert.equal(type?.value, "time of use", "never the raw database token 'tou'");
+  assert.ok(!rows.some((r) => /time-of-use pricing/i.test(r.label)),
+    "two rows stating one fact is how a panel disagrees with itself");
+  assert.ok(!rows.some((r) => r.value === "tou"),
+    "the raw token must not appear anywhere");
+});
+
+test("U3: the bill-eliminated derivation is THE SAME function on both surfaces", () => {
+  for (const spend of [0, -412.5, 1190.35, null]) {
+    const job = {
+      sizing_results: [{ sizing_result_id: "s1", solar_kw: 9.24 }],
+      financial_results: [{ sizing_result_id: "s1",
+        projected_annual_spend: spend }],
+    };
+    const section = resultsView(job).projected;
+    const tab = resultsTabView(job).projected;
+    assert.deepEqual(section, tab,
+      `projected spend ${spend}: the section and the tab must render the same framing`);
+    assert.deepEqual(section, projectedSpendView(spend),
+      "and both ARE projectedSpendView's own answer — one derivation");
+  }
+});
+
+test("U4: score-curve data — solar, battery, empty, one point, junk, and the tie", () => {
+  const solarJob = {
+    sizing_results: [{
+      sizing_result_id: "s1", solar_kw: 9.24, run_kind: "solar",
+      objective_used: "max_npv",
+      evaluated_options: {
+        dimension_keys: ["solar_kw"],
+        chosen_index: 2,
+        points: [
+          { solar_kw: 0, npv_25yr: 0 },
+          { solar_kw: 6.6, npv_25yr: 15000 },
+          { solar_kw: 9.24, npv_25yr: 17068 },
+          { solar_kw: 11.4, npv_25yr: 17040 },
+        ],
+      },
+    }],
+    financial_results: [{ sizing_result_id: "s1" }],
+  };
+  const solar = scoreCurveView(solarJob);
+  assert.ok(solar.points && solar.points.length === 4);
+  assert.equal(solar.chosenX, 9.24, "chosen_index names the point exactly");
+  assert.equal(solar.xLabel, "Solar size (kW)");
+  assert.equal(solar.yLabel, "25-year NPV ($)");
+  assert.equal(solar.flatNote, null,
+    "top three span 2068 on 17068 — NOT trivial, so no flat note here (U4b pins the firing case)");
+
+  // A battery run, chosen matched on capacity AND cost.
+  const batteryJob = {
+    sizing_results: [{
+      sizing_result_id: "s1", solar_kw: 9.24, battery_kwh: 9.83,
+      system_cost: 11868.77, run_kind: "solar_battery",
+      objective_used: "max_npv",
+      evaluated_options: {
+        dimension_keys: ["battery_id"],
+        points: [
+          { usable_kwh: 0, incremental_npv: 0, system_cost: 6342 },
+          { usable_kwh: 9.83, incremental_npv: 2867, system_cost: 11868.77 },
+          { usable_kwh: 12.8, incremental_npv: 2100, system_cost: 14842 },
+        ],
+      },
+    }],
+    financial_results: [{ sizing_result_id: "s1" }],
+  };
+  const battery = scoreCurveView(batteryJob);
+  assert.equal(battery.chosenX, 9.83);
+  assert.equal(battery.xLabel, "Battery size (kWh)");
+
+  // THE DELIBERATE TIE: two candidates share capacity and cost — mark NOTHING.
+  const tieJob = JSON.parse(JSON.stringify(batteryJob));
+  tieJob.sizing_results[0].evaluated_options.points.push(
+    { usable_kwh: 9.83, incremental_npv: 2500, system_cost: 11868.77 });
+  const tie = scoreCurveView(tieJob);
+  assert.equal(tie.chosenX, null, "a tie must mark nothing rather than guess");
+  assert.match(tie.chosenNote ?? "", /tie/);
+
+  // Empty, one point, junk: no chart, an honest note, no throw.
+  for (const evaluated of [
+    undefined,
+    { dimension_keys: ["solar_kw"], points: [] },
+    { dimension_keys: ["solar_kw"], points: [{ solar_kw: 6.6, npv_25yr: 1 }] },
+    { dimension_keys: ["solar_kw"], points: "junk" },
+    { points: [{ solar_kw: 1, npv_25yr: 1 }, { solar_kw: 2, npv_25yr: 2 }] },
+  ]) {
+    const v = scoreCurveView({
+      sizing_results: [{ sizing_result_id: "s1", objective_used: "max_npv",
+        evaluated_options: evaluated }],
+    });
+    assert.equal(v.points, null);
+    assert.ok(v.note, "an honest line, never an empty axis");
+  }
+  assert.doesNotThrow(() => scoreCurveView(null));
+  assert.doesNotThrow(() => scoreCurveView({ sizing_results: [{ sizing_result_id: "s1",
+    objective_used: "banana", evaluated_options: { dimension_keys: ["solar_kw"],
+    points: [{ solar_kw: 1, npv_25yr: 1 }, { solar_kw: 2, npv_25yr: 2 }] } }] }));
+});
+
+test("U4b: the flat-spread note fires when the top three genuinely sit within 1%", () => {
+  const v = scoreCurveView({
+    sizing_results: [{
+      sizing_result_id: "s1", run_kind: "solar", objective_used: "max_npv",
+      evaluated_options: {
+        dimension_keys: ["solar_kw"], chosen_index: 1,
+        points: [
+          { solar_kw: 9.2, npv_25yr: 17060 },
+          { solar_kw: 10.1, npv_25yr: 17068 },
+          { solar_kw: 11.4, npv_25yr: 17040 },
+        ],
+      },
+    }],
+  });
+  assert.ok(v.flatNote, "a $28 spread on $17k must be named, not dramatised");
+  assert.match(v.flatNote ?? "", /fine margin/);
+});
+
+// ── 3.13-4b test 5: THE CHART IS MEASURED ON WHAT IT RENDERS ─────────────────
+//
+// The August all-black chart passed its check because the check measured the
+// TOKEN, not what the browser rendered — `hsl(hsl(...))` is invalid and SVG
+// silently falls back to black. Recharts v3 dispatches its chart size in a
+// useEffect (node_modules/recharts/es6/context/chartLayoutContext.js), so NO
+// static render of the full chart can ever emit the SVG — that is a recharts
+// limitation, not a choice. The honest achievable measurement, in two halves
+// that together cover the whole colour path:
+//   (1) a real SVG rendered through the REAL useChartDefaults hook chain
+//       (chart-tokens -> wrap -> chart-container defaults -> attribute) —
+//       the exact strings recharts passes through verbatim as attributes;
+//   (2) a source-level lock on the last hop: score-curve.tsx contains no
+//       hsl( literal at all, so it CANNOT wrap what the hook hands it.
+
+test("chart colours land in a real SVG as exactly one hsl(...) each — rendered through the live hook chain", async () => {
+  const [{ default: ts }, nodeModule, fs, path, React, ReactDOMServer] =
+    await Promise.all([
+      import("typescript"),
+      import("node:module"),
+      import("node:fs"),
+      import("node:path"),
+      import("react"),
+      import("react-dom/server"),
+    ]);
+  const FRONTEND = path.resolve(import.meta.dirname, "..");
+  const projectRequire = nodeModule.createRequire(
+    path.join(FRONTEND, "package.json"),
+  );
+  const cache = new Map<string, Record<string, unknown>>();
+  const resolveTs = (base: string): string => {
+    for (const ext of ["", ".ts", ".tsx"]) {
+      const candidate = base + ext;
+      if (fs.existsSync(candidate) && fs.statSync(candidate).isFile()) {
+        return candidate;
+      }
+    }
+    throw new Error(`cannot resolve ${base}`);
+  };
+  const loadTs = (file: string): Record<string, unknown> => {
+    const full = path.resolve(file);
+    const hit = cache.get(full);
+    if (hit) return hit;
+    const js = ts.transpileModule(fs.readFileSync(full, "utf8"), {
+      compilerOptions: {
+        module: ts.ModuleKind.CommonJS,
+        target: ts.ScriptTarget.ES2020,
+        jsx: ts.JsxEmit.ReactJSX,
+        esModuleInterop: true,
+      },
+    }).outputText;
+    const mod = { exports: {} as Record<string, unknown> };
+    const req = (spec: string): unknown => {
+      if (spec === "next-themes") {
+        // Third-party theme hook only — outside a provider it reports no
+        // theme either way; the tokens hook then serves its SSR fallback,
+        // which is the app's own first-render path. The COLOUR path under
+        // test is entirely ours.
+        return { useTheme: () => ({ resolvedTheme: "dark" }) };
+      }
+      if (spec.startsWith("@/")) {
+        return loadTs(resolveTs(path.join(FRONTEND, spec.slice(2))));
+      }
+      if (spec.startsWith(".")) {
+        return loadTs(resolveTs(path.resolve(path.dirname(full), spec)));
+      }
+      return projectRequire(spec);
+    };
+    cache.set(full, mod.exports);
+    new Function("require", "module", "exports", js)(req, mod, mod.exports);
+    return mod.exports;
+  };
+
+  // (1) The REAL hook chain, transpiled from the real .tsx, feeding a real
+  // rendered SVG — the same strings recharts passes through as attributes.
+  const container = loadTs(
+    path.join(FRONTEND, "components/charts/chart-container.tsx"),
+  );
+  const useChartDefaults = container.useChartDefaults as () => {
+    series: string[];
+    tokens: Record<string, string>;
+  };
+  function Probe(): unknown {
+    const d = useChartDefaults();
+    return React.createElement(
+      "svg",
+      null,
+      React.createElement("path", { stroke: d.series[0] }),
+      React.createElement("path", { stroke: d.series[1] }),
+      React.createElement("path", { stroke: d.tokens["chart-axis"] }),
+      React.createElement("path", { stroke: d.tokens["chart-grid"] }),
+    );
+  }
+  const html = ReactDOMServer.renderToStaticMarkup(
+    React.createElement(Probe as never),
+  );
+  assert.ok(html.includes("<svg"), html.slice(0, 120));
+  const strokes = html.match(/stroke="[^"]*"/g) ?? [];
+  assert.equal(strokes.length, 4, `expected 4 rendered strokes: ${strokes}`);
+  for (const attr of strokes) {
+    const count = (attr.match(/hsl\(/g) ?? []).length;
+    assert.equal(count, 1,
+      `RENDERED stroke must contain exactly one hsl( — got ${attr} (hsl(hsl( renders BLACK)`);
+  }
+  assert.ok(!html.includes("hsl(hsl("), "double-wrap landed in the SVG");
+
+  // (2) The last hop cannot wrap: score-curve.tsx passes the hook's strings
+  // verbatim and contains no hsl( literal with which to wrap them.
+  const curveSrc = fs.readFileSync(
+    path.join(FRONTEND, "components/results/score-curve.tsx"),
+    "utf8",
+  );
+  const curveCode = curveSrc
+    .replace(/\/\*[\s\S]*?\*\//g, "")
+    .replace(/^\s*\/\/.*$/gm, "");
+  assert.ok(!curveCode.includes("hsl("),
+    "score-curve.tsx CODE must not contain an hsl( literal — the tokens arrive already wrapped (the docstring may name the fault; the code may not)");
+  assert.ok(curveSrc.includes("stroke={d.series[0]}"),
+    "the line's stroke is the hook's string, verbatim");
 });

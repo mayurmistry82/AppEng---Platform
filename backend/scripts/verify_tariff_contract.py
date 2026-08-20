@@ -240,7 +240,17 @@ def t4_no_regression() -> None:
           abs(mean - 0.38) > 0.01, f"mean={mean:.6f}")
     check("(4) fit from the bill: 0.07, not a fallback",
           t["fit"] == 0.07 and t["fit_is_fallback"] is False)
-    check("(4) source is 'bill'", t["source"] == "bill", t["source"])
+    # 3.13 prompt 4b: `source` RENAMED to import_rate_source (what it always
+    # genuinely meant). The scalar came from the bill; the flat vector it
+    # tiled therefore carries the bill's provenance too.
+    check("(4) import_rate_source is 'bill'",
+          t["import_rate_source"] == "bill", t["import_rate_source"])
+    check("(4) rate_24_source: the bill's WINDOWS built the vector -> 'bill'",
+          t["rate_24_source"] == "bill", t["rate_24_source"])
+    check("(4) fit_source is 'bill' (the bill's feed-in figure)",
+          t["fit_source"] == "bill", t["fit_source"])
+    check("(4) tariff_type_source is 'bill'",
+          t["tariff_type_source"] == "bill", t["tariff_type_source"])
 
 
 def t5_resolution_order() -> None:
@@ -267,9 +277,11 @@ def t5_resolution_order() -> None:
         stub = StubClient({"jobs": [], **tables})
         flags: list[str] = []
         t = sizing_route._resolve_tariff(stub, body, "SA", "5000", flags)
-        check(f"(5{label[0]}) import_rate {exp_rate} / source {exp_source}",
-              t["import_rate"] == exp_rate and t["source"] == exp_source,
-              f"{t['import_rate']} / {t['source']}")
+        check(f"(5{label[0]}) import_rate {exp_rate} / import_rate_source "
+              f"{exp_source} (3.13-4b rename of `source`)",
+              t["import_rate"] == exp_rate
+              and t["import_rate_source"] == exp_source,
+              f"{t['import_rate']} / {t['import_rate_source']}")
         if exp_fit is not None:
             check(f"(5{label[0]}) fit {exp_fit}", t["fit"] == exp_fit, str(t["fit"]))
         if exp_export is not None:
@@ -629,8 +641,9 @@ def t10_supply_charge_source() -> None:
           repr(t.get("supply_charge_source")))
     check("(10a) ...while `source` (the import rate's) is 'default' — the two "
           "keys provably answer DIFFERENT questions on this one row",
-          t.get("source") == "default" and t.get("supply_charge_source") != t.get("source"),
-          f"source={t.get('source')!r}")
+          t.get("import_rate_source") == "default"
+          and t.get("supply_charge_source") != t.get("import_rate_source"),
+          f"import_rate_source={t.get('import_rate_source')!r}")
 
     # (b) charge from the parsed bill's structured tariff.
     flags2: list[str] = []
@@ -672,6 +685,77 @@ def t10_supply_charge_source() -> None:
           f"{annual3!r} / {src3!r} / {flags5}")
 
 
+def t11_per_field_provenance() -> None:
+    """3.13 prompt 4b: every value carries its OWN provenance, set where it is
+    read. WHY THESE MOVE: pre-4b one `source` flag was assigned only when the
+    SCALAR resolved, so a job with stored TOU windows and no scalar read
+    "default" against the installer's own typed rates — the defect Mayur
+    found on screen, third of its kind."""
+    print("\nT11. per-field provenance — the vector, the type and the fit "
+          "each carry their own source")
+
+    # (a) THE DEFECT SHAPE: stored windows, NULL scalar, stored fit.
+    stored_tou = {"job_id": "j1", "tariff_type": "tou", "supply_charge": 1.05,
+                  "tou_windows": [
+                      {"label": "peak", "rate": 0.55, "start": "17:00", "end": "21:00", "days": "all"},
+                      {"label": "offpeak", "rate": 0.20, "start": "21:00", "end": "07:00", "days": "all"},
+                      {"label": "shoulder", "rate": 0.35, "start": "07:00", "end": "17:00", "days": "all"}],
+                  "import_rate": None, "fit_aud_per_kwh": 0.05,
+                  "export_limit_kw": 5.0, "source": "installer"}
+    flags: list[str] = []
+    t = sizing_route._resolve_tariff(
+        StubClient({"tariffs": [stored_tou], "bills": []}),
+        body_ns(job_id="j1"), "SA", "5000", flags)
+    check("(11a) stored windows + NULL scalar: rate_24_source 'installer' — "
+          "the installer's typed rates are never labelled 'default'",
+          t["rate_24_source"] == "installer", repr(t["rate_24_source"]))
+    check("(11a) ...while import_rate_source is 'default' (the scalar "
+          "genuinely defaulted) — the two answer different questions",
+          t["import_rate_source"] == "default", repr(t["import_rate_source"]))
+    check("(11a) tariff_type_source 'installer'",
+          t["tariff_type_source"] == "installer", repr(t["tariff_type_source"]))
+    check("(11a) fit_source 'installer' (fit_aud_per_kwh stored on the row) "
+          "and fit_is_fallback False, unchanged",
+          t["fit_source"] == "installer" and t["fit_is_fallback"] is False,
+          f"{t['fit_source']!r}/{t['fit_is_fallback']!r}")
+
+    # (b) the flat installer scalar (the 456e0242 shape): the vector IS the
+    # scalar tiled, so it carries the scalar's provenance.
+    stored_flat = {"job_id": "j1", "tariff_type": "flat", "supply_charge": None,
+                   "tou_windows": None, "import_rate": 0.42,
+                   "fit_aud_per_kwh": 0.05, "export_limit_kw": None,
+                   "source": "installer"}
+    t2 = sizing_route._resolve_tariff(
+        StubClient({"tariffs": [stored_flat], "bills": []}),
+        body_ns(job_id="j1"), "SA", "5000", [])
+    check("(11b) flat stored scalar: rate_24_source 'installer' (the flat "
+          "vector is the installer's scalar tiled)",
+          t2["rate_24_source"] == "installer" and t2["import_rate_source"] == "installer",
+          f"{t2['rate_24_source']!r}/{t2['import_rate_source']!r}")
+
+    # (c) nothing anywhere: default scalar priced every hour -> 'default';
+    # nothing supplied the type -> 'not stated', never 'default'.
+    t3 = sizing_route._resolve_tariff(
+        StubClient({"tariffs": [], "bills": []}),
+        body_ns(job_id="j1"), "SA", "5000", [])
+    check("(11c) nothing stored: rate_24_source and fit_source 'default', "
+          "tariff_type_source 'not stated' — an unknown origin is never "
+          "claimed as a default",
+          t3["rate_24_source"] == "default" and t3["fit_source"] == "default"
+          and t3["tariff_type_source"] == "not stated",
+          f"{t3['rate_24_source']!r}/{t3['fit_source']!r}/{t3['tariff_type_source']!r}")
+
+    # (d) request windows beat everything.
+    t4 = sizing_route._resolve_tariff(
+        StubClient({"tariffs": [stored_tou], "bills": []}),
+        body_ns(job_id="j1", tou_windows=[{"label": "peak", "rate": 0.9,
+                                           "start": "00:00", "end": "24:00",
+                                           "days": "all"}]),
+        "SA", "5000", [])
+    check("(11d) request windows: rate_24_source 'request'",
+          t4["rate_24_source"] == "request", repr(t4["rate_24_source"]))
+
+
 def main() -> int:
     print("verify_tariff_contract.py — 3.8 prompt 1 (writes nothing)\n")
     t1_structure()
@@ -683,6 +767,7 @@ def main() -> int:
     t8_never_raises()
     t9_fallback_flag_condition()
     t10_supply_charge_source()
+    t11_per_field_provenance()
     print(f"\n{'-' * 60}")
     if FAILURES:
         print(f"FAIL: {len(FAILURES)} of {CHECKS_RUN} checks failed:")

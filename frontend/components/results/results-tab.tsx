@@ -1,5 +1,6 @@
 import Link from "next/link";
 import { Notice } from "@/components/ui/notice";
+import { ScoreCurve } from "@/components/results/score-curve";
 import { NoticeStack } from "@/components/ui/notice-stack";
 import {
   Table,
@@ -17,9 +18,9 @@ import type { ResultsTabView } from "@/lib/worksheet";
  * panel layout in words, then the assumptions block, expandable. Every figure
  * traces to an assumption; every stored gap is an honest sentence.
  *
- * NO CHART — and deliberately no placeholder promising one: a promise naming
- * a row number is exactly what went stale in the results bar and was deleted
- * there. Prompt 4b brings the score curve.
+ * The score curve (3.13 prompt 4b) renders between the split and the cost —
+ * this tab is the ONE route that pays the chart library's First Load cost;
+ * the worksheet stays chart-free (F47).
  *
  * A NULL cost-line amount reads "installer to confirm", NEVER $0 — an
  * unpriced line is a different fact from a free one. A breakdown whose lines
@@ -65,7 +66,7 @@ export function ResultsTab({
     <div className="flex flex-col gap-6">
       {/* ── Headline ── */}
       {h ? (
-        <div className="flex flex-wrap gap-x-8 gap-y-3">
+        <div className="flex flex-wrap gap-x-12 gap-y-5">
           {(
             [
               ["Solar", h.solarKw],
@@ -80,9 +81,9 @@ export function ResultsTab({
                 : []),
             ] as [string, string][]
           ).map(([label, value]) => (
-            <div key={label}>
+            <div key={label} className="min-w-[132px]">
               <p className="text-caption text-muted-foreground">{label}</p>
-              <p className="metric-lg text-foreground">{value}</p>
+              <p className="mt-0.5 metric-lg text-foreground">{value}</p>
             </div>
           ))}
           {/* Projected spend carries the UT-9 framing: at or below zero the
@@ -163,6 +164,16 @@ export function ResultsTab({
             {view.splitNote}
           </p>
         )}
+      </section>
+
+      {/* ── The score curve (3.13 prompt 4b) ── */}
+      <section aria-label="Score curve">
+        <h2 className="text-h3 text-foreground">
+          Every option the engine scored
+        </h2>
+        <div className="mt-2">
+          <ScoreCurve view={view.curve} />
+        </div>
       </section>
 
       {/* ── Itemised cost ── */}

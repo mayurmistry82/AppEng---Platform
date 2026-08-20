@@ -398,12 +398,22 @@ def _resolve_tariff(
     explicit_windows = bool(getattr(body, "import_rates_24", None)) or bool(
         getattr(body, "tou_windows", None)
     )
+    # 3.13 prompt 4b: `source` was ONE flag assigned only when the SCALAR
+    # import rate resolved, and every assumptions row borrowed it — so a job
+    # with stored TOU windows and no scalar read "default" against the
+    # installer's own typed rates (the third occurrence of this hole; the
+    # supply charge fell into it at prompt 2). Each value now carries its own
+    # provenance, set AT THE POINT THAT VALUE IS ACTUALLY READ, never
+    # inferred from another. `source` is RENAMED to import_rate_source in the
+    # return rather than kept beside it, so no second copy can drift.
     source: Optional[str] = (
         "request" if (import_rate is not None or explicit_windows) else None
     )
+    fit_source: Optional[str] = "request" if fit is not None else None
 
     stored = _read_tariff_row(client, body.job_id, flags)
     tariff_type = stored.get("tariff_type") if stored else None
+    tariff_type_source = "installer" if tariff_type is not None else "not stated"
     supply_charge = stored.get("supply_charge") if stored else None
     # 3.13 prompt 2 (G): the supply charge's OWN provenance, tracked where the
     # charge itself is read — the fit_is_fallback pattern, never inferred from
@@ -424,6 +434,7 @@ def _resolve_tariff(
     if fit is None and stored and stored.get("fit_aud_per_kwh") is not None:
         try:
             fit = float(stored["fit_aud_per_kwh"])
+            fit_source = "installer"
         except (TypeError, ValueError):
             pass
     export_limit_kw = body.export_limit_kw
@@ -450,6 +461,8 @@ def _resolve_tariff(
             )
             if tariff_type is None and structured:
                 tariff_type = structured.get("tariff_type")
+                if tariff_type is not None:
+                    tariff_type_source = "bill"
             if supply_charge is None and structured:
                 supply_charge = structured.get("supply_charge")
                 if supply_charge is not None:
@@ -463,6 +476,7 @@ def _resolve_tariff(
                     bf = pj.get("feed_in_tariff")
                 if bf is not None:
                     fit = float(bf)
+                    fit_source = "bill"
 
     # 3.12: the scalar still RESOLVES (it is reported in assumptions and is
     # the flat rate _build_rate_24 fills uncovered hours with), but the
@@ -483,6 +497,7 @@ def _resolve_tariff(
         fd = nem_data.get_default_fit(state)
         fit = fd["fit_aud_per_kwh"]
         fit_is_fallback = True
+        fit_source = "default"
         flags.append(f"fit fallback {fit}/kWh ({fd.get('scheme')}) — is_fallback")
 
     if export_given is not None and export_limit_kw is not None:
@@ -496,6 +511,17 @@ def _resolve_tariff(
             flags.append("export_limit defaulted (state/postcode not recognised)")
 
     windows_for_rate = getattr(body, "tou_windows", None) or stored_windows
+    # 3.13 prompt 4b: the hourly vector's OWN provenance — where the thing
+    # that will price the hours was read, tracked before the build so the
+    # build stays a pure converter.
+    if explicit_windows:
+        vector_origin: Optional[str] = "request"
+    elif stored_windows is not None:
+        vector_origin = "installer"
+    elif structured and structured.get("tou_windows"):
+        vector_origin = "bill"
+    else:
+        vector_origin = None
     n_flags_before = len(flags)
     rate_24, is_tou = _build_rate_24(
         getattr(body, "import_rates_24", None), windows_for_rate, structured,
@@ -510,6 +536,15 @@ def _resolve_tariff(
         flags.append(
             f"import_rate fallback ${import_rate:.2f}/kWh (no bill rate) — is_fallback"
         )
+    # The vector's source: windows built it -> their origin; a flat vector is
+    # the scalar tiled, so it carries the SCALAR's own source — "default" only
+    # when the documented fallback itself priced the hours. A windows build
+    # gap-filled by the default keeps the windows' origin (the gap-fill flag
+    # above already names the fallback's part).
+    if is_tou and vector_origin is not None:
+        rate_24_source = vector_origin
+    else:
+        rate_24_source = source
 
     return {
         "import_rate": float(import_rate),
@@ -520,9 +555,15 @@ def _resolve_tariff(
         "export_limit_kw": float(export_limit_kw),
         "export_meta": export_meta,
         "tariff_type": tariff_type,
+        "tariff_type_source": tariff_type_source,
         "supply_charge": supply_charge,
         "supply_charge_source": supply_charge_source,
-        "source": source,
+        # 3.13 prompt 4b: `source` RENAMED — this is what it always genuinely
+        # meant, the SCALAR import rate's provenance. The vector and the fit
+        # carry their own.
+        "import_rate_source": source,
+        "rate_24_source": rate_24_source,
+        "fit_source": fit_source,
         # 3.12: flat_rate_for_solar is GONE. It was sum(rate_24)/24, the
         # battery endpoint's private third meaning of "the import rate", and
         # the solar optimiser now takes rate_24 itself — the averaged copy has
@@ -987,11 +1028,14 @@ async def optimise_sizing(
         assumptions = {
             "engine_version": solar_optimiser.ENGINE_VERSION,
             "import_rate": import_rate,
-            "tariff_source": tariff["source"],
+            "import_rate_source": tariff["import_rate_source"],
+            "rate_24_source": tariff["rate_24_source"],
             "tariff_type": tariff["tariff_type"],
+            "tariff_type_source": tariff["tariff_type_source"],
             "supply_charge_annual": supply_charge_annual,
             "supply_charge_source": supply_charge_source,
             "fit": fit,
+            "fit_source": tariff["fit_source"],
             "fit_is_fallback": fit_is_fallback,
             "export_limit_kw": export_limit_kw,
             "export_limit_source": export_meta,
@@ -1604,12 +1648,15 @@ async def battery_sizing(
         assumptions = {
             "engine_version": battery_optimiser.ENGINE_VERSION,
             "is_tou": is_tou,
-            "tariff_source": tariff["source"],
             "tariff_type": tariff["tariff_type"],
+            "tariff_type_source": tariff["tariff_type_source"],
             "supply_charge_annual": supply_charge_annual,
             "supply_charge_source": supply_charge_source,
             "import_rates_24": rate_24,
+            "rate_24_source": tariff["rate_24_source"],
+            "import_rate_source": tariff["import_rate_source"],
             "fit": fit,
+            "fit_source": tariff["fit_source"],
             "fit_is_fallback": fit_is_fallback,
             "export_limit_kw": export_limit_kw,
             "export_limit_source": export_meta,
