@@ -5,6 +5,11 @@ import { ChevronDown, ChevronRight } from "lucide-react";
 import { KpiTile } from "@/components/ui/kpi-tile";
 import { PinChip } from "@/components/ui/override-drawer";
 import {
+  formatKw,
+  formatKwh,
+  formatMoney,
+  formatPct,
+  formatYears,
   RESULTS_BAR_DEFAULT_HEIGHT,
   RESULTS_BAR_MIN_HEIGHT,
   RESULTS_BAR_STORAGE_KEY,
@@ -62,9 +67,9 @@ import {
  * component owns only the DOM measurement that feeds it.
  */
 
-function fmt(value: number | null, suffix: string): string {
-  return value == null ? "—" : `${value}${suffix}`;
-}
+// 3.13 prompt 4 (E): NO local formatter — the bar renders through the same
+// shared set the Results section and the Results tab use, so the three
+// surfaces cannot disagree about the same stored number again.
 
 export function ResultsBar({ view }: { view: ResultsBarView }) {
   // First render: the D3 default, derived purely from props so server and
@@ -253,8 +258,8 @@ export function ResultsBar({ view }: { view: ResultsBarView }) {
 
   const heroValue = view.sized
     ? [
-        view.solarKw != null ? `${view.solarKw} kW` : null,
-        view.batteryKwh != null ? `${view.batteryKwh} kWh` : null,
+        view.solarKw != null ? formatKw(view.solarKw) : null,
+        view.batteryKwh != null ? formatKwh(view.batteryKwh) : null,
       ]
         .filter(Boolean)
         .join(" + ") || "—"
@@ -301,16 +306,37 @@ export function ResultsBar({ view }: { view: ResultsBarView }) {
             />
             <KpiTile
               label="Payback"
-              value={view.sized ? fmt(view.paybackYears, " yr") : "—"}
+              value={
+                view.sized && view.paybackYears != null
+                  ? formatYears(view.paybackYears)
+                  : "—"
+              }
             />
             <KpiTile
               label="NPV"
-              value={view.sized && view.npv != null ? `$${view.npv}` : "—"}
+              value={view.sized && view.npv != null ? formatMoney(view.npv) : "—"}
             />
-            {/* Self-sufficiency and split solar ROI are produced at 3.12/3.13 —
-                no field carries them yet, so they are em-dashes even when sized. */}
-            <KpiTile label="Self-sufficiency" value="—" />
-            <KpiTile label="Solar ROI" value="—" />
+            {/* 3.13 prompt 4 (E): read from the SAME stored derivations the
+                Results section uses — the bar showed dashes eight lines above
+                a section showing 84.1%, on one screen. */}
+            <KpiTile
+              label="Self-sufficiency"
+              value={
+                view.sized && view.selfSufficiencyPct != null
+                  ? formatPct(view.selfSufficiencyPct)
+                  : "—"
+              }
+            />
+            <KpiTile
+              label="NPV split (solar + battery)"
+              value={
+                view.sized &&
+                view.splitSolarNpv != null &&
+                view.splitBatteryNpv != null
+                  ? `${formatMoney(view.splitSolarNpv)} + ${formatMoney(view.splitBatteryNpv)}`
+                  : "—"
+              }
+            />
           </div>
           <div className="flex flex-wrap items-center gap-1.5">
             <PinChip>reserve —</PinChip>
@@ -327,25 +353,13 @@ export function ResultsBar({ view }: { view: ResultsBarView }) {
           <div className="flex min-h-0 flex-1 flex-col gap-1">
             {/* flex-1 + min-h-0: the ONLY element that absorbs the leftover
                 height, so the bar never has empty space at any drag height. */}
+            {/* 3.13 prompt 4 (E): where the chart will go, NOTHING is
+                promised — the three sentences that used to sit here named
+                shipped rows and went stale on screen. The area stays empty
+                until a real chart fills it. */}
             <div className="flex min-h-0 flex-1 items-center justify-center rounded-lg border border-border bg-muted">
               <span className="px-4 text-center text-caption text-muted-foreground">
-                {view.sized
-                  ? "Chart arrives with battery sizing (3.12)"
-                  : "Results appear after the first sizing run (3.11-3.12)"}
-              </span>
-            </div>
-            <div className="flex shrink-0 items-center justify-between">
-              <button
-                type="button"
-                disabled
-                title="Metric selection arrives with the real chart (3.12)"
-                className="inline-flex items-center gap-1 rounded-md border border-border-subtle px-2 py-1 text-caption text-text-disabled"
-              >
-                Metric
-                <ChevronDown aria-hidden="true" className="h-3 w-3" />
-              </button>
-              <span className="text-caption text-muted-foreground">
-                dashed = baseline (A) · solid = current (B) · auto-recomputes on edit
+                {view.sized ? "" : "Not yet sized"}
               </span>
             </div>
           </div>

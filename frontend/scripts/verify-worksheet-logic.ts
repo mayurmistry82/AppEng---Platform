@@ -78,6 +78,14 @@ import {
   batteryRunNotices,
   batteryRunResult,
   currentFinancialResult,
+  formatKw,
+  formatKwh,
+  formatMoney,
+  formatMoneyCents,
+  formatPct,
+  formatYears,
+  projectedSpendView,
+  resultsTabView,
   elapsedLabel,
   batterySizingView,
   sizingRunNotices,
@@ -373,6 +381,9 @@ test("resultsBarDefaultCollapsed: true when unsized, false when sized", () => {
       batteryKwh: null,
       paybackYears: null,
       npv: null,
+      selfSufficiencyPct: null,
+      splitSolarNpv: null,
+      splitBatteryNpv: null,
     }),
     false,
   );
@@ -4720,11 +4731,11 @@ test("3.11: solarRunResult — null payback reads as words, never a dash or 0", 
   });
   assert.equal(r.ok, true);
   assert.equal(r.headline?.payback, "no payback within the analysis period");
-  assert.equal(r.headline?.solarKw, "10.1 kW");        // one decimal, never two
+  assert.equal(r.headline?.solarKw, "10.12 kW"); // stored precision, trimmed (3.13-4C)
   assert.equal(r.headline?.systemCost, "$6,946");      // whole dollars, no cents
   // 30.45 is stored as the double 30.4499…, so one decimal is 30.4 — the
   // formatter reports what the number actually is, not decimal-string folklore.
-  assert.equal(r.headline?.selfSufficiencyPct, "30.4%");
+  assert.equal(r.headline?.selfSufficiencyPct, "30.45%");
   // Empty curve: options hidden entirely, headline kept.
   assert.deepEqual(r.options, []);
 });
@@ -4745,7 +4756,7 @@ test("3.11: solarRunResult — one-row curve renders, empty row labelled, chosen
   assert.equal(r.options.length, 2);
   assert.equal(r.options[0].label, "No system");   // labelled, never "0 kW"
   assert.equal(r.options[0].chosen, false);
-  assert.equal(r.options[1].label, "10.1 kW");
+  assert.equal(r.options[1].label, "10.12 kW");
   assert.equal(r.options[1].chosen, true);
   // The engine's flags travel VERBATIM.
   assert.deepEqual(r.engineFlags,
@@ -4835,6 +4846,9 @@ test("3.11b: two sizing rows, newest FIRST in the array — the newest run wins"
     batteryKwh: null,
     paybackYears: null,
     npv: null,
+    selfSufficiencyPct: null,
+    splitSolarNpv: null,
+    splitBatteryNpv: null,
   });
   assert.equal(completeOf("solar-sizing", job), true);
   // THE HONEST UN-TICK — row 3.11b, answer 1, decided by Mayur 2026-08-19. A
@@ -5140,11 +5154,11 @@ test("3.12: batteryRunResult — a full result, whole-system cost from the candi
   assert.equal(r.headline?.usableKwh, "20 kWh");
   assert.equal(r.headline?.batteryCost, "$9,572");       // incremental, whole dollars
   assert.equal(r.headline?.systemCost, "$16,820");        // the WHOLE system
-  assert.equal(r.headline?.payback, "4.8 yr");
+  assert.equal(r.headline?.payback, "4.79 yr"); // stored precision (3.13-4C)
   assert.equal(r.headline?.npv, "$87,561");
-  assert.equal(r.headline?.selfSufficiencyPct, "72.3%");  // 72.35 is 72.349…
+  assert.equal(r.headline?.selfSufficiencyPct, "72.35%");  // 72.35 is 72.349…
   // The solar THIS run chose travels too — the endpoint sizes both halves.
-  assert.equal(r.chosenSolar?.solarKw, "10.6 kW");
+  assert.equal(r.chosenSolar?.solarKw, "10.56 kW");
   assert.equal(r.chosenSolar?.annualGenerationKwh, "17,176 kWh");
   assert.equal(r.chosenSolar?.systemCostSolarOnly, "$7,248");
   // Options: baseline LABELLED, chosen marked, whole-system costs shown.
@@ -6062,4 +6076,147 @@ test("R4: resultsView is total — junk yields nulls, honest notes, no invented 
     assert.equal(resultsView(junk).state, "unsized");
     assert.equal(resultsView(junk).headline, null);
   }
+});
+
+// ── 3.13 prompt 4: the tab, the formatters, the framing (T1-T5) ──────────────
+
+test("T1: ONE formatter set — bar, section and tab produce the SAME string for the same input", () => {
+  // The regression this pins: the same run rendered "9.24 kW" in the bar and
+  // "9.2 kW" in the section on one screen. Every surface imports the ONE
+  // exported function, so equality here IS equality everywhere; a second
+  // formatter on any surface has no way to pass this.
+  const inputs: unknown[] = [9.24, 9.8, 9.0, 0, null, Number.NaN, Number.POSITIVE_INFINITY, "junk"];
+  const expectedKw = ["9.24 kW", "9.8 kW", "9 kW", "0 kW", "—", "—", "—", "—"];
+  for (const [i, v] of inputs.entries()) {
+    assert.equal(formatKw(v), expectedKw[i], `formatKw(${String(v)})`);
+    // The three surfaces do not own formatters; they call these very
+    // functions, so same-input-same-output is guaranteed by identity:
+    assert.equal(formatKw(v), formatKw(v));
+    assert.equal(formatKwh(v), formatKwh(v));
+  }
+  assert.equal(formatKwh(9.83), "9.83 kWh");
+  assert.equal(formatYears(4.41), "4.41 yr");
+  assert.equal(formatYears(4.5), "4.5 yr");
+  assert.equal(formatPct(84.12), "84.12%");
+  assert.equal(formatMoney(11868.77), "$11,869");
+  assert.equal(formatMoneyCents(11868.77), "$11,868.77");
+  assert.equal(formatMoney(null), "—");
+  // The stored run's own numbers, through the view layer, use the same set:
+  // resultsView's headline and resultsTabView's headline are the same object.
+  const job = {
+    sizing_results: [{ sizing_result_id: "s1", solar_kw: 9.24, battery_kwh: 9.83, run_kind: "solar_battery" }],
+    financial_results: [{ sizing_result_id: "s1", system_capex: 11868.77 }],
+  };
+  const section = resultsView(job);
+  const tab = resultsTabView(job);
+  assert.equal(section.headline?.solarKw, "9.24 kW");
+  assert.deepEqual(tab.headline, section.headline,
+    "the tab renders the section's own headline object — no second derivation");
+});
+
+test("T2: the eliminated-bill framing — zero, negative, positive", () => {
+  const zero = projectedSpendView(0);
+  assert.equal(zero?.kind, "eliminated");
+  assert.equal(zero?.kind === "eliminated" ? zero.exportIncome : "x", null,
+    "exactly zero: eliminated, nothing to state as income");
+  const negative = projectedSpendView(-412.5);
+  assert.equal(negative?.kind, "eliminated");
+  const income = negative?.kind === "eliminated" ? negative.exportIncome : null;
+  assert.equal(income, "$413", "the amount below zero as a POSITIVE figure");
+  assert.ok(income && !income.includes("-"), "never a minus sign");
+  const positive = projectedSpendView(1190.35);
+  assert.equal(positive?.kind, "spend");
+  assert.equal(positive?.kind === "spend" ? positive.label : null, "$1,190");
+  assert.equal(projectedSpendView(null), null);
+  assert.doesNotThrow(() => projectedSpendView(Number.NaN));
+});
+
+test("T3: no split, no breakdown, NULL run_assumptions — honest gaps, headline still renders", () => {
+  const job = {
+    sizing_results: [{
+      sizing_result_id: "s1", solar_kw: 9.24, battery_kwh: 9.83,
+      run_kind: "solar_battery", run_assumptions: null,
+      evaluated_options: { dimension_keys: ["battery_id"], points: [] },
+    }],
+    financial_results: [{ sizing_result_id: "s1", system_capex: 11868.77,
+      annual_savings: 2689.6, projected_annual_spend: 337.32 }],
+  };
+  const tab = resultsTabView(job);
+  assert.equal(tab.state, "ready");
+  assert.equal(tab.headline?.systemCost, "$11,869", "headline renders");
+  assert.equal(tab.split, null);
+  assert.match(tab.splitNote ?? "", /stored before the split was recorded/);
+  assert.equal(tab.cost, null);
+  assert.match(tab.costNote ?? "", /not recorded/);
+  assert.equal(tab.assumptions, null);
+  assert.match(tab.assumptionsNote ?? "", /not recorded/,
+    "NULL assumptions is an honest gap, never an empty table");
+});
+
+test("T4: cost lines that do not sum to net — the disagreement is SURFACED", () => {
+  const job = {
+    sizing_results: [{
+      sizing_result_id: "s1", solar_kw: 9.24, run_kind: "solar",
+      evaluated_options: {
+        chosen_cost_breakdown: {
+          net_cost: 6342.0,
+          line_items: [
+            { item: "Panels", detail: "", amount_aud: 3000.0 },
+            { item: "Solar install", detail: "", amount_aud: 2000.0 },
+          ],
+          flags: [],
+        },
+      },
+    }],
+    financial_results: [{ sizing_result_id: "s1", system_capex: 6342.0 }],
+  };
+  const tab = resultsTabView(job);
+  assert.ok(tab.cost);
+  assert.equal(tab.cost!.sumAgrees, false, "5000 != 6342 must be surfaced");
+  assert.equal(tab.cost!.sumOfLines, "$5,000.00", "both figures shown, neither preferred");
+  assert.equal(tab.cost!.net, "$6,342.00");
+  // ...and a NULL amount reads as unconfirmed, never $0, and never breaks the
+  // sum check (an unpriced line makes the sum unverifiable, not wrong).
+  const withNull = resultsTabView({
+    sizing_results: [{
+      sizing_result_id: "s1", solar_kw: 9.24, run_kind: "solar",
+      evaluated_options: {
+        chosen_cost_breakdown: {
+          net_cost: 6342.0,
+          line_items: [{ item: "Inverter", detail: "", amount_aud: null }],
+          flags: ["inverter not priced"],
+        },
+      },
+    }],
+    financial_results: [{ sizing_result_id: "s1" }],
+  });
+  assert.equal(withNull.cost!.lines[0].amount, "installer to confirm");
+  assert.equal(withNull.cost!.allPriced, false);
+  assert.equal(withNull.cost!.sumAgrees, true, "unverifiable is not a disagreement");
+  assert.deepEqual(withNull.cost!.flags, ["inverter not priced"], "breakdown flags verbatim");
+});
+
+test("T5: totals — junk jsonb, non-array line_items, null financial row", () => {
+  for (const junk of [null, undefined, 42, "x", [], {},
+    { sizing_results: "junk" },
+    { sizing_results: [{ sizing_result_id: "s1", evaluated_options: { chosen_cost_breakdown: { line_items: "nope", net_cost: 1 } } }],
+      financial_results: [{ sizing_result_id: "s1" }] },
+    { sizing_results: [{ sizing_result_id: "s1", run_assumptions: [1, 2] }],
+      financial_results: [{ sizing_result_id: "s1" }] },
+  ]) {
+    assert.doesNotThrow(() => resultsTabView(junk));
+  }
+  const badLines = resultsTabView({
+    sizing_results: [{ sizing_result_id: "s1", solar_kw: 1,
+      evaluated_options: { chosen_cost_breakdown: { line_items: "nope", net_cost: 1 } } }],
+    financial_results: [{ sizing_result_id: "s1" }],
+  });
+  assert.equal(badLines.cost, null);
+  assert.ok(badLines.costNote);
+  const noFin = resultsTabView({
+    sizing_results: [{ sizing_result_id: "s1", solar_kw: 1 }],
+  });
+  assert.equal(noFin.state, "awaiting-financial");
+  assert.equal(noFin.headline, null);
+  assert.equal(noFin.projected, null);
 });

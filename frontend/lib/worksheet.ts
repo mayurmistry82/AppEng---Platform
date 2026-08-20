@@ -743,6 +743,14 @@ export type ResultsBarView =
       batteryKwh: number | null;
       paybackYears: number | null;
       npv: number | null;
+      /** 3.13 prompt 4 (E): read from the SAME stored derivation the Results
+          section uses (storedSelfSufficiencyPct) — the bar showed a dash
+          eight lines above a section showing 84.1%, on one screen. */
+      selfSufficiencyPct: number | null;
+      /** The stored split (battery runs only): solar-only NPV and what the
+          battery adds. null on a solar-only run or a pre-split row. */
+      splitSolarNpv: number | null;
+      splitBatteryNpv: number | null;
     };
 
 /**
@@ -768,12 +776,17 @@ export function resultsBarView(job: unknown): ResultsBarView {
   const latestFin = currentFinancialResult(job);
   const num = (v: unknown): number | null =>
     typeof v === "number" && Number.isFinite(v) ? v : null;
+  const eo = asRecord(latest.evaluated_options);
+  const split = asRecord(eo.split);
   return {
     sized: true,
     solarKw: num(latest.solar_kw),
     batteryKwh: num(latest.battery_kwh),
     paybackYears: num(latestFin?.payback_years),
     npv: num(latestFin?.npv_25_year),
+    selfSufficiencyPct: storedSelfSufficiencyPct(latest, eo),
+    splitSolarNpv: tariffNum(asRecord(split.solar_only).npv_25yr),
+    splitBatteryNpv: tariffNum(asRecord(split.battery_increment).incremental_npv),
   };
 }
 
@@ -4308,23 +4321,75 @@ export interface SolarSizingView {
 const NO_PAYBACK = "no payback within the analysis period";
 
 /** kW to the single decimal the inputs justify; no two-decimal kW. */
-function fmtKw(value: number): string {
-  return `${Number(value.toFixed(1))} kW`;
+// ── THE ONE SET OF RESULT FORMATTERS (3.13 prompt 4, step C) ─────────────────
+// Decided here, once: kW, kWh, years and percent at the precision actually
+// STORED, trailing zeros trimmed (`${n}` on a JSON-parsed numeric is exactly
+// that — 9.24 renders "9.24", 9.2 renders "9.2", 9 renders "9"); money to
+// whole dollars in headline tiles (formatMoney) and to cents in the itemised
+// breakdown (formatMoneyCents). The results BAR, the worksheet SECTION and
+// the results TAB all import these same functions — the same run rendering
+// as "9.24 kW" in one place and "9.2 kW" eight lines below it is the
+// regression this block exists to end. A second formatter anywhere is that
+// regression back.
+
+export function formatKw(value: unknown): string {
+  const n = tariffNum(value);
+  return n === null ? "—" : `${n} kW`;
 }
 
-/** Whole dollars — no cents on a system cost. */
+export function formatKwh(value: unknown): string {
+  const n = tariffNum(value);
+  return n === null ? "—" : `${n} kWh`;
+}
+
+export function formatYears(value: unknown): string {
+  const n = tariffNum(value);
+  if (n === null) return NO_PAYBACK;
+  return `${n} yr`;
+}
+
+export function formatPct(value: unknown): string {
+  const n = tariffNum(value);
+  return n === null ? "—" : `${n}%`;
+}
+
+/** Whole dollars — headline tiles. Negative keeps its sign; the eliminated-
+    bill framing (projectedSpendView) is where a negative spend becomes a
+    positive export income instead. */
+export function formatMoney(value: unknown): string {
+  const n = tariffNum(value);
+  if (n === null) return "—";
+  const sign = n < 0 ? "-" : "";
+  return `${sign}$${Math.round(Math.abs(n)).toLocaleString("en-AU")}`;
+}
+
+/** Cents — the itemised cost breakdown, where the lines must sum to net. */
+export function formatMoneyCents(value: unknown): string {
+  const n = tariffNum(value);
+  if (n === null) return "—";
+  const sign = n < 0 ? "-" : "";
+  return `${sign}$${Math.abs(n).toLocaleString("en-AU", {
+    minimumFractionDigits: 2,
+    maximumFractionDigits: 2,
+  })}`;
+}
+
+// The pre-existing private names delegate to the shared set, so every view
+// that already used them inherits the one decision.
+function fmtKw(value: number): string {
+  return formatKw(value);
+}
+
 function fmtAud(value: number): string {
-  return `$${Math.round(value).toLocaleString("en-AU")}`;
+  return formatMoney(value);
 }
 
 function fmtYears(value: unknown): string {
-  const n = tariffNum(value);
-  if (n === null) return NO_PAYBACK;
-  return `${Number(n.toFixed(1))} yr`;
+  return formatYears(value);
 }
 
 function fmtPct(value: number): string {
-  return `${Number(value.toFixed(1))}%`;
+  return formatPct(value);
 }
 
 export const SOLAR_EXISTING_UNRECORDED_NOTICE: RoofNoticeView = {
@@ -4562,7 +4627,7 @@ export interface BatterySizingView {
 
 /** kWh to the single decimal the inputs justify. */
 function fmtKwh(value: number): string {
-  return `${Number(value.toFixed(1))} kWh`;
+  return formatKwh(value);
 }
 
 /**
@@ -4728,6 +4793,45 @@ export function elapsedLabel(ms: number): string {
 }
 
 // ── Results section (checklist 3.13 prompt 3) ────────────────────────────────
+
+/**
+ * Self-sufficiency as the STORED run recorded it, never recomputed. A solar
+ * run names its winning point by chosen_index; a battery run's chosen
+ * candidate is identified by the row's own stored figures (usable_kwh +
+ * system_cost) — an ambiguous match yields null, never a guess. ONE
+ * derivation, two readers (resultsView and resultsBarView).
+ */
+function storedSelfSufficiencyPct(
+  sizing: Record<string, unknown>,
+  eo: Record<string, unknown>,
+): number | null {
+  const runKind = typeof sizing.run_kind === "string" ? sizing.run_kind : null;
+  if (runKind === "solar_battery") {
+    const points = Array.isArray(eo.points) ? eo.points : [];
+    const rowKwh = tariffNum(sizing.battery_kwh);
+    const rowCost = tariffNum(sizing.system_cost);
+    const matches = points
+      .map((p) => asRecord(p))
+      .filter(
+        (p) =>
+          rowKwh !== null &&
+          rowCost !== null &&
+          tariffNum(p.usable_kwh) === rowKwh &&
+          tariffNum(p.system_cost) === rowCost,
+      );
+    return matches.length === 1
+      ? tariffNum(matches[0].self_sufficiency_pct)
+      : null;
+  }
+  if (
+    typeof eo.chosen_index === "number" &&
+    Number.isInteger(eo.chosen_index) &&
+    Array.isArray(eo.points)
+  ) {
+    return tariffNum(asRecord(eo.points[eo.chosen_index]).self_sufficiency_pct);
+  }
+  return null;
+}
 
 export interface ResultsHeadline {
   solarKw: string;
@@ -4898,12 +5002,22 @@ export function resultsView(job: unknown): ResultsView {
         }
         const compass = azimuthLabel(tariffNum(plane.azimuth));
         const pitch = tariffNum(plane.pitch);
+        // 3.13 prompt 4 (F, found on screen): four planes rendered as two
+        // pairs sharing a description ("… the WNW-facing plane" twice), so
+        // four faces read as two. Each line now leads with the plane's own
+        // identity — its index in the SAME order the roof section's table
+        // lists them, plus the stored label when the roof carries one — and
+        // keeps direction and pitch as the distinguishing facts of record.
+        const storedLabel =
+          typeof plane.label === "string" && plane.label
+            ? ` (${plane.label})`
+            : "";
         const direction = compass
-          ? `the ${compass}-facing plane`
-          : "a plane whose direction was not recorded";
-        const pitchPart = pitch !== null ? ` (pitch ${pitch}°)` : "";
+          ? `${compass}-facing`
+          : "direction not recorded";
+        const pitchPart = pitch !== null ? `, pitch ${pitch}°` : "";
         lines.push(
-          `${count} panel${count === 1 ? "" : "s"} on ${direction}${pitchPart}`,
+          `Plane ${rawIdx + 1}${storedLabel} — ${count} panel${count === 1 ? "" : "s"}, ${direction}${pitchPart}`,
         );
       }
       if (broken || lines.length === 0) {
@@ -4915,36 +5029,9 @@ export function resultsView(job: unknown): ResultsView {
     }
   }
 
-  // ── Self-sufficiency: read from the stored run, never recomputed. A solar
-  // run names its point by chosen_index; a battery run's chosen candidate is
-  // identified by the row's own stored figures (usable_kwh + system_cost) —
-  // an ambiguous match yields null, never a guess.
-  let selfSufficiency: number | null = null;
-  if (runKind === "solar_battery") {
-    const points = Array.isArray(eo.points) ? eo.points : [];
-    const rowKwh = tariffNum(sizing.battery_kwh);
-    const rowCost = tariffNum(sizing.system_cost);
-    const matches = points
-      .map((p) => asRecord(p))
-      .filter(
-        (p) =>
-          rowKwh !== null &&
-          rowCost !== null &&
-          tariffNum(p.usable_kwh) === rowKwh &&
-          tariffNum(p.system_cost) === rowCost,
-      );
-    if (matches.length === 1) {
-      selfSufficiency = tariffNum(matches[0].self_sufficiency_pct);
-    }
-  } else if (
-    typeof eo.chosen_index === "number" &&
-    Number.isInteger(eo.chosen_index) &&
-    Array.isArray(eo.points)
-  ) {
-    selfSufficiency = tariffNum(
-      asRecord(eo.points[eo.chosen_index]).self_sufficiency_pct,
-    );
-  }
+  // ── Self-sufficiency: read from the stored run, never recomputed —
+  // ONE derivation (storedSelfSufficiencyPct), shared with resultsBarView.
+  const selfSufficiency = storedSelfSufficiencyPct(sizing, eo);
 
   let headline: ResultsHeadline | null = null;
   if (fin !== null) {
@@ -4983,5 +5070,362 @@ export function resultsView(job: unknown): ResultsView {
         ? eo.dispatch_resolution
         : null,
     runKind,
+  };
+}
+
+// ── The Results tab (checklist 3.13 prompt 4) ────────────────────────────────
+
+/**
+ * THE BILL-ELIMINATED FRAMING (UT-9): a projected annual spend at or below
+ * zero never renders as "$0" or a negative dollar figure — the bill is
+ * eliminated, and the amount below zero is stated as a POSITIVE export
+ * income. exportIncome is null at exactly zero (nothing to state).
+ */
+export type ProjectedSpendView =
+  | { kind: "spend"; label: string }
+  | { kind: "eliminated"; exportIncome: string | null };
+
+export function projectedSpendView(value: unknown): ProjectedSpendView | null {
+  const n = tariffNum(value);
+  if (n === null) return null;
+  if (n <= 0) {
+    return {
+      kind: "eliminated",
+      exportIncome: n < 0 ? formatMoney(Math.abs(n)) : null,
+    };
+  }
+  return { kind: "spend", label: formatMoney(n) };
+}
+
+export interface ResultsSplitColumn {
+  savings: string;
+  npv: string;
+  payback: string;
+  cost: string;
+}
+
+export interface ResultsCostLine {
+  item: string;
+  detail: string;
+  /** formatMoneyCents, or the literal "installer to confirm" for a null
+      amount — NEVER $0: an unpriced line is a different fact from a free one. */
+  amount: string;
+  confirmed: boolean;
+}
+
+export interface ResultsCostView {
+  lines: ResultsCostLine[];
+  net: string;
+  /** True when every line is priced AND the lines sum to net within a cent.
+      False means the disagreement is SHOWN (sumOfLines beside net), never
+      silently resolved — cost lines summing to net is the row's acceptance,
+      so a mismatch is a finding. */
+  sumAgrees: boolean;
+  /** Rendered beside net when sumAgrees is false and every line is priced. */
+  sumOfLines: string | null;
+  allPriced: boolean;
+  flags: string[];
+}
+
+export interface ResultsAssumptionRow {
+  label: string;
+  value: string;
+  source: string | null;
+}
+
+export interface ResultsTabView {
+  state: "unsized" | "awaiting-financial" | "ready";
+  headline: ResultsHeadline | null;
+  projected: ProjectedSpendView | null;
+  roofNotices: RoofNoticeView[];
+  layoutLines: string[] | null;
+  layoutNote: string | null;
+  dispatchResolution: string | null;
+  runKind: string | null;
+  split: {
+    solar: ResultsSplitColumn;
+    battery: ResultsSplitColumn;
+    whole: ResultsSplitColumn;
+  } | null;
+  splitNote: string | null;
+  cost: ResultsCostView | null;
+  costNote: string | null;
+  assumptions: ResultsAssumptionRow[] | null;
+  assumptionsNote: string | null;
+}
+
+/** Plain-English labels for the known assumption keys, with the block's own
+    provenance keys paired as sources. Unknown keys still render — every
+    figure traces to an assumption, so nothing stored is hidden. */
+function assumptionRows(ra: Record<string, unknown>): ResultsAssumptionRow[] {
+  const rows: ResultsAssumptionRow[] = [];
+  const used = new Set<string>();
+  const take = (key: string): unknown => {
+    used.add(key);
+    return ra[key];
+  };
+  const str = (v: unknown): string =>
+    v === null || v === undefined
+      ? "not recorded"
+      : typeof v === "string"
+        ? v
+        : typeof v === "number" || typeof v === "boolean"
+          ? String(v)
+          : JSON.stringify(v);
+
+  // Provenance keys consumed as SOURCES, not rows of their own.
+  const tariffSource = str(take("tariff_source"));
+  const supplySource = str(take("supply_charge_source"));
+  const fitFallback = take("fit_is_fallback") === true;
+  const exportMeta = asRecord(take("export_limit_source"));
+  const exportSource =
+    typeof exportMeta.source === "string"
+      ? exportMeta.source
+      : typeof exportMeta.dnsp === "string"
+        ? exportMeta.dnsp
+        : exportMeta.is_default === true
+          ? "default"
+          : null;
+
+  const importRate = take("import_rate");
+  if (importRate !== undefined) {
+    rows.push({
+      label: "Import rate",
+      value: `${formatMoneyCents(importRate)}/kWh`,
+      source: tariffSource,
+    });
+  }
+  const rates24 = take("import_rates_24");
+  if (Array.isArray(rates24) && rates24.length > 0) {
+    const nums = rates24
+      .map((v) => tariffNum(v))
+      .filter((v): v is number => v !== null);
+    rows.push({
+      label: "Hourly import rates",
+      value:
+        nums.length > 0
+          ? `${rates24.length} hourly rates, ${formatMoneyCents(Math.min(...nums))}–${formatMoneyCents(Math.max(...nums))}/kWh`
+          : "unreadable",
+      source: tariffSource,
+    });
+  } else {
+    used.add("import_rates_24");
+  }
+  if ("tariff_type" in ra) {
+    rows.push({ label: "Tariff type", value: str(take("tariff_type")), source: tariffSource });
+  }
+  if ("is_tou" in ra) {
+    rows.push({ label: "Time-of-use pricing", value: take("is_tou") === true ? "yes" : "no", source: null });
+  }
+  if ("fit" in ra) {
+    rows.push({
+      label: "Feed-in tariff",
+      value: `${formatMoneyCents(take("fit"))}/kWh`,
+      source: fitFallback ? "default (state scheme)" : tariffSource,
+    });
+  }
+  if ("supply_charge_annual" in ra) {
+    const sc = take("supply_charge_annual");
+    rows.push({
+      label: "Daily supply charge (annualised)",
+      value: sc === null ? "not stated" : `${formatMoney(sc)}/yr`,
+      source: supplySource,
+    });
+  }
+  if ("export_limit_kw" in ra) {
+    rows.push({ label: "Export limit", value: formatKw(take("export_limit_kw")), source: exportSource });
+  }
+  if ("resolution" in ra) {
+    rows.push({
+      label: "Battery dispatch",
+      value:
+        take("resolution") === "full_year"
+          ? "all 365 real days (full year)"
+          : str(ra.resolution),
+      source: null,
+    });
+  }
+  if ("performance_ratio_non_temp" in ra) {
+    rows.push({ label: "Performance ratio (non-temperature)", value: str(take("performance_ratio_non_temp")), source: null });
+  }
+  if ("temperature_derating_applied" in ra) {
+    rows.push({
+      label: "Temperature derating",
+      value: take("temperature_derating_applied") === true ? "applied here" : "already in the PVGIS profile",
+      source: null,
+    });
+  }
+  if ("discount_rate" in ra) {
+    rows.push({ label: "Discount rate", value: str(take("discount_rate")), source: null });
+  }
+  if ("analysis_years" in ra) {
+    rows.push({ label: "Analysis period", value: `${str(take("analysis_years"))} years`, source: null });
+  }
+  if ("degradation_annual_pct" in ra) {
+    rows.push({ label: "Panel degradation", value: `${str(take("degradation_annual_pct"))}%/yr`, source: null });
+  }
+  if ("tariff_escalation_pct" in ra) {
+    rows.push({ label: "Tariff escalation", value: `${str(take("tariff_escalation_pct"))}%/yr`, source: null });
+  }
+  const panel = take("panel");
+  if (panel !== undefined) {
+    const p = asRecord(panel);
+    const watts = tariffNum(p.watts);
+    rows.push({
+      label: "Panel",
+      value: watts !== null ? `${watts} W` : str(panel),
+      source: null,
+    });
+  }
+  if ("total_load_kwh" in ra) {
+    rows.push({ label: "Annual load", value: `${str(take("total_load_kwh"))} kWh`, source: null });
+  }
+  if ("custom_weight" in ra) {
+    const w = take("custom_weight");
+    if (w !== null) rows.push({ label: "Custom objective blend", value: str(w), source: null });
+  }
+  const constraints = take("constraints_applied");
+  const conRec = asRecord(constraints);
+  const activeCons = Object.entries(conRec).filter(([, v]) => v != null);
+  rows.push({
+    label: "Constraints applied",
+    value:
+      activeCons.length === 0
+        ? "none"
+        : activeCons.map(([k, v]) => `${k}: ${str(v)}`).join(", "),
+    source: null,
+  });
+  if ("engine_version" in ra) {
+    rows.push({ label: "Engine", value: str(take("engine_version")), source: null });
+  }
+  used.add("cache_hits");
+  used.add("cache_misses");
+  used.add("n_configs_evaluated");
+
+  // Anything the block carries that this list does not know still renders —
+  // every stored assumption traces, none is hidden.
+  for (const [key, value] of Object.entries(ra)) {
+    if (!used.has(key)) rows.push({ label: key, value: str(value), source: null });
+  }
+  return rows;
+}
+
+/**
+ * resultsTabView (3.13 prompt 4) — everything the Results tab renders, from
+ * the CURRENT sizing result and its matching financial row via the same two
+ * helpers the section and the bar use. Total: never throws; every stored gap
+ * is an honest sentence, never an empty table or a zero.
+ */
+export function resultsTabView(job: unknown): ResultsTabView {
+  const base = resultsView(job);
+  const sizing = currentSizingResult(job);
+  const fin = currentFinancialResult(job);
+  const eo = asRecord(sizing?.evaluated_options);
+
+  // ── The split ROI ──
+  let split: ResultsTabView["split"] = null;
+  let splitNote: string | null = null;
+  if (base.state === "ready") {
+    const s = asRecord(eo.split);
+    const so = asRecord(s.solar_only);
+    const bi = asRecord(s.battery_increment);
+    if (base.runKind === "solar") {
+      splitNote =
+        "This is a solar-only run — there is no battery half to split out.";
+    } else if (Object.keys(so).length === 0 || Object.keys(bi).length === 0) {
+      splitNote =
+        "This run was stored before the split was recorded, so the solar and battery halves cannot be shown separately.";
+    } else {
+      split = {
+        solar: {
+          savings: formatMoney(so.annual_savings),
+          npv: formatMoney(so.npv_25yr),
+          payback: formatYears(so.simple_payback_years),
+          cost: formatMoney(so.system_cost),
+        },
+        battery: {
+          savings: formatMoney(bi.annual_savings_vs_solar_only),
+          npv: formatMoney(bi.incremental_npv),
+          payback: formatYears(bi.incremental_payback_years),
+          cost: formatMoney(bi.battery_cost),
+        },
+        whole: {
+          savings: formatMoney(fin?.annual_savings),
+          npv: formatMoney(fin?.npv_25_year),
+          payback: formatYears(fin?.payback_years),
+          cost: formatMoney(fin?.system_capex),
+        },
+      };
+    }
+  }
+
+  // ── The itemised cost ──
+  let cost: ResultsCostView | null = null;
+  let costNote: string | null = null;
+  if (base.state === "ready") {
+    const bd = asRecord(eo.chosen_cost_breakdown);
+    const rawLines = Array.isArray(bd.line_items) ? bd.line_items : null;
+    const net = tariffNum(bd.net_cost);
+    if (!rawLines || net === null) {
+      costNote =
+        "The itemised cost was not recorded for this run — re-run the sizing to capture it.";
+    } else {
+      const lines: ResultsCostLine[] = [];
+      let sum = 0;
+      let allPriced = true;
+      for (const raw of rawLines) {
+        const li = asRecord(raw);
+        const amount = tariffNum(li.amount_aud);
+        if (amount === null) allPriced = false;
+        else sum += amount;
+        lines.push({
+          item: typeof li.item === "string" ? li.item : "—",
+          detail: typeof li.detail === "string" ? li.detail : "",
+          amount: amount === null ? "installer to confirm" : formatMoneyCents(amount),
+          confirmed: amount !== null,
+        });
+      }
+      const sumAgrees = !allPriced || Math.abs(sum - net) <= 0.01;
+      cost = {
+        lines,
+        net: formatMoneyCents(net),
+        sumAgrees,
+        sumOfLines: !sumAgrees ? formatMoneyCents(sum) : null,
+        allPriced,
+        flags: Array.isArray(bd.flags)
+          ? bd.flags.filter((f): f is string => typeof f === "string")
+          : [],
+      };
+    }
+  }
+
+  // ── The assumptions ──
+  let assumptions: ResultsAssumptionRow[] | null = null;
+  let assumptionsNote: string | null = null;
+  if (base.state !== "unsized") {
+    const ra = sizing?.run_assumptions;
+    if (typeof ra === "object" && ra !== null && !Array.isArray(ra)) {
+      assumptions = assumptionRows(ra as Record<string, unknown>);
+    } else {
+      assumptionsNote =
+        "The assumptions were not recorded for this run — runs made before 3.13 prompt 4 did not store them. Re-run the sizing to capture them.";
+    }
+  }
+
+  return {
+    state: base.state,
+    headline: base.headline,
+    projected: fin ? projectedSpendView(fin.projected_annual_spend) : null,
+    roofNotices: base.roofNotices,
+    layoutLines: base.layoutLines,
+    layoutNote: base.layoutNote,
+    dispatchResolution: base.dispatchResolution,
+    runKind: base.runKind,
+    split,
+    splitNote,
+    cost,
+    costNote,
+    assumptions,
+    assumptionsNote,
   };
 }

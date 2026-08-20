@@ -147,6 +147,12 @@ _ALLOWED: dict[str, set[str]] = {
         # SILENTLY DROPPED by _filtered, which is the whole reason these are
         # here. Vocabularies: RUN_KINDS / ENGINE_MODES below.
         "run_kind", "engine_mode", "evaluated_options",
+        # 3.13 prompt 4: the assumptions block the endpoint already builds for
+        # its response, stored VERBATIM. Absent from this allowlist the column
+        # would be SILENTLY DROPPED by _filtered — which is exactly what this
+        # allowlist does, and why every new column is added here in the same
+        # change as its migration.
+        "run_assumptions",
     },
     "financial_results": {
         "financial_result_id", "job_id", "system_capex", "annual_savings",

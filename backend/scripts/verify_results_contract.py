@@ -784,6 +784,30 @@ def t_r7(client) -> dict:
                                         "incremental_payback_years",
                                         "battery_cost")),
               f"solar_only={sorted(so)} battery_increment={sorted(bi)}")
+        # 3.13 prompt 4 (S1): run_assumptions is persisted on BOTH payloads
+        # and is the SAME OBJECT the response carries — asserted by identity,
+        # which is stronger than equality: the route builds the dict once and
+        # hands the one object to both, so no copy exists to drift.
+        s_ra = sol_rec[0].get("run_assumptions")
+        b_ra = bat_rec[0].get("run_assumptions")
+        print(f"        solar   run_assumptions keys: {sorted(s_ra) if isinstance(s_ra, dict) else s_ra!r}")
+        print(f"        battery run_assumptions keys: {sorted(b_ra) if isinstance(b_ra, dict) else b_ra!r}")
+        check("(S1) solar: persisted run_assumptions IS the response's "
+              "assumptions object (identity, not a copy)",
+              isinstance(s_ra, dict) and s_ra is sol.get("assumptions"),
+              f"identity={s_ra is sol.get('assumptions')}")
+        check("(S1) battery: persisted run_assumptions IS the response's "
+              "assumptions object (identity, not a copy)",
+              isinstance(b_ra, dict) and b_ra is bat.get("assumptions"),
+              f"identity={b_ra is bat.get('assumptions')}")
+        check("(S1) both blocks carry the supply charge and its provenance — "
+              "the keys the tab's assumptions panel headlines",
+              isinstance(s_ra, dict) and isinstance(b_ra, dict)
+              and all("supply_charge_annual" in d and "supply_charge_source" in d
+                      for d in (s_ra, b_ra))
+              and "resolution" in b_ra,
+              "")
+
         s_sum = round((so.get("annual_savings") or 0)
                       + (bi.get("annual_savings_vs_solar_only") or 0), 2)
         n_sum = round((so.get("npv_25yr") or 0)
@@ -1395,6 +1419,77 @@ def t_q1_red() -> None:
     shutil.rmtree(tmpdir, ignore_errors=True)
 
 
+_S2_FROM = '        "run_assumptions",\n'
+
+
+def t_s2_s3(client) -> None:
+    print("\nS2. the allowlist entry is load-bearing — proven by removing it "
+          "in a byte-hashed copy of capture.py")
+    probe = {"job_id": "j", "solar_kw": 1.0, "run_assumptions": {"fit": 0.05}}
+    kept = capture._filtered("sizing_results", dict(probe))
+    check("(S2) GREEN: _filtered KEEPS run_assumptions with the entry in "
+          "place",
+          kept.get("run_assumptions") == {"fit": 0.05}, str(sorted(kept)))
+
+    target = os.path.join(BACKEND_DIR, "capture.py")
+    original = open(target, "rb").read()
+    original_hash = hashlib.sha256(original).hexdigest()
+    print(f"        original SHA-256: {original_hash}")
+    text = original.decode("utf-8")
+    n = text.count(_S2_FROM)
+    check("(S2) the allowlist line exists EXACTLY once", n == 1, f"count={n}")
+    if n != 1:
+        return
+    tmpdir = tempfile.mkdtemp(prefix="s2_")
+    backup = os.path.join(tmpdir, "capture.py.bak")
+    shutil.copyfile(target, backup)
+    runner = (
+        "import json, sys\n"
+        f"sys.path.insert(0, {BACKEND_DIR!r})\n"
+        "import capture\n"
+        "out = capture._filtered('sizing_results', "
+        "{'job_id': 'j', 'solar_kw': 1.0, 'run_assumptions': {'fit': 0.05}})\n"
+        "print('PROBE:' + json.dumps({'kept': 'run_assumptions' in out}))\n"
+    )
+    try:
+        with open(target, "w", encoding="utf-8") as fh:
+            fh.write(text.replace(_S2_FROM, ""))
+        _rm_pycache()
+        proc = subprocess.run([sys.executable, "-c", runner],
+                              capture_output=True, text=True, timeout=120)
+        red = next((json.loads(l[len("PROBE:"):])
+                    for l in proc.stdout.splitlines()
+                    if l.startswith("PROBE:")), None)
+        print(f"        without the entry: {red}")
+        check("(S2) RED: without the allowlist entry the key VANISHES — the "
+              "silent drop is real, which is why the entry ships in the same "
+              "change as the migration",
+              isinstance(red, dict) and red.get("kept") is False, repr(red))
+    finally:
+        shutil.copyfile(backup, target)
+        _rm_pycache()
+    restored_hash = hashlib.sha256(open(target, "rb").read()).hexdigest()
+    check("(S2) RESTORED: capture.py byte-identical (from the copy, never "
+          "git)",
+          restored_hash == original_hash, restored_hash)
+    shutil.rmtree(tmpdir, ignore_errors=True)
+
+    print("\nS3. the rows stored BEFORE the column existed read back NULL — "
+          "a legal state, not a defect")
+    rows = (client.table("sizing_results")
+            .select("sizing_result_id,run_assumptions,created_at")
+            .lt("created_at", "2026-08-20T13:07:00+00:00")
+            .execute().data) or []
+    check("(S3) the pre-migration rows are all readable (the eight known "
+          "rows, none raising)",
+          len(rows) >= 8, f"{len(rows)} rows")
+    check("(S3) every pre-migration row reads run_assumptions NULL — no "
+          "default invented assumptions they never had",
+          all(r.get("run_assumptions") is None for r in rows),
+          str([r["sizing_result_id"][:8] for r in rows
+               if r.get("run_assumptions") is not None]))
+
+
 def t_p10_full_year_blocks() -> None:
     """3.13 prompt 2b (D35): full_year is 365 REAL daily blocks, day-cyclic by
     construction. WHY THESE MOVE: the pre-2b branch returned ONE 8,760-step
@@ -1506,6 +1601,7 @@ def main() -> int:
         r7 = t_r7(client)
         t_r8(client, r7.get("sol") or {})
         t_q1_red()
+        t_s2_s3(client)
 
     if start is not None:
         end = _counts()

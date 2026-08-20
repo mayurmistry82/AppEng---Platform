@@ -229,9 +229,9 @@ def t_f_endpoint_payloads(client) -> None:
     )
     generation._cache_put = lambda *a, **k: None
     try:
-        asyncio.run(sizing_route.optimise_sizing(
+        sol_resp = asyncio.run(sizing_route.optimise_sizing(
             sizing_route.OptimiseRequest(job_id=LIVE_JOB), gate_caller))
-        asyncio.run(sizing_route.battery_sizing(
+        bat_resp = asyncio.run(sizing_route.battery_sizing(
             sizing_route.BatteryRequest(job_id=LIVE_JOB), gate_caller))
     finally:
         capture.save_sizing_result = original_save
@@ -449,6 +449,27 @@ def t_f_endpoint_payloads(client) -> None:
               f"{fin_recorded[1].get('annual_savings')}; npv parts "
               f"{b_so.get('npv_25yr')}+{b_bi.get('incremental_npv')} vs "
               f"whole {fin_recorded[1].get('npv_25_year')}")
+
+    # 3.13 prompt 4: run_assumptions is persisted on BOTH payloads and is THE
+    # SAME OBJECT each response carries — identity, so no copy can drift.
+    # WHY IT MOVES: pre-prompt-4 neither payload carries the key at all.
+    check("(f4) solar payload: run_assumptions IS the response's assumptions "
+          "object",
+          isinstance(recorded[0].get("run_assumptions"), dict)
+          and recorded[0]["run_assumptions"] is sol_resp.get("assumptions"),
+          f"type={type(recorded[0].get('run_assumptions'))}")
+    check("(f4) battery payload: run_assumptions IS the response's "
+          "assumptions object",
+          isinstance(recorded[1].get("run_assumptions"), dict)
+          and recorded[1]["run_assumptions"] is bat_resp.get("assumptions"),
+          f"type={type(recorded[1].get('run_assumptions'))}")
+    check("(f4) capture accepts the column — run_assumptions survives "
+          "_filtered for sizing_results",
+          "run_assumptions" in capture._ALLOWED["sizing_results"]
+          and "run_assumptions" in capture._filtered(
+              "sizing_results",
+              {"job_id": "j", "run_assumptions": {"fit": 0.05}}),
+          str(sorted(capture._ALLOWED["sizing_results"])))
 
     check("(f2) each endpoint set the quote value exactly once, company-"
           "scoped, to its own system_capex",

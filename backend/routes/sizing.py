@@ -981,6 +981,35 @@ async def optimise_sizing(
         # persisted row and the response (same dict by construction).
         roof_conf = _roof_confidence(roof, flags)
 
+        # 3.13 prompt 4: the assumptions block, built ONCE — the SAME object
+        # goes into the response and into the persisted run_assumptions, so
+        # no gate ever has to compare two copies and they cannot drift.
+        assumptions = {
+            "engine_version": solar_optimiser.ENGINE_VERSION,
+            "import_rate": import_rate,
+            "tariff_source": tariff["source"],
+            "tariff_type": tariff["tariff_type"],
+            "supply_charge_annual": supply_charge_annual,
+            "supply_charge_source": supply_charge_source,
+            "fit": fit,
+            "fit_is_fallback": fit_is_fallback,
+            "export_limit_kw": export_limit_kw,
+            "export_limit_source": export_meta,
+            "performance_ratio_non_temp": fin["performance_ratio_non_temp"],
+            "temperature_derating_applied": False,
+            "discount_rate": fin["discount_rate"],
+            "analysis_years": fin["analysis_years"],
+            "degradation_annual_pct": fin["degradation_annual_pct"],
+            "tariff_escalation_pct": fin["tariff_escalation_pct"],
+            "panel": con_panel if solar_constraints_active else panel,
+            "total_load_kwh": round(sum(load_hourly), 1),
+            "n_configs_evaluated": result["n_configs_evaluated"],
+            "cache_hits": result["cache_hits"],
+            "cache_misses": result["cache_misses"],
+            "custom_weight": custom_weight if objective == "custom" else None,
+            "constraints_applied": constraints_applied,
+        }
+
         # ── Persist the CONSTRAINED (chosen) result to sizing_results (capture) ──
         # system_cost is THE TOTAL UP-FRONT NET COST OF EVERYTHING THIS ROW
         # RECOMMENDS — a run_kind='solar' row recommends solar only, so this is
@@ -1022,6 +1051,9 @@ async def optimise_sizing(
                         # with no migration).
                         "run_kind": "solar",
                         "engine_mode": "sequential",
+                        # 3.13 prompt 4: the SAME assumptions object the
+                        # response carries, verbatim.
+                        "run_assumptions": assumptions,
                         "evaluated_options": {
                             "dimension_keys": ["solar_kw"],
                             "points": score_curve,
@@ -1078,31 +1110,8 @@ async def optimise_sizing(
             "score_curve": score_curve,
             "cost_breakdown": opt.get("cost_breakdown"),
             "chosen_index": result.get("chosen_index"),
-            "assumptions": {
-                "engine_version": solar_optimiser.ENGINE_VERSION,
-                "import_rate": import_rate,
-                "tariff_source": tariff["source"],
-                "tariff_type": tariff["tariff_type"],
-                "supply_charge_annual": supply_charge_annual,
-                "supply_charge_source": supply_charge_source,
-                "fit": fit,
-                "fit_is_fallback": fit_is_fallback,
-                "export_limit_kw": export_limit_kw,
-                "export_limit_source": export_meta,
-                "performance_ratio_non_temp": fin["performance_ratio_non_temp"],
-                "temperature_derating_applied": False,
-                "discount_rate": fin["discount_rate"],
-                "analysis_years": fin["analysis_years"],
-                "degradation_annual_pct": fin["degradation_annual_pct"],
-                "tariff_escalation_pct": fin["tariff_escalation_pct"],
-                "panel": con_panel if solar_constraints_active else panel,
-                "total_load_kwh": round(sum(load_hourly), 1),
-                "n_configs_evaluated": result["n_configs_evaluated"],
-                "cache_hits": result["cache_hits"],
-                "cache_misses": result["cache_misses"],
-                "custom_weight": custom_weight if objective == "custom" else None,
-                "constraints_applied": constraints_applied,
-            },
+            # 3.13 prompt 4: the same object persisted as run_assumptions.
+            "assumptions": assumptions,
             "failed_planes": result["failed_planes"],
             "persisted": persisted,
             "financial_persisted": financial_persisted,
@@ -1590,6 +1599,32 @@ async def battery_sizing(
         # 3.11 — same object into the row and the response; see optimise_sizing.
         roof_conf = _roof_confidence(roof, flags)
 
+        # 3.13 prompt 4: the assumptions block, built ONCE — the SAME object
+        # goes into the response and into the persisted run_assumptions.
+        assumptions = {
+            "engine_version": battery_optimiser.ENGINE_VERSION,
+            "is_tou": is_tou,
+            "tariff_source": tariff["source"],
+            "tariff_type": tariff["tariff_type"],
+            "supply_charge_annual": supply_charge_annual,
+            "supply_charge_source": supply_charge_source,
+            "import_rates_24": rate_24,
+            "fit": fit,
+            "fit_is_fallback": fit_is_fallback,
+            "export_limit_kw": export_limit_kw,
+            "export_limit_source": export_meta,
+            "performance_ratio_non_temp": pr,
+            "discount_rate": fin["discount_rate"],
+            "analysis_years": fin["analysis_years"],
+            "degradation_annual_pct": fin["degradation_annual_pct"],
+            "tariff_escalation_pct": fin["tariff_escalation_pct"],
+            "resolution": result["resolution"],
+            "total_load_kwh": round(sum(load_hourly), 1),
+            "panel": used_panel,
+            "custom_weight": custom_weight if objective == "custom" else None,
+            "constraints_applied": constraints_applied,
+        }
+
         # ── 3.13 prompt 2 (C), reworded by prompt 2b: THE DISPATCH RESOLUTION
         # METER. The no-battery baseline's grid_cost and the chosen solar's
         # energy-only annual bill are two computations of the same year's
@@ -1666,6 +1701,9 @@ async def battery_sizing(
                     # dimension_keys names the CHOICE key of each point (D33).
                     "run_kind": "solar_battery",
                     "engine_mode": "sequential",
+                    # 3.13 prompt 4: the SAME assumptions object the response
+                    # carries, verbatim.
+                    "run_assumptions": assumptions,
                     "evaluated_options": {
                         "dimension_keys": ["battery_id"],
                         "points": result["candidates"],
@@ -1786,29 +1824,8 @@ async def battery_sizing(
                 "panels_per_plane": chosen_solar["panels_per_plane"],
                 "cost_breakdown": chosen_solar["cost_breakdown"],
             },
-            "assumptions": {
-                "engine_version": battery_optimiser.ENGINE_VERSION,
-                "is_tou": is_tou,
-                "tariff_source": tariff["source"],
-                "tariff_type": tariff["tariff_type"],
-                "supply_charge_annual": supply_charge_annual,
-                "supply_charge_source": supply_charge_source,
-                "import_rates_24": rate_24,
-                "fit": fit,
-                "fit_is_fallback": fit_is_fallback,
-                "export_limit_kw": export_limit_kw,
-                "export_limit_source": export_meta,
-                "performance_ratio_non_temp": pr,
-                "discount_rate": fin["discount_rate"],
-                "analysis_years": fin["analysis_years"],
-                "degradation_annual_pct": fin["degradation_annual_pct"],
-                "tariff_escalation_pct": fin["tariff_escalation_pct"],
-                "resolution": result["resolution"],
-                "total_load_kwh": round(sum(load_hourly), 1),
-                "panel": used_panel,
-                "custom_weight": custom_weight if objective == "custom" else None,
-                "constraints_applied": constraints_applied,
-            },
+            # 3.13 prompt 4: the same object persisted as run_assumptions.
+            "assumptions": assumptions,
             "persisted": persisted,
             "financial_persisted": financial_persisted,
             "flags": flags,
