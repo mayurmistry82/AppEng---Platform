@@ -1031,6 +1031,11 @@ async def optimise_sizing(
                             # stored run without re-running the engine.
                             "chosen_index": result.get("chosen_index"),
                             "chosen_cost_breakdown": opt.get("cost_breakdown"),
+                            # 3.13 prompt 3 (F191): a solar-only run performs
+                            # no dispatch at all — the key is present as None
+                            # so that absence is a RECORDED fact, not an
+                            # omission a later reader has to guess at.
+                            "dispatch_resolution": None,
                         },
                     }
                 )
@@ -1674,6 +1679,31 @@ async def battery_sizing(
                             "panel_count": chosen_solar["panel_count"],
                             "plane_indices": chosen_solar["plane_indices"],
                             "panels_per_plane": chosen_solar["panels_per_plane"],
+                        },
+                        # 3.13 prompt 3 (F191): the dispatch mode this run
+                        # actually used — the number's provenance travels
+                        # with the number.
+                        "dispatch_resolution": result.get("resolution"),
+                        # 3.13 prompt 3 (B): the split-ROI parts, READ from
+                        # the two dicts that already carry them, never
+                        # recomputed. The redundancy against the stored
+                        # whole-system financial row is DELIBERATE and gated:
+                        # the whole is the sum of these parts by construction
+                        # (prompt 2 step C), and verify_results_contract Q1
+                        # asserts the sum two-sidedly to the cent.
+                        "split": {
+                            "solar_only": {
+                                "annual_savings": chosen_solar["annual_savings"],
+                                "npv_25yr": chosen_solar["npv_25yr"],
+                                "simple_payback_years": chosen_solar["simple_payback_years"],
+                                "system_cost": chosen_solar["system_cost"],
+                            },
+                            "battery_increment": {
+                                "annual_savings_vs_solar_only": opt.get("annual_savings_vs_solar_only"),
+                                "incremental_npv": opt.get("incremental_npv"),
+                                "incremental_payback_years": opt.get("incremental_payback_years"),
+                                "battery_cost": opt.get("battery_cost"),
+                            },
                         },
                     },
                 })

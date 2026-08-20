@@ -281,11 +281,15 @@ export function SolarSizingSection({
         <Button onClick={run} disabled={running}>
           {running ? "Sizing…" : "Size the solar"}
         </Button>
+        {/* 3.13 prompt 3 (G/F183): "replaces the stored result" was FALSE —
+            the run log has been append-only since 3.11b; a new run is
+            INSERTED and earlier runs survive (D33's engine comparison and
+            3.14's A/B compare depend on exactly that). */}
         {running ? (
           <RunProgress startedAt={startedAt} />
         ) : view.alreadySized && !result && !keptResult ? (
           <span className="text-caption text-muted-foreground">
-            Already sized{view.storedSolarKw !== null ? ` — ${view.storedSolarKw} kW stored` : ""}. Running again replaces the stored result.
+            Already sized{view.storedSolarKw !== null ? ` — ${view.storedSolarKw} kW stored` : ""}. Running again adds a new result; earlier runs are kept.
           </span>
         ) : null}
       </div>

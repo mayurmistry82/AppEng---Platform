@@ -402,6 +402,54 @@ def t_f_endpoint_payloads(client) -> None:
                   "beside it",
                   "roi_percent" in fin and fin.get("roi_percent") is None,
                   repr(fin.get("roi_percent")))
+    # 3.13 prompt 3: the payload gains the dispatch mode (F191) and, on the
+    # battery side only, the split-ROI parts. WHY THESE MOVE: pre-prompt-3
+    # neither payload carries dispatch_resolution or split at all.
+    s_opts = recorded[0].get("evaluated_options") or {}
+    b_opts = recorded[1].get("evaluated_options") or {}
+    check("(f3) solar payload: dispatch_resolution present and None — a "
+          "solar-only run performs no dispatch, and the None is a recorded "
+          "fact, not an omission",
+          "dispatch_resolution" in s_opts
+          and s_opts.get("dispatch_resolution") is None,
+          repr(s_opts.get("dispatch_resolution", "<absent>")))
+    check("(f3) battery payload: dispatch_resolution is a non-empty string "
+          "(the mode the run used)",
+          isinstance(b_opts.get("dispatch_resolution"), str)
+          and bool(b_opts.get("dispatch_resolution")),
+          repr(b_opts.get("dispatch_resolution")))
+    check("(f3) solar payload: NO split key — no parts to split",
+          "split" not in s_opts, str(sorted(s_opts)))
+    b_split = b_opts.get("split") or {}
+    b_so = b_split.get("solar_only") or {}
+    b_bi = b_split.get("battery_increment") or {}
+    check("(f3) battery payload: split carries solar_only and "
+          "battery_increment, four keys each",
+          all(k in b_so for k in ("annual_savings", "npv_25yr",
+                                  "simple_payback_years", "system_cost"))
+          and all(k in b_bi for k in ("annual_savings_vs_solar_only",
+                                      "incremental_npv",
+                                      "incremental_payback_years",
+                                      "battery_cost")),
+          f"solar_only={sorted(b_so)} battery_increment={sorted(b_bi)}")
+    if len(fin_recorded) == 2:
+        check("(f3) the DELIBERATE redundancy is two-sidedly gated: "
+              "split.solar_only + split.battery_increment == the financial "
+              "row's whole-system annual_savings and npv_25_year, to the cent",
+              isinstance(fin_recorded[1].get("annual_savings"), (int, float))
+              and abs(round((b_so.get("annual_savings") or 0)
+                            + (b_bi.get("annual_savings_vs_solar_only") or 0), 2)
+                      - fin_recorded[1]["annual_savings"]) <= 0.01
+              and isinstance(fin_recorded[1].get("npv_25_year"), (int, float))
+              and abs(round((b_so.get("npv_25yr") or 0)
+                            + (b_bi.get("incremental_npv") or 0), 2)
+                      - fin_recorded[1]["npv_25_year"]) <= 0.01,
+              f"savings parts {b_so.get('annual_savings')}+"
+              f"{b_bi.get('annual_savings_vs_solar_only')} vs whole "
+              f"{fin_recorded[1].get('annual_savings')}; npv parts "
+              f"{b_so.get('npv_25yr')}+{b_bi.get('incremental_npv')} vs "
+              f"whole {fin_recorded[1].get('npv_25_year')}")
+
     check("(f2) each endpoint set the quote value exactly once, company-"
           "scoped, to its own system_capex",
           len(quote_recorded) == 2

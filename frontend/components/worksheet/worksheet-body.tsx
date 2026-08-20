@@ -13,6 +13,7 @@ import { BatterySizingSection } from "@/components/worksheet/battery-sizing-sect
 import { EnergyDataSection } from "@/components/worksheet/energy-data-section";
 import { EquipmentSpecsSection } from "@/components/worksheet/equipment-specs-section";
 import { ObjectiveBudgetSection } from "@/components/worksheet/objective-budget-section";
+import { ResultsSection } from "@/components/worksheet/results-section";
 import { SiteDetailsSection } from "@/components/worksheet/site-details-section";
 import { SolarSizingSection } from "@/components/worksheet/solar-sizing-section";
 import { TariffNetworkSection } from "@/components/worksheet/tariff-network-section";
@@ -23,6 +24,7 @@ import {
   type EnergyDataView,
   type EquipmentSpecsView,
   type ObjectiveBudgetView,
+  type ResultsView,
   type RoofDiagramView,
   type SiteDetailsView,
   type SolarSizingView,
@@ -85,6 +87,7 @@ export function WorksheetBody({
   equipmentSpecs,
   solarSizing,
   batterySizing,
+  results,
   jobId,
 }: {
   sections: readonly WorksheetBodySection[];
@@ -111,6 +114,10 @@ export function WorksheetBody({
   /** 3.12: the Battery sizing view — path battery mode and the stored result.
       Derived from the job the page already has; no new fetch. */
   batterySizing?: BatterySizingView;
+  /** 3.13 prompt 3: the Results view — the current run, its financial row,
+      the roof's doubt and the panels' direction. NOTE: this section GATES —
+      once it completes, Incentives and Summary & finish unlock behind it. */
+  results?: ResultsView;
   jobId?: string;
 }) {
   const [openIds, setOpenIds] = React.useState<Record<string, boolean>>(() => {
@@ -165,6 +172,8 @@ export function WorksheetBody({
         <SolarSizingSection view={solarSizing} jobId={jobId} />
       ) : section.id === "battery-sizing" && batterySizing && jobId ? (
         <BatterySizingSection view={batterySizing} jobId={jobId} />
+      ) : section.id === "results" && results && jobId ? (
+        <ResultsSection view={results} jobId={jobId} />
       ) : (
         <p className="text-caption text-muted-foreground">
           Built at {section.builtAt}

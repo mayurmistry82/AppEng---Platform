@@ -77,6 +77,7 @@ import {
   BATTERY_SIZING_REQUEST_KEYS,
   batteryRunNotices,
   batteryRunResult,
+  currentFinancialResult,
   elapsedLabel,
   batterySizingView,
   sizingRunNotices,
@@ -105,6 +106,7 @@ import {
   worldSizePx,
   latestRoofGeometry,
   resultsBarView,
+  resultsView,
   roofEntryState,
   sectionStates,
   sectionsForPath,
@@ -272,8 +274,10 @@ test("all predicates true: 11 complete, phases all done", () => {
     // sized, which was never what these tests were about.
     load_profiles: [{ annual_kwh: 5500, created_at: "2026-08-01T00:00:00Z" }],
     tariffs: [{ tariff_id: "t1" }],
-    sizing_results: [{ solar_kw: 6.6, battery_kwh: 12.8 }],
-    financial_results: [{ payback_years: 4.2 }],
+    // 3.13 prompt 3: the Results predicate now demands the financial row for
+    // THE CURRENT sizing result, so the all-complete fixture links them.
+    sizing_results: [{ sizing_result_id: "s1", solar_kw: 6.6, battery_kwh: 12.8 }],
+    financial_results: [{ sizing_result_id: "s1", payback_years: 4.2 }],
   });
   // equipment-specs / incentives are () => false by design (no columns exist
   // until 3.10 / 3.13b), so "all true" means: force those two true to test the
@@ -4862,17 +4866,26 @@ test("3.11b: the same two rows with the BATTERY run newest — battery ticks", (
   assert.equal(solarSizingView(job).storedSolarKw, 6.6);
 });
 
-test("3.11b: two financial rows, newest FIRST — payback and NPV come from the newer", () => {
+test("3.13-3C: two financial rows — the bar reads the row MATCHING the current sizing result", () => {
+  // RESTATED at 3.13 prompt 3 (was "newest wins"): the bar now reads
+  // currentFinancialResult, so it is the MATCHING row that wins — here the
+  // OLDER financial row, because the newest financial row belongs to a
+  // different (superseded) run. The old rule would have shown 4.2/31000.
+  const sid = (NEWER_SOLAR_ONLY as Record<string, unknown>).sizing_result_id;
+  const currentSid = typeof sid === "string" && sid ? sid : "s-current";
   const job = emptyJob({
-    sizing_results: [NEWER_SOLAR_ONLY],
+    sizing_results: [{ ...NEWER_SOLAR_ONLY, sizing_result_id: currentSid }],
     financial_results: [
-      { created_at: "2026-08-19T05:00:00Z", payback_years: 4.2, npv_25_year: 31000 },
-      { created_at: "2026-08-19T04:00:00Z", payback_years: 9.9, npv_25_year: 12000 },
+      { created_at: "2026-08-19T05:00:00Z", sizing_result_id: "s-older",
+        payback_years: 4.2, npv_25_year: 31000 },
+      { created_at: "2026-08-19T04:00:00Z", sizing_result_id: currentSid,
+        payback_years: 9.9, npv_25_year: 12000 },
     ],
   });
   const bar = resultsBarView(job);
-  assert.equal(bar.sized && bar.paybackYears, 4.2, "9.9 is the superseded run");
-  assert.equal(bar.sized && bar.npv, 31000);
+  assert.equal(bar.sized && bar.paybackYears, 9.9,
+    "the newest financial row belongs to another run and must not win");
+  assert.equal(bar.sized && bar.npv, 12000);
 });
 
 test("3.11b: three sizing rows in scrambled order — the newest wins regardless of position", () => {
@@ -4975,18 +4988,24 @@ test("3.11b: the section predicate and solarSizingView agree on the same current
   }
 });
 
-test("3.11b: the Results section rule is DELIBERATELY unchanged — financial existence, not linkage", () => {
-  // The correct rule is "a financial result exists FOR THE CURRENT SIZING
-  // RESULT", and the column that expresses it (financial_results.
-  // sizing_result_id) does not exist until prompt 2, with nothing writing
-  // financials until 3.13. Half of it now is the shape D29 rejects. This test
-  // pins the current rule so the omission is recorded, not forgotten.
-  const job = emptyJob({
-    sizing_results: [NEWER_SOLAR_ONLY],
+test("3.13-3C: the Results section rule IS the linkage now — a financial result for THE CURRENT sizing result", () => {
+  // RESTATED at 3.13 prompt 3: the 3.11b test in this spot pinned "existence
+  // only" and said, in its own comment, that the correct rule was linkage and
+  // would land when something wrote financials. Something does (prompt 2), so
+  // the recorded omission is closed: an UNLINKED financial row no longer
+  // ticks the section.
+  const unlinked = emptyJob({
+    sizing_results: [{ ...NEWER_SOLAR_ONLY, sizing_result_id: "s-current" }],
     financial_results: [{ created_at: "2026-08-19T04:00:00Z", payback_years: 9.9 }],
   });
-  assert.equal(completeOf("results", job), true,
-    "existence only — linkage to the current sizing run lands with prompt 2 + 3.13");
+  assert.equal(completeOf("results", unlinked), false,
+    "a financial row with no sizing_result_id belongs to no run and must not tick");
+  const linked = emptyJob({
+    sizing_results: [{ ...NEWER_SOLAR_ONLY, sizing_result_id: "s-current" }],
+    financial_results: [{ created_at: "2026-08-19T04:00:00Z",
+      sizing_result_id: "s-current", payback_years: 9.9 }],
+  });
+  assert.equal(completeOf("results", linked), true);
   assert.equal(completeOf("results", emptyJob()), false);
 });
 
@@ -5282,13 +5301,25 @@ test("3.12: BATTERY_SIZING_REQUEST_KEYS — the D29 restraint, held locally too"
   }
 });
 
-test("3.12: no within_budget is derived in the browser — the response has none", () => {
-  // The endpoint computes within_budget inside the WRITER, which only runs when
-  // a job_id is present, and never puts it in the response body. A second
-  // derivation here would be the copy 2R.1 forbids; the budget cause is
-  // carried honestly in not_economic_reason instead.
+test("3.13-3H: within_budget is CARRIED from the response verbatim, never derived", () => {
+  // RESTATED at 3.13 prompt 3 (was "the response has none"): 3.13 prompt 1
+  // made the endpoint RETURN within_budget, derived from the same system_cost
+  // its own budget filter tests, and step H renders it. The 2R.1 rule is
+  // unchanged in substance — the browser still never COMPUTES the flag; it
+  // carries the engine's answer or reports null. A response without the key
+  // yields null, never an invented boolean.
   const r = batteryRunResult(BATTERY_RESPONSE);
-  assert.ok(!("withinBudget" in r), "no budget flag may be invented here");
+  assert.equal(r.withinBudget, null, "absent flag -> null, never invented");
+  const withFlag = batteryRunResult({
+    ...(BATTERY_RESPONSE as Record<string, unknown>),
+    within_budget: false,
+  });
+  assert.equal(withFlag.withinBudget, false, "the engine's false carries as false");
+  const withTrue = batteryRunResult({
+    ...(BATTERY_RESPONSE as Record<string, unknown>),
+    within_budget: true,
+  });
+  assert.equal(withTrue.withinBudget, true, "the engine's true carries as true");
   assert.ok(!("budget" in r));
   for (const key of Object.keys(r.headline ?? {})) {
     assert.ok(!key.toLowerCase().includes("budget"), key);
@@ -5875,4 +5906,160 @@ test("elapsedLabel: total — junk never throws, everything junk is '0s'", () =>
   assert.equal(elapsedLabel(null as unknown as number), "0s");
   assert.equal(elapsedLabel(undefined as unknown as number), "0s");
   assert.equal(elapsedLabel("47" as unknown as number), "0s");
+});
+
+// ── 3.13 prompt 3: the Results section (R1-R4) ───────────────────────────────
+
+test("R1: currentFinancialResult picks the MATCHING row; unmatched-only yields null", () => {
+  const sizing = { sizing_result_id: "s2", created_at: "2026-08-02T00:00:00Z", solar_kw: 9.9 };
+  // Array DELIBERATELY ordered the reverse of created_at — position must not win.
+  const fins = [
+    { sizing_result_id: "s2", created_at: "2026-08-03T00:00:00Z", payback_years: 3.3 },
+    { sizing_result_id: "s2", created_at: "2026-08-05T00:00:00Z", payback_years: 2.2 },
+    { sizing_result_id: "s1", created_at: "2026-08-06T00:00:00Z", payback_years: 9.9 },
+  ];
+  const job = emptyJob({ sizing_results: [sizing], financial_results: fins });
+  const row = currentFinancialResult(job);
+  assert.equal(row?.payback_years, 2.2,
+    "the NEWEST row among those matching s2 — never the newest overall (9.9 is s1's)");
+
+  // THE NULL CASE, the one that matters: the only financial row belongs to an
+  // OLDER sizing result — null, never a fallback to the unmatched row.
+  const orphanOnly = emptyJob({
+    sizing_results: [sizing],
+    financial_results: [
+      { sizing_result_id: "s1", created_at: "2026-08-06T00:00:00Z", payback_years: 9.9 },
+    ],
+  });
+  assert.equal(currentFinancialResult(orphanOnly), null,
+    "a financial row for a superseded run must yield NULL — a missing number is honest, a mismatched one is not");
+
+  // Total.
+  for (const junk of [null, undefined, 42, "x", {}, { financial_results: "nope" }]) {
+    assert.doesNotThrow(() => currentFinancialResult(junk));
+  }
+});
+
+test("R2: the Results predicate and resultsView agree on EVERY fixture — run both, compare", () => {
+  const spec = SECTIONS.find((s) => s.id === "results");
+  assert.ok(spec);
+  const fixtures: unknown[] = [
+    emptyJob(),
+    emptyJob({ sizing_results: [{ sizing_result_id: "s1", solar_kw: 6.6 }] }),
+    emptyJob({
+      sizing_results: [{ sizing_result_id: "s1", solar_kw: 6.6 }],
+      financial_results: [{ sizing_result_id: "s1", annual_savings: 1800 }],
+    }),
+    emptyJob({
+      sizing_results: [{ sizing_result_id: "s2", solar_kw: 6.6 }],
+      financial_results: [{ sizing_result_id: "s1", annual_savings: 1800 }],
+    }),
+    emptyJob({ financial_results: [{ sizing_result_id: "s1", annual_savings: 1800 }] }),
+    emptyJob({ sizing_results: "junk", financial_results: "junk" }),
+  ];
+  for (const [i, job] of fixtures.entries()) {
+    const tick = spec!.complete(job as never);
+    const body = resultsView(job);
+    assert.equal(tick, body.state === "ready",
+      `fixture ${i}: tick says ${tick} but the body renders ${body.state} — a section whose tick and body disagree is the 2026-08-20 fault`);
+  }
+});
+
+test("R3: resultsView joins the roof BY ID — the newest roof row must NOT win", () => {
+  const job = emptyJob({
+    sizing_results: [{
+      sizing_result_id: "s1", solar_kw: 6.6, run_kind: "solar",
+      roof_geometry_id: "roof-OLD", roof_low_confidence: false,
+      evaluated_options: {
+        dimension_keys: ["solar_kw"],
+        points: [
+          { solar_kw: 0, plane_indices: [], panels_per_plane: [] },
+          { solar_kw: 6.6, plane_indices: [0], panels_per_plane: [15] },
+        ],
+        chosen_index: 1,
+      },
+    }],
+    financial_results: [{ sizing_result_id: "s1", annual_savings: 1800 }],
+    roof_geometry: [
+      // NEWEST first, and it is NOT the roof the run names: its plane faces
+      // south. If the code took the newest, the direction would read S.
+      { roof_geometry_id: "roof-NEW", created_at: "2026-08-10T00:00:00Z",
+        planes: [{ azimuth: 180, pitch: 30, panel_count: 15 }] },
+      { roof_geometry_id: "roof-OLD", created_at: "2026-08-01T00:00:00Z",
+        planes: [{ azimuth: 0, pitch: 22, panel_count: 15 }] },
+    ],
+  });
+  const view = resultsView(job);
+  assert.equal(view.state, "ready");
+  assert.ok(view.layoutLines, `layout missing: ${view.layoutNote}`);
+  assert.match(view.layoutLines![0], /N-facing/,
+    "the direction must come from roof-OLD (azimuth 0 = N), the row the run NAMES");
+  assert.doesNotMatch(view.layoutLines![0], /S-facing/,
+    "S would mean the newest roof won — the exact fault this check exists to catch");
+});
+
+test("R4: resultsView is total — junk yields nulls, honest notes, no invented figures", () => {
+  // Junk evaluated_options.
+  const junkEo = emptyJob({
+    sizing_results: [{ sizing_result_id: "s1", solar_kw: 6.6,
+      roof_geometry_id: "r1", evaluated_options: "garbage" }],
+    financial_results: [{ sizing_result_id: "s1", annual_savings: 1800 }],
+    roof_geometry: [{ roof_geometry_id: "r1", planes: [{ azimuth: 0 }] }],
+  });
+  const v1 = resultsView(junkEo);
+  assert.equal(v1.state, "ready");
+  assert.equal(v1.layoutLines, null);
+  assert.ok(v1.layoutNote, "the omitted direction carries an honest line");
+
+  // Missing roof row for the named id.
+  const noRoof = emptyJob({
+    sizing_results: [{ sizing_result_id: "s1", solar_kw: 6.6,
+      roof_geometry_id: "r-gone",
+      evaluated_options: { points: [{ plane_indices: [0], panels_per_plane: [5], solar_kw: 6.6 }], chosen_index: 0 } }],
+    financial_results: [{ sizing_result_id: "s1", annual_savings: 1800 }],
+    roof_geometry: [{ roof_geometry_id: "r-other", planes: [] }],
+  });
+  const v2 = resultsView(noRoof);
+  assert.equal(v2.layoutLines, null);
+  assert.match(v2.layoutNote ?? "", /could not be matched/);
+
+  // roof_low_confidence null is NOT clean — the not-recorded notice renders.
+  assert.ok(
+    resultsView(noRoof).roofNotices.some((n) => /not recorded/.test(n.title)),
+    "null roof state must say 'not recorded', never pass as clean",
+  );
+  // ...and false IS clean — no roof notice at all.
+  const clean = emptyJob({
+    sizing_results: [{ sizing_result_id: "s1", solar_kw: 6.6,
+      roof_low_confidence: false }],
+    financial_results: [{ sizing_result_id: "s1", annual_savings: 1800 }],
+  });
+  assert.equal(resultsView(clean).roofNotices.length, 0);
+
+  // A sizing row with no financial row: awaiting, headline null.
+  const awaiting = emptyJob({
+    sizing_results: [{ sizing_result_id: "s1", solar_kw: 6.6 }],
+  });
+  const v3 = resultsView(awaiting);
+  assert.equal(v3.state, "awaiting-financial");
+  assert.equal(v3.headline, null);
+
+  // Non-array planes.
+  const badPlanes = emptyJob({
+    sizing_results: [{ sizing_result_id: "s1", solar_kw: 6.6,
+      roof_geometry_id: "r1",
+      evaluated_options: { points: [{ plane_indices: [0], panels_per_plane: [5], solar_kw: 6.6 }], chosen_index: 0 } }],
+    financial_results: [{ sizing_result_id: "s1", annual_savings: 1800 }],
+    roof_geometry: [{ roof_geometry_id: "r1", planes: "not-an-array" }],
+  });
+  const v4 = resultsView(badPlanes);
+  assert.equal(v4.layoutLines, null);
+  assert.ok(v4.layoutNote);
+
+  // Total, and the unsized state never shows a zero.
+  for (const junk of [null, undefined, 0, "x", [], {}]) {
+    assert.doesNotThrow(() => resultsView(junk));
+    assert.equal(resultsView(junk).state, "unsized");
+    assert.equal(resultsView(junk).headline, null);
+  }
 });

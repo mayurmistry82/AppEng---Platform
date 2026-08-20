@@ -421,6 +421,8 @@ def _probe_via_subprocess() -> dict | None:
 def _rm_pycache() -> None:
     shutil.rmtree(os.path.join(BACKEND_DIR, "__pycache__"),
                   ignore_errors=True)
+    shutil.rmtree(os.path.join(BACKEND_DIR, "routes", "__pycache__"),
+                  ignore_errors=True)
 
 
 def t_r4() -> None:
@@ -743,6 +745,63 @@ def t_r7(client) -> dict:
               == "full_year",
               f"{bat.get('resolution')!r} / "
               f"{(bat.get('assumptions') or {}).get('resolution')!r}")
+
+        # 3.13 prompt 3 (Q2): the dispatch mode is STORED with the run —
+        # present on BOTH payloads, the string the run used on the battery
+        # side, and None on the solar side (a solar-only run performs no
+        # dispatch; the recorded None is a fact, not an omission).
+        sopts = sol_rec[0].get("evaluated_options") or {}
+        bopts = bat_rec[0].get("evaluated_options") or {}
+        check("(Q2) solar payload: dispatch_resolution key present and None",
+              "dispatch_resolution" in sopts
+              and sopts.get("dispatch_resolution") is None,
+              repr(sopts.get("dispatch_resolution", "<absent>")))
+        check("(Q2) battery payload: dispatch_resolution == the resolution "
+              "the response reports",
+              bopts.get("dispatch_resolution") == bat.get("resolution")
+              and isinstance(bopts.get("dispatch_resolution"), str),
+              f"{bopts.get('dispatch_resolution')!r} vs "
+              f"{bat.get('resolution')!r}")
+        # (Q3) a solar-only run has no parts to split.
+        check("(Q3) solar payload: NO split key — a solar-only run has no "
+              "parts to split",
+              "split" not in sopts, str(sorted(sopts)))
+        # (Q1, healthy half): the split parts SUM to the stored whole, both
+        # figures, to the cent — the deliberate redundancy is two-sidedly
+        # gated. WHY IT MOVES: the whole-system annual_savings and npv_25_year
+        # on the financial row are round(solar + increment, 2) by construction
+        # (prompt 2 step C); if either copy ever drifts the sum breaks and
+        # this names which side moved.
+        split = bopts.get("split") or {}
+        so = split.get("solar_only") or {}
+        bi = split.get("battery_increment") or {}
+        check("(Q1) battery payload carries split.solar_only and "
+              "split.battery_increment with all four keys each",
+              all(k in so for k in ("annual_savings", "npv_25yr",
+                                    "simple_payback_years", "system_cost"))
+              and all(k in bi for k in ("annual_savings_vs_solar_only",
+                                        "incremental_npv",
+                                        "incremental_payback_years",
+                                        "battery_cost")),
+              f"solar_only={sorted(so)} battery_increment={sorted(bi)}")
+        s_sum = round((so.get("annual_savings") or 0)
+                      + (bi.get("annual_savings_vs_solar_only") or 0), 2)
+        n_sum = round((so.get("npv_25yr") or 0)
+                      + (bi.get("incremental_npv") or 0), 2)
+        print(f"        split sums: savings {so.get('annual_savings')} + "
+              f"{bi.get('annual_savings_vs_solar_only')} = {s_sum} vs stored "
+              f"{bat_fin[0].get('annual_savings')}; npv {so.get('npv_25yr')} "
+              f"+ {bi.get('incremental_npv')} = {n_sum} vs stored "
+              f"{bat_fin[0].get('npv_25_year')}")
+        check("(Q1) solar_only + battery_increment == the stored whole-system "
+              "annual_savings, to the cent",
+              isinstance(bat_fin[0].get("annual_savings"), (int, float))
+              and abs(s_sum - bat_fin[0]["annual_savings"]) <= 0.01,
+              f"{s_sum} vs {bat_fin[0].get('annual_savings')}")
+        check("(Q1) ...and the same for the two NPVs",
+              isinstance(bat_fin[0].get("npv_25_year"), (int, float))
+              and abs(n_sum - bat_fin[0]["npv_25_year"]) <= 0.01,
+              f"{n_sum} vs {bat_fin[0].get('npv_25_year')}")
 
     sopts = sol_rec[0].get("evaluated_options") or {}
     bopts = bat_rec[0].get("evaluated_options") or {}
@@ -1234,6 +1293,108 @@ def t_p7() -> None:
           head2.get("payback_years") is None, repr(head2.get("payback_years")))
 
 
+def subprocess_probe_q1() -> dict:
+    """Fresh interpreter: run the battery endpoint on the fixture job with all
+    writers recorded and report whether the persisted split parts still sum to
+    the stored whole-system figures."""
+    client = sizing_route._sb()
+    caller = _caller_for(client, TOU_JOB)
+    _bat, bat_rec, bat_fin, _q = _run_endpoint(
+        sizing_route.battery_sizing,
+        sizing_route.BatteryRequest(job_id=TOU_JOB), caller)
+    split = ((bat_rec[0].get("evaluated_options") or {}).get("split")
+             if bat_rec else {}) or {}
+    so = split.get("solar_only") or {}
+    bi = split.get("battery_increment") or {}
+    fin = bat_fin[0] if bat_fin else {}
+    s_sum = round((so.get("annual_savings") or 0)
+                  + (bi.get("annual_savings_vs_solar_only") or 0), 2)
+    n_sum = round((so.get("npv_25yr") or 0)
+                  + (bi.get("incremental_npv") or 0), 2)
+    return {
+        "s_sum": s_sum, "fin_savings": fin.get("annual_savings"),
+        "n_sum": n_sum, "fin_npv": fin.get("npv_25_year"),
+        "savings_ok": isinstance(fin.get("annual_savings"), (int, float))
+                      and abs(s_sum - fin["annual_savings"]) <= 0.01,
+        "npv_ok": isinstance(fin.get("npv_25_year"), (int, float))
+                  and abs(n_sum - fin["npv_25_year"]) <= 0.01,
+    }
+
+
+def _probe_q1_via_subprocess() -> dict | None:
+    runner = (
+        "import json, sys\n"
+        f"sys.path.insert(0, {SCRIPTS_DIR!r})\n"
+        f"sys.path.insert(0, {BACKEND_DIR!r})\n"
+        "import verify_results_contract as g\n"
+        "print('PROBE:' + json.dumps(g.subprocess_probe_q1()))\n"
+    )
+    proc = subprocess.run([sys.executable, "-c", runner],
+                          capture_output=True, text=True, timeout=600)
+    for line in proc.stdout.splitlines():
+        if line.startswith("PROBE:"):
+            return json.loads(line[len("PROBE:"):])
+    print(f"        probe stdout: {proc.stdout[-400:]!r}")
+    print(f"        probe stderr: {proc.stderr[-400:]!r}")
+    return None
+
+
+_Q1_FROM = '                                "annual_savings": chosen_solar["annual_savings"],\n'
+_Q1_TO = '                                "annual_savings": chosen_solar["annual_savings"] + 1.0,\n'
+
+
+def t_q1_red() -> None:
+    print("\nQ1-RED. the split-sum check can FAIL — one part perturbed in a "
+          "byte-hashed copy of routes/sizing.py")
+    target = os.path.join(BACKEND_DIR, "routes", "sizing.py")
+    original = open(target, "rb").read()
+    original_hash = hashlib.sha256(original).hexdigest()
+    print(f"        original SHA-256: {original_hash}")
+    text = original.decode("utf-8")
+    n = text.count(_Q1_FROM)
+    check("(Q1-RED) the perturbation line (the split's solar_only "
+          "annual_savings) exists EXACTLY once",
+          n == 1, f"count={n}")
+    if n != 1:
+        return
+    tmpdir = tempfile.mkdtemp(prefix="q1_")
+    backup = os.path.join(tmpdir, "sizing.py.bak")
+    shutil.copyfile(target, backup)
+    check("(Q1-RED) the byte copy was taken FIRST and matches the original "
+          "hash",
+          hashlib.sha256(open(backup, "rb").read()).hexdigest()
+          == original_hash, backup)
+    try:
+        with open(target, "w", encoding="utf-8") as fh:
+            fh.write(text.replace(_Q1_FROM, _Q1_TO))
+        _rm_pycache()
+        red = _probe_q1_via_subprocess()
+        print(f"        perturbed probe: {red}")
+        check("(Q1-RED) RED: with one dollar added to the stored solar part, "
+              "the savings sum no longer matches the stored whole — the "
+              "two-sided check genuinely bites",
+              isinstance(red, dict) and red.get("savings_ok") is False,
+              repr(red))
+        check("(Q1-RED) RED: ...and the NPV sum, untouched, still matches — "
+              "the check localises WHICH figure moved",
+              isinstance(red, dict) and red.get("npv_ok") is True,
+              repr(red))
+    finally:
+        shutil.copyfile(backup, target)
+        _rm_pycache()
+    restored_hash = hashlib.sha256(open(target, "rb").read()).hexdigest()
+    print(f"        restored SHA-256: {restored_hash}")
+    check("(Q1-RED) RESTORED: routes/sizing.py is byte-identical to the one "
+          "tested (restored from the copy, never from git)",
+          restored_hash == original_hash, restored_hash)
+    green = _probe_q1_via_subprocess()
+    print(f"        restored probe : {green}")
+    check("(Q1-RED) GREEN AGAIN: both sums match after the restore",
+          isinstance(green, dict) and green.get("savings_ok") is True
+          and green.get("npv_ok") is True, repr(green))
+    shutil.rmtree(tmpdir, ignore_errors=True)
+
+
 def t_p10_full_year_blocks() -> None:
     """3.13 prompt 2b (D35): full_year is 365 REAL daily blocks, day-cyclic by
     construction. WHY THESE MOVE: the pre-2b branch returned ONE 8,760-step
@@ -1344,6 +1505,7 @@ def main() -> int:
         t_p2()
         r7 = t_r7(client)
         t_r8(client, r7.get("sol") or {})
+        t_q1_red()
 
     if start is not None:
         end = _counts()

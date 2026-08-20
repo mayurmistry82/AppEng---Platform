@@ -172,6 +172,23 @@ export function BatterySizingSection({
               <div key={label as string}>
                 <p className="text-caption text-muted-foreground">{label}</p>
                 <p className="metric-sm text-foreground">{value}</p>
+                {/* 3.13 prompt 3 (H/F184): the ENGINE's within_budget flag,
+                    verbatim, beside the cost it judges — rendered only when
+                    the job HAS a budget (a job with no cap has nothing to be
+                    within), and never recomputed on screen (D29, 2R.1). */}
+                {label === "Whole system cost" &&
+                view.hasBudget &&
+                r.withinBudget !== null ? (
+                  <p
+                    className={
+                      r.withinBudget
+                        ? "text-caption text-success"
+                        : "text-caption text-destructive"
+                    }
+                  >
+                    {r.withinBudget ? "Within the budget" : "Over the budget"}
+                  </p>
+                ) : null}
               </div>
             ))}
           </div>

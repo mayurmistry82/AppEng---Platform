@@ -12,6 +12,7 @@ import {
   objectiveBudgetView,
   phaseStates,
   resultsBarView,
+  resultsView,
   roofDiagramView,
   sectionStates,
   siteDetailsView,
@@ -132,6 +133,7 @@ export default async function Page({
         equipmentSpecs={equipmentSpecsView(job, catalogue)}
         solarSizing={solarSizingView(job)}
         batterySizing={batterySizingView(job)}
+        results={resultsView(job)}
         jobId={id}
       />
     </div>

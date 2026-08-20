@@ -104,6 +104,33 @@ export function currentSizingResult(job: unknown): Record<string, unknown> | nul
 }
 
 /**
+ * THE CURRENT RUN'S FINANCIAL RESULT (3.13 prompt 3) — the newest
+ * financial_results row whose sizing_result_id equals the CURRENT sizing
+ * result's, or null.
+ *
+ * ONE DEFINITION, THREE READERS, deliberately: the Results section's
+ * completeness predicate, its body (resultsView) and the results bar all ask
+ * the same question about the same row — "does THIS run have its figures" —
+ * and a section whose tick and whose body read different places is the fault
+ * that hit twice in one day on 2026-08-20.
+ *
+ * NEVER the newest unmatched row: a financial row belonging to an older,
+ * superseded run must yield null here — a missing number is honest, a
+ * mismatched one is not (the exact pairing defect prompt 2 removed from the
+ * jobs list). Total: never throws for any input.
+ */
+export function currentFinancialResult(job: unknown): Record<string, unknown> | null {
+  const sizing = currentSizingResult(job);
+  if (!sizing) return null;
+  const sid = sizing.sizing_result_id;
+  if (typeof sid !== "string" || !sid) return null;
+  const matching = arr(asObject(job).financial_results).filter(
+    (row) => row.sizing_result_id === sid,
+  );
+  return newestByCreatedAt(matching);
+}
+
+/**
  * THE JOB'S USABLE STORED LOAD PROFILE (2026-08-20) — the newest
  * `load_profiles` row when it carries a yearly figure the engine could size
  * on, else null.
@@ -317,7 +344,14 @@ export const SECTIONS: readonly WorksheetSectionSpec[] = [
     title: "Results",
     phase: "resolve",
     builtAt: "3.13",
-    complete: (job) => arr(job.financial_results).length > 0,
+    // 3.13 prompt 3: complete means A FINANCIAL RESULT FOR THE CURRENT SIZING
+    // RESULT — the rule 3.11b recorded and deliberately parked until
+    // something wrote financial rows (prompt 2 does). "Any financial row
+    // exists" would tick this section on a row belonging to an older,
+    // superseded run. The predicate, the section body (resultsView) and the
+    // results bar all read currentFinancialResult — one definition, never a
+    // tick and a body reading different places (2026-08-20, twice).
+    complete: (job) => currentFinancialResult(job) !== null,
   },
   {
     id: "incentives",
@@ -718,7 +752,6 @@ export type ResultsBarView =
  * null figures" case): either way there is nothing real to show.
  */
 export function resultsBarView(job: unknown): ResultsBarView {
-  const detail = asObject(job);
   // The CURRENT result, never the last array element (3.11b prompt 1). The
   // discriminant itself is unchanged — it is simply evaluated against the
   // current row: no row at all, or a row whose figures are both null, is
@@ -729,7 +762,10 @@ export function resultsBarView(job: unknown): ResultsBarView {
     return { sized: false };
   }
 
-  const latestFin = newestByCreatedAt(arr(detail.financial_results));
+  // 3.13 prompt 3: THE MATCHING financial row, via the same helper the
+  // Results section's tick and body use — never the newest unmatched one, so
+  // the bar and the section can never disagree.
+  const latestFin = currentFinancialResult(job);
   const num = (v: unknown): number | null =>
     typeof v === "number" && Number.isFinite(v) ? v : null;
   return {
@@ -4505,6 +4541,10 @@ export interface BatteryRunResult {
   notEconomicReason: string | null;
   /** The engine's own flag strings, VERBATIM (F161) — never paraphrased. */
   engineFlags: string[];
+  /** 3.13 prompt 3 (H/F184): the RETURNED within_budget flag, verbatim —
+      derived by the engine from the same system_cost its budget filter
+      tests, never recomputed on screen (D29, 2R.1). null when absent. */
+  withinBudget: boolean | null;
 }
 
 export interface BatterySizingView {
@@ -4513,6 +4553,10 @@ export interface BatterySizingView {
   /** The CURRENT stored result's battery_kwh, for the revisit case. */
   storedBatteryKwh: number | null;
   alreadySized: boolean;
+  /** 3.13 prompt 3 (H/F184): whether the JOB has a budget at all. A job with
+      no cap has nothing to be within, so the run's within_budget flag renders
+      only when this is true — a badge on an uncapped job is noise. */
+  hasBudget: boolean;
   notices: RoofNoticeView[];
 }
 
@@ -4540,6 +4584,10 @@ export function batterySizingView(job: unknown): BatterySizingView {
     batteryMode: rule ? rule.batteryMode : null,
     storedBatteryKwh,
     alreadySized: storedBatteryKwh !== null,
+    // 3.13 prompt 3 (H): the same coerced read objectiveBudgetView uses — a
+    // stored cap that parses to a positive number is a budget; anything else
+    // is "no cap".
+    hasBudget: (tariffNum(detail.budget_aud) ?? 0) > 0,
     // No D25 finding is available from stored state alone: whether a battery
     // is worth it is the ENGINE's answer, carried in not_economic_reason after
     // a run — never guessed here from the path.
@@ -4653,6 +4701,8 @@ export function batteryRunResult(response: unknown): BatteryRunResult {
     noBattery,
     notEconomicReason,
     engineFlags,
+    withinBudget:
+      typeof body.within_budget === "boolean" ? body.within_budget : null,
   };
 }
 
@@ -4675,4 +4725,263 @@ export function elapsedLabel(ms: number): string {
   const seconds = totalSeconds % 60;
   if (minutes === 0) return `${seconds}s`;
   return `${minutes}m ${String(seconds).padStart(2, "0")}s`;
+}
+
+// ── Results section (checklist 3.13 prompt 3) ────────────────────────────────
+
+export interface ResultsHeadline {
+  solarKw: string;
+  /** null on a solar-only run (no battery was sized — different fact from
+      "No battery", which is the engine's answer on a battery run). */
+  battery: string | null;
+  systemCost: string;
+  annualSavings: string;
+  payback: string;
+  npv: string;
+  currentSpend: string;
+  projectedSpend: string;
+  selfSufficiency: string | null;
+}
+
+export interface ResultsView {
+  /**
+   * "unsized"            — no current sizing result. Say so; never "0 kW".
+   * "awaiting-financial" — a run exists but ITS financial row does not.
+   *                        Never fall back to an unmatched row (the pairing
+   *                        defect prompt 2 removed must not reappear here).
+   * "ready"              — the current run and its matching financial row.
+   * ready ⇔ currentFinancialResult(job) !== null BY CONSTRUCTION, so the
+   * section's tick and its body can never disagree.
+   */
+  state: "unsized" | "awaiting-financial" | "ready";
+  headline: ResultsHeadline | null;
+  /** THE ROOF'S DOUBT (F93), read from the SIZING ROW — the run was built on
+      the roof as it stood at the time, never the job's newest roof. */
+  roofNotices: RoofNoticeView[];
+  /** THE PANELS' DIRECTION (F168): plain statements of fact, one per plane.
+      null when the layout could not be honestly derived — see layoutNote. */
+  layoutLines: string[] | null;
+  /** The honest line shown when layoutLines is null. */
+  layoutNote: string | null;
+  /** For the Results tab (prompt 4); not rendered by the section. */
+  dispatchResolution: string | null;
+  runKind: string | null;
+}
+
+/**
+ * resultsView (3.13 prompt 3) — the Results section's one source: the CURRENT
+ * sizing result and ITS financial row, the roof doubt stored ON that run, and
+ * the chosen panel layout joined BY roof_geometry_id — never newest-first.
+ * Total: never throws; junk yields nulls and the section renders what it has.
+ * Nothing is invented and no figure is shown without the doubt that belongs
+ * to it.
+ */
+export function resultsView(job: unknown): ResultsView {
+  const sizing = currentSizingResult(job);
+  const fin = currentFinancialResult(job);
+  const state: ResultsView["state"] =
+    fin !== null ? "ready" : sizing !== null ? "awaiting-financial" : "unsized";
+  if (sizing === null) {
+    return {
+      state: "unsized",
+      headline: null,
+      roofNotices: [],
+      layoutLines: null,
+      layoutNote: null,
+      dispatchResolution: null,
+      runKind: null,
+    };
+  }
+
+  const runKind = typeof sizing.run_kind === "string" ? sizing.run_kind : null;
+  const eo = asRecord(sizing.evaluated_options);
+
+  // ── The roof's doubt, from the sizing row (F93). null is NOT clean —
+  // 3.11 preserved the null/false distinction deliberately.
+  const roofNotices: RoofNoticeView[] = [];
+  const low = sizing.roof_low_confidence;
+  const needs = sizing.roof_needs_manual_confirmation;
+  const reason =
+    typeof sizing.roof_reason === "string" && sizing.roof_reason
+      ? sizing.roof_reason
+      : null;
+  if (low === true) {
+    roofNotices.push({
+      tone: "caution",
+      level: "notice",
+      title: "Sized on a roof that was flagged for checking",
+      body:
+        reason ??
+        "The roof measurement was flagged before this run and was used as it stood, so this result is only as good as that roof.",
+    });
+  } else if (low !== false) {
+    roofNotices.push({
+      tone: "info",
+      level: "notice",
+      title: "The roof state was not recorded for this run",
+      body: "This run did not record the roof's confidence, which is a different fact from a clean roof.",
+    });
+  }
+  if (needs === true) {
+    roofNotices.push({
+      tone: "caution",
+      level: "notice",
+      title: "The roof needs manual confirmation",
+      body: reason ?? "The roof model asked for a manual check before this run.",
+    });
+  }
+
+  // ── The panels' direction (F168): join the roof BY ID, never newest.
+  const rgid =
+    typeof sizing.roof_geometry_id === "string" && sizing.roof_geometry_id
+      ? sizing.roof_geometry_id
+      : null;
+  const roofRow = rgid
+    ? (arr(asObject(job).roof_geometry).find(
+        (r) => r.roof_geometry_id === rgid,
+      ) ?? null)
+    : null;
+
+  // The chosen point: a battery run stores the chosen solar layout in
+  // evaluated_options.chosen_solar; a solar run names its winning point by
+  // chosen_index into points.
+  let chosenLayout: Record<string, unknown> | null = null;
+  const chosenSolar = asRecord(eo.chosen_solar);
+  if (Array.isArray(chosenSolar.plane_indices)) {
+    chosenLayout = chosenSolar;
+  } else if (
+    typeof eo.chosen_index === "number" &&
+    Number.isInteger(eo.chosen_index) &&
+    Array.isArray(eo.points)
+  ) {
+    const point = eo.points[eo.chosen_index];
+    const p = asRecord(point);
+    if (Array.isArray(p.plane_indices)) chosenLayout = p;
+  }
+
+  let layoutLines: string[] | null = null;
+  let layoutNote: string | null = null;
+  if (!rgid || !roofRow) {
+    layoutNote =
+      "The roof this run was sized on could not be matched to a stored roof, so which planes the panels sit on cannot be stated.";
+  } else if (
+    !chosenLayout ||
+    !Array.isArray(chosenLayout.plane_indices) ||
+    !Array.isArray(chosenLayout.panels_per_plane)
+  ) {
+    layoutNote =
+      "This run did not record which planes its panels sit on, so the direction cannot be stated.";
+  } else {
+    const planes = Array.isArray(roofRow.planes) ? roofRow.planes : null;
+    if (!planes) {
+      layoutNote =
+        "The roof this run was sized on holds no readable planes, so the direction cannot be stated.";
+    } else {
+      const lines: string[] = [];
+      let broken = false;
+      for (const rawIdx of chosenLayout.plane_indices) {
+        if (
+          typeof rawIdx !== "number" ||
+          !Number.isInteger(rawIdx) ||
+          rawIdx < 0 ||
+          rawIdx >= planes.length
+        ) {
+          broken = true;
+          break;
+        }
+        const plane = asRecord(planes[rawIdx]);
+        const count = chosenLayout.panels_per_plane[rawIdx];
+        if (typeof count !== "number" || !Number.isFinite(count) || count <= 0) {
+          // A named plane carrying no panels in this config is skipped, not
+          // invented into a sentence.
+          continue;
+        }
+        const compass = azimuthLabel(tariffNum(plane.azimuth));
+        const pitch = tariffNum(plane.pitch);
+        const direction = compass
+          ? `the ${compass}-facing plane`
+          : "a plane whose direction was not recorded";
+        const pitchPart = pitch !== null ? ` (pitch ${pitch}°)` : "";
+        lines.push(
+          `${count} panel${count === 1 ? "" : "s"} on ${direction}${pitchPart}`,
+        );
+      }
+      if (broken || lines.length === 0) {
+        layoutNote =
+          "This run's stored layout does not match the roof it names, so the direction cannot be stated.";
+      } else {
+        layoutLines = lines;
+      }
+    }
+  }
+
+  // ── Self-sufficiency: read from the stored run, never recomputed. A solar
+  // run names its point by chosen_index; a battery run's chosen candidate is
+  // identified by the row's own stored figures (usable_kwh + system_cost) —
+  // an ambiguous match yields null, never a guess.
+  let selfSufficiency: number | null = null;
+  if (runKind === "solar_battery") {
+    const points = Array.isArray(eo.points) ? eo.points : [];
+    const rowKwh = tariffNum(sizing.battery_kwh);
+    const rowCost = tariffNum(sizing.system_cost);
+    const matches = points
+      .map((p) => asRecord(p))
+      .filter(
+        (p) =>
+          rowKwh !== null &&
+          rowCost !== null &&
+          tariffNum(p.usable_kwh) === rowKwh &&
+          tariffNum(p.system_cost) === rowCost,
+      );
+    if (matches.length === 1) {
+      selfSufficiency = tariffNum(matches[0].self_sufficiency_pct);
+    }
+  } else if (
+    typeof eo.chosen_index === "number" &&
+    Number.isInteger(eo.chosen_index) &&
+    Array.isArray(eo.points)
+  ) {
+    selfSufficiency = tariffNum(
+      asRecord(eo.points[eo.chosen_index]).self_sufficiency_pct,
+    );
+  }
+
+  let headline: ResultsHeadline | null = null;
+  if (fin !== null) {
+    const solarKw = tariffNum(sizing.solar_kw);
+    const batteryKwh = tariffNum(sizing.battery_kwh);
+    const money = (v: unknown): string => {
+      const n = tariffNum(v);
+      return n !== null ? fmtAud(n) : "—";
+    };
+    headline = {
+      solarKw: solarKw !== null ? fmtKw(solarKw) : "—",
+      battery:
+        batteryKwh === null
+          ? null
+          : batteryKwh > 0
+            ? fmtKwh(batteryKwh)
+            : "No battery",
+      systemCost: money(fin.system_capex),
+      annualSavings: money(fin.annual_savings),
+      payback: fmtYears(fin.payback_years),
+      npv: money(fin.npv_25_year),
+      currentSpend: money(fin.current_annual_spend),
+      projectedSpend: money(fin.projected_annual_spend),
+      selfSufficiency: selfSufficiency !== null ? fmtPct(selfSufficiency) : null,
+    };
+  }
+
+  return {
+    state,
+    headline,
+    roofNotices,
+    layoutLines,
+    layoutNote,
+    dispatchResolution:
+      typeof eo.dispatch_resolution === "string" && eo.dispatch_resolution
+        ? eo.dispatch_resolution
+        : null,
+    runKind,
+  };
 }
