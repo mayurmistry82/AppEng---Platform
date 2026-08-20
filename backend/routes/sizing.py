@@ -455,12 +455,17 @@ def _resolve_tariff(
                 if bf is not None:
                     fit = float(bf)
 
-    if import_rate is None:
+    # 3.12: the scalar still RESOLVES (it is reported in assumptions and is
+    # the flat rate _build_rate_24 fills uncovered hours with), but the
+    # fallback FLAG moved below the rate_24 build — it fires only when the
+    # defaulted scalar actually priced at least one hour. A fallback flag that
+    # fires when the fallback had no effect is noise that trains installers to
+    # ignore flags (observed live: it fired on a job whose 24 hours were all
+    # window-covered).
+    scalar_defaulted = import_rate is None
+    if scalar_defaulted:
         import_rate = solar_optimiser.DEFAULT_IMPORT_RATE
         source = source or "default"
-        flags.append(
-            f"import_rate fallback ${import_rate:.2f}/kWh (no bill rate) — is_fallback"
-        )
     if source is None:
         source = "default"
 
@@ -482,10 +487,20 @@ def _resolve_tariff(
             flags.append("export_limit defaulted (state/postcode not recognised)")
 
     windows_for_rate = getattr(body, "tou_windows", None) or stored_windows
+    n_flags_before = len(flags)
     rate_24, is_tou = _build_rate_24(
         getattr(body, "import_rates_24", None), windows_for_rate, structured,
         float(import_rate), flags,
     )
+    # The defaulted scalar REACHED rate_24 iff the tariff came out flat, or
+    # the window build filled at least one uncovered hour with it (the exact
+    # gap-fill flag, matched from this call's own additions).
+    if scalar_defaulted and (
+        not is_tou or _FLAG_GAPS in flags[n_flags_before:]
+    ):
+        flags.append(
+            f"import_rate fallback ${import_rate:.2f}/kWh (no bill rate) — is_fallback"
+        )
 
     return {
         "import_rate": float(import_rate),
@@ -498,7 +513,10 @@ def _resolve_tariff(
         "tariff_type": tariff_type,
         "supply_charge": supply_charge,
         "source": source,
-        "flat_rate_for_solar": sum(rate_24) / 24.0,
+        # 3.12: flat_rate_for_solar is GONE. It was sum(rate_24)/24, the
+        # battery endpoint's private third meaning of "the import rate", and
+        # the solar optimiser now takes rate_24 itself — the averaged copy has
+        # no consumer and keeping it would be keeping the drift (2R.1).
     }
 
 
@@ -722,10 +740,14 @@ async def optimise_sizing(
             return {"error": f"load profile must be {solar_optimiser.HOURS} hourly values (got {len(load_hourly)}).",
                     "flags": ["bad_load_length"]}
 
-        # ── Tariff + export limit: the ONE resolver (3.8). The solar optimiser
-        # keeps taking the SCALAR import_rate — never sum(rate_24)/24. ──
+        # ── Tariff + export limit: the ONE resolver (3.8). 3.12: the solar
+        # optimiser now takes rate_24 — the SAME hour-by-hour vector the
+        # battery LP dispatches against — so self-consumed solar is valued at
+        # the rate of the hour it was consumed. The scalar import_rate remains
+        # only as reporting (assumptions). ──
         tariff = _resolve_tariff(client, body, state, postcode, flags)
         import_rate = tariff["import_rate"]
+        rate_24 = tariff["rate_24"]
         fit = tariff["fit"]
         fit_is_fallback = tariff["fit_is_fallback"]
         export_limit_kw = tariff["export_limit_kw"]
@@ -738,7 +760,7 @@ async def optimise_sizing(
             return solar_optimiser.optimise(
                 roof_planes=planes_, candidate_configs=configs_, lat=float(lat), lon=float(lon),
                 utc_offset_hours=utc_offset,
-                panel=panel_, load_hourly=load_hourly, import_rate=float(import_rate), fit=float(fit),
+                panel=panel_, load_hourly=load_hourly, rate_24=rate_24, fit=float(fit),
                 export_limit_kw=float(export_limit_kw), objective=objective, fin=fin,
                 postcode=postcode, state=state, installer_id=caller.user_id,
                 custom_weight=custom_weight,
@@ -974,6 +996,12 @@ def _window_hour(value: Any) -> Optional[int]:
     return None
 
 
+# One definition of the gap-fill sentence: _build_rate_24 emits it and
+# _resolve_tariff's fallback-flag condition matches on it (3.12). A literal in
+# both places would be two copies of one fact.
+_FLAG_GAPS = "Some hours had no TOU window — filled with the flat rate."
+
+
 def _build_rate_24(
     import_rates_24: Optional[list],
     tou_windows: Optional[list],
@@ -1098,7 +1126,7 @@ def _build_rate_24(
         if any(r is not None for r in rate):
             filled = [r if r is not None else flat_rate for r in rate]
             if any(r is None for r in rate):
-                flags.append("Some hours had no TOU window — filled with the flat rate.")
+                flags.append(_FLAG_GAPS)
             return filled, True
 
     flags.append("No TOU tariff — flat import rate used (battery value = self-consumption + peak avoidance only) — is_fallback.")
@@ -1203,7 +1231,6 @@ async def battery_sizing(
         fit_is_fallback = tariff["fit_is_fallback"]
         rate_24 = tariff["rate_24"]
         is_tou = tariff["is_tou"]
-        flat_rate_for_solar = tariff["flat_rate_for_solar"]
         export_limit_kw = tariff["export_limit_kw"]
         export_meta = tariff["export_meta"]
 
@@ -1217,7 +1244,11 @@ async def battery_sizing(
             sres = solar_optimiser.optimise(
                 roof_planes=planes_, candidate_configs=configs_, lat=float(lat), lon=float(lon),
                 utc_offset_hours=utc_offset,
-                panel=panel_, load_hourly=load_hourly, import_rate=flat_rate_for_solar, fit=float(fit),
+                # 3.12: the SAME rate_24 the battery LP dispatches against —
+                # never a 24-hour mean, never a different scalar from the
+                # other endpoint. This is what makes the two endpoints agree
+                # on the chosen solar for one job (the AGREE gate checks).
+                panel=panel_, load_hourly=load_hourly, rate_24=rate_24, fit=float(fit),
                 export_limit_kw=export_limit_kw, objective=objective, fin=fin,
                 postcode=postcode, state=state, installer_id=caller.user_id,
                 custom_weight=custom_weight,

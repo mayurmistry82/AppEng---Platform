@@ -517,7 +517,10 @@ def t5_two_modes(client, true_hourly: list[float]) -> None:
             res = solar_optimiser.optimise(
                 roof_planes=planes, candidate_configs=configs, lat=lat, lon=lon,
                 utc_offset_hours=offset, panel=panel, load_hourly=load,
-                import_rate=0.40, fit=0.05, export_limit_kw=5.0,
+                # 3.12: optimise takes the 24-hour vector now; a flat tariff
+                # is 24 copies of the old scalar, so this test's economics are
+                # unchanged.
+                rate_24=[0.40] * 24, fit=0.05, export_limit_kw=5.0,
                 objective="max_npv", fin=fin, postcode="5000", state="SA",
             )
             dt = time.perf_counter() - t0
@@ -554,10 +557,62 @@ def t5_two_modes(client, true_hourly: list[float]) -> None:
           f"before={n0} after={n1}")
 
 
+def t6_hour_index_pricing() -> None:
+    """3.12: net_config prices each hour at rate_24[h % 24]. That `% 24` is a
+    CLAIM that the load index, the generation index and the rate index all mean
+    the same local-standard hour (the 3.7 convention this whole gate guards).
+    A single distinctive hour in the rate vector must move the priced sums at
+    EXACTLY that hour's energy — and nowhere else — or the claim is false."""
+    print("\nT6. hour-index pricing — a spiked rate hour moves exactly that hour (3.12)")
+    hours = 48  # two days, so the % 24 wrap is exercised, not just index 0-23
+    load = [1.0] * hours
+    gen = [0.0] * hours
+    gen[36] = 2.0  # day 2, 12:00 local — 1 kWh self-consumed, 1 kWh surplus
+    flat = [0.10] * 24
+    spiked = list(flat)
+    spiked[12] = 1.10  # +$1.00 at hour 12 of the day, both days
+
+    base = solar_optimiser.net_config(gen, load, 5.0, flat)
+    spik = solar_optimiser.net_config(gen, load, 5.0, spiked)
+
+    # Energy must not move at all — a price cannot change physics.
+    for key in ("self_consumed", "export", "import", "curtailed", "peak_export_kwh_h"):
+        check(f"(6a) {key} identical under both rate vectors", base[key] == spik[key],
+              f"{base[key]} vs {spik[key]}")
+
+    # The spiked hour prices min(gen, load) = 1 kWh once (only day 2 generates),
+    # so self_consumed_value moves by exactly 1.0 * (1.10 - 0.10).
+    d_scv = spik["self_consumed_value"] - base["self_consumed_value"]
+    check("(6b) self_consumed_value moves by EXACTLY the spiked hour's "
+          "min(gen, load) x the rate difference (1 kWh x $1.00)",
+          abs(d_scv - 1.0) < 1e-9, f"delta={d_scv}")
+    # load_value moves at hour 12 of BOTH days (load is 1 kWh in each).
+    d_lv = spik["load_value"] - base["load_value"]
+    check("(6c) load_value moves by 2 kWh x $1.00 — hour 12 of each of the two days",
+          abs(d_lv - 2.0) < 1e-9, f"delta={d_lv}")
+    # import_value moves only on day 1 (day 2's hour 12 imports nothing).
+    d_iv = spik["import_value"] - base["import_value"]
+    check("(6d) import_value moves by 1 kWh x $1.00 — only the day with no generation",
+          abs(d_iv - 1.0) < 1e-9, f"delta={d_iv}")
+
+    # Spiking an hour where nothing generates must not move the SELF-CONSUMED
+    # value at all — the control that pins the index, not just the magnitude.
+    dark = list(flat)
+    dark[3] = 1.10  # 03:00 — generation is zero at 3am on both days
+    darkr = solar_optimiser.net_config(gen, load, 5.0, dark)
+    check("(6e) a spike at 03:00 (no generation) moves self_consumed_value by ZERO",
+          darkr["self_consumed_value"] == base["self_consumed_value"],
+          f"{darkr['self_consumed_value']} vs {base['self_consumed_value']}")
+    check("(6e) ...while load_value still moves (the load exists at 3am)",
+          abs((darkr["load_value"] - base["load_value"]) - 2.0) < 1e-9,
+          f"delta={darkr['load_value'] - base['load_value']}")
+
+
 def main() -> int:
     print("verify_sizing_time_base.py — 3.7: one time base, then the true series\n")
     t1_offsets_and_rotation()
     t1b_reference_selection()
+    t6_hour_index_pricing()
     client = sizing_route._sb()
     if client is None:
         check("(live) Supabase client available", False, "env not configured")

@@ -116,7 +116,12 @@ def expand_load_to_8760(annual_kwh: float, hourly_weights: Optional[list]) -> li
 
 
 # ── Hourly netting under the export cap ───────────────────────────────────────
-def net_config(system_hourly: list[float], load_hourly: list[float], export_limit_kw: float) -> dict:
+def net_config(
+    system_hourly: list[float],
+    load_hourly: list[float],
+    export_limit_kw: float,
+    rate_24: list[float],
+) -> dict:
     """
     Net hourly generation against load under the export cap. Per hour:
       self = min(gen, load); surplus = max(gen-load, 0);
@@ -124,18 +129,39 @@ def net_config(system_hourly: list[float], load_hourly: list[float], export_limi
       import = max(load-gen, 0).
     Excess above the cap is CURTAILED (lost) — this is why oversizing past the limit has
     diminishing returns. Returns annual sums (kWh) + peak export hour.
+
+    3.12: the energy is ALSO priced here, hour by hour against `rate_24` — the
+    same vector the battery LP dispatches against — so self-consumed solar is
+    valued at the rate that actually applied in the hour it was consumed,
+    never at one averaged or defaulted number. Three priced sums are added
+    (self_consumed_value / load_value / import_value, all AUD); the five
+    energy keys keep their exact meanings and values.
+
+    THE INDEX CLAIM, stated because it is a claim (F134, 2O.1): `rate_24[h % 24]`
+    against `load_hourly[h]` and `system_hourly[h]` asserts that hour 0 means
+    local standard midnight 1 January for all three. It does — that is the one
+    declared time base from 3.7, guarded by verify_sizing_time_base.py (which
+    also proves, with a single-hour spiked vector, that the priced sums move at
+    exactly the hour the spike names) — and battery_optimiser._tile already
+    tiles the same vector over the same hours for the LP.
     """
     sc = ex = im = cur = 0.0
+    scv = lv = iv = 0.0
     peak_export = 0.0
     n = min(len(system_hourly), len(load_hourly))
     for h in range(n):
         g = system_hourly[h]
         l = load_hourly[h]
+        r = rate_24[h % 24]
+        lv += l * r
         if g <= l:
             sc += g
             im += l - g
+            scv += g * r
+            iv += (l - g) * r
         else:
             sc += l
+            scv += l * r
             surplus = g - l
             e = surplus if surplus < export_limit_kw else export_limit_kw
             ex += e
@@ -148,23 +174,29 @@ def net_config(system_hourly: list[float], load_hourly: list[float], export_limi
         "import": im,
         "curtailed": cur,
         "peak_export_kwh_h": peak_export,
+        "self_consumed_value": scv,
+        "load_value": lv,
+        "import_value": iv,
     }
 
 
 # ── Financials ────────────────────────────────────────────────────────────────
 def financials(
-    self_consumed: float,
+    self_consumed_value: float,
+    load_value: float,
+    import_value: float,
     export: float,
-    total_load: float,
-    import_rate: float,
     fit: float,
     system_cost: float,
     fin: dict,
 ) -> dict:
-    bill_before = total_load * import_rate
-    import_kwh = total_load - self_consumed
-    bill_after = import_kwh * import_rate - export * fit
-    annual_savings = self_consumed * import_rate + export * fit
+    """3.12: the three AUD amounts arrive already priced hour by hour from
+    net_config — there is no import-rate scalar here any more, and no
+    total_load (it priced the old scalar arithmetic and nothing else). Export
+    keeps its single feed-in tariff: the FiT is one number by nature."""
+    bill_before = load_value
+    bill_after = import_value - export * fit
+    annual_savings = self_consumed_value + export * fit
 
     payback = (system_cost / annual_savings) if annual_savings > 0 else None
 
@@ -225,7 +257,7 @@ def optimise(
     utc_offset_hours: Optional[float],
     panel: dict,
     load_hourly: list[float],
-    import_rate: float,
+    rate_24: list[float],
     fit: float,
     export_limit_kw: float,
     objective: str,
@@ -252,8 +284,34 @@ def optimise(
     local standard time — the base `load_hourly` is already in. Netting the two in
     different bases was the pre-3.7 fault; a default here would let this internal call
     silently keep receiving UTC.
+
+    3.12: `rate_24` REPLACED the old scalar `import_rate` — the same 24-hour
+    import-rate vector the battery LP dispatches against, so both endpoints
+    price self-consumed solar identically and hour by hour. The scalar is GONE
+    rather than left beside the vector: a dead parameter two callers can still
+    pass is the second copy that drifts, and it is what created the fault this
+    fixed (the two endpoints chose two different scalars for one job).
     """
     flags = flags if flags is not None else []
+    # D24: a malformed rate vector flags and falls back to a flat vector —
+    # sizing is never blocked. bool is excluded (a subclass of int), and
+    # NaN/inf parse as floats but are not rates.
+    rate_ok = (
+        isinstance(rate_24, (list, tuple)) and len(rate_24) == 24
+        and all(
+            isinstance(v, (int, float)) and not isinstance(v, bool)
+            and v == v and abs(v) != float("inf")
+            for v in rate_24
+        )
+    )
+    if rate_ok:
+        rate_24 = [float(v) for v in rate_24]
+    else:
+        flags.append(
+            f"import rate vector unusable — every hour priced at the flat "
+            f"${DEFAULT_IMPORT_RATE:.2f}/kWh default — is_fallback"
+        )
+        rate_24 = [DEFAULT_IMPORT_RATE] * 24
     pr = fin["performance_ratio_non_temp"]
     total_load = sum(load_hourly)
     panel_id = panel.get("id")
@@ -303,13 +361,17 @@ def optimise(
 
         if not alloc or solar_kw <= 0:
             gen_kwh = 0.0
-            netd = {"self_consumed": 0.0, "export": 0.0, "import": total_load,
-                    "curtailed": 0.0, "peak_export_kwh_h": 0.0}
+            # 3.12: the empty system goes through the SAME netting/pricing
+            # loop as every real config (zero generation in, full load out) —
+            # the old hand-built dict was a second copy of net_config's
+            # semantics and would have needed the priced sums copied too.
+            netd = net_config([0.0] * len(load_hourly), load_hourly,
+                              export_limit_kw, rate_24)
             system_cost = 0.0
         else:
             sysgen = generation.system_generation_for_config(net_planes, cfg)
             gen_kwh = sysgen["annual_kwh"]
-            netd = net_config(sysgen["hourly_kwh"], load_hourly, export_limit_kw)
+            netd = net_config(sysgen["hourly_kwh"], load_hourly, export_limit_kw, rate_24)
             cost = cost_model.compute_system_cost(
                 solar_kw=solar_kw,
                 panel_id=panel_id,
@@ -322,8 +384,8 @@ def optimise(
             system_cost = cost["net_cost"]
 
         fins = financials(
-            netd["self_consumed"], netd["export"], total_load,
-            import_rate, fit, system_cost, fin,
+            netd["self_consumed_value"], netd["load_value"], netd["import_value"],
+            netd["export"], fit, system_cost, fin,
         )
         ss_pct = round(netd["self_consumed"] / total_load * 100, 2) if total_load > 0 else 0.0
         sc_pct = round(netd["self_consumed"] / gen_kwh * 100, 2) if gen_kwh > 0 else 0.0

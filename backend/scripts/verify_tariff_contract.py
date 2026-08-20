@@ -543,6 +543,66 @@ def t8_never_raises() -> None:
           rate == expected and is_tou is True and flags == [], f"{rate} {flags}")
 
 
+def t9_fallback_flag_condition() -> None:
+    """3.12: the import_rate fallback flag fires ONLY when the defaulted scalar
+    actually REACHED rate_24 — the tariff is flat, or _build_rate_24 filled at
+    least one uncovered hour with it. A fallback flag that fires when the
+    fallback priced nothing is noise that trains installers to ignore flags."""
+    print("\nT9. the fallback flag fires ONLY when the fallback was used (3.12)")
+
+    def resolve(windows):
+        stored = {"job_id": "j1", "tariff_type": "tou", "supply_charge": 1.0,
+                  "tou_windows": windows, "import_rate": None,
+                  "fit_aud_per_kwh": 0.06, "export_limit_kw": 5.0,
+                  "source": "installer"}
+        stub = StubClient({"jobs": [], "tariffs": [stored], "bills": []})
+        flags: list[str] = []
+        t = sizing_route._resolve_tariff(stub, body_ns(job_id="j1"), "SA", "5000", flags)
+        return t, flags
+
+    # (9a) EVERY hour covered by windows: the defaulted scalar reaches nothing.
+    # WHY IT MOVES: pre-3.12 the flag fired whenever the scalar was defaulted,
+    # coverage or no coverage — observed live on job a57e13f1.
+    full, flags_full = resolve([
+        {"label": "peak", "rate": 0.35, "start": "07:00", "end": "21:00", "days": "all"},
+        {"label": "offpeak", "rate": 0.20, "start": "21:00", "end": "07:00", "days": "all"},
+    ])
+    check("(9a) all 24 hours window-covered, no scalar anywhere: NO fallback flag",
+          not any("import_rate fallback" in f for f in flags_full), str(flags_full))
+    check("(9a) ...and rate_24 carries only window rates (the default reached nothing)",
+          full["is_tou"] is True and set(full["rate_24"]) == {0.35, 0.20},
+          str(sorted(set(full["rate_24"]))))
+    check("(9a) ...while import_rate still RESOLVES to the default for reporting",
+          full["import_rate"] == solar_optimiser_default(), str(full["import_rate"]))
+
+    # (9b) PARTIAL coverage: the uncovered hours were filled with the default,
+    # so the fallback genuinely priced hours and the flag must fire.
+    part, flags_part = resolve([
+        {"label": "peak", "rate": 0.35, "start": "07:00", "end": "21:00", "days": "all"},
+    ])
+    check("(9b) uncovered hours filled with the default: the flag FIRES",
+          any("import_rate fallback" in f and "— is_fallback" in f for f in flags_part),
+          str(flags_part))
+    check("(9b) ...and the filled hour really is the default rate",
+          part["rate_24"][23] == solar_optimiser_default(), str(part["rate_24"][23]))
+    check("(9b) ...alongside the gap-fill flag naming what happened",
+          FLAG_GAPS in flags_part, str(flags_part))
+
+    # (9c) CONTROL — nothing stored at all: flat default everywhere, flag fires
+    # (this is t5d's case, re-asserted beside its two new neighbours so the
+    # three conditions read as one rule).
+    stub = StubClient({"jobs": [], "tariffs": [], "bills": []})
+    flags_none: list[str] = []
+    sizing_route._resolve_tariff(stub, body_ns(job_id="j1"), "SA", "5000", flags_none)
+    check("(9c) nothing stored: flat default everywhere, the flag still fires",
+          any("import_rate fallback" in f for f in flags_none), str(flags_none))
+
+
+def solar_optimiser_default() -> float:
+    import solar_optimiser  # noqa: PLC0415
+    return solar_optimiser.DEFAULT_IMPORT_RATE
+
+
 def main() -> int:
     print("verify_tariff_contract.py — 3.8 prompt 1 (writes nothing)\n")
     t1_structure()
@@ -552,6 +612,7 @@ def main() -> int:
     t6_days_flag()
     t7_endpoint()
     t8_never_raises()
+    t9_fallback_flag_condition()
     print(f"\n{'-' * 60}")
     if FAILURES:
         print(f"FAIL: {len(FAILURES)} of {CHECKS_RUN} checks failed:")

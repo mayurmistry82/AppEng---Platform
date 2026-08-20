@@ -178,15 +178,19 @@ FIX_PANEL_ID = "7ea2822f-2293-42b0-a511-88d33843699b"
 FIX_PANEL_W = 440
 # WHY A BATTERY WINS HERE, stated so the fixture can be argued with: a big
 # north-facing array generates ~17 MWh against a 14 MWh load whose consumption
-# is concentrated at 18:00-21:00, hours at which generation is zero. The
-# evening peak rate is 8x the overnight rate. That gap — surplus at midday,
-# expensive demand after sunset — is exactly what a battery is paid to close.
+# is concentrated at 18:00-21:00, hours at which generation is zero. Every
+# surplus kWh is worth $0.05 exported but $0.45 when discharged into the
+# evening instead — a $0.40/kWh margin on every cycled kWh. That gap — surplus
+# at midday, demand after sunset — is exactly what a battery is paid to close.
+#
+# ONE FLAT TARIFF FOR BOTH ENDPOINTS, deliberately (3.12 pricing fix): the two
+# endpoints must now agree on the chosen solar, and a stateless OptimiseRequest
+# can only carry a flat rate — so the battery body carries NO tou_windows
+# either, and the agreement check below holds the two to the same answer.
 FIX_ANNUAL_LOAD_KWH = 14000.0
 FIX_LOAD_SHAPE = ([0.2] * 6 + [0.4, 0.6, 0.5, 0.4, 0.4, 0.4, 0.4, 0.4, 0.4,
                                0.5, 0.8, 2.2, 3.2, 3.2, 2.6, 1.6, 0.8, 0.4])
-FIX_PEAK_RATE = 1.20
-FIX_OFFPEAK_RATE = 0.15
-FIX_FLAT_RATE = 0.45   # the solar endpoint's scalar (OptimiseRequest takes no windows)
+FIX_FLAT_RATE = 0.45   # both endpoints' import rate — one price, one meaning
 FIX_FIT = 0.05
 FIX_EXPORT_LIMIT_KW = 5.0
 
@@ -268,12 +272,6 @@ def t_b1_fixture() -> None:
           f"(lat_cell, lon_cell, tilt, aspect) {wanted}")
 
     load = _fixture_load()
-    windows = [
-        {"label": "peak", "rate": FIX_PEAK_RATE, "start": "17:00", "end": "22:00",
-         "days": "all"},
-        {"label": "offpeak", "rate": FIX_OFFPEAK_RATE, "start": "22:00",
-         "end": "17:00", "days": "all"},
-    ]
     common = dict(planes=planes, candidate_configs=candidate_configs,
                   lat=FIX_LAT, lon=FIX_LON, panel_id=FIX_PANEL_ID,
                   panel_watts=FIX_PANEL_W, load_hourly_8760=load,
@@ -284,9 +282,8 @@ def t_b1_fixture() -> None:
     # job_id) — a synthetic company is correct here, not a shortcut.
     caller = auth.Caller(user_id="gate-runner", email="gate@example.com",
                          company_id="co-gate-fixture", role="owner")
-    print(f"        annual load {round(sum(load), 1)} kWh, peak "
-          f"${FIX_PEAK_RATE}/kWh 17:00-22:00 vs ${FIX_OFFPEAK_RATE} overnight, "
-          f"solar-endpoint flat ${FIX_FLAT_RATE}")
+    print(f"        annual load {round(sum(load), 1)} kWh, flat "
+          f"${FIX_FLAT_RATE}/kWh import vs ${FIX_FIT} feed-in on BOTH endpoints")
 
     def solar_run(budget):
         return _run_endpoint(sizing_route.optimise_sizing,
@@ -295,9 +292,12 @@ def t_b1_fixture() -> None:
                              caller)
 
     def battery_run(budget):
+        # SAME tariff as the solar run — no tou_windows, one flat rate. The
+        # agreement check below is what this buys: both endpoints must choose
+        # the same solar under the same price (3.12 pricing fix).
         return _run_endpoint(sizing_route.battery_sizing,
                              sizing_route.BatteryRequest(
-                                 tou_windows=windows, import_rate=FIX_FLAT_RATE,
+                                 import_rate=FIX_FLAT_RATE,
                                  budget=budget, **common),
                              caller)
 
@@ -331,6 +331,20 @@ def t_b1_fixture() -> None:
     if not (isinstance(S, (int, float)) and isinstance(S_b, (int, float))
             and isinstance(incr, (int, float))):
         return
+
+    # ── THE AGREEMENT CHECK, flat case (3.12 pricing fix — the control). Both
+    # endpoints were given the SAME flat tariff, so they must choose the SAME
+    # solar. On a flat tariff the old scalar and the old 24-hour mean were the
+    # same number, so this case passes even against pre-fix code — it is the
+    # control that proves the TOU case below fails for the price vector and
+    # not for some other divergence between the two endpoints.
+    check("(AGREE/flat) both endpoints choose the SAME solar_kw under one "
+          "flat tariff",
+          opt_s.get("solar_kw") == chosen_solar.get("solar_kw"),
+          f"solar endpoint {opt_s.get('solar_kw')} kW vs battery endpoint "
+          f"{chosen_solar.get('solar_kw')} kW")
+    check("(AGREE/flat) ...and the SAME solar-only system_cost",
+          S == S_b, f"${S} vs ${S_b}")
 
     C = round(S_b + incr, 2)
     check("(B1/fixture) C (whole-system cost) == the chosen candidate's own "
@@ -510,6 +524,54 @@ def t_live_endpoints(client) -> None:
               "in the response flags (2N.1 — a capped array is never silent)",
               any("budget_too_low" in f for f in (resp1.get("flags") or [])),
               str(resp1.get("flags")))
+
+
+# ── AGREE/tou: the 3.12 pricing fault, on the live time-of-use job ───────────
+# One job, one stored tariff, one minute — and pre-fix, two different systems:
+# the solar endpoint priced self-consumption at the DEFAULT scalar ($0.40,
+# because a stored TOU tariff has import_rate NULL) while the battery
+# endpoint's internal solar run priced it at sum(rate_24)/24. F152's family:
+# one input meaning two things across two endpoints, nothing comparing them.
+# This check IS the comparison. It needs no synthetic fixture and no economic
+# battery — it depends only on both endpoints receiving the same price vector.
+TOU_JOB = "a57e13f1-24f2-48e3-b816-8a08cb6b2fed"
+
+
+def t_agree_live(client) -> None:
+    print("\nAGREE. one live TOU job, both endpoints, the SAME chosen solar")
+    owner = (client.table("jobs").select("company_id")
+             .eq("job_id", TOU_JOB).limit(1).execute())
+    company_id = (owner.data or [{}])[0].get("company_id")
+    caller = auth.Caller(user_id="gate-runner", email="gate@example.com",
+                        company_id=company_id, role="owner")
+
+    sol, _ = _run_endpoint(sizing_route.optimise_sizing,
+                           sizing_route.OptimiseRequest(job_id=TOU_JOB), caller)
+    bat, _ = _run_endpoint(sizing_route.battery_sizing,
+                           sizing_route.BatteryRequest(job_id=TOU_JOB), caller)
+    opt = sol.get("optimal") or {}
+    cs = bat.get("chosen_solar") or {}
+    print(f"        solar endpoint : {opt.get('solar_kw')} kW  "
+          f"${opt.get('system_cost')}")
+    print(f"        battery's solar: {cs.get('solar_kw')} kW  "
+          f"${cs.get('system_cost_solar_only')}")
+    check("(AGREE/tou) the job's stored tariff is genuinely TOU — the case "
+          "can bite (a flat tariff here would make this the control twice)",
+          (sol.get("assumptions") or {}).get("tariff_type") == "tou",
+          repr((sol.get("assumptions") or {}).get("tariff_type")))
+    # WHY IT MOVES: pre-3.12 the two endpoints price solar with two different
+    # scalars, so on this TOU job they choose different systems (observed live
+    # 2026-08-20: 11.44 kW vs 9.24 kW).
+    check("(AGREE/tou) both endpoints choose the SAME solar_kw on the same "
+          "job with the same stored inputs",
+          opt.get("solar_kw") is not None
+          and opt.get("solar_kw") == cs.get("solar_kw"),
+          f"solar endpoint {opt.get('solar_kw')} kW vs battery endpoint "
+          f"{cs.get('solar_kw')} kW")
+    check("(AGREE/tou) ...and the SAME solar-only system_cost",
+          opt.get("system_cost") is not None
+          and opt.get("system_cost") == cs.get("system_cost_solar_only"),
+          f"${opt.get('system_cost')} vs ${cs.get('system_cost_solar_only')}")
 
 
 # ── B3: F142 — five window shapes through _build_rate_24 directly ────────────
@@ -740,6 +802,7 @@ def main() -> int:
     t_b1_fixture()
     if client is not None:
         t_live_endpoints(client)
+        t_agree_live(client)
     t_b3()
     t_b4()
     t_b5()
