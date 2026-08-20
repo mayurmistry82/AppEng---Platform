@@ -4655,3 +4655,24 @@ export function batteryRunResult(response: unknown): BatteryRunResult {
     engineFlags,
   };
 }
+
+// ── Run progress (checklist 3.13 prompt 2b) ──────────────────────────────────
+
+/**
+ * The live elapsed label the RunProgress indicator ticks: "0s", "47s",
+ * "1m 04s", "2m 31s". Seconds are zero-padded only when minutes are shown.
+ *
+ * Total: never throws for ANY input — negative, NaN, Infinity and non-numbers
+ * all yield "0s". It lives in lib, not the component, so the node suite can
+ * test it; the component holds no formatting logic.
+ */
+export function elapsedLabel(ms: number): string {
+  const totalSeconds =
+    typeof ms === "number" && Number.isFinite(ms) && ms > 0
+      ? Math.floor(ms / 1000)
+      : 0;
+  const minutes = Math.floor(totalSeconds / 60);
+  const seconds = totalSeconds % 60;
+  if (minutes === 0) return `${seconds}s`;
+  return `${minutes}m ${String(seconds).padStart(2, "0")}s`;
+}

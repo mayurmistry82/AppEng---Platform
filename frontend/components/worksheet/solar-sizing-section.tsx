@@ -5,6 +5,7 @@ import Link from "next/link";
 import { useRouter } from "next/navigation";
 import { Button } from "@/components/ui/button";
 import { Notice } from "@/components/ui/notice";
+import { RunProgress } from "@/components/ui/run-progress";
 import { NoticeStack } from "@/components/ui/notice-stack";
 import {
   Table,
@@ -65,6 +66,10 @@ export function SolarSizingSection({
 }) {
   const router = useRouter();
   const [running, setRunning] = React.useState(false);
+  // 3.13 prompt 2b: when the in-flight run began, for the live elapsed
+  // counter. Cleared in the same finally that clears `running`, so the
+  // indicator can never be left ticking after a failure.
+  const [startedAt, setStartedAt] = React.useState<number | null>(null);
   // "keep" is only offered when canPin (path pins AND a size was recorded).
   const [mode, setMode] = React.useState<"keep" | "reoptimise">(
     view.canPin ? "keep" : "reoptimise",
@@ -79,6 +84,7 @@ export function SolarSizingSection({
   async function run() {
     if (running) return;
     setRunning(true);
+    setStartedAt(Date.now());
     setActionError(null);
     try {
       // THE WHOLE BODY. Nothing stored on the job travels from the browser.
@@ -109,6 +115,7 @@ export function SolarSizingSection({
       if (parsed.ok) router.refresh(); // the tick + results bar read the new row
     } finally {
       setRunning(false);
+      setStartedAt(null);
     }
   }
 
@@ -275,9 +282,7 @@ export function SolarSizingSection({
           {running ? "Sizing…" : "Size the solar"}
         </Button>
         {running ? (
-          <span className="text-caption text-muted-foreground">
-            Running — this takes a few seconds
-          </span>
+          <RunProgress startedAt={startedAt} />
         ) : view.alreadySized && !result && !keptResult ? (
           <span className="text-caption text-muted-foreground">
             Already sized{view.storedSolarKw !== null ? ` — ${view.storedSolarKw} kW stored` : ""}. Running again replaces the stored result.

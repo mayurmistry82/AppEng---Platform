@@ -5,6 +5,7 @@ import Link from "next/link";
 import { useRouter } from "next/navigation";
 import { Button } from "@/components/ui/button";
 import { Notice } from "@/components/ui/notice";
+import { RunProgress } from "@/components/ui/run-progress";
 import { NoticeStack } from "@/components/ui/notice-stack";
 import {
   Table,
@@ -85,6 +86,10 @@ export function BatterySizingSection({
 }) {
   const router = useRouter();
   const [running, setRunning] = React.useState(false);
+  // 3.13 prompt 2b: when the in-flight run began, for the live elapsed
+  // counter. Cleared in the same finally that clears `running`, so the
+  // indicator can never be left ticking after a failure.
+  const [startedAt, setStartedAt] = React.useState<number | null>(null);
   const [result, setResult] = React.useState<BatteryRunResult | null>(null);
   const [runNotices, setRunNotices] = React.useState<readonly RoofNoticeView[]>([]);
   const [actionError, setActionError] = React.useState<
@@ -94,6 +99,7 @@ export function BatterySizingSection({
   async function run() {
     if (running) return;
     setRunning(true);
+    setStartedAt(Date.now());
     setActionError(null);
     try {
       // THE WHOLE BODY. Nothing stored on the job travels from the browser.
@@ -113,6 +119,7 @@ export function BatterySizingSection({
       if (parsed.ok) router.refresh(); // the tick + results bar read the new row
     } finally {
       setRunning(false);
+      setStartedAt(null);
     }
   }
 
@@ -277,8 +284,15 @@ export function BatterySizingSection({
           {running ? "Sizing…" : "Size the system"}
         </Button>
         {running ? (
-          <span className="text-caption text-muted-foreground">
-            Running — this takes a few seconds
+          <span className="flex flex-col gap-1">
+            <RunProgress startedAt={startedAt} />
+            {/* The one honest sentence — this button runs the full-year
+                dispatch (D35). The live counter above is the caption; no
+                fixed duration promise anywhere. */}
+            <span className="text-caption text-muted-foreground">
+              A full-year run checks all 365 days and can take a minute or
+              two.
+            </span>
           </span>
         ) : view.alreadySized && !result ? (
           // NOT "running again replaces the stored result" — the run log has

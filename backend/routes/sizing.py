@@ -1145,7 +1145,10 @@ class BatteryRequest(BaseModel):
     objective: Optional[str] = None
     custom_weight: Optional[float] = None
     budget: Optional[float] = None
-    resolution: str = "representative_days"
+    # 3.13 prompt 2b (D35): the full-year dispatch is the default. The
+    # representative-day shortcut stays callable but nothing selects it
+    # automatically — no timeout, no size threshold, no retry downgrade.
+    resolution: str = "full_year"
     # Optional installer constraints (additive; absent/empty ⇒ behaves exactly as today)
     constraints: Optional[dict] = None
 
@@ -1582,16 +1585,19 @@ async def battery_sizing(
         # 3.11 — same object into the row and the response; see optimise_sizing.
         roof_conf = _roof_confidence(roof, flags)
 
-        # ── 3.13 prompt 2 (C): THE TWO-ENGINE AGREEMENT, asserted in code.
-        # The no-battery baseline's grid_cost and the chosen solar's
-        # annual_bill_after are two computations of the same year's ENERGY
-        # bill for the same chosen solar, by two different engines — the only
-        # place the suite compares their arithmetic against each other.
-        # annual_bill_after has carried the daily supply charge since 3.13
-        # prompt 1, and grid_cost never has, so the KNOWN charge is removed
-        # before comparing — otherwise the check would flag every job whose
-        # tariff states a charge, about a difference that is not the engines'.
-        # A disagreement names BOTH numbers and the run persists anyway. ──
+        # ── 3.13 prompt 2 (C), reworded by prompt 2b: THE DISPATCH RESOLUTION
+        # METER. The no-battery baseline's grid_cost and the chosen solar's
+        # energy-only annual bill are two computations of the same year's
+        # ENERGY bill for the same chosen solar, by two different engines —
+        # the only place the suite compares their arithmetic against each
+        # other. On full_year (365 real daily blocks) the two sum the same
+        # hours and must agree to the cent; on representative_days the gap IS
+        # the averaging error, a measurement worth naming, not a fault
+        # (observed $30.20 on $807.10 on the fixture job). annual_bill_after
+        # has carried the daily supply charge since prompt 1 and grid_cost
+        # never has, so the KNOWN charge is removed before comparing. Any
+        # divergence still fires loudly, naming both numbers AND the mode
+        # that produced them, and the run persists anyway. ──
         _baseline_grid_cost = (result.get("no_battery_baseline") or {}).get("grid_cost")
         _bill_after = chosen_solar.get("annual_bill_after")
         _energy_after = (
@@ -1605,10 +1611,10 @@ async def battery_sizing(
             and abs(_baseline_grid_cost - _energy_after) > 0.01
         ):
             flags.append(
-                f"engine_disagreement — the battery engine's no-battery baseline "
-                f"prices the chosen solar's year at ${_baseline_grid_cost:,.2f} "
-                f"while the solar engine's energy-only bill is "
-                f"${_energy_after:,.2f}"
+                f"dispatch_resolution_gap — under {result.get('resolution')!r} "
+                f"the battery engine's no-battery baseline prices the chosen "
+                f"solar's year at ${_baseline_grid_cost:,.2f} while the solar "
+                f"engine's energy-only bill is ${_energy_after:,.2f}"
             )
 
         # ── Persist chosen solar + battery to sizing_results ──

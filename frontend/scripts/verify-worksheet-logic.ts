@@ -77,6 +77,7 @@ import {
   BATTERY_SIZING_REQUEST_KEYS,
   batteryRunNotices,
   batteryRunResult,
+  elapsedLabel,
   batterySizingView,
   sizingRunNotices,
   equipmentSaveNotices,
@@ -5847,4 +5848,31 @@ test("2026-08-20 (2nd): ONE RULE — the predicate and energyDataView cannot dis
       `predicate vs rule: ${JSON.stringify(shape)}`,
     );
   }
+});
+
+// ── elapsedLabel (checklist 3.13 prompt 2b) ──────────────────────────────────
+
+test("elapsedLabel: the documented shape — seconds bare, minutes zero-pad the seconds", () => {
+  assert.equal(elapsedLabel(0), "0s");
+  assert.equal(elapsedLabel(999), "0s"); // floor, not round — a second is a second only once it has elapsed
+  assert.equal(elapsedLabel(1000), "1s");
+  assert.equal(elapsedLabel(47_000), "47s");
+  assert.equal(elapsedLabel(59_000), "59s");
+  assert.equal(elapsedLabel(60_000), "1m 00s");
+  assert.equal(elapsedLabel(61_000), "1m 01s");
+  assert.equal(elapsedLabel(64_000), "1m 04s");
+  assert.equal(elapsedLabel(151_000), "2m 31s");
+  assert.equal(elapsedLabel(3_599_000), "59m 59s");
+  assert.equal(elapsedLabel(3_600_000), "60m 00s");
+});
+
+test("elapsedLabel: total — junk never throws, everything junk is '0s'", () => {
+  assert.equal(elapsedLabel(-1), "0s");
+  assert.equal(elapsedLabel(-999_999), "0s");
+  assert.equal(elapsedLabel(Number.NaN), "0s");
+  assert.equal(elapsedLabel(Number.POSITIVE_INFINITY), "0s");
+  assert.equal(elapsedLabel(Number.NEGATIVE_INFINITY), "0s");
+  assert.equal(elapsedLabel(null as unknown as number), "0s");
+  assert.equal(elapsedLabel(undefined as unknown as number), "0s");
+  assert.equal(elapsedLabel("47" as unknown as number), "0s");
 });

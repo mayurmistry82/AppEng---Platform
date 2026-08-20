@@ -735,6 +735,14 @@ def t_r7(client) -> dict:
               and bat.get("financial_persisted") is True,
               f"{sol.get('financial_persisted')!r} / "
               f"{bat.get('financial_persisted')!r}")
+        check("(P10/R7) the battery run reports resolution 'full_year' in "
+              "the response and in assumptions — the screen can always say "
+              "which mode produced a number",
+              bat.get("resolution") == "full_year"
+              and (bat.get("assumptions") or {}).get("resolution")
+              == "full_year",
+              f"{bat.get('resolution')!r} / "
+              f"{(bat.get('assumptions') or {}).get('resolution')!r}")
 
     sopts = sol_rec[0].get("evaluated_options") or {}
     bopts = bat_rec[0].get("evaluated_options") or {}
@@ -871,8 +879,11 @@ def t_p1(opt3: dict, ctx: dict) -> None:
     # solve_candidate, the solar's from net_config — then pinned to the
     # candidates' rounded figures so the reconstruction is provably the same
     # computation and not a lookalike.
+    # 3.13 prompt 2b: the SAME resolution the engine now defaults to — the
+    # candidates being verified were produced by the full-year dispatch, so
+    # the raw savings must be rebuilt on the same 365 real daily blocks.
     blocks = battery_optimiser.build_blocks(
-        ctx["s8760"], load, list(FIX_RATE_24), "representative_days")
+        ctx["s8760"], load, list(FIX_RATE_24), "full_year")
     base = battery_optimiser.baseline(blocks, FIX_FIT, FIX_EXPORT_LIMIT_KW)
     res = battery_optimiser.solve_candidate(blocks, bat, FIX_FIT,
                                             FIX_EXPORT_LIMIT_KW)
@@ -1223,6 +1234,51 @@ def t_p7() -> None:
           head2.get("payback_years") is None, repr(head2.get("payback_years")))
 
 
+def t_p10_full_year_blocks() -> None:
+    """3.13 prompt 2b (D35): full_year is 365 REAL daily blocks, day-cyclic by
+    construction. WHY THESE MOVE: the pre-2b branch returned ONE 8,760-step
+    block, which made state of charge cyclic over the YEAR and let the solver
+    bank summer energy into winter — every check below fails against that
+    shape on the block count alone."""
+    print("\nP10. build_blocks('full_year') — 365 real days, no averaging, "
+          "and the default")
+    s = [float(h % 24) for h in range(8760)]
+    ld = [1.0] * 8760
+    blocks = battery_optimiser.build_blocks(s, ld, [0.4] * 24, "full_year")
+    check("(P10) 365 blocks of 24 steps, every weight 1.0 — never one "
+          "year-cyclic block",
+          len(blocks) == 365
+          and all(b["steps"] == 24 and b["weight"] == 1.0 for b in blocks),
+          f"{len(blocks)} blocks")
+    flat = [v for b in blocks for v in b["solar"]]
+    check("(P10) the blocks carry the REAL hours in calendar order — "
+          "concatenating them reproduces the input series exactly, no "
+          "averaging",
+          flat == s, f"first mismatch at "
+          f"{next((i for i, (a, b) in enumerate(zip(flat, s)) if a != b), None)}")
+    check("(P10) each block's rate is the 24-hour vector",
+          all(b["rate"] == [0.4] * 24 for b in blocks), "")
+    # A short series: whole days only, flagged, never padded (padding invents
+    # nights) and never silently truncated.
+    fl: list[str] = []
+    short = battery_optimiser.build_blocks(s[:2500], ld[:2500], [0.4] * 24,
+                                           "full_year", fl)
+    check("(P10) a 2,500-hour series yields 104 WHOLE days and a flag — "
+          "no zero-padding, no silent truncation",
+          len(short) == 104
+          and any("shorter than a year" in f for f in fl),
+          f"{len(short)} blocks; flags={fl}")
+    check("(P10) the default resolution IS full_year on both the engine and "
+          "the request model — hard mode is the default, the shortcut is "
+          "never auto-selected",
+          battery_optimiser.optimise_battery.__kwdefaults__.get("resolution")
+          == "full_year"
+          and sizing_route.BatteryRequest.model_fields["resolution"].default
+          == "full_year",
+          f"engine={battery_optimiser.optimise_battery.__kwdefaults__.get('resolution')!r} "
+          f"request={sizing_route.BatteryRequest.model_fields['resolution'].default!r}")
+
+
 def t_p8_resolver() -> None:
     print("\nP8. supply_charge_source at the resolver — the exact fixture "
           "case that was wrong")
@@ -1266,6 +1322,7 @@ def main() -> int:
     t_p5_p6()
     t_p7()
     t_p8_resolver()
+    t_p10_full_year_blocks()
 
     client = sizing_route._sb()
     if client is None:

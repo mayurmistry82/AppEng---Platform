@@ -112,18 +112,57 @@ def _tile(rate_24: list[float], steps: int) -> list[float]:
 
 
 def build_blocks(
-    solar_8760: list[float], load_8760: list[float], rate_24: list[float], resolution: str
+    solar_8760: list[float], load_8760: list[float], rate_24: list[float], resolution: str,
+    flags: Optional[list[str]] = None,
 ) -> list[dict]:
     """
     Representative days: 12 monthly typical days (hour-of-day averages), weighted by days in
-    month → captures seasonal solar variation, tractable LP. Full year: one 8,760 block.
-    Each block has its own cyclic SoC.
+    month → captures seasonal solar variation, tractable LP.
+
+    Full year (3.13 prompt 2b, D35 — the default): 365 REAL daily blocks of 24 steps each,
+    calendar order, no averaging, each weight 1.0. solve_candidate makes state of charge
+    cyclic WITHIN a block, so a daily block enforces the one physical rule a home battery
+    lives by: it fills by day, empties by evening, and starts tomorrow where it started
+    today. The single 8,760-step block this branch used to return is DELETED rather than
+    kept as a third mode: it made state of charge cyclic over the YEAR, which let the
+    solver charge in summer, hold for months, and discharge in winter — seasonal energy
+    banking no home battery can do — and every figure it produced was optimistic with
+    nothing on screen looking odd. Each block still has its own cyclic SoC; the LP itself
+    is unchanged.
+
+    A series that is not 8,760 hours long is never padded (padding invents nights) and
+    never silently truncated: the honest set of WHOLE days is built and the shortfall is
+    flagged via `flags` when the caller passed a list.
     """
     if resolution == "full_year":
-        return [{
-            "solar": list(solar_8760), "load": list(load_8760),
-            "rate": _tile(rate_24, len(solar_8760)), "weight": 1.0, "steps": len(solar_8760),
-        }]
+        # The same _DAYS_2019 month lengths the representative branch walks, so both
+        # paths agree on what a year is: 31+28+...+31 = 365 days, 365 × 24 = 8,760.
+        assert sum(_DAYS_2019) == 365 and sum(_DAYS_2019) * 24 == 8760
+        n_hours = min(len(solar_8760), len(load_8760))
+        n_days = n_hours // 24
+        if n_days > 365:
+            n_days = 365
+        if n_days < 365 and flags is not None:
+            flags.append(
+                f"dispatch series shorter than a year — {n_days} whole days "
+                "dispatched, the rest of the year has no data — is_fallback"
+            )
+        blocks: list[dict] = []
+        d = 0
+        for month_days in _DAYS_2019:
+            for _ in range(month_days):
+                if d >= n_days:
+                    break
+                h = d * 24
+                blocks.append({
+                    "solar": list(solar_8760[h:h + 24]),
+                    "load": list(load_8760[h:h + 24]),
+                    "rate": list(rate_24),
+                    "weight": 1.0,
+                    "steps": 24,
+                })
+                d += 1
+        return blocks
     blocks: list[dict] = []
     h = 0
     for days in _DAYS_2019:
@@ -275,7 +314,11 @@ def optimise_battery(
     objective: str,
     custom_weight: float = 0.5,
     budget: Optional[float] = None,
-    resolution: str = "representative_days",
+    # 3.13 prompt 2b (D35): hard mode IS the default — all 365 real days.
+    # The representative-day shortcut stays available but is NEVER selected
+    # automatically by any code path; if hard mode ever proves unusable the
+    # switch back is Mayur's deliberate call, not a quiet downgrade.
+    resolution: str = "full_year",
     fix_battery_kwh: Optional[float] = None,
     force_no_battery: bool = False,
     flags: Optional[list[str]] = None,
@@ -301,7 +344,7 @@ def optimise_battery(
             flags.append(f"Pinned battery size {fix_battery_kwh} kWh: no catalogue battery has a usable capacity — only the no-battery option was evaluated.")
             battery_rows = []
 
-    blocks = build_blocks(solar_8760, load_8760, rate_24, resolution)
+    blocks = build_blocks(solar_8760, load_8760, rate_24, resolution, flags)
     base = baseline(blocks, fit, export_limit_kw)
     total_load = base["load"]
     base_self_suff = round((total_load - base["import"]) / total_load * 100, 2) if total_load > 0 else 0.0
