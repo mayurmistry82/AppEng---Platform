@@ -18,6 +18,7 @@ import {
   SECTIONS,
   clampResultsBarHeight,
   currentSizingResult,
+  storedLoadProfile,
   groupSectionsByPhase,
   jobBarView,
   parseResultsBarPreference,
@@ -34,6 +35,7 @@ import {
   TILE_IMG_SCALE,
   TILE_W,
   FLAT_PROFILE_TOLERANCE,
+  EMPTY_SURVEY_ANSWERS,
   SURVEY_OPTIONS,
   WEIGHT_SUM_TOLERANCE,
   formatAnnualKwh,
@@ -72,6 +74,11 @@ import {
   solarRunNotices,
   solarRunResult,
   solarSizingView,
+  BATTERY_SIZING_REQUEST_KEYS,
+  batteryRunNotices,
+  batteryRunResult,
+  batterySizingView,
+  sizingRunNotices,
   equipmentSaveNotices,
   equipmentSpecsView,
   OBJECTIVE_OPTIONS,
@@ -258,6 +265,11 @@ test("all predicates true: 11 complete, phases all done", () => {
     electrical_phase: "single",
     roof_geometry: [{ created_at: "2026-08-01T00:00:00Z", found: true, planes: [{ panel_count: 12 }] }],
     bills: [{ bill_id: "b1" }],
+    // A parsed bill writes a load_profiles row; Energy data now ticks on the
+    // LOAD the engine could use, not on the bill row's mere existence
+    // (2026-08-20). Without this the fixture describes a job that can never be
+    // sized, which was never what these tests were about.
+    load_profiles: [{ annual_kwh: 5500, created_at: "2026-08-01T00:00:00Z" }],
     tariffs: [{ tariff_id: "t1" }],
     sizing_results: [{ solar_kw: 6.6, battery_kwh: 12.8 }],
     financial_results: [{ payback_years: 4.2 }],
@@ -607,6 +619,11 @@ test("phaseStates: path E Optimise holds 3 sections, none of them solar-sizing",
     dwelling_type: "house",
     electrical_phase: "single",
     bills: [{ bill_id: "b1" }],
+    // A parsed bill writes a load_profiles row; Energy data now ticks on the
+    // LOAD the engine could use, not on the bill row's mere existence
+    // (2026-08-20). Without this the fixture describes a job that can never be
+    // sized, which was never what these tests were about.
+    load_profiles: [{ annual_kwh: 5500, created_at: "2026-08-01T00:00:00Z" }],
     tariffs: [{ tariff_id: "t1" }],
   });
   const phases = phaseStates(job);
@@ -2290,6 +2307,11 @@ test("D5 check 4: every GATING section keeps today's behaviour exactly", () => {
 test("D5 check 5: all gating complete + Site details empty -> unlocked, NOT complete", () => {
   const allDone = liveShapedJob({
     bills: [{ bill_id: "b1" }],
+    // A parsed bill writes a load_profiles row; Energy data now ticks on the
+    // LOAD the engine could use, not on the bill row's mere existence
+    // (2026-08-20). Without this the fixture describes a job that can never be
+    // sized, which was never what these tests were about.
+    load_profiles: [{ annual_kwh: 5500, created_at: "2026-08-01T00:00:00Z" }],
     tariffs: [{ tariff_id: "t1" }],
     sizing_results: [{ solar_kw: 6.6, battery_kwh: 10 }],
     financial_results: [{ payback_years: 7 }],
@@ -4104,6 +4126,11 @@ test("3.9 (1c): the active section MOVES when an objective lands — the newly o
     dwelling_type: "house",
     electrical_phase: "single",
     bills: [{ bill_id: "b1" }],
+    // A parsed bill writes a load_profiles row; Energy data now ticks on the
+    // LOAD the engine could use, not on the bill row's mere existence
+    // (2026-08-20). Without this the fixture describes a job that can never be
+    // sized, which was never what these tests were about.
+    load_profiles: [{ annual_kwh: 5500, created_at: "2026-08-01T00:00:00Z" }],
     tariffs: [{ tariff_id: "t1" }],
   });
   const before = sectionStates(base).filter((s) => s.state === "active");
@@ -4527,7 +4554,7 @@ test("3.10 (5a): CUSTOM_EQUIPMENT_FIELDS — three kinds, complete rows, no dupl
 test("3.10 (5b): customUnitNotices across the response shapes", () => {
   // Assumptions only.
   const withAssumptions = customUnitNotices({
-    id: "x", engine_assumptions: ["Acme AX1: warranty_cycles missing — assumed 6000 cycles for replacement modelling."],
+    id: "x", engine_assumptions: ["Acme AX1: warranty cycles missing — assumed 6000 cycles for replacement modelling."],
     duplicates: [], flags: [],
   });
   assert.ok(withAssumptions.some((n) => n.tone === "caution" && n.level === "notice"));
@@ -4960,4 +4987,864 @@ test("3.11b: the Results section rule is DELIBERATELY unchanged — financial ex
   assert.equal(completeOf("results", job), true,
     "existence only — linkage to the current sizing run lands with prompt 2 + 3.13");
   assert.equal(completeOf("results", emptyJob()), false);
+});
+
+// ── 3.12: Battery sizing ─────────────────────────────────────────────────────
+
+/** A full battery response, shaped exactly as routes/sizing.py returns one. */
+const BATTERY_RESPONSE = {
+  optimal_battery: {
+    battery_id: "b1", model: "Sungrow SBH200", usable_kwh: 20,
+    annual_savings_vs_solar_only: 2000, self_sufficiency_pct: 72.35,
+    cycles_per_year: 180, peak_import_reduction_kw: 3.2,
+    battery_cost: 9571.84, incremental_payback_years: 4.79,
+    incremental_npv: 87561.15, grid_cost: 400, annual_import_kwh: 3800,
+    annual_export_kwh: 900, annual_discharge_kwh: 3600, replacement_year: null,
+    round_trip_efficiency: 0.96, depth_of_discharge: 1, system_cost: 16819.84,
+  },
+  chosen_solar: {
+    solar_kw: 10.56, annual_generation_kwh: 17176.1,
+    system_cost_solar_only: 7248, plane_indices: [0],
+  },
+  candidates: [
+    {
+      // THE BASELINE — no battery_id, no annual_discharge_kwh, no
+      // round_trip_efficiency, no depth_of_discharge. All four absent.
+      usable_kwh: 0, model: "No battery", annual_savings_vs_solar_only: 0,
+      self_sufficiency_pct: 41.2, cycles_per_year: 0,
+      peak_import_reduction_kw: 0, battery_cost: 0,
+      incremental_payback_years: null, incremental_npv: 0, grid_cost: 2400,
+      annual_import_kwh: 6100, annual_export_kwh: 4200, replacement_year: null,
+      system_cost: 7248,
+    },
+    {
+      battery_id: "b1", model: "Sungrow SBH200", usable_kwh: 20,
+      self_sufficiency_pct: 72.35, battery_cost: 9571.84,
+      incremental_payback_years: 4.79, incremental_npv: 87561.15,
+      system_cost: 16819.84,
+    },
+  ],
+  not_economic_reason: null,
+  flags: ["Sungrow SBH200: warranty cycles missing — assumed 6000 cycles for replacement modelling."],
+};
+
+test("3.12: batterySizingView across the six paths — batteryMode from PATH_RULES, never re-derived", () => {
+  const modes: Record<string, string | null> = {};
+  for (const path of ["A", "B", "C", "D", "E", "F"]) {
+    modes[path] = batterySizingView(emptyJob({ path })).batteryMode;
+  }
+  assert.deepEqual(modes, {
+    A: "none", B: "size", C: "size", D: "size", E: "size", F: "none",
+  });
+  // A and F HIDE the section entirely — the view still answers, the section
+  // list is what omits it (sectionsForPath), and the two must agree.
+  for (const hidden of ["A", "F"]) {
+    assert.ok(
+      !sectionsForPath(hidden).some((s) => s.id === "battery-sizing"),
+      `path ${hidden} must not show Battery sizing`,
+    );
+  }
+  for (const shown of ["B", "C", "D", "E"]) {
+    assert.ok(
+      sectionsForPath(shown).some((s) => s.id === "battery-sizing"),
+      `path ${shown} must show Battery sizing`,
+    );
+  }
+  // An unknown or missing path degrades to null AND still SHOWS the section —
+  // never hide a step because the path could not be determined.
+  assert.equal(batterySizingView(emptyJob({ path: null })).batteryMode, null);
+  assert.equal(batterySizingView(emptyJob({ path: "Z" })).batteryMode, null);
+  for (const unknown of [null, "Z"]) {
+    assert.ok(
+      sectionsForPath(unknown).some((s) => s.id === "battery-sizing"),
+      `an unknown path (${String(unknown)}) must still show Battery sizing`,
+    );
+  }
+  // Total for any input.
+  for (const junk of [null, undefined, "x", 42, [], {}]) {
+    assert.doesNotThrow(() => batterySizingView(junk));
+    assert.equal(batterySizingView(junk).alreadySized, false);
+  }
+});
+
+test("3.12: batterySizingView agrees with the SECTIONS predicate on the SAME job", () => {
+  // One rule, two readers. If these ever disagree, one of them re-derived it.
+  const jobs: JobDetailLike[] = [
+    emptyJob(),
+    emptyJob({ sizing_results: [{ solar_kw: 10.12, battery_kwh: null }] }),
+    emptyJob({ sizing_results: [{ solar_kw: 10.12, battery_kwh: 13.5 }] }),
+    emptyJob({ sizing_results: [{ solar_kw: 10.12, battery_kwh: 0 }] }),
+  ];
+  for (const job of jobs) {
+    assert.equal(
+      batterySizingView(job).alreadySized,
+      completeOf("battery-sizing", job),
+      JSON.stringify(job.sizing_results),
+    );
+  }
+  // battery_kwh 0 is a REAL answer ("no battery was worth it"), not absence.
+  const zero = emptyJob({ sizing_results: [{ solar_kw: 10.12, battery_kwh: 0 }] });
+  assert.equal(batterySizingView(zero).storedBatteryKwh, 0);
+  assert.equal(batterySizingView(zero).alreadySized, true);
+});
+
+test("3.12: the honest un-tick — array order REVERSED, a battery run superseded by solar-only", () => {
+  // Array order is deliberately the REVERSE of created_at: the older,
+  // battery-bearing row is LAST. A last-element reader would report 13.5 kWh
+  // stored and tick the section; the newest-by-created_at rule reports neither.
+  const job = emptyJob({
+    sizing_results: [NEWER_SOLAR_ONLY, OLDER_WITH_BATTERY],
+  });
+  const view = batterySizingView(job);
+  assert.equal(view.storedBatteryKwh, null,
+    "the superseded battery run is not the current recommendation");
+  assert.equal(view.alreadySized, false);
+  assert.equal(completeOf("battery-sizing", job), false);
+  // The mirror case: the same two rows with the battery run newest.
+  const battNewest = emptyJob({
+    sizing_results: [
+      { ...OLDER_WITH_BATTERY, created_at: "2026-08-19T06:00:00Z" },
+      { ...NEWER_SOLAR_ONLY, created_at: "2026-08-19T05:00:00Z" },
+    ],
+  });
+  assert.equal(batterySizingView(battNewest).storedBatteryKwh, 13.5);
+  assert.equal(batterySizingView(battNewest).alreadySized, true);
+  assert.equal(completeOf("battery-sizing", battNewest), true);
+});
+
+test("3.12: batteryRunResult — a full result, whole-system cost from the candidate's own key", () => {
+  const r = batteryRunResult(BATTERY_RESPONSE);
+  assert.equal(r.ok, true);
+  assert.equal(r.noBattery, false);
+  assert.equal(r.headline?.model, "Sungrow SBH200");
+  assert.equal(r.headline?.usableKwh, "20 kWh");
+  assert.equal(r.headline?.batteryCost, "$9,572");       // incremental, whole dollars
+  assert.equal(r.headline?.systemCost, "$16,820");        // the WHOLE system
+  assert.equal(r.headline?.payback, "4.8 yr");
+  assert.equal(r.headline?.npv, "$87,561");
+  assert.equal(r.headline?.selfSufficiencyPct, "72.3%");  // 72.35 is 72.349…
+  // The solar THIS run chose travels too — the endpoint sizes both halves.
+  assert.equal(r.chosenSolar?.solarKw, "10.6 kW");
+  assert.equal(r.chosenSolar?.annualGenerationKwh, "17,176 kWh");
+  assert.equal(r.chosenSolar?.systemCostSolarOnly, "$7,248");
+  // Options: baseline LABELLED, chosen marked, whole-system costs shown.
+  assert.equal(r.options.length, 2);
+  assert.equal(r.options[0].label, "No battery");
+  assert.equal(r.options[0].chosen, false);
+  assert.equal(r.options[0].systemCost, "$7,248");
+  assert.equal(r.options[1].label, "20 kWh");
+  assert.equal(r.options[1].chosen, true);
+  assert.equal(r.options[1].systemCost, "$16,820");
+  // The engine's flags travel VERBATIM.
+  assert.deepEqual(r.engineFlags, BATTERY_RESPONSE.flags);
+  assert.equal(r.notEconomicReason, null,
+    "a reason that is always present is not a signal");
+});
+
+test("3.12: batteryRunResult — no battery is a RESULT, and its reason is byte-for-byte the engine's", () => {
+  // The exact sentence prompt 1 put in the engine. Any rewording here would be
+  // the second copy F161 exists to prevent.
+  const REASON =
+    "every battery took the whole-system cost over the $12,033.92 budget " +
+    "(the cheapest solar-plus-battery system available was $12,774.77) — " +
+    "solar-only is recommended under this cap.";
+  const r = batteryRunResult({
+    ...BATTERY_RESPONSE,
+    optimal_battery: BATTERY_RESPONSE.candidates[0],
+    not_economic_reason: REASON,
+  });
+  assert.equal(r.ok, true, "no battery is a RESULT, never an error");
+  assert.equal(r.noBattery, true);
+  assert.equal(r.errorMessage, null, "not an error");
+  assert.equal(r.notEconomicReason, REASON, "verbatim — never paraphrased");
+  // The headline still exists and LABELS the outcome, never "0 kWh".
+  assert.equal(r.headline?.usableKwh, "No battery");
+  assert.equal(r.headline?.model, "No battery");
+});
+
+test("3.12: the baseline's four absent keys render as '—', never undefined/null/0/NaN", () => {
+  // A candidates list containing ONLY the baseline — the case where every
+  // absent key is the only thing on screen.
+  const r = batteryRunResult({
+    optimal_battery: BATTERY_RESPONSE.candidates[0],
+    chosen_solar: BATTERY_RESPONSE.chosen_solar,
+    candidates: [BATTERY_RESPONSE.candidates[0]],
+    not_economic_reason: "no battery beats solar-only on NPV — battery not economic for this job.",
+    flags: [],
+  });
+  assert.equal(r.options.length, 1);
+  const only = r.options[0];
+  assert.equal(only.label, "No battery");
+  assert.equal(only.model, "No battery");
+  assert.equal(only.payback, "no payback within the analysis period");
+  // Nothing anywhere in the rendered row may read as a raw JS absence.
+  for (const value of Object.values(only)) {
+    if (typeof value !== "string") continue;
+    for (const bad of ["undefined", "null", "NaN"]) {
+      assert.ok(!value.includes(bad), `"${value}" leaked ${bad}`);
+    }
+  }
+  // A candidate with the four keys genuinely missing AND no numbers at all:
+  // every figure falls back to the dash, never to a fabricated zero.
+  const bare = batteryRunResult({
+    optimal_battery: { usable_kwh: 0, model: "No battery" },
+    candidates: [{ usable_kwh: 0, model: "No battery" }],
+    flags: [],
+  });
+  assert.equal(bare.options[0].systemCost, "—");
+  assert.equal(bare.options[0].npv, "—");
+  assert.equal(bare.options[0].selfSufficiency, "—");
+  assert.equal(bare.headline?.batteryCost, "—");
+  assert.equal(bare.headline?.systemCost, "—");
+});
+
+test("3.12: batteryRunResult — needs_roof_input and error are BODY branches, not res.ok", () => {
+  // After change 1 the battery endpoint answers needs_roof_input, NOT
+  // needs_solar_result: it re-runs the solar step itself, so it can never need
+  // a stored solar result (D33).
+  const roofless = batteryRunResult({
+    needs_roof_input: true, flags: ["no_roof_geometry"],
+    error: null,
+  });
+  assert.equal(roofless.ok, false);
+  assert.equal(roofless.needsRoofInput, true);
+  assert.equal(roofless.errorMessage, null);
+  assert.equal(roofless.headline, null);
+  assert.deepEqual(roofless.engineFlags, ["no_roof_geometry"]);
+  // A 200 CARRYING error.
+  const errored = batteryRunResult({
+    error: "Internal error in the battery optimiser.",
+    flags: ["internal_error"],
+  });
+  assert.equal(errored.ok, false);
+  assert.equal(errored.errorMessage, "Internal error in the battery optimiser.");
+  assert.equal(errored.headline, null);
+  assert.equal(errored.noBattery, false, "an error is not a no-battery recommendation");
+});
+
+test("3.12: batteryRunResult — total for junk, including a candidates list of nulls", () => {
+  for (const junk of [null, undefined, "x", 42, [], {}]) {
+    const out = batteryRunResult(junk);
+    assert.equal(out.ok, false);
+    assert.equal(out.headline, null);
+    assert.equal(out.chosenSolar, null);
+    assert.ok(Array.isArray(out.options));
+    assert.deepEqual(out.options, []);
+    assert.equal(out.notEconomicReason, null);
+  }
+  // A candidates array containing nulls and junk: the readable rows survive,
+  // the unreadable ones are skipped, nothing throws.
+  const mixed = batteryRunResult({
+    optimal_battery: BATTERY_RESPONSE.optimal_battery,
+    chosen_solar: BATTERY_RESPONSE.chosen_solar,
+    candidates: [null, "nonsense", 42, BATTERY_RESPONSE.candidates[0], undefined,
+                 { model: "no usable_kwh here" }],
+    flags: null,
+  });
+  assert.equal(mixed.ok, true);
+  assert.equal(mixed.options.length, 1, "only the one readable candidate");
+  assert.equal(mixed.options[0].label, "No battery");
+  assert.deepEqual(mixed.engineFlags, [], "a non-array flags field yields none");
+});
+
+test("3.12: the notices are ONE function with two doors, not a copy", () => {
+  // Same input, same output, byte for byte — a copied D25 classification is
+  // exactly what D25 says must not exist.
+  const response = {
+    roof_confidence: {
+      roof_low_confidence: true,
+      roof_reason: "a roof face at 77° is too steep to be a roof",
+    },
+  };
+  assert.deepEqual(batteryRunNotices(response), solarRunNotices(response));
+  assert.deepEqual(batteryRunNotices(response), sizingRunNotices(response));
+  const roofNotice = batteryRunNotices(response).find((n) => n.level === "notice");
+  assert.ok(roofNotice, "a flagged roof must produce a level:notice here too");
+  assert.ok(roofNotice!.body.includes("too steep to be a roof"));
+  // Junk never throws through either door.
+  for (const junk of [null, undefined, "x", 42, []]) {
+    assert.doesNotThrow(() => batteryRunNotices(junk));
+    assert.deepEqual(batteryRunNotices(junk), solarRunNotices(junk));
+  }
+});
+
+test("3.12: BATTERY_SIZING_REQUEST_KEYS — the D29 restraint, held locally too", () => {
+  assert.deepEqual([...BATTERY_SIZING_REQUEST_KEYS].sort(), ["constraints", "job_id"]);
+  // The solar list plus the two this endpoint additionally accepts and which
+  // are ALSO stored on the job: the battery ids (3.10) and the tariff (3.8).
+  for (const forbidden of ["objective", "custom_weight", "budget",
+                           "equipment_panel_id", "equipment_inverter_id",
+                           "equipment_battery_id", "installer_id",
+                           "battery_ids", "tou_windows", "import_rates_24"]) {
+    assert.ok(!(BATTERY_SIZING_REQUEST_KEYS as readonly string[]).includes(forbidden),
+      `${forbidden} is stored on the job and must never travel from the browser`);
+  }
+});
+
+test("3.12: no within_budget is derived in the browser — the response has none", () => {
+  // The endpoint computes within_budget inside the WRITER, which only runs when
+  // a job_id is present, and never puts it in the response body. A second
+  // derivation here would be the copy 2R.1 forbids; the budget cause is
+  // carried honestly in not_economic_reason instead.
+  const r = batteryRunResult(BATTERY_RESPONSE);
+  assert.ok(!("withinBudget" in r), "no budget flag may be invented here");
+  assert.ok(!("budget" in r));
+  for (const key of Object.keys(r.headline ?? {})) {
+    assert.ok(!key.toLowerCase().includes("budget"), key);
+  }
+});
+
+// ── 2026-08-20: the Energy data tick vs the engine's load resolver ───────────
+//
+// FOUND ON SCREEN: the section ticked on `interval_data | bills | surveys`
+// being non-empty, while the engine resolves a load from
+// interval_data.parsed_series_ref or the load_profiles row. A typed annual
+// figure writes a load_profiles row and — the survey being optional — no
+// surveys row, so the section stayed incomplete forever and every gating
+// section after it stayed LOCKED. The section BODY read load_profiles; the
+// TICK did not. These shapes are the same seven the backend gate
+// (verify_demand_contract.py T13) pairs against the real _resolve_load, plus
+// the newest-row case (h) that a `.some(...)` rule would get wrong.
+
+const WEIGHTS_24 = Array.from({ length: 24 }, () => 1);
+
+function energyComplete(job: JobDetailLike): boolean | undefined {
+  return completeOf("energy-data", job);
+}
+
+test("2026-08-20: the seven paired shapes — the tick means 'the engine could get a load'", () => {
+  // (a) a typed annual figure ALONE ticks. THE REPORTED FAULT: this was false.
+  assert.equal(
+    energyComplete(emptyJob({
+      load_profiles: [{ annual_kwh: 8240, hourly_profile_weights: WEIGHTS_24,
+                        accuracy_tier: 1, created_at: "2026-08-20T00:00:00Z" }],
+    })),
+    true,
+    "a typed usage figure is a load the engine can size on — this is the fault",
+  );
+  // (b) annual_kwh null — the engine answers missing_load, so no tick.
+  assert.equal(
+    energyComplete(emptyJob({
+      load_profiles: [{ annual_kwh: null, hourly_profile_weights: WEIGHTS_24,
+                        accuracy_tier: 1, created_at: "2026-08-20T00:00:00Z" }],
+    })),
+    false,
+  );
+  // (c) annual_kwh 0 — the engine's `0 or ...` treats it as no figure too.
+  assert.equal(
+    energyComplete(emptyJob({
+      load_profiles: [{ annual_kwh: 0, hourly_profile_weights: WEIGHTS_24,
+                        accuracy_tier: 1, created_at: "2026-08-20T00:00:00Z" }],
+    })),
+    false,
+    "0 kWh is not a load — ticking here would promise what sizing cannot find",
+  );
+  // (d) an interval series with NO profile row — the profile write failed, and
+  // the engine still resolves a load from the parsed series. NOT redundant.
+  assert.equal(
+    energyComplete(emptyJob({
+      interval_data: [{ parsed_series_ref: "bills/interval/tok.series.json",
+                        created_at: "2026-08-20T00:00:00Z" }],
+    })),
+    true,
+  );
+  // (e) nothing at all.
+  assert.equal(energyComplete(emptyJob()), false);
+  // (f) and (g): a bill or a survey that produced NO profile has given the
+  // engine nothing — _resolve_load cannot read either table.
+  assert.equal(
+    energyComplete(emptyJob({ bills: [{ bill_id: "b1" }] })), false,
+    "a bill that produced no profile is not a load",
+  );
+  assert.equal(
+    energyComplete(emptyJob({ surveys: [{ survey_id: "s1" }] })), false,
+    "a survey that produced no profile is not a load",
+  );
+});
+
+test("2026-08-20: NEWEST row, not `.some(...)` — a superseded series ref does not tick", () => {
+  // _resolve_load reads interval_data with order(created_at, desc).limit(1),
+  // so a ref on a superseded row is not one the engine would use. Array order
+  // is the REVERSE of created_at, so a last-element reader cannot pass here by
+  // accident either.
+  const job = emptyJob({
+    interval_data: [
+      { parsed_series_ref: null, created_at: "2026-08-20T02:00:00Z" },
+      { parsed_series_ref: "bills/interval/old.series.json",
+        created_at: "2026-08-20T01:00:00Z" },
+    ],
+  });
+  assert.equal(energyComplete(job), false);
+  // The mirror: the NEWEST row carrying the ref does tick, same array order.
+  const newestHasRef = emptyJob({
+    interval_data: [
+      { parsed_series_ref: "bills/interval/new.series.json",
+        created_at: "2026-08-20T02:00:00Z" },
+      { parsed_series_ref: null, created_at: "2026-08-20T01:00:00Z" },
+    ],
+  });
+  assert.equal(energyComplete(newestHasRef), true);
+  // Same rule on load_profiles: the newest row's figure is the one that counts.
+  const supersededFigure = emptyJob({
+    load_profiles: [
+      { annual_kwh: null, created_at: "2026-08-20T02:00:00Z" },
+      { annual_kwh: 8240, created_at: "2026-08-20T01:00:00Z" },
+    ],
+  });
+  // Two rows, array order the reverse of created_at — the newest carries no
+  // figure, so the engine has none and the section must not tick.
+  assert.equal(energyComplete(supersededFigure), false,
+    "the newest profile carries no figure, so the engine has none");
+});
+
+test("2026-08-20: the predicate is TOTAL — hostile shapes yield false, never a throw", () => {
+  // A numeric STRING is legitimate PostgREST output and must be accepted.
+  assert.equal(
+    energyComplete(emptyJob({
+      load_profiles: [{ annual_kwh: "8240", created_at: "2026-08-20T00:00:00Z" }],
+    })),
+    true,
+    'PostgREST hands numerics back as strings — "8240" is a real figure',
+  );
+  // Everything that is not a finite positive number is not a figure.
+  for (const bad of [null, undefined, 0, -3, NaN, Infinity, -Infinity, "",
+                     "eight thousand", true, {}, []]) {
+    const job = emptyJob({
+      load_profiles: [{ annual_kwh: bad as never, created_at: "2026-08-20T00:00:00Z" }],
+    });
+    assert.doesNotThrow(() => energyComplete(job), `annual_kwh=${String(bad)}`);
+    assert.equal(energyComplete(job), false, `annual_kwh=${String(bad)} must not tick`);
+  }
+  // A ref that is not a non-empty string is not a series.
+  for (const bad of [null, undefined, "", 42, true, {}, []]) {
+    const job = emptyJob({
+      interval_data: [{ parsed_series_ref: bad as never, created_at: "2026-08-20T00:00:00Z" }],
+    });
+    assert.doesNotThrow(() => energyComplete(job));
+    assert.equal(energyComplete(job), false, `parsed_series_ref=${String(bad)}`);
+  }
+  // Whole-job junk: missing keys, wrong types, arrays of nulls.
+  const spec = SECTIONS.find((s) => s.id === "energy-data");
+  assert.ok(spec);
+  for (const junk of [{}, { load_profiles: null }, { load_profiles: "rows" },
+                      { load_profiles: [null, undefined, 42, "x"] },
+                      { interval_data: [null] },
+                      { load_profiles: [null], interval_data: "x" }]) {
+    assert.doesNotThrow(() => spec!.complete(unsafe<JobDetailLike>(junk)),
+      JSON.stringify(junk));
+    assert.equal(spec!.complete(unsafe<JobDetailLike>(junk)), false, JSON.stringify(junk));
+  }
+  // sectionStates keeps its own try/catch — belt and braces, both must hold.
+  for (const junk of [null, undefined, "garbage", 42, []]) {
+    assert.doesNotThrow(() => sectionStates(junk));
+  }
+});
+
+test("2026-08-20: THE USER-VISIBLE FAULT — a typed figure unlocks the sections after Energy data", () => {
+  // This is the assertion the whole change exists for. Before the fix, Energy
+  // data was "active" on this job and every gating section after it was
+  // "locked", so the job could never be worked.
+  const job = emptyJob({
+    path: "B",
+    load_profiles: [{ annual_kwh: 8240, hourly_profile_weights: WEIGHTS_24,
+                      accuracy_tier: 1, created_at: "2026-08-20T00:00:00Z" }],
+    roof_geometry: [{ created_at: "2026-08-20T00:00:00Z",
+                      planes: [{ panel_count: 12 }] }],
+  });
+  const states = new Map(sectionStates(job).map((s) => [s.id, s.state]));
+  assert.equal(states.get("energy-data"), "complete",
+    "the typed figure completes Energy data");
+  // Tariff & network is the next gating section and becomes ACTIVE — it was
+  // "locked" before the fix.
+  assert.equal(states.get("tariff-network"), "active",
+    "the next gating section must now be reachable");
+  // And NOTHING after it is locked-out by Energy data any more. Every section
+  // beyond the new active one is either locked for its OWN reason or unlocked;
+  // what must not happen is Energy data itself holding the gate.
+  assert.notEqual(states.get("energy-data"), "active");
+  assert.notEqual(states.get("energy-data"), "locked");
+
+  // THE CONTROL: the same job with the figure removed still locks, so this
+  // test is not passing because everything unlocks unconditionally.
+  const noFigure = emptyJob({
+    path: "B",
+    roof_geometry: [{ created_at: "2026-08-20T00:00:00Z",
+                      planes: [{ panel_count: 12 }] }],
+  });
+  const lockedStates = new Map(sectionStates(noFigure).map((s) => [s.id, s.state]));
+  assert.equal(lockedStates.get("energy-data"), "active");
+  assert.equal(lockedStates.get("tariff-network"), "locked",
+    "without a load the gate must still hold — otherwise the test proves nothing");
+});
+
+test("2026-08-20: the section BODY and the section TICK now read the same table", () => {
+  // The contradiction that was on screen: energyDataView reported the figure
+  // while the predicate reported incomplete. One job, both readers, agreeing.
+  const job = emptyJob({
+    load_profiles: [{ annual_kwh: 8240, daily_avg_kwh: 22.6,
+                      hourly_profile_weights: WEIGHTS_24, accuracy_tier: 1,
+                      created_at: "2026-08-20T00:00:00Z" }],
+  });
+  const view = energyDataView(job);
+  assert.equal(view.annualKwh, 8240, "the body reads the figure");
+  assert.equal(view.tier, 1);
+  assert.equal(energyComplete(job), true,
+    "and the tick agrees — the screen no longer contradicts itself");
+});
+
+// ── 2026-08-20 (second fault): the stored profile must render on REVISIT ─────
+//
+// FOUND ON SCREEN: `recorded` is set ONLY from the /api/load/characterise
+// response and never seeded from `view`, so on any reload the panel vanished
+// and the empty form came back reading "We cannot work out a profile without a
+// yearly total" — on a job whose load_profiles row exists and whose section
+// tick was correctly TRUE. The BODY and the TICK disagreed, in the opposite
+// direction to the fault fixed earlier the same day. Nobody saw it because the
+// section could never tick until today, so no one ever reloaded a job past it.
+//
+// THESE CHECKS RENDER THE REAL COMPONENT and read the real markup. A check that
+// reads the props it passed in cannot see a fault that happens on the way to
+// the screen (the F47 shape the LoadPreviewStrip harness above exists for).
+
+const renderEnergySection = await (async () => {
+  const { registerHooks } = await import("node:module");
+  const ts = (await import("typescript")).default;
+  const { readFileSync, existsSync } = await import("node:fs");
+  const { fileURLToPath, pathToFileURL } = await import("node:url");
+  const path = await import("node:path");
+
+  const root = path.dirname(path.dirname(fileURLToPath(import.meta.url)));
+  const exts = ["", ".tsx", ".ts", "/index.tsx", "/index.ts"];
+  // next/navigation's useRouter throws outside an app-router context. The stub
+  // is served from memory — no file is added to the repo for it — and it is
+  // INERT: refresh() does nothing, which is correct here because these checks
+  // never click anything.
+  const NAV_STUB = "file:///__verify__/next-navigation.js";
+
+  registerHooks({
+    resolve(specifier, context, nextResolve) {
+      if (specifier === "next/navigation") {
+        return { url: NAV_STUB, shortCircuit: true };
+      }
+      let target: string | null = null;
+      if (specifier.startsWith("@/")) {
+        target = path.join(root, specifier.slice(2));
+      } else if (specifier.startsWith(".") && context.parentURL?.startsWith("file:")) {
+        target = path.resolve(path.dirname(fileURLToPath(context.parentURL)), specifier);
+      }
+      if (target !== null) {
+        for (const ext of exts) {
+          if (existsSync(target + ext) && !existsSync(target + ext + "/")) {
+            return { url: pathToFileURL(target + ext).href, shortCircuit: true };
+          }
+        }
+      }
+      return nextResolve(specifier, context);
+    },
+    load(url, context, nextLoad) {
+      if (url === NAV_STUB) {
+        return {
+          format: "module",
+          shortCircuit: true,
+          source:
+            "export function useRouter(){return{refresh(){},push(){},replace(){}," +
+            "back(){},forward(){},prefetch(){}};}\n" +
+            "export function usePathname(){return '/';}\n" +
+            "export function useSearchParams(){return new URLSearchParams();}\n",
+        };
+      }
+      if (url.startsWith("file:") && /\.tsx?$/.test(url)) {
+        const source = readFileSync(fileURLToPath(url), "utf8");
+        const out = ts.transpileModule(source, {
+          compilerOptions: {
+            target: ts.ScriptTarget.ES2022,
+            module: ts.ModuleKind.ESNext,
+            jsx: ts.JsxEmit.ReactJSX,
+            verbatimModuleSyntax: false,
+          },
+        });
+        return { format: "module", source: out.outputText, shortCircuit: true };
+      }
+      return nextLoad(url, context);
+    },
+  });
+
+  const React = (await import("react")).default;
+  const { renderToStaticMarkup } = await import("react-dom/server");
+  const { EnergyDataSection } = await import(
+    "../components/worksheet/energy-data-section.tsx"
+  );
+  return (view: unknown) =>
+    renderToStaticMarkup(
+      React.createElement(EnergyDataSection, { view, jobId: "job-1" } as never),
+    );
+})();
+
+/** A view as energyDataView builds one; overrides applied on top. */
+function energyView(overrides: Record<string, unknown> = {}): Record<string, unknown> {
+  return {
+    state: "empty",
+    tier: null,
+    nmi: null,
+    source: null,
+    coverageDays: null,
+    gapDays: null,
+    pctActual: null,
+    intervalMinutes: null,
+    periodStart: null,
+    periodEnd: null,
+    readoutParts: [],
+    notices: [],
+    address: null,
+    profileWeights: null,
+    annualKwh: null,
+    dailyAvgKwh: null,
+    hasStoredProfile: false,
+    survey: { ...EMPTY_SURVEY_ANSWERS },
+    ...overrides,
+  };
+}
+
+/** The view for a job whose typed figure is stored — job a57e13f1's real shape. */
+function storedProfileView(overrides: Record<string, unknown> = {}) {
+  return energyView({
+    tier: 1,
+    annualKwh: 8240,
+    dailyAvgKwh: 22.6,
+    profileWeights: WEIGHTS_24,
+    hasStoredProfile: true,
+    ...overrides,
+  });
+}
+
+/** Text as a reader sees it: tags stripped, entities decoded, spaces collapsed. */
+function visibleText(markup: string): string {
+  return markup
+    .replace(/<[^>]*>/g, " ")
+    .replace(/&#x27;|&apos;/g, "'")
+    .replace(/&quot;/g, '"')
+    .replace(/&amp;/g, "&")
+    .replace(/&nbsp;/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+const NO_YEARLY_TOTAL = "We cannot work out a profile without a yearly total";
+
+test("2026-08-20 (2nd): a STORED profile renders on revisit — no fresh save in this session", () => {
+  const text = visibleText(renderEnergySection(storedProfileView()));
+  // THE FAULT: today the panel is absent and the empty form claims the figure
+  // is missing, on a job whose row exists and whose tick is TRUE.
+  assert.ok(
+    !text.includes(NO_YEARLY_TOTAL),
+    `the section must not claim the yearly total is missing when it is stored — got: ${text.slice(0, 400)}`,
+  );
+  // The figures the row actually carries DO reach the screen.
+  assert.ok(text.includes("8,240"), `the stored annual figure must render — got: ${text.slice(0, 400)}`);
+  assert.ok(text.includes("Tier 1"), `the stored tier must render — got: ${text.slice(0, 400)}`);
+});
+
+test("2026-08-20 (2nd): THE PROVENANCE PROOF — a stored profile renders NO call-only sentence", () => {
+  // Seven of DemandRecorded's eleven fields are facts about the SAVE CALL, not
+  // about the row. The row knows none of them, so none of their sentences may
+  // appear. Read from the RENDERED STRING: a check that reads its own input
+  // cannot see a fault that happens on the way to the screen.
+  const text = visibleText(renderEnergySection(storedProfileView()));
+  const callOnly: [string, string][] = [
+    ["typed-source note", "entered by the installer"],
+    ["typed-source note (status line)", "entered by you"],
+    ["bill-source note", "A bill gives us twelve months of totals"],
+    ["bill-source note (status line)", "from the bill"],
+    ["corrected note", "Figures you corrected"],
+    ["survey-not-saved warning", "The survey answers did not save"],
+    ["not-fully-saved warning", "Not fully saved"],
+    // tierMismatchNotice compares `predicted` against `tier` — both call-only.
+    ["tier-mismatch notice", "we expected"],
+    ["tier-mismatch notice (alt)", "Tier recorded"],
+  ];
+  for (const [label, needle] of callOnly) {
+    assert.ok(
+      !text.toLowerCase().includes(needle.toLowerCase()),
+      `${label} must not appear for a stored profile — the row cannot know it. Found "${needle}" in: ${text.slice(0, 500)}`,
+    );
+  }
+  // The CONTROL: the tier-1 "no daily shape" caption is a fact about the ROW
+  // (tier 1 IS stored), so it is allowed — this proves the assertion above is
+  // not passing merely because nothing at all rendered.
+  assert.ok(text.includes("8,240"), "something really did render");
+});
+
+test("2026-08-20 (2nd): tier null with a real figure is a REAL STATE — figures render, 'Tier null' never does", () => {
+  // energyDataView's own comment: showing a tier off the mere presence of a
+  // file would be a lie. A row can carry a figure and no tier.
+  const text = visibleText(renderEnergySection(storedProfileView({ tier: null })));
+  assert.ok(text.includes("8,240"), "the figure still renders");
+  assert.ok(text.includes("tier not recorded"), `expected the not-recorded wording — got: ${text.slice(0, 300)}`);
+  assert.ok(!text.includes("Tier null"), "never print 'Tier null'");
+  assert.ok(!text.includes("Tier undefined"), "never print 'Tier undefined'");
+  assert.ok(!text.includes(NO_YEARLY_TOTAL));
+});
+
+test("2026-08-20 (2nd): no usable figure — 0, negative, NaN, Infinity, null — is NOT a stored profile", () => {
+  // hasStoredProfile comes from storedLoadProfile, so these are the same
+  // values the section predicate refuses. The empty form is CORRECT here.
+  for (const bad of [0, -3, NaN, Infinity, -Infinity, null]) {
+    const view = storedProfileView({ annualKwh: bad, hasStoredProfile: false });
+    const text = visibleText(renderEnergySection(view));
+    assert.ok(
+      text.includes(NO_YEARLY_TOTAL),
+      `annualKwh=${String(bad)} is no figure — the empty form must still say so`,
+    );
+    assert.ok(!text.includes("Usage profile on this job"),
+      `annualKwh=${String(bad)} must not render the stored panel`);
+  }
+  // And the shared rule agrees, at source: this is the SAME function the
+  // predicate calls, so the two cannot disagree.
+  for (const bad of [0, -3, NaN, Infinity, null, "", "eight thousand", true, {}]) {
+    assert.equal(
+      storedLoadProfile({ load_profiles: [{ annual_kwh: bad as never,
+                                            created_at: "2026-08-20T00:00:00Z" }] }),
+      null,
+      `annual_kwh=${String(bad)}`,
+    );
+  }
+  // A numeric string IS a figure — PostgREST hands numerics back that way.
+  assert.notEqual(
+    storedLoadProfile({ load_profiles: [{ annual_kwh: "8240",
+                                          created_at: "2026-08-20T00:00:00Z" }] }),
+    null,
+  );
+});
+
+test("2026-08-20 (2nd): profileWeights null or wrong-length — figures render, NO chart", () => {
+  for (const weights of [null, [], [1, 2, 3], Array.from({ length: 25 }, () => 1)]) {
+    const text = visibleText(renderEnergySection(storedProfileView({ profileWeights: weights })));
+    assert.ok(text.includes("8,240"),
+      `weights=${JSON.stringify(weights)?.slice(0, 20)}: the figures must still render`);
+    assert.ok(!text.includes(NO_YEARLY_TOTAL));
+  }
+  // The valid case really does draw the strip, so the assertions above are
+  // about absence of a chart, not absence of a chart everywhere.
+  const good = renderEnergySection(storedProfileView({ profileWeights: WEIGHTS_24 }));
+  assert.ok(good.includes('role="img"'),
+    "24 valid weights must draw the preview strip (the strip is the only role=img svg)");
+  const none = renderEnergySection(storedProfileView({ profileWeights: null }));
+  assert.ok(!none.includes('role="img"'),
+    "no weights must draw no strip — never a fabricated chart");
+});
+
+test("2026-08-20 (2nd): interval stored with NO profile — the existing behaviour is untouched", () => {
+  // The orthogonality that made a separate boolean necessary: `state` is about
+  // the FILE, hasStoredProfile about the PROFILE.
+  const view = energyView({
+    state: "have_interval",
+    hasStoredProfile: false,
+    readoutParts: ["360 days", "98% actual"],
+    nmi: "6123456789",
+  });
+  const text = visibleText(renderEnergySection(view));
+  assert.ok(text.includes("Smart-meter data — read and checked"),
+    `the interval read must still render — got: ${text.slice(0, 300)}`);
+  assert.ok(!text.includes("Usage profile on this job"),
+    "no profile row means no stored-profile panel");
+  // And energyDataView itself still reports the two facts separately.
+  const built = energyDataView({
+    interval_data: [{ parsed_series_ref: "bills/interval/x.json",
+                      created_at: "2026-08-20T00:00:00Z" }],
+  });
+  assert.equal(built.state, "have_interval");
+  assert.equal(built.hasStoredProfile, false, "a file is not a profile");
+});
+
+test("2026-08-20 (2nd): both stored — the interval branch renders, the stored panel does not duplicate it", () => {
+  const view = energyView({
+    state: "have_interval",
+    hasStoredProfile: true,
+    tier: 3,
+    annualKwh: 5500,
+    dailyAvgKwh: 15.1,
+    profileWeights: WEIGHTS_24,
+    readoutParts: ["360 days", "98% actual"],
+  });
+  const text = visibleText(renderEnergySection(view));
+  assert.ok(text.includes("Smart-meter data — read and checked"));
+  // The interval block ALREADY renders view.annualKwh — a second panel would
+  // print the same figures twice.
+  assert.ok(!text.includes("Usage profile on this job"),
+    "the interval branch owns this case; never render both");
+  assert.ok(text.includes("5,500"), "the figures reach the screen via the interval block");
+});
+
+test("2026-08-20 (2nd): neither stored — the empty form is CORRECT and unchanged", () => {
+  const text = visibleText(renderEnergySection(energyView()));
+  assert.ok(text.includes(NO_YEARLY_TOTAL),
+    "with no profile and no file the original wording is right");
+  assert.ok(text.includes("Record this profile"),
+    "and the button still reads Record, not Replace");
+  assert.ok(!text.includes("Usage profile on this job"));
+});
+
+test("2026-08-20 (2nd): the inputs stay reachable, and the button says Replace when one is stored", () => {
+  const text = visibleText(renderEnergySection(storedProfileView()));
+  // A stored profile must never hide or disable the ways in.
+  assert.ok(text.includes("Drop a NEM12 or interval CSV here"), "upload zone stays");
+  assert.ok(text.includes("Annual usage (kWh)"), "the typed-usage box stays");
+  assert.ok(text.includes("How much, per year"), "half 1 stays");
+  assert.ok(text.includes("When it uses it") || text.includes("when it uses it"),
+    "half 2 stays");
+  assert.ok(text.includes("Replace this profile"),
+    "re-recording keeps working, and the label says what it does");
+  assert.ok(!text.includes("Record this profile"),
+    "'Record' would describe a job with nothing stored");
+});
+
+test("2026-08-20 (2nd): storedLoadProfile is TOTAL and reads the NEWEST row", () => {
+  for (const junk of [null, undefined, "x", 42, [], {}, { load_profiles: null },
+                      { load_profiles: "rows" }, { load_profiles: [null, 42] }]) {
+    assert.doesNotThrow(() => storedLoadProfile(junk), JSON.stringify(junk));
+    assert.equal(storedLoadProfile(junk), null, JSON.stringify(junk));
+  }
+  // Array order the REVERSE of created_at: a last-element reader would return
+  // the older row and report a figure the engine would not use.
+  const superseded = storedLoadProfile({
+    load_profiles: [
+      { annual_kwh: null, created_at: "2026-08-20T02:00:00Z" },
+      { annual_kwh: 8240, created_at: "2026-08-20T01:00:00Z" },
+    ],
+  });
+  assert.equal(superseded, null, "the newest row carries no figure");
+  const current = storedLoadProfile({
+    load_profiles: [
+      { annual_kwh: 8240, created_at: "2026-08-20T02:00:00Z" },
+      { annual_kwh: null, created_at: "2026-08-20T01:00:00Z" },
+    ],
+  });
+  assert.equal(current?.annual_kwh, 8240);
+});
+
+test("2026-08-20 (2nd): ONE RULE — the predicate and energyDataView cannot disagree", () => {
+  // Both call storedLoadProfile, so this holds by construction; the test is
+  // here because it stopped holding twice today when they did not.
+  const shapes: Record<string, unknown>[] = [
+    { load_profiles: [{ annual_kwh: 8240, created_at: "2026-08-20T00:00:00Z" }] },
+    { load_profiles: [{ annual_kwh: 0, created_at: "2026-08-20T00:00:00Z" }] },
+    { load_profiles: [{ annual_kwh: null, created_at: "2026-08-20T00:00:00Z" }] },
+    { load_profiles: [] },
+    {},
+  ];
+  for (const shape of shapes) {
+    const job = emptyJob(shape as Partial<JobDetailLike>);
+    assert.equal(
+      energyDataView(job).hasStoredProfile,
+      storedLoadProfile(job) !== null,
+      `view vs rule: ${JSON.stringify(shape)}`,
+    );
+    // The predicate agrees too, on every shape where the interval branch is
+    // not in play (these all have no interval rows).
+    assert.equal(
+      completeOf("energy-data", job),
+      storedLoadProfile(job) !== null,
+      `predicate vs rule: ${JSON.stringify(shape)}`,
+    );
+  }
 });

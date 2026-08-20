@@ -103,6 +103,33 @@ export function currentSizingResult(job: unknown): Record<string, unknown> | nul
   return newestByCreatedAt(arr(asObject(job).sizing_results));
 }
 
+/**
+ * THE JOB'S USABLE STORED LOAD PROFILE (2026-08-20) — the newest
+ * `load_profiles` row when it carries a yearly figure the engine could size
+ * on, else null.
+ *
+ * ONE DEFINITION, TWO READERS, deliberately: the Energy data section's
+ * completeness predicate asks "can the engine get a load from this job", and
+ * energyDataView asks "should the stored panel render". They are the same
+ * question about the same row, and answering it twice is precisely how the
+ * TICK and the BODY came to contradict each other — twice in one day, in
+ * opposite directions.
+ *
+ * A FINITE FIGURE ABOVE ZERO is the rule, because that is what the engine
+ * does: backend/routes/sizing.py::_resolve_load reads this row with
+ * `order(created_at, desc).limit(1)` and treats `0` as no figure (`annual_kwh
+ * or ...`). 0, negatives, NaN, Infinity and null are all "no figure".
+ * verify_demand_contract.py's T13 pairs this against that resolver.
+ *
+ * Total: never throws for any input.
+ */
+export function storedLoadProfile(job: unknown): Record<string, unknown> | null {
+  const profile = newestByCreatedAt(arr(asObject(job).load_profiles));
+  if (!profile) return null;
+  const annual = tariffNum(profile.annual_kwh);
+  return annual !== null && annual > 0 ? profile : null;
+}
+
 // ── Sections ─────────────────────────────────────────────────────────────────
 
 export type WorksheetPhase = "site" | "demand" | "optimise" | "resolve";
@@ -178,10 +205,46 @@ export const SECTIONS: readonly WorksheetSectionSpec[] = [
     title: "Energy data",
     phase: "demand",
     builtAt: "3.6",
-    complete: (job) =>
-      arr(job.interval_data).length > 0 ||
-      arr(job.bills).length > 0 ||
-      arr(job.surveys).length > 0,
+    // COMPLETE MEANS "THE ENGINE COULD GET A LOAD FROM THIS JOB", and it
+    // MIRRORS backend/routes/sizing.py::_resolve_load — the one resolver both
+    // sizing endpoints use. verify_demand_contract.py's T13 runs this
+    // predicate and that resolver over the same job shapes and asserts the two
+    // ANSWERS ARE EQUAL, so they cannot drift apart again.
+    //
+    // WHAT THIS REPLACED, and why (found on screen 2026-08-20): the rule was
+    // `interval_data | bills | surveys` being non-empty. A typed annual usage
+    // figure writes a load_profiles row and — the five survey questions being
+    // optional — NO surveys row, so the section stayed incomplete forever
+    // while its own body rendered "Usage profile recorded — Tier 1 / 8,240
+    // kWh". Every gating section after it stayed locked and the job could
+    // never be worked. The body read load_profiles; the tick did not.
+    //
+    // BILLS AND SURVEYS ARE GONE ON PURPOSE: _resolve_load cannot read either
+    // table, so a bill or survey that produced no profile has given the engine
+    // nothing, and ticking there would promise a load that sizing would fail
+    // to find. (Both tables were empty live when this changed, so no existing
+    // tick was removed — derived, not assumed.)
+    //
+    // NEWEST-ROW, NOT `.some(...)`, ON BOTH TABLES: _resolve_load reads each
+    // with `order(created_at, desc).limit(1)`, so an older row carrying a
+    // series ref that the newest row lacks is NOT something the engine would
+    // use. Same append-only rule as currentSizingResult.
+    // THE PROFILE HALF OF THIS RULE IS NOW storedLoadProfile(), because
+    // energyDataView needs the SAME answer to decide whether to render the
+    // stored panel (2026-08-20, second fault). The DECISION is unchanged — the
+    // extraction moved no logic and loosened nothing; it exists so there is one
+    // definition rather than two kept in step, which is how these halves keep
+    // drifting apart.
+    complete: (job) => {
+      if (storedLoadProfile(job) !== null) return true;
+      // The interval branch stays because it is NOT redundant: a job can hold
+      // an interval row with no load_profiles row when the profile write
+      // failed (see energyDataView), and the engine still resolves a load from
+      // the parsed series in that state.
+      const interval = newestByCreatedAt(arr(job.interval_data));
+      const ref = interval ? interval.parsed_series_ref : null;
+      return typeof ref === "string" && ref !== "";
+    },
   },
   {
     id: "tariff-network",
@@ -2147,6 +2210,18 @@ export interface EnergyDataView {
    *  downstream calculation depends on and which appeared nowhere on screen. */
   annualKwh: number | null;
   dailyAvgKwh: number | null;
+  /**
+   * 2026-08-20: the job already holds a usage profile the engine could size on
+   * — `storedLoadProfile(job) !== null`, the SAME rule the section's
+   * completeness predicate uses.
+   *
+   * A SEPARATE BOOLEAN, NOT A THIRD `state` VALUE, on purpose: `state`
+   * describes the INTERVAL FILE, and a job can hold an interval row with no
+   * profile row (see below), so the two facts are orthogonal. Folding them
+   * into one enum would make every existing `state` consumer answer a question
+   * it was not asked.
+   */
+  hasStoredProfile: boolean;
   /** Pre-filled survey answers from the stored surveys row. */
   survey: SurveyAnswers;
 }
@@ -2177,9 +2252,13 @@ export function energyDataView(job: unknown): EnergyDataView {
     profileWeights: null,
     annualKwh: null,
     dailyAvgKwh: null,
+    hasStoredProfile: false,
     survey: { ...EMPTY_SURVEY_ANSWERS },
   };
   view.survey = surveyView(detail);
+  // The ONE rule, shared with the section's completeness predicate — see
+  // storedLoadProfile. Never re-derived here.
+  view.hasStoredProfile = storedLoadProfile(detail) !== null;
   const customer = arr(detail.customer);
   const address = customer[0]?.property_address_full;
   view.address = typeof address === "string" && address.trim() ? address : null;
@@ -4253,10 +4332,16 @@ export function solarSizingView(job: unknown): SolarSizingView {
 }
 
 /**
- * One optimiser response → notices. D25 applied per notice, with the test —
- * could this ever NOT fire on a job like this one? — answered inline.
+ * One SIZING response → notices, for either endpoint (3.12).
+ *
+ * ONE FUNCTION, TWO CALLERS, NOT A COPY. The battery response carries the SAME
+ * roof_confidence object and the same method fact is true of it — both runs
+ * read the objective, tariff, load and equipment already stored on the job. A
+ * copied D25 classification is exactly what D25 says must not exist, so the
+ * body lives here once and `solarRunNotices` / `batteryRunNotices` are named
+ * doors onto it rather than two implementations kept in step (2R.1).
  */
-export function solarRunNotices(response: unknown): RoofNoticeView[] {
+export function sizingRunNotices(response: unknown): RoofNoticeView[] {
   const body = asRecord(response);
   const out: RoofNoticeView[] = [];
 
@@ -4288,6 +4373,19 @@ export function solarRunNotices(response: unknown): RoofNoticeView[] {
     body: "Sized with the objective, tariff, load and equipment already saved on this job. Change those in their sections and run again.",
   });
   return out;
+}
+
+/**
+ * The solar section's door onto sizingRunNotices. Kept exported and unchanged
+ * in behaviour so nothing that already calls it breaks (3.12).
+ */
+export function solarRunNotices(response: unknown): RoofNoticeView[] {
+  return sizingRunNotices(response);
+}
+
+/** The battery section's door onto the same one function (3.12). */
+export function batteryRunNotices(response: unknown): RoofNoticeView[] {
+  return sizingRunNotices(response);
 }
 
 /**
@@ -4347,4 +4445,213 @@ export function solarRunResult(response: unknown): SolarRunResult {
     : [];
 
   return { ok, needsRoofInput, errorMessage, headline, options, engineFlags };
+}
+
+// ── Battery sizing (checklist 3.12) ──────────────────────────────────────────
+
+/**
+ * THE WHOLE REQUEST BODY the Battery sizing screen may send. Same restraint as
+ * SOLAR_SIZING_REQUEST_KEYS and the same reason: nothing stored on the job
+ * travels from the browser — not the objective, not the budget, not the
+ * equipment ids, not the tariff, not the battery ids, not installer_id. Those
+ * are read server-side by the resolvers, and sending them would be a second
+ * source of truth for values 3.9/3.10 exist to hold (D29). The two-sided gate
+ * verify_sizing_request_contract.py holds this mechanically, against
+ * BatteryRequest.model_fields.
+ */
+export const BATTERY_SIZING_REQUEST_KEYS = ["job_id", "constraints"] as const;
+
+/** One row of the battery options table — for reading, not for arithmetic. */
+export interface BatteryOptionRow {
+  /** "13.5 kWh", or "No battery" for the baseline — NEVER "0 kWh". */
+  label: string;
+  model: string;
+  /** The WHOLE system: solar plus this battery's incremental cost. */
+  systemCost: string;
+  payback: string;
+  npv: string;
+  selfSufficiency: string;
+  chosen: boolean;
+}
+
+export interface BatteryHeadline {
+  model: string;
+  usableKwh: string;
+  /** The battery's INCREMENTAL net cost — not the whole system's. */
+  batteryCost: string;
+  systemCost: string;
+  payback: string;
+  npv: string;
+  selfSufficiencyPct: string;
+}
+
+export interface BatteryChosenSolar {
+  solarKw: string;
+  annualGenerationKwh: string;
+  systemCostSolarOnly: string;
+}
+
+export interface BatteryRunResult {
+  ok: boolean;
+  needsRoofInput: boolean;
+  errorMessage: string | null;
+  headline: BatteryHeadline | null;
+  /** The solar THIS run chose — it re-runs the solar step itself (D33). */
+  chosenSolar: BatteryChosenSolar | null;
+  options: BatteryOptionRow[];
+  /** True when the engine recommends no battery — a legitimate outcome. */
+  noBattery: boolean;
+  /** The engine's own sentence, VERBATIM (F161), or null. Never reworded. */
+  notEconomicReason: string | null;
+  /** The engine's own flag strings, VERBATIM (F161) — never paraphrased. */
+  engineFlags: string[];
+}
+
+export interface BatterySizingView {
+  /** From pathRule(job.path): "size" | "none" | null. */
+  batteryMode: PathRule["batteryMode"] | null;
+  /** The CURRENT stored result's battery_kwh, for the revisit case. */
+  storedBatteryKwh: number | null;
+  alreadySized: boolean;
+  notices: RoofNoticeView[];
+}
+
+/** kWh to the single decimal the inputs justify. */
+function fmtKwh(value: number): string {
+  return `${Number(value.toFixed(1))} kWh`;
+}
+
+/**
+ * The section's stored-state view. Total, never throws.
+ *
+ * `alreadySized` READS THE CURRENT RESULT, never `.some(...)` over every row,
+ * and it agrees with the battery-sizing predicate in SECTIONS by construction:
+ * both are `currentSizingResult(job)` plus a non-null battery_kwh. That is the
+ * honest un-tick from 3.11b — when a newer solar-only run supersedes a battery
+ * run, the current recommendation contains no battery, so both go false
+ * together. Two rules for one idea is what 2R.1 forbids.
+ */
+export function batterySizingView(job: unknown): BatterySizingView {
+  const detail = asRecord(job);
+  const rule = pathRule(detail.path);
+  const latest = currentSizingResult(job);
+  const storedBatteryKwh = latest ? tariffNum(latest.battery_kwh) : null;
+  return {
+    batteryMode: rule ? rule.batteryMode : null,
+    storedBatteryKwh,
+    alreadySized: storedBatteryKwh !== null,
+    // No D25 finding is available from stored state alone: whether a battery
+    // is worth it is the ENGINE's answer, carried in not_economic_reason after
+    // a run — never guessed here from the path.
+    notices: [],
+  };
+}
+
+/**
+ * One battery-endpoint response → the figures an installer reads. Every
+ * formatter is here so the suite asserts the exact strings that reach the
+ * screen. Total: null, a string, an array of nulls all yield an empty view.
+ *
+ * A 200 IS NOT AUTOMATICALLY A RESULT — this branches on the BODY exactly as
+ * solarRunResult does: needs_roof_input is not an error, and `error` can
+ * arrive with a 200.
+ *
+ * THE NO-BATTERY BASELINE carries a deliberately smaller key set and NO
+ * battery_id, NO annual_discharge_kwh, NO round_trip_efficiency and NO
+ * depth_of_discharge. Every absent key renders "—", never "undefined", "null",
+ * "0" or "NaN", and the row is LABELLED "No battery" rather than shown as
+ * "0 kWh". Its absent battery_id IS the no-choice option — never invent one.
+ *
+ * THERE IS DELIBERATELY NO BUDGET BADGE. The response carries no
+ * within_budget field (the endpoint computes it inside the writer, which only
+ * runs when a job_id is present), and deriving one here would be a second
+ * copy of a rule the engine already owns (2R.1). The budget cause is carried
+ * honestly in not_economic_reason. Results presentation is 3.13.
+ */
+export function batteryRunResult(response: unknown): BatteryRunResult {
+  const body = asRecord(response);
+  const errorMessage =
+    typeof body.error === "string" && body.error ? body.error : null;
+  const needsRoofInput = body.needs_roof_input === true;
+  const opt = asRecord(body.optimal_battery);
+  const usableKwh = tariffNum(opt.usable_kwh);
+
+  const ok = !errorMessage && !needsRoofInput && usableKwh !== null;
+  const noBattery = ok && usableKwh === 0;
+
+  let headline: BatteryHeadline | null = null;
+  if (ok && usableKwh !== null) {
+    const battCost = tariffNum(opt.battery_cost);
+    const sysCost = tariffNum(opt.system_cost);
+    const npv = tariffNum(opt.incremental_npv);
+    const self = tariffNum(opt.self_sufficiency_pct);
+    headline = {
+      model: typeof opt.model === "string" && opt.model ? opt.model : "—",
+      usableKwh: usableKwh > 0 ? fmtKwh(usableKwh) : "No battery",
+      batteryCost: battCost !== null ? fmtAud(battCost) : "—",
+      systemCost: sysCost !== null ? fmtAud(sysCost) : "—",
+      payback: fmtYears(opt.incremental_payback_years),
+      npv: npv !== null ? fmtAud(npv) : "—",
+      selfSufficiencyPct: self !== null ? fmtPct(self) : "—",
+    };
+  }
+
+  let chosenSolar: BatteryChosenSolar | null = null;
+  if (ok) {
+    const cs = asRecord(body.chosen_solar);
+    const kw = tariffNum(cs.solar_kw);
+    if (kw !== null) {
+      const gen = tariffNum(cs.annual_generation_kwh);
+      const cost = tariffNum(cs.system_cost_solar_only);
+      chosenSolar = {
+        solarKw: fmtKw(kw),
+        annualGenerationKwh:
+          gen !== null ? `${Math.round(gen).toLocaleString("en-AU")} kWh` : "—",
+        systemCostSolarOnly: cost !== null ? fmtAud(cost) : "—",
+      };
+    }
+  }
+
+  const options: BatteryOptionRow[] = [];
+  const candidates = Array.isArray(body.candidates) ? body.candidates : [];
+  for (const raw of candidates) {
+    if (typeof raw !== "object" || raw === null) continue;
+    const row = raw as Record<string, unknown>;
+    const kwh = tariffNum(row.usable_kwh);
+    if (kwh === null) continue;
+    const sysCost = tariffNum(row.system_cost);
+    const npv = tariffNum(row.incremental_npv);
+    const self = tariffNum(row.self_sufficiency_pct);
+    options.push({
+      // The no-battery baseline is LABELLED, never shown as "0 kWh".
+      label: kwh > 0 ? fmtKwh(kwh) : "No battery",
+      model: typeof row.model === "string" && row.model ? row.model : "—",
+      systemCost: sysCost !== null ? fmtAud(sysCost) : "—",
+      payback: fmtYears(row.incremental_payback_years),
+      npv: npv !== null ? fmtAud(npv) : "—",
+      selfSufficiency: self !== null ? fmtPct(self) : "—",
+      chosen: usableKwh !== null && kwh === usableKwh,
+    });
+  }
+
+  const notEconomicReason =
+    typeof body.not_economic_reason === "string" && body.not_economic_reason
+      ? body.not_economic_reason
+      : null;
+
+  const engineFlags = Array.isArray(body.flags)
+    ? body.flags.filter((f): f is string => typeof f === "string" && f !== "")
+    : [];
+
+  return {
+    ok,
+    needsRoofInput,
+    errorMessage,
+    headline,
+    chosenSolar,
+    options,
+    noBattery,
+    notEconomicReason,
+    engineFlags,
+  };
 }

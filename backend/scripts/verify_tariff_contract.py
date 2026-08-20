@@ -424,6 +424,24 @@ def t8_never_raises() -> None:
           rate is not None and rate[6] == 0.6 and rate[7] == 0.6 and rate[8] == 0.40,
           str(rate))
 
+    # 8b2 (3.12, F142): an `hours` value that is NOT a list at all. A bare
+    # string is truthy AND iterable, so pre-3.12 "06:00" iterated character by
+    # character and hours 0 and 6 took the rate; a bare int RAISED. The fix
+    # iterates nothing for a non-list/tuple, so the whole window is ignored
+    # with the unreadable-HOURS-LIST flag — never the unreadable-TIMES flag
+    # (that would misname an hours fault as a start/end fault).
+    for label, hours_val in (("'06:00' (bare string)", "06:00"),
+                             ("{'a': 1} (a dict)", {"a": 1}),
+                             ("6 (a bare int)", 6)):
+        rate, is_tou, flags, err = _build([{"rate": 0.6, "hours": hours_val}])
+        check(f"(8b2) hours {label} does not raise", err is None, str(err))
+        check(f"(8b2) hours {label}: whole window ignored — flat fill, is_tou False",
+              rate == [0.40] * 24 and is_tou is False, f"{rate} is_tou={is_tou}")
+        check(f"(8b2) hours {label}: unreadable-hours-list flag, never unreadable times",
+              any(f.startswith("A TOU window had an unreadable hours list and was ignored: ")
+                  for f in flags)
+              and not any("unreadable times" in f for f in flags), str(flags))
+
     rate, is_tou, flags, err = _build([{"rate": 0.6, "hours": ["breakfast"]}])
     check("(8b) hours ['breakfast'] does not raise", err is None, str(err))
     check("(8b) ...whole window ignored, flat fill, is_tou False",

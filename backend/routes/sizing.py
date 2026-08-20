@@ -1039,7 +1039,12 @@ def _build_rate_24(
                 # two rules for one idea is how the halves drift apart.
                 applied_any = False
                 skipped_any = False
-                for h in hours:
+                # 3.12 (F142): a bare string is truthy AND iterable, so
+                # {"hours": "06:00"} would iterate '0','6',':','0','0' and
+                # hand hours 0 and 6 the rate. A non-list/tuple iterates
+                # nothing, applied_any stays False, and the existing
+                # unreadable-hours-list flag fires.
+                for h in (hours if isinstance(hours, (list, tuple)) else ()):
                     hv = _window_hour(h)
                     if hv is None or not (0 <= hv < 24):
                         skipped_any = True
@@ -1145,8 +1150,13 @@ async def battery_sizing(
         if (planes is None or candidate_configs is None) and body.job_id and client is not None:
             roof = _load_roof(client, body.job_id)
             if roof is None:
-                return {"needs_solar_result": True, "flags": ["no_roof_geometry"],
-                        "error": "No roof geometry for this job — run /api/roof/geometry then /api/sizing/optimise (D1) first."}
+                # 3.12 (D33): this endpoint does NOT read a stored solar
+                # result — it re-runs the solar step itself — so it can never
+                # need one. What it lacks here is a ROOF, which is what the
+                # solar endpoint already says in this same situation. One
+                # shape, not two kept in step (2R.1).
+                return {"needs_roof_input": True, "flags": ["no_roof_geometry"],
+                        "error": "No roof for this job yet — find or enter the roof first, then size."}
             if not roof.get("found") or roof.get("manual_entry_required"):
                 return {"needs_roof_input": True, "flags": ["manual_entry_required"],
                         "error": "Roof not found by imagery — manual entry required before sizing."}
@@ -1163,8 +1173,10 @@ async def battery_sizing(
                 panel = {"id": sp.get("id"), "watts": sp.get("watts")}
 
         if not planes or candidate_configs is None or lat is None or lon is None or panel is None:
-            return {"needs_solar_result": True, "flags": ["missing_roof_or_solar"],
-                    "error": "Need a roof + solar config first (pass them or a job_id with stored roof geometry; run D1)."}
+            # Same fact, same shape (3.12): a roof this run could size on is
+            # missing or incomplete. Never "size the solar first".
+            return {"needs_roof_input": True, "flags": ["missing_roof_or_solar"],
+                    "error": "This job needs a usable roof before it can be sized — find or enter the roof, including a panel to lay out."}
 
         if (postcode is None or state is None) and body.job_id and client is not None:
             jobrow = _load_one(client, "jobs", body.job_id, "site_postcode,site_state")
@@ -1209,7 +1221,13 @@ async def battery_sizing(
                 export_limit_kw=export_limit_kw, objective=objective, fin=fin,
                 postcode=postcode, state=state, installer_id=caller.user_id,
                 custom_weight=custom_weight,
-                budget=None, constraints=sconstraints_, flags=fl,
+                # 3.12 (F152, D33): the cap is an INPUT to both halves of the
+                # sequential run, never a filter applied after one of them.
+                # Solar alone costing more than the cap is a necessary
+                # condition of the whole system exceeding it, and the solar
+                # optimiser already answers an impossible cap honestly
+                # (budget_too_low + cheapest real config, within_budget false).
+                budget=budget, constraints=sconstraints_, flags=fl,
             )
             ch = sres["optimal"]
             watts = float(panel_.get("watts") or 0.0)
@@ -1292,7 +1310,11 @@ async def battery_sizing(
         } if solar_con_active else None
 
         if not constrained_active:
-            chosen, solar_8760, _ = _solar_chosen(planes, candidate_configs, panel, None)
+            # 3.12 (2N.1): this run's solar flags — budget_too_low above all —
+            # REACH the response; a capped, downsized array must never be
+            # silent about why.
+            chosen, solar_8760, solar_run_flags = _solar_chosen(planes, candidate_configs, panel, None)
+            flags.extend(solar_run_flags)
             result = _battery_run(solar_8760, chosen, panel, _filter_rows(body.battery_ids), None, False, flags)
             opt = result["optimal_battery"]
             unconstrained_optimum_battery = None
@@ -1300,9 +1322,13 @@ async def battery_sizing(
             chosen_solar, used_panel = chosen, panel
             constraints_applied = {}
         else:
+            # 3.12 (2N.1): the SHADOW run exists only for the deltas — its
+            # flags stay discarded, or every solar flag would appear twice.
             unc_chosen, unc_solar, _ = _solar_chosen(planes, candidate_configs, panel, None)
             unc_result = _battery_run(unc_solar, unc_chosen, panel, full_catalogue, None, False, [])
-            chosen, solar_8760, _ = _solar_chosen(con_planes, con_configs, con_panel, con_solar_constraints)
+            # The RESULT-BEARING run: its solar flags reach the response.
+            chosen, solar_8760, solar_run_flags = _solar_chosen(con_planes, con_configs, con_panel, con_solar_constraints)
+            flags.extend(solar_run_flags)
             result = _battery_run(solar_8760, chosen, con_panel, _filter_rows(con_batt_ids), fix_kwh, force_nb, flags)
             opt = result["optimal_battery"]
             unconstrained_optimum_battery = unc_result["optimal_battery"]
@@ -1345,15 +1371,19 @@ async def battery_sizing(
                 round((gen_annual - export_opt) / gen_annual, 4)
                 if (gen_annual > 0 and export_opt is not None) else None
             )
+            # 3.12 (F152): ONE local for the whole-system cost — the row stores
+            # it AND within_budget is derived from the SAME number. Two
+            # expressions for one idea is how the two halves drifted apart.
+            total_system_cost = round(chosen_solar["system_cost"] + opt.get("battery_cost", 0), 2)
             try:
                 sid = capture.save_sizing_result({
                     "job_id": body.job_id,
                     "solar_kw": chosen_solar["solar_kw"],
                     "battery_kwh": opt.get("usable_kwh", 0),
                     "self_consumption_ratio": self_cons_ratio,
-                    "system_cost": round(chosen_solar["system_cost"] + opt.get("battery_cost", 0), 2),
+                    "system_cost": total_system_cost,
                     "annual_solar_generation_kwh": gen_annual,
-                    "within_budget": (budget is None) or (opt.get("battery_cost", 0) <= budget),
+                    "within_budget": (budget is None) or (total_system_cost <= budget),
                     "engine_version": battery_optimiser.ENGINE_VERSION,
                     "objective_used": objective,
                     "roof_geometry_id": roof_conf["roof_geometry_id"],

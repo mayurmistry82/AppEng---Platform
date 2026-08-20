@@ -30,6 +30,7 @@ import io
 import json
 import os
 import re
+import subprocess
 import sys
 import traceback
 
@@ -47,9 +48,11 @@ import bill_parser  # noqa: E402
 import capture  # noqa: E402
 import interval_parser  # noqa: E402
 import job_tier  # noqa: E402
+import solar_optimiser  # noqa: E402
 from routes import demand  # noqa: E402
 from routes import interval  # noqa: E402
 from routes import load as load_route  # noqa: E402
+from routes import sizing as sizing_route  # noqa: E402
 
 FAILURES: list[str] = []
 CHECKS_RUN = 0
@@ -1021,6 +1024,216 @@ def t11_pii_scrub() -> None:
         check("(10) a self-referencing payload terminates without raising", False, str(exc))
 
 
+# ── T13 (2026-08-20): THE SCREEN'S TICK vs THE ENGINE'S LOAD RESOLVER ────────
+#
+# THE FAULT THIS EXISTS FOR: the Energy data section ticked on
+# `interval_data | bills | surveys` being non-empty, while the engine resolves a
+# load from `interval_data.parsed_series_ref` or the `load_profiles` row. A
+# typed annual usage figure writes a load_profiles row and (with the optional
+# survey unanswered) NO surveys row — so the section stayed incomplete forever
+# and every gating section after it stayed locked, on a job the engine could
+# size perfectly well. The F134 family: two halves each correct alone, the fault
+# living in the RELATIONSHIP, with nothing comparing them.
+#
+# BOTH SIDES RUN, NEITHER IS PARSED (F148): the TypeScript side executes the
+# REAL predicate out of lib/worksheet.ts over node; the Python side calls the
+# REAL _resolve_load with a stub client serving the same job shape. THE POINT IS
+# THE PAIRING — one assertion per shape that the two ANSWERS ARE EQUAL, never
+# two independent lists of expectations that could both drift.
+
+_WEIGHTS_24 = [1.0] * 24
+_DAY_24 = [0.8] * 6 + [1.2] * 12 + [1.6] * 6
+
+# A real stored series document, shaped as interval.py writes one, so the
+# interval branch of _resolve_load genuinely RESOLVES rather than falling
+# through to the profile branch. A stub that could not serve this would make
+# case (d) pass for the wrong reason.
+_SERIES_DOC = {
+    "series_by_date": {f"2025-01-{d:02d}": list(_DAY_24) for d in range(1, 29)},
+    "average_day_kwh": list(_DAY_24),
+    "annual_kwh": 8240.0,
+    "coverage_days": 28,
+}
+
+# The seven shapes, each a job as GET /api/job/{id} hydrates one. Both sides
+# read the SAME dict, so neither can be tuned to its own half.
+_PAIR_SHAPES: list[tuple[str, str, dict]] = [
+    ("a", "load profile, positive annual figure, no interval",
+     {"load_profiles": [{"annual_kwh": 8240.0, "hourly_profile_weights": _WEIGHTS_24,
+                         "accuracy_tier": 1, "created_at": "2026-08-20T00:00:00Z"}]}),
+    ("b", "load profile with annual_kwh NULL, no interval",
+     {"load_profiles": [{"annual_kwh": None, "hourly_profile_weights": _WEIGHTS_24,
+                         "accuracy_tier": 1, "created_at": "2026-08-20T00:00:00Z"}]}),
+    ("c", "load profile with annual_kwh 0, no interval",
+     {"load_profiles": [{"annual_kwh": 0, "hourly_profile_weights": _WEIGHTS_24,
+                         "accuracy_tier": 1, "created_at": "2026-08-20T00:00:00Z"}]}),
+    ("d", "interval row with a parsed_series_ref, NO load profile",
+     {"interval_data": [{"parsed_series_ref": "bills/interval/tok.series.json",
+                         "coverage_days": 28, "created_at": "2026-08-20T00:00:00Z"}]}),
+    ("e", "nothing at all", {}),
+    ("f", "a bill row only, no profile, no interval",
+     {"bills": [{"bill_id": "b1", "created_at": "2026-08-20T00:00:00Z"}]}),
+    ("g", "a survey row only, no profile, no interval",
+     {"surveys": [{"survey_id": "s1", "created_at": "2026-08-20T00:00:00Z"}]}),
+    # (h) NOT in the original seven, added because the rule is "the NEWEST row",
+    # not "any row ever": _resolve_load reads interval_data with
+    # order(created_at, desc).limit(1), so a series ref on a SUPERSEDED row is
+    # not one the engine would use. A `.some(...)` screen rule would tick here
+    # and the engine would answer missing_load. Array order is deliberately the
+    # reverse of created_at so a last-element reader cannot pass by accident.
+    ("h", "newest interval row has NO ref, an older one does, no profile",
+     {"interval_data": [
+         {"parsed_series_ref": None, "coverage_days": None,
+          "created_at": "2026-08-20T02:00:00Z"},
+         {"parsed_series_ref": "bills/interval/old.series.json",
+          "coverage_days": 28, "created_at": "2026-08-20T01:00:00Z"},
+     ]}),
+]
+
+_CHILD_KEYS = ("interval_data", "bills", "surveys", "load_profiles", "tariffs",
+               "roof_geometry", "sizing_results", "financial_results", "customer")
+
+
+def _pair_job(shape: dict) -> dict:
+    """One shape as a full hydrated job — every child key present as an array,
+    so neither side is answering a question about a MISSING key by accident."""
+    job = {key: [] for key in _CHILD_KEYS}
+    job.update({"status": "draft", "path": "B", "path_label": None})
+    job.update(shape)
+    return job
+
+
+class _PairResult:
+    def __init__(self, data):
+        self.data = data
+
+
+class _PairQuery:
+    def __init__(self, rows):
+        self._rows = rows
+
+    def select(self, *_a, **_k):
+        return self
+
+    def eq(self, *_a, **_k):
+        return self
+
+    def order(self, *_a, **_k):
+        return self
+
+    def limit(self, *_a, **_k):
+        return self
+
+    def execute(self):
+        return _PairResult([dict(r) for r in self._rows])
+
+
+class _PairStorage:
+    def from_(self, _bucket):
+        return self
+
+    def download(self, _key):
+        return json.dumps(_SERIES_DOC).encode()
+
+
+class _PairClient:
+    """Serves one job shape. Reads only — there is no write path on it at all,
+    so this cannot touch the database even by mistake."""
+
+    def __init__(self, job: dict):
+        self._job = job
+        self.storage = _PairStorage()
+
+    def table(self, name):
+        return _PairQuery(self._job.get(name) or [])
+
+
+def _engine_resolves(job: dict) -> bool:
+    """The REAL _resolve_load against this shape: True when the engine gets a
+    load, False when it returns the missing_load error."""
+    from types import SimpleNamespace  # noqa: PLC0415
+
+    body = SimpleNamespace(job_id="pair-job", load_hourly_8760=None,
+                           load_source=None, annual_kwh=None,
+                           hourly_profile_weights=None)
+    flags: list[str] = []
+    load, _source, error = sizing_route._resolve_load(_PairClient(job), body, flags)
+    if error is not None:
+        return False
+    return bool(load) and len(load) == solar_optimiser.HOURS
+
+
+def _screen_ticks() -> tuple[dict | None, str]:
+    """Run the REAL energy-data predicate out of lib/worksheet.ts over node.
+    Returns ({key: bool}, ""), (None, "skip") for the missing-export signature
+    only, or (None, <stderr>) for anything else — which FAILS, so the bridge
+    cannot rot silently."""
+    frontend = os.path.abspath(os.path.join(BACKEND_DIR, "..", "frontend"))
+    shapes = {key: _pair_job(shape) for key, _label, shape in _PAIR_SHAPES}
+    script = (
+        'import { SECTIONS } from "./lib/worksheet.ts";\n'
+        f"const shapes = {json.dumps(shapes)};\n"
+        'const spec = SECTIONS.find((s) => s.id === "energy-data");\n'
+        'if (!spec) { console.error("does not provide an export named energy-data"); process.exit(9); }\n'
+        "const out = {};\n"
+        "for (const [key, job] of Object.entries(shapes)) {\n"
+        "  try { out[key] = spec.complete(job) === true; }\n"
+        '  catch (e) { out[key] = "THREW: " + String(e); }\n'
+        "}\n"
+        "console.log(JSON.stringify(out));"
+    )
+    try:
+        proc = subprocess.run(
+            ["node", "--experimental-strip-types", "--input-type=module", "-e", script],
+            cwd=frontend, capture_output=True, text=True, timeout=120,
+        )
+    except FileNotFoundError:
+        return None, "node not found"
+    if proc.returncode != 0:
+        stderr = proc.stderr or ""
+        if "does not provide an export named" in stderr:
+            return None, "skip"
+        return None, stderr.strip()[:300]
+    return json.loads(proc.stdout.strip()), ""
+
+
+def t13_screen_vs_engine() -> int:
+    """Returns the number of SKIPPED checks (0 or 1) — never a pass (2Q.1)."""
+    print("\nT13. the Energy data TICK vs the engine's load resolver — one "
+          "assertion per shape that the two ANSWERS AGREE")
+    ticks, err = _screen_ticks()
+    if ticks is None:
+        if err == "skip":
+            print("  SKIP  the energy-data section spec is not exported yet — "
+                  "pending the frontend half. NOT counted as a pass.")
+            return 1
+        check("(T13) node ran the real predicate out of lib/worksheet.ts", False, err)
+        return 0
+
+    print(f"        {'case':<4} {'shape':<52} {'screen':<8} {'engine':<8} agree")
+    for key, label, shape in _PAIR_SHAPES:
+        job = _pair_job(shape)
+        screen = ticks.get(key)
+        engine = _engine_resolves(job)
+        agree = screen is engine
+        print(f"        ({key})  {label:<52} "
+              f"{str(screen):<8} {str(engine):<8} {'yes' if agree else 'NO'}")
+        # THE PAIRED ASSERTION. Not "the screen says X" and separately "the
+        # engine says X" — two lists can drift together and both stay green.
+        check(f"(T13{key}) {label}: the tick EQUALS whether the engine can "
+              "resolve a load",
+              agree,
+              f"screen says complete={screen!r}, engine resolves a load={engine!r} "
+              "— the section would " + ("promise a load the engine cannot find"
+                                        if screen else "hide a job the engine can size"))
+    # The pairing is only meaningful if the shapes actually EXERCISE both
+    # answers: a table where every row is True would agree vacuously.
+    engine_answers = {_engine_resolves(_pair_job(shape)) for _k, _l, shape in _PAIR_SHAPES}
+    check("(T13) the shape table exercises BOTH answers — it cannot agree "
+          "vacuously", engine_answers == {True, False}, str(engine_answers))
+    return 0
+
+
 def main_() -> int:
     live = "--live" in sys.argv
     print("verify_demand_contract.py — 3.6 prompt-1 demand write path"
@@ -1037,16 +1250,19 @@ def main_() -> int:
     t10_annualise_boundary()
     t11_pii_scrub()
     t12_quality_columns()
+    skipped = t13_screen_vs_engine()
     if live:
         t_live()
 
     print(f"\n{'-' * 60}")
     if FAILURES:
-        print(f"FAIL: {len(FAILURES)} of {CHECKS_RUN} checks failed:")
+        print(f"FAIL: {len(FAILURES)} of {CHECKS_RUN} checks failed "
+              f"({skipped} skipped, not counted):")
         for name in FAILURES:
             print(f"  - {name}")
         return 1
-    print(f"OK: all {CHECKS_RUN} checks passed")
+    tail = f" ({skipped} skipped, not counted)" if skipped else ""
+    print(f"OK: all {CHECKS_RUN} checks passed{tail}")
     return 0
 
 

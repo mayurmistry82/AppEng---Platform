@@ -9,6 +9,7 @@ import {
 } from "@/components/ui/phase-rail";
 import { WorksheetSection } from "@/components/ui/worksheet-section";
 import { AddressRoofSection } from "@/components/worksheet/address-roof-section";
+import { BatterySizingSection } from "@/components/worksheet/battery-sizing-section";
 import { EnergyDataSection } from "@/components/worksheet/energy-data-section";
 import { EquipmentSpecsSection } from "@/components/worksheet/equipment-specs-section";
 import { ObjectiveBudgetSection } from "@/components/worksheet/objective-budget-section";
@@ -18,6 +19,7 @@ import { TariffNetworkSection } from "@/components/worksheet/tariff-network-sect
 import {
   groupSectionsByPhase,
   type AddressRoofView,
+  type BatterySizingView,
   type EnergyDataView,
   type EquipmentSpecsView,
   type ObjectiveBudgetView,
@@ -82,6 +84,7 @@ export function WorksheetBody({
   objectiveBudget,
   equipmentSpecs,
   solarSizing,
+  batterySizing,
   jobId,
 }: {
   sections: readonly WorksheetBodySection[];
@@ -105,6 +108,9 @@ export function WorksheetBody({
   equipmentSpecs?: EquipmentSpecsView;
   /** 3.11: the Solar sizing view — path mode, pinnability, stored result. */
   solarSizing?: SolarSizingView;
+  /** 3.12: the Battery sizing view — path battery mode and the stored result.
+      Derived from the job the page already has; no new fetch. */
+  batterySizing?: BatterySizingView;
   jobId?: string;
 }) {
   const [openIds, setOpenIds] = React.useState<Record<string, boolean>>(() => {
@@ -157,6 +163,8 @@ export function WorksheetBody({
         <EquipmentSpecsSection view={equipmentSpecs} jobId={jobId} />
       ) : section.id === "solar-sizing" && solarSizing && jobId ? (
         <SolarSizingSection view={solarSizing} jobId={jobId} />
+      ) : section.id === "battery-sizing" && batterySizing && jobId ? (
+        <BatterySizingSection view={batterySizing} jobId={jobId} />
       ) : (
         <p className="text-caption text-muted-foreground">
           Built at {section.builtAt}

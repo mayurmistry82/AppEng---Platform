@@ -435,6 +435,12 @@ export function EnergyDataSection({
   const haveStoredInterval = view.state === "have_interval";
   const intervalFailed = upload !== null && !upload.ok;
   const showIntervalRead = (haveFreshInterval || haveStoredInterval) && !replacing;
+  // 2026-08-20: the job already holds a usage profile. The FRESH panel wins
+  // whenever both could apply — that session knows eleven facts, this one
+  // knows four — and the interval branch already renders the stored figures
+  // itself, so the stored panel belongs to the other branch only. Never both.
+  const showStoredProfile =
+    !recorded && view.hasStoredProfile && (!showIntervalRead || replacing);
 
   const billNotices: RoofNoticeView[] = bill?.ok
     ? [
@@ -543,6 +549,31 @@ export function EnergyDataSection({
               Figures you corrected are used instead of the parsed ones.
             </NoticeCaption>
           ) : null}
+        </div>
+      ) : null}
+
+      {/* ── The STORED profile (2026-08-20) — ONLY the facts the row carries ──
+          The row knows the tier, the yearly figure, the daily average and the
+          24 weights. It does NOT know what the UI predicted, what that call
+          warned about, whether a surveys row was written, whether the figure
+          was typed or read off a bill, whether survey answers were sent, or
+          whether the installer corrected a parsed bill — those are facts about
+          a SAVE CALL, and this panel renders none of their sentences. Putting
+          any of them here would print something not known to be true. */}
+      {showStoredProfile ? (
+        <div className="flex flex-col gap-2 rounded-lg border border-border bg-card p-3">
+          <p className="text-label text-foreground">
+            Usage profile on this job —{" "}
+            {view.tier !== null ? `Tier ${view.tier}` : "tier not recorded"}
+          </p>
+          <HeadlineFigures
+            annualKwh={view.annualKwh}
+            dailyAvgKwh={view.dailyAvgKwh}
+            preview={storedPreview}
+          />
+          {/* No weights, or the wrong number of them: the figures render and
+              the strip does not. Never an empty or fabricated chart. */}
+          {storedPreview.ok ? <LoadPreviewStrip view={storedPreview} /> : null}
         </div>
       ) : null}
 
@@ -902,22 +933,48 @@ export function EnergyDataSection({
             <p className="text-overline text-muted-foreground">
               Where this leaves the job
             </p>
-            <p className="text-body text-foreground">
-              {status.have}
-              {status.tier !== null ? (
-                <span className="metric-sm"> — Tier {status.tier}</span>
-              ) : null}
-            </p>
-            {status.next ? (
-              <p className="text-caption text-muted-foreground">{status.next}</p>
-            ) : null}
+            {/* 2026-08-20: with a profile already stored and nothing new
+                entered this session, `status` describes the EMPTY FORM and
+                would say the yearly total is missing — false, and the exact
+                contradiction this fix removes. The inputs above stay fully
+                reachable either way; only the sentence changes. The moment a
+                new figure is typed or a bill is read, `usageKwh` is non-null
+                and the normal line returns, correctly describing the NEW
+                figure rather than the stored one. */}
+            {showStoredProfile && usageKwh === null ? (
+              <>
+                <p className="text-body text-foreground">
+                  This job already has a usage profile — the figures are above.
+                </p>
+                <p className="text-caption text-muted-foreground">
+                  To replace it, upload a smart-meter file, add a bill, or type
+                  a new yearly total.
+                </p>
+              </>
+            ) : (
+              <>
+                <p className="text-body text-foreground">
+                  {status.have}
+                  {status.tier !== null ? (
+                    <span className="metric-sm"> — Tier {status.tier}</span>
+                  ) : null}
+                </p>
+                {status.next ? (
+                  <p className="text-caption text-muted-foreground">{status.next}</p>
+                ) : null}
+              </>
+            )}
             <div className="mt-1">
               <Button
                 size="sm"
                 onClick={() => void recordProfile()}
                 disabled={busy !== null || usageKwh === null}
               >
-                {busy === "demand" ? "Recording…" : "Record this profile"}
+                {busy === "demand"
+                  ? "Recording…"
+                  : showStoredProfile
+                    ? "Replace this profile"
+                    : "Record this profile"}
               </Button>
             </div>
           </div>

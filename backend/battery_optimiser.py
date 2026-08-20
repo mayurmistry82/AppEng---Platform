@@ -55,16 +55,16 @@ def battery_specs(row: dict, flags: list[str]) -> Optional[dict]:
     usable = _num(row.get("usable_capacity_kwh"))
     cost = _num(row.get("cost_aud"))
     if not usable or usable <= 0:
-        flags.append(f"{name}: usable_capacity_kwh missing — skipped (not treated as 0).")
+        flags.append(f"{name}: usable capacity missing — skipped (not treated as 0).")
         return None
     if cost is None:
-        flags.append(f"{name}: cost_aud missing — skipped (price cannot be assumed 0).")
+        flags.append(f"{name}: price missing — skipped (a price cannot be assumed to be $0).")
         return None
 
     dod_pct = _num(row.get("depth_of_discharge_pct"))
     if dod_pct is None:
         dod = _DEFAULT_DOD
-        flags.append(f"{name}: depth_of_discharge missing — assumed {int(_DEFAULT_DOD*100)}% (full usable).")
+        flags.append(f"{name}: depth of discharge missing — assumed {int(_DEFAULT_DOD*100)}% (full usable range).")
     else:
         dod = dod_pct / 100.0
 
@@ -88,7 +88,7 @@ def battery_specs(row: dict, flags: list[str]) -> Optional[dict]:
     cycle_life = row.get("warranty_cycles")
     cycle_life = int(cycle_life) if cycle_life else _DEFAULT_CYCLE_LIFE
     if not row.get("warranty_cycles"):
-        flags.append(f"{name}: warranty_cycles missing — assumed {_DEFAULT_CYCLE_LIFE} cycles for replacement modelling.")
+        flags.append(f"{name}: warranty cycles missing — assumed {_DEFAULT_CYCLE_LIFE} cycles for replacement modelling.")
 
     return {
         "id": row.get("id"),
@@ -283,7 +283,7 @@ def optimise_battery(
 
     # Constraints on the candidate set.
     if force_no_battery:
-        flags.append("force_no_battery constraint applied")
+        flags.append("The no-battery constraint was applied — only the solar-only outcome was evaluated.")
         battery_rows = []  # only the no-battery baseline is evaluated
     elif fix_battery_kwh is not None and battery_rows:
         valid = [(r, _num(r.get("usable_capacity_kwh"))) for r in battery_rows]
@@ -293,11 +293,11 @@ def optimise_battery(
             battery_rows = [nearest]
             if abs(u - float(fix_battery_kwh)) > 1e-9:
                 flags.append(
-                    f"fix_battery_kwh {fix_battery_kwh} → nearest catalogue {u} kWh "
-                    f"({nearest.get('brand')} {nearest.get('model')})."
+                    f"Pinned battery size {fix_battery_kwh} kWh matched to the nearest "
+                    f"catalogue battery: {u} kWh ({nearest.get('brand')} {nearest.get('model')})."
                 )
         else:
-            flags.append(f"fix_battery_kwh {fix_battery_kwh}: no catalogue battery with a usable capacity — only the no-battery baseline evaluated.")
+            flags.append(f"Pinned battery size {fix_battery_kwh} kWh: no catalogue battery has a usable capacity — only the no-battery option was evaluated.")
             battery_rows = []
 
     blocks = build_blocks(solar_8760, load_8760, rate_24, resolution)
@@ -319,6 +319,10 @@ def optimise_battery(
         "annual_import_kwh": round(base["import"], 1),
         "annual_export_kwh": round(base["export"], 1),
         "replacement_year": None,
+        # 3.12 (F152/D33): the total up-front net cost of the whole
+        # recommendation — for the no-battery point, the solar alone. The
+        # budget filter below tests THIS key, never battery_cost.
+        "system_cost": round(solar_only_net_cost, 2),
     }
     candidates: list[dict] = [no_battery]
     solve_seconds = 0.0
@@ -363,11 +367,29 @@ def optimise_battery(
             "replacement_year": fins["replacement_year"],
             "round_trip_efficiency": bat["rte"],
             "depth_of_discharge": bat["dod"],
+            # 3.12 (F152/D33): whole-system cost — solar plus this battery's
+            # incremental net cost. battery_cost keeps its incremental meaning.
+            "system_cost": round(solar_only_net_cost + incr_capex, 2),
         })
 
     # ── Budget filter + objective selection ──
-    pool = [c for c in candidates if budget is None or c["battery_cost"] <= budget]
+    # 3.12 (F152, D33): budget_aud caps the WHOLE SYSTEM — the filter tests
+    # system_cost, the total up-front net cost of the recommendation, never
+    # the incremental battery cost alone. The same sentence defines the
+    # system_cost column, and /api/sizing/optimise already filters this way.
+    pool = [c for c in candidates if budget is None or c["system_cost"] <= budget]
+    battery_candidates = [c for c in candidates if c.get("battery_id") is not None]
+    # Two DIFFERENT no-battery causes the reasons below must not conflate:
+    # every battery pushed the system over the cap, vs solar alone already
+    # exceeds it (in which case the baseline itself was filtered out).
+    batteries_cut_by_budget = (
+        budget is not None and bool(battery_candidates)
+        and not any(c.get("battery_id") is not None for c in pool)
+    )
+    solar_alone_over_budget = budget is not None and no_battery["system_cost"] > budget
     if not pool:
+        # Even solar alone exceeds the cap. The run still answers with the
+        # baseline and an honest reason — doubt travels, it never blocks (D24).
         pool = [no_battery]
 
     not_economic_reason = None
@@ -380,7 +402,7 @@ def optimise_battery(
             "candidates": sorted(candidates, key=lambda c: c["usable_kwh"]),
             "resolution": resolution,
             "solve_seconds": round(solve_seconds, 3),
-            "not_economic_reason": "battery excluded by the force_no_battery constraint.",
+            "not_economic_reason": "battery excluded by the no-battery constraint.",
             "n_candidates": len(candidates) - 1,
             "flags": flags,
         }
@@ -390,8 +412,6 @@ def optimise_battery(
         viable = [c for c in pool if c["usable_kwh"] > 0 and c["incremental_npv"] > 0
                   and c["incremental_payback_years"] is not None]
         optimal = min(viable, key=lambda c: c["incremental_payback_years"]) if viable else no_battery
-        if not viable:
-            not_economic_reason = "no battery has a positive-NPV payback under this tariff/cost — battery not economic."
     elif objective == "custom":
         npvs = [c["incremental_npv"] for c in pool]
         sss = [c["self_sufficiency_pct"] for c in pool]
@@ -405,11 +425,31 @@ def optimise_battery(
         optimal = max(pool, key=blend)
     else:  # max_npv (default)
         optimal = max(pool, key=lambda c: c["incremental_npv"])
-        if optimal["usable_kwh"] == 0:
-            not_economic_reason = "no battery beats solar-only on NPV — battery not economic for this job."
 
     if optimal.get("usable_kwh", 0) == 0:
-        flags.append("battery_not_economic")
+        # 3.12 change 4: EVERY no-battery outcome carries an honest reason —
+        # a budget cause is named as a budget cause, never as economics.
+        if solar_alone_over_budget:
+            not_economic_reason = (
+                f"even the solar-only system (${no_battery['system_cost']:,.2f}) costs "
+                f"more than the ${budget:,.2f} budget — no battery could be added under this cap."
+            )
+        elif batteries_cut_by_budget:
+            cheapest = min(c["system_cost"] for c in battery_candidates)
+            not_economic_reason = (
+                f"every battery took the whole-system cost over the ${budget:,.2f} budget "
+                f"(the cheapest solar-plus-battery system available was ${cheapest:,.2f}) — "
+                "solar-only is recommended under this cap."
+            )
+        elif objective == "max_self_sufficiency":
+            not_economic_reason = "no battery raised self-sufficiency above solar-only — battery not economic for this job."
+        elif objective == "min_payback":
+            not_economic_reason = "no battery has a positive-NPV payback under this tariff and cost — battery not economic for this job."
+        elif objective == "custom":
+            not_economic_reason = "no battery scored higher than solar-only on the chosen blend of NPV and self-sufficiency — battery not economic for this job."
+        else:  # max_npv
+            not_economic_reason = "no battery beats solar-only on NPV — battery not economic for this job."
+        flags.append("No battery is recommended for this job — the reason is stated with the result.")
 
     return {
         "objective": objective,

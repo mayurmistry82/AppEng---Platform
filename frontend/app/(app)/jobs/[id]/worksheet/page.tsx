@@ -6,6 +6,7 @@ import { apiGet } from "@/lib/api-server";
 import { getJob } from "@/lib/job-server";
 import {
   addressRoofView,
+  batterySizingView,
   energyDataView,
   equipmentSpecsView,
   objectiveBudgetView,
@@ -130,6 +131,7 @@ export default async function Page({
         objectiveBudget={objectiveBudgetView(job)}
         equipmentSpecs={equipmentSpecsView(job, catalogue)}
         solarSizing={solarSizingView(job)}
+        batterySizing={batterySizingView(job)}
         jobId={id}
       />
     </div>
