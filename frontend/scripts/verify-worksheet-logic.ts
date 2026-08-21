@@ -85,6 +85,8 @@ import {
   formatPct,
   formatYears,
   projectedSpendView,
+  roiFigures,
+  ROI_EXPLANATIONS,
   scoreCurveView,
   resultsTabView,
   elapsedLabel,
@@ -6504,4 +6506,91 @@ test("chart colours land in a real SVG as exactly one hsl(...) each — rendered
     "score-curve.tsx CODE must not contain an hsl( literal — the tokens arrive already wrapped (the docstring may name the fault; the code may not)");
   assert.ok(curveSrc.includes("stroke={d.series[0]}"),
     "the line's stroke is the hook's string, verbatim");
+});
+
+// ── 3.13 prompt 4c: the D34 ROI figures (V1-V3) ──────────────────────────────
+
+test("V1: roiFigures — always ALL THREE, smallest-first order, no divisions by zero", () => {
+  const healthy = roiFigures({
+    system_capex: 11868.77, annual_savings: 2689.6,
+    npv_25_year: 19935.55, undiscounted_savings_25yr: 71234.5,
+  });
+  assert.equal(healthy.length, 3, "no code path can produce fewer than three");
+  assert.deepEqual(healthy.map((f) => f.key), ["annual", "discounted", "total"],
+    "the ORDER is annual, discounted, total — the page must not open on its biggest number");
+  assert.equal(healthy[0].value, "23%");
+  assert.equal(healthy[1].value, "168%");
+  assert.equal(healthy[2].value, "500%");
+  // capex zero / null / negative: all three unavailable, nothing thrown.
+  for (const capex of [0, null, -5, "junk"]) {
+    const out = roiFigures({ system_capex: capex, annual_savings: 1000,
+      npv_25_year: 1000, undiscounted_savings_25yr: 1000 });
+    assert.equal(out.length, 3);
+    assert.ok(out.every((f) => f.value === null),
+      `capex ${capex}: every figure must be unavailable`);
+    assert.ok(out.every((f) => !`${f.value}`.includes("Infinity")));
+  }
+  // null NPV: the other two still render; null undiscounted (the three rows
+  // already stored): the total is unavailable and NEVER savings x 25.
+  const noUnd = roiFigures({ system_capex: 10000, annual_savings: 2000,
+    npv_25_year: 15000, undiscounted_savings_25yr: null });
+  assert.equal(noUnd[0].value, "20%");
+  assert.equal(noUnd[1].value, "150%");
+  assert.equal(noUnd[2].value, null,
+    "null undiscounted -> unavailable, never annual_savings x 25 (the figure D34 rejected)");
+  assert.equal(roiFigures(null).every((f) => f.value === null), true);
+});
+
+test("V2: the toggle state — off unless the job says boolean true; view carries all three", () => {
+  const base = {
+    sizing_results: [{ sizing_result_id: "s1", solar_kw: 9.24 }],
+    financial_results: [{ sizing_result_id: "s1", system_capex: 10000,
+      annual_savings: 2000, npv_25_year: 15000,
+      undiscounted_savings_25yr: 60000 }],
+  };
+  assert.equal(resultsTabView({ ...base, show_roi: true }).showRoi, true);
+  // Anything that is not boolean true is OFF — off is the safe state; the
+  // string "true"/"false" trap equipment_confirmed documents.
+  for (const junk of [false, undefined, null, "true", "false", 1]) {
+    assert.equal(resultsTabView({ ...base, show_roi: junk }).showRoi, false,
+      `show_roi ${JSON.stringify(junk)} must be OFF`);
+  }
+  const view = resultsTabView({ ...base, show_roi: true });
+  assert.equal(view.roi.length, 3);
+  assert.deepEqual(view.roi.map((f) => f.key), ["annual", "discounted", "total"]);
+});
+
+test("V3: the explanation strings are lib's own, and the component declares none", async () => {
+  const fs = await import("node:fs");
+  const path = await import("node:path");
+  // The strings exist, exported, one per figure, and the figures carry them.
+  assert.ok(ROI_EXPLANATIONS.annual.includes("ignores panel degradation"));
+  assert.ok(ROI_EXPLANATIONS.discounted.includes("worth less than today's"));
+  assert.ok(ROI_EXPLANATIONS.total.includes("says the least"));
+  const figs = roiFigures({ system_capex: 1, annual_savings: 1,
+    npv_25_year: 1, undiscounted_savings_25yr: 2 });
+  assert.equal(figs[0].explanation, ROI_EXPLANATIONS.annual);
+  assert.equal(figs[1].explanation, ROI_EXPLANATIONS.discounted);
+  assert.equal(figs[2].explanation, ROI_EXPLANATIONS.total);
+  // The component imports nothing of the sort and declares no second copy —
+  // it renders figure.explanation, which IS the lib string (8.1 prints the
+  // same words; two copies would drift within a month).
+  const tabSrc = fs.readFileSync(
+    path.resolve(import.meta.dirname, "../components/results/results-tab.tsx"),
+    "utf8");
+  assert.ok(tabSrc.includes("{figure.explanation}"),
+    "the component renders the lib string carried on the figure");
+  for (const fragment of ["ignores panel degradation", "worth less than today's", "says the least"]) {
+    assert.ok(!tabSrc.includes(fragment),
+      `the component must not declare its own copy of: ${fragment}`);
+  }
+  // OFF renders nothing and ON renders the fixed triple through ONE map —
+  // no per-figure conditional, no slice, no filter on view.roi.
+  assert.ok(tabSrc.includes("view.showRoi ? ("),
+    "the whole panel is behind the toggle");
+  assert.equal((tabSrc.match(/view\.roi/g) ?? []).length, 1,
+    "view.roi is consumed exactly once — by the one map");
+  assert.ok(tabSrc.includes("view.roi.map("), "one map over the fixed triple");
+  assert.ok(!/view\.roi\.(slice|filter|find)\(/.test(tabSrc),
+    "no code path can render a subset of the three");
 });

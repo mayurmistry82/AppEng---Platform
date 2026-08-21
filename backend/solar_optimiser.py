@@ -221,8 +221,14 @@ def financials(
     esc = fin["tariff_escalation_pct"] / 100.0
     years = fin["analysis_years"]
     npv = -system_cost
+    # 3.13 prompt 4c (D34): the SAME degraded-and-escalated year terms the NPV
+    # sums, with the discount divisor removed — the real savings curve, never
+    # annual_savings x years. One loop, two sums; the NPV term is untouched.
+    undiscounted = 0.0
     for y in range(1, years + 1):
-        npv += annual_savings * ((1 - deg) ** y) * ((1 + esc) ** y) / ((1 + disc) ** y)
+        year_term = annual_savings * ((1 - deg) ** y) * ((1 + esc) ** y)
+        undiscounted += year_term
+        npv += year_term / ((1 + disc) ** y)
 
     return {
         "annual_bill_before": round(bill_before, 2),
@@ -230,6 +236,7 @@ def financials(
         "annual_savings": round(annual_savings, 2),
         "simple_payback_years": round(payback, 2) if payback is not None else None,
         "npv_25yr": round(npv, 2),
+        "undiscounted_savings_25yr": round(undiscounted, 2),
         "annual_supply_charge": round(sc, 2) if sc_known else None,
         "bill_includes_supply_charge": sc_known,
     }

@@ -205,11 +205,13 @@ def t1_write_path() -> None:
     # baseline, so the check states what 3.10 contributed rather than pinning
     # an absolute that goes stale the next time the whitelist legitimately
     # grows — which is exactly what happened to this check between prompts.
-    added_by_310 = set(trio) | {"equipment_confirmed"}
-    check("(1d) _JOBS_PATCH_FIELDS == the fourteen pre-3.10 names + exactly the four "
-          "3.10 names (the trio + equipment_confirmed)",
+    # 3.13 prompt 4c added show_roi through the same one writer — the delta
+    # grows with the model, exactly as this check's own comment demands.
+    added_by_310 = set(trio) | {"equipment_confirmed"} | {"show_roi"}
+    check("(1d) _JOBS_PATCH_FIELDS == the fourteen pre-3.10 names + the four "
+          "3.10 names (the trio + equipment_confirmed) + 4c's show_roi",
           job_route._JOBS_PATCH_FIELDS == pre_310 | added_by_310
-          and len(job_route._JOBS_PATCH_FIELDS) == len(pre_310) + 4,
+          and len(job_route._JOBS_PATCH_FIELDS) == len(pre_310) + 5,
           str(sorted(job_route._JOBS_PATCH_FIELDS)))
 
 
@@ -884,8 +886,9 @@ def t8_wiring() -> None:
     n_jobs = len(job_route._JOBS_PATCH_FIELDS)
     print(f"        len(JobSitePatch.model_fields) = {n_fields}")
     print(f"        len(_JOBS_PATCH_FIELDS)        = {n_jobs}")
-    check("(8e) JobSitePatch holds 20 fields and _JOBS_PATCH_FIELDS holds 18",
-          n_fields == 20 and n_jobs == 18, f"{n_fields} / {n_jobs}")
+    check("(8e) JobSitePatch holds 21 fields and _JOBS_PATCH_FIELDS holds 19 "
+          "(20/18 + 4c's show_roi)",
+          n_fields == 21 and n_jobs == 19, f"{n_fields} / {n_jobs}")
 
 
 

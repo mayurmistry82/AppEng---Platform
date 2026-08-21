@@ -60,6 +60,8 @@ const FIELDS = [
   "equipment_inverter_id",
   "equipment_battery_id",
   "equipment_confirmed",
+  // 3.13 prompt 4c (D34): the ROI toggle.
+  "show_roi",
 ] as const;
 
 async function forward(

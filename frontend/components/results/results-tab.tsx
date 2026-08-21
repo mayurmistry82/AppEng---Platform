@@ -1,5 +1,11 @@
+"use client";
+
+import * as React from "react";
 import Link from "next/link";
+import { useRouter } from "next/navigation";
 import { Notice } from "@/components/ui/notice";
+import { HoverHelp } from "@/components/ui/tooltip";
+import { requestJson } from "@/lib/client-api";
 import { ScoreCurve } from "@/components/results/score-curve";
 import { NoticeStack } from "@/components/ui/notice-stack";
 import {
@@ -27,6 +33,96 @@ import type { ResultsTabView } from "@/lib/worksheet";
  * do not sum to its own net shows BOTH figures and says they disagree
  * (summing to net is the row's acceptance, so a mismatch is a finding).
  */
+/**
+ * The D34 ROI panel (3.13 prompt 4c). OFF renders NOTHING — not a collapsed
+ * panel, not a placeholder. ON renders ALL THREE definitions together via one
+ * map over roiFigures' fixed triple — there is deliberately no code path that
+ * can render one figure without the other two, because a control that picks
+ * one is the persuasion lever D34 rejected. The explanations come from the
+ * figures themselves (lib's ROI_EXPLANATIONS) — the same strings 8.1 prints
+ * in the customer report.
+ */
+function RoiPanel({
+  view,
+  jobId,
+}: {
+  view: ResultsTabView;
+  jobId: string;
+}) {
+  const router = useRouter();
+  const [saving, setSaving] = React.useState(false);
+  const [error, setError] = React.useState<string | null>(null);
+
+  async function setShowRoi(next: boolean) {
+    if (saving) return;
+    setSaving(true);
+    setError(null);
+    try {
+      // The ONE writer every other job setting uses — no second endpoint.
+      const res = await requestJson<Record<string, unknown>>(
+        "PATCH",
+        `/api/job/${encodeURIComponent(jobId)}`,
+        { show_roi: next },
+      );
+      if (!res.ok) {
+        setError("The setting could not be saved — nothing changed.");
+        return;
+      }
+      router.refresh();
+    } finally {
+      setSaving(false);
+    }
+  }
+
+  return (
+    <section aria-label="Return on investment">
+      <label className="flex items-center gap-2 text-body text-foreground">
+        <input
+          type="checkbox"
+          role="switch"
+          checked={view.showRoi}
+          disabled={saving}
+          onChange={(e) => void setShowRoi(e.target.checked)}
+          className="h-4 w-4 accent-primary"
+        />
+        Show return on investment
+        <HoverHelp label="About return on investment">
+          Return on investment has three defensible definitions that give very
+          different numbers for the same system, so when it is shown, all
+          three appear together. The setting is saved on the job and the
+          customer report follows it.
+        </HoverHelp>
+      </label>
+      {error ? (
+        <p className="mt-1 text-caption text-destructive">{error}</p>
+      ) : null}
+      {view.showRoi ? (
+        view.state === "ready" ? (
+          <div className="mt-3 flex flex-wrap gap-x-12 gap-y-4">
+            {view.roi.map((figure) => (
+              <div key={figure.key} className="min-w-[132px]">
+                <p className="flex items-center gap-1 text-caption text-muted-foreground">
+                  {figure.label}
+                  <HoverHelp label={`About ${figure.label.toLowerCase()}`}>
+                    {figure.explanation}
+                  </HoverHelp>
+                </p>
+                <p className="mt-0.5 metric-lg text-foreground">
+                  {figure.value ?? "unavailable for this run"}
+                </p>
+              </div>
+            ))}
+          </div>
+        ) : (
+          <p className="mt-2 text-caption text-muted-foreground">
+            Nothing to show yet — run the sizing first.
+          </p>
+        )
+      ) : null}
+    </section>
+  );
+}
+
 export function ResultsTab({
   view,
   jobId,
@@ -53,11 +149,16 @@ export function ResultsTab({
   }
   if (view.state === "awaiting-financial") {
     return (
-      <p className="text-body text-muted-foreground">
-        This job is sized, but the financial figures for the current run are
-        still being worked out. Run the sizing again in {worksheetLink} —
-        earlier runs are kept.
-      </p>
+      <div className="flex flex-col gap-4">
+        <p className="text-body text-muted-foreground">
+          This job is sized, but the financial figures for the current run are
+          still being worked out. Run the sizing again in {worksheetLink} —
+          earlier runs are kept.
+        </p>
+        {/* The toggle still renders on a run with no financial row — it says
+            there is nothing to show yet (3.13-4c fallback). */}
+        <RoiPanel view={view} jobId={jobId} />
+      </div>
     );
   }
 
@@ -165,6 +266,9 @@ export function ResultsTab({
           </p>
         )}
       </section>
+
+      {/* ── Return on investment (3.13 prompt 4c, D34) ── */}
+      <RoiPanel view={view} jobId={jobId} />
 
       {/* ── The score curve (3.13 prompt 4b) ── */}
       <section aria-label="Score curve">

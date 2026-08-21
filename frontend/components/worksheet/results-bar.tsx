@@ -328,7 +328,7 @@ export function ResultsBar({ view }: { view: ResultsBarView }) {
               }
             />
             <KpiTile
-              label="NPV split (solar + battery)"
+              label="NPV: solar part + battery part"
               value={
                 view.sized &&
                 view.splitSolarNpv != null &&

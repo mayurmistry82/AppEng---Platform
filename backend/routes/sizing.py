@@ -1139,6 +1139,8 @@ async def optimise_sizing(
                     ),
                     "payback_years": opt["simple_payback_years"],
                     "npv_25_year": opt["npv_25yr"],
+                    # 3.13 prompt 4c (D34): the real savings curve, undiscounted.
+                    "undiscounted_savings_25yr": opt.get("undiscounted_savings_25yr"),
                 },
                 flags,
             )
@@ -1820,6 +1822,15 @@ async def battery_sizing(
                 if _sol_npv is not None and _inc_npv is not None else None
             )
             _spend_before = chosen_solar.get("annual_bill_before")
+            # 3.13 prompt 4c (D34): the whole-system undiscounted savings
+            # compose exactly as the NPV does — solar plus incremental, the
+            # incremental already carrying its replacement cost undiscounted.
+            _sol_und = chosen_solar.get("undiscounted_savings_25yr")
+            _inc_und = opt.get("undiscounted_savings_25yr")
+            whole_undiscounted = (
+                _sol_und + _inc_und
+                if _sol_und is not None and _inc_und is not None else None
+            )
             financial_persisted = _persist_financial_and_quote(
                 client, caller, body.job_id, sid,
                 {
@@ -1842,6 +1853,10 @@ async def battery_sizing(
                     ),
                     "annual_bill_reduction": (
                         round(whole_savings, 2) if whole_savings is not None else None
+                    ),
+                    "undiscounted_savings_25yr": (
+                        round(whole_undiscounted, 2)
+                        if whole_undiscounted is not None else None
                     ),
                 },
                 flags,

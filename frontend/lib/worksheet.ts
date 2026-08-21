@@ -50,6 +50,7 @@ export interface JobDetailLike {
   objective?: string | null;
   custom_weight?: number | null;
   budget_aud?: number | null;
+  show_roi?: boolean | null;
   // 3.11 — the existing array's recorded size (a 3.3c job-bar field); read
   // by solarSizingView for the path-C keep-as-is option.
   existing_solar_kw?: number | null;
@@ -5148,6 +5149,11 @@ export interface ResultsTabView {
   runKind: string | null;
   /** 3.13 prompt 4b: the score curve's data — rendered only by the tab. */
   curve: ScoreCurveView;
+  /** 3.13 prompt 4c (D34): the ROI toggle, stored on the job. Strictly
+      boolean-true; anything else is off — off is the safe state. */
+  showRoi: boolean;
+  /** ALWAYS all three, smallest first; null values render as unavailable. */
+  roi: [RoiFigure, RoiFigure, RoiFigure];
   split: {
     solar: ResultsSplitColumn;
     battery: ResultsSplitColumn;
@@ -5472,6 +5478,8 @@ export function resultsTabView(job: unknown): ResultsTabView {
     dispatchResolution: base.dispatchResolution,
     runKind: base.runKind,
     curve: scoreCurveView(job),
+    showRoi: asObject(job).show_roi === true,
+    roi: roiFigures(fin),
     split,
     splitNote,
     cost,
@@ -5672,4 +5680,87 @@ export function scoreCurveView(job: unknown): ScoreCurveView {
     chosenNote,
     flatNote,
   };
+}
+
+// ── The return-on-investment toggle (checklist 3.13 prompt 4c, D34) ─────────
+
+/**
+ * THE THREE EXPLANATIONS, ONE STRING EACH, EXPORTED — the Results tab shows
+ * them in a HoverHelp and 8.1 prints the SAME words beneath each figure in
+ * the customer report, because nobody hovers over a PDF. Two separate strings
+ * would drift within a month, and the report is the artifact that leaves the
+ * building. Each says what the figure means AND what it ignores.
+ */
+export const ROI_EXPLANATIONS = {
+  annual:
+    "This year's savings divided by the system's net cost. It ignores panel " +
+    "degradation and rising prices — every later year is assumed to look " +
+    "like this one.",
+  discounted:
+    "The 25-year net present value divided by the net cost. Future dollars " +
+    "are counted as worth less than today's — this is the figure the " +
+    "sizing itself optimises.",
+  total:
+    "Every year's real savings added up with no discounting, minus the net " +
+    "cost, divided by the net cost. It is the largest of the three and says " +
+    "the least — a longer analysis period inflates it without the system " +
+    "being any better.",
+} as const;
+
+export interface RoiFigure {
+  key: "annual" | "discounted" | "total";
+  label: string;
+  /** null = unavailable — capex missing/zero/negative, or the input figure
+      null. NEVER a division by zero, an infinity, or a guessed stand-in
+      (annual_savings x 25 is the figure D34 rejected). */
+  value: string | null;
+  explanation: string;
+}
+
+/**
+ * The three D34 figures, ALWAYS all three, in this order — annual,
+ * discounted, total: smallest first, so the page does not open on its
+ * biggest number. There is deliberately NO parameter to select a subset:
+ * every installer would pick the biggest, and the platform must not build
+ * that lever.
+ */
+export function roiFigures(
+  fin: Record<string, unknown> | null,
+): [RoiFigure, RoiFigure, RoiFigure] {
+  const capex = fin ? tariffNum(fin.system_capex) : null;
+  const usable = capex !== null && capex > 0;
+  const pct = (numerator: number | null): string | null =>
+    usable && numerator !== null
+      ? formatPct(Math.round((numerator / (capex as number)) * 100))
+      : null;
+  const savings = fin ? tariffNum(fin.annual_savings) : null;
+  const npv = fin ? tariffNum(fin.npv_25_year) : null;
+  const undiscounted = fin ? tariffNum(fin.undiscounted_savings_25yr) : null;
+  return [
+    {
+      key: "annual",
+      label: "Annual return on cost",
+      value: pct(savings),
+      explanation: ROI_EXPLANATIONS.annual,
+    },
+    {
+      key: "discounted",
+      label: "Discounted return",
+      value: pct(npv),
+      explanation: ROI_EXPLANATIONS.discounted,
+    },
+    {
+      key: "total",
+      label: "Total 25-year return",
+      value:
+        usable && undiscounted !== null
+          ? formatPct(
+              Math.round(
+                ((undiscounted - (capex as number)) / (capex as number)) * 100,
+              ),
+            )
+          : null,
+      explanation: ROI_EXPLANATIONS.total,
+    },
+  ];
 }

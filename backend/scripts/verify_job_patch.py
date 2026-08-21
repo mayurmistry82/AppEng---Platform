@@ -167,14 +167,16 @@ def main() -> int:
     # name above can never quietly drift from reality again.
     fields = set(job_route.JobSitePatch.model_fields.keys())
     print(f"   len(JobSitePatch.model_fields) = {len(fields)}")
-    check("model has exactly the twenty fields",
+    check("model has exactly the twenty-one fields",
           fields == {"storeys", "roof_material", "dwelling_type", "year_built",
                      "bedrooms", "floor_area_m2", "electrical_phase",
                      "customer_name", "has_existing_solar", "existing_solar_kw",
                      "existing_inverter_kw", "intent", "address",
                      "objective", "custom_weight", "budget_aud",
                      "equipment_panel_id", "equipment_inverter_id",
-                     "equipment_battery_id", "equipment_confirmed"}, str(fields))
+                     "equipment_battery_id", "equipment_confirmed",
+                     # 3.13 prompt 4c (D34): the ROI toggle.
+                     "show_roi"}, str(fields))
     stub = StubClient()
     smuggle = {"storeys": 2, "company_id": "co-EVIL", "installer_id": "x",
                "path": "F", "status": "won", "address": "1 Evil St"}

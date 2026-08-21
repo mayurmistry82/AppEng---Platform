@@ -627,6 +627,10 @@ class JobSitePatch(BaseModel):
     # complete with nothing pinned (D24's propose-then-confirm shape). It does
     # NOT gate sizing and takes NO part in the address lock.
     equipment_confirmed: Optional[bool] = None
+    # 3.13 prompt 4c (D34): the ROI toggle. STRICTLY BOOLEAN — a truthy check
+    # would turn the string "false" into an on switch (the equipment_confirmed
+    # trap); pydantic's Optional[bool] refuses non-boolean junk at the door.
+    show_roi: Optional[bool] = None
 
 
 # Where each JobSitePatch field is WRITTEN (3.3c). jobs has NO address and NO
@@ -642,6 +646,8 @@ _JOBS_PATCH_FIELDS = {
     "objective", "custom_weight", "budget_aud",
     "equipment_panel_id", "equipment_inverter_id", "equipment_battery_id",
     "equipment_confirmed",
+    # 3.13 prompt 4c (D34): the ROI toggle travels through this ONE writer.
+    "show_roi",
 }
 _CUSTOMER_PATCH_FIELDS = {
     "customer_name": "customer_name",

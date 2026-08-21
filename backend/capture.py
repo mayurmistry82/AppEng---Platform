@@ -101,6 +101,9 @@ _ALLOWED: dict[str, set[str]] = {
         # is one the legacy /api/job/save path and the flywheel writer discard
         # without a word.
         "equipment_confirmed",
+        # 3.13 prompt 4c (D34): the ROI toggle — stored on the job so the
+        # customer report inherits it. Same silent-drop reason as above.
+        "show_roi",
     },
     "bills": {
         "bill_id", "job_id", "raw_file_path", "parsed_json", "parser_version",
@@ -163,6 +166,10 @@ _ALLOWED: dict[str, set[str]] = {
         # installer-priced distinction (D6) — pricing_basis, NOT basis, which
         # already means measurement basis in the frontend roof section.
         "sizing_result_id", "pricing_basis",
+        # 3.13 prompt 4c (D34): the real degraded-and-escalated savings curve
+        # summed without discounting — the one figure the third ROI definition
+        # needs. Absent from this allowlist it would be SILENTLY DROPPED.
+        "undiscounted_savings_25yr",
     },
     "corrections": {
         "correction_id", "job_id", "source_module", "field_path", "original_value",

@@ -277,19 +277,29 @@ def battery_financials(
     esc = fin["tariff_escalation_pct"] / 100.0
     N = fin["analysis_years"]
     npv = -incr_capex
+    # 3.13 prompt 4c (D34): the same year terms without the discount divisor —
+    # see solar_optimiser.financials. The NPV term is untouched.
+    undiscounted = 0.0
     for y in range(1, N + 1):
-        npv += savings * ((1 - deg) ** y) * ((1 + esc) ** y) / ((1 + disc) ** y)
+        year_term = savings * ((1 - deg) ** y) * ((1 + esc) ** y)
+        undiscounted += year_term
+        npv += year_term / ((1 + disc) ** y)
     repl_year = None
     if cycles_per_year > 0 and cycle_life:
         yr = cycle_life / cycles_per_year
         if yr < N:
             repl_year = int(math.ceil(yr))
             npv -= hardware_cost / ((1 + disc) ** repl_year)
+            # The undiscounted figure pays for the replacement too — a "total
+            # savings" that quietly ignored a cost the NPV pays for would make
+            # the LARGEST of the three ROI figures the least honest.
+            undiscounted -= hardware_cost
     payback = (incr_capex / savings) if savings > 0 else None
     return {
         "incremental_npv": round(npv, 2),
         "incremental_payback_years": round(payback, 2) if payback is not None else None,
         "replacement_year": repl_year,
+        "undiscounted_savings_25yr": round(undiscounted, 2),
     }
 
 
@@ -359,6 +369,8 @@ def optimise_battery(
         "battery_cost": 0.0,
         "incremental_payback_years": None,
         "incremental_npv": 0.0,
+        # 3.13 prompt 4c: no battery adds nothing — a true zero, not a null.
+        "undiscounted_savings_25yr": 0.0,
         "grid_cost": round(base["cost"], 2),
         "annual_import_kwh": round(base["import"], 1),
         "annual_export_kwh": round(base["export"], 1),
@@ -408,6 +420,7 @@ def optimise_battery(
             "battery_cost": round(incr_capex, 2),
             "incremental_payback_years": fins["incremental_payback_years"],
             "incremental_npv": fins["incremental_npv"],
+            "undiscounted_savings_25yr": fins["undiscounted_savings_25yr"],
             "grid_cost": round(res["cost"], 2),
             "annual_import_kwh": round(res["import"], 1),
             "annual_export_kwh": round(res["export"], 1),

@@ -737,6 +737,27 @@ def t_r7(client) -> dict:
               and bat.get("financial_persisted") is True,
               f"{sol.get('financial_persisted')!r} / "
               f"{bat.get('financial_persisted')!r}")
+        # 3.13 prompt 4c (W1): the undiscounted figure composes exactly as
+        # the NPV does — solar plus incremental — and the stored whole IS
+        # that sum. WHY IT MOVES: if either engine changed an existing figure,
+        # or the route re-derived instead of composing, these sums break.
+        _sol_und = (sol.get("optimal") or {}).get("undiscounted_savings_25yr")
+        _inc_und = (bat.get("optimal_battery") or {}).get("undiscounted_savings_25yr")
+        check("(W1) solar fin payload carries undiscounted_savings_25yr == "
+              "the engine's own figure",
+              sol_fin[0].get("undiscounted_savings_25yr") == _sol_und
+              and isinstance(_sol_und, (int, float)),
+              f"{sol_fin[0].get('undiscounted_savings_25yr')} vs {_sol_und}")
+        check("(W1) battery fin payload: whole undiscounted == solar + "
+              "incremental, to the cent",
+              isinstance(_sol_und, (int, float))
+              and isinstance(_inc_und, (int, float))
+              and isinstance(bat_fin[0].get("undiscounted_savings_25yr"), (int, float))
+              and abs(bat_fin[0]["undiscounted_savings_25yr"]
+                      - round(_sol_und + _inc_und, 2)) <= 0.01,
+              f"{bat_fin[0].get('undiscounted_savings_25yr')} vs "
+              f"{_sol_und}+{_inc_und}")
+
         check("(P10/R7) the battery run reports resolution 'full_year' in "
               "the response and in assumptions — the screen can always say "
               "which mode produced a number",
@@ -1615,6 +1636,179 @@ def t_u_red() -> None:
     shutil.rmtree(tmpdir, ignore_errors=True)
 
 
+def t_w2_replacement() -> None:
+    """3.13 prompt 4c (W2). THIS CHECK FAILS IF THE REPLACEMENT IS IGNORED:
+    the fixture's battery is replaced in year 10, and the undiscounted total
+    must pay for it — a 'total savings' that quietly ignored a cost the NPV
+    pays for would make the largest ROI figure the least honest."""
+    print("\nW2. the battery replacement is paid undiscounted too")
+    fin = {"degradation_annual_pct": 0.5, "discount_rate": 0.055,
+           "tariff_escalation_pct": 0.0, "analysis_years": 25}
+    with_repl = battery_optimiser.battery_financials(
+        savings=1000.0, incr_capex=8000.0, hardware_cost=6000.0,
+        cycles_per_year=400.0, cycle_life=4000, fin=fin)
+    no_repl = battery_optimiser.battery_financials(
+        savings=1000.0, incr_capex=8000.0, hardware_cost=6000.0,
+        cycles_per_year=400.0, cycle_life=10_000_000, fin=fin)
+    expected = round(sum(1000.0 * (1 - 0.005) ** y for y in range(1, 26))
+                     - 6000.0, 2)
+    print(f"        with replacement: {with_repl['undiscounted_savings_25yr']} "
+          f"(gate-derived {expected}); without: "
+          f"{no_repl['undiscounted_savings_25yr']}")
+    check("(W2) replacement inside the horizon (year "
+          f"{with_repl['replacement_year']}): the undiscounted total equals "
+          "the gate's own loop MINUS the hardware cost",
+          with_repl["replacement_year"] == 10
+          and with_repl["undiscounted_savings_25yr"] == expected,
+          f"{with_repl['undiscounted_savings_25yr']} vs {expected}")
+    check("(W2) ...and differs from the no-replacement control by EXACTLY the "
+          "hardware cost — ignoring the replacement would erase this gap and "
+          "fail the check above",
+          round(no_repl["undiscounted_savings_25yr"]
+                - with_repl["undiscounted_savings_25yr"], 2) == 6000.0,
+          f"gap={round(no_repl['undiscounted_savings_25yr'] - with_repl['undiscounted_savings_25yr'], 2)}")
+    # The untouched keys: the NPV's replacement term is the DISCOUNTED
+    # hardware cost — the same gap, divided by 1.055^10. Asserting the exact
+    # relationship pins that the 4c edit changed neither term.
+    npv_gap = round(no_repl["incremental_npv"] - with_repl["incremental_npv"], 2)
+    check("(W2) the NPV still pays the replacement DISCOUNTED — its gap is "
+          "hardware/(1.055^10), unchanged by the 4c edit",
+          abs(npv_gap - round(6000.0 / (1.055 ** 10), 2)) <= 0.01,
+          f"npv gap {npv_gap} vs {round(6000.0 / (1.055 ** 10), 2)}")
+
+
+def subprocess_probe_w1() -> dict:
+    """Fresh interpreter: does the stored whole still equal solar + incremental?"""
+    client = sizing_route._sb()
+    caller = _caller_for(client, TOU_JOB)
+    sol, _r1, sol_fin, _q1 = _run_endpoint(
+        sizing_route.optimise_sizing,
+        sizing_route.OptimiseRequest(job_id=TOU_JOB), caller)
+    bat, _r2, bat_fin, _q2 = _run_endpoint(
+        sizing_route.battery_sizing,
+        sizing_route.BatteryRequest(job_id=TOU_JOB), caller)
+    s = (sol.get("optimal") or {}).get("undiscounted_savings_25yr")
+    i = (bat.get("optimal_battery") or {}).get("undiscounted_savings_25yr")
+    w = bat_fin[0].get("undiscounted_savings_25yr") if bat_fin else None
+    ok = (isinstance(s, (int, float)) and isinstance(i, (int, float))
+          and isinstance(w, (int, float)) and abs(w - round(s + i, 2)) <= 0.01)
+    return {"s": s, "i": i, "w": w, "ok": ok}
+
+
+def _probe_w1_via_subprocess() -> dict | None:
+    runner = (
+        "import json, sys\n"
+        f"sys.path.insert(0, {SCRIPTS_DIR!r})\n"
+        f"sys.path.insert(0, {BACKEND_DIR!r})\n"
+        "import verify_results_contract as g\n"
+        "print('PROBE:' + json.dumps(g.subprocess_probe_w1()))\n"
+    )
+    proc = subprocess.run([sys.executable, "-c", runner],
+                          capture_output=True, text=True, timeout=600)
+    for line in proc.stdout.splitlines():
+        if line.startswith("PROBE:"):
+            return json.loads(line[len("PROBE:"):])
+    print(f"        probe stdout: {proc.stdout[-400:]!r}")
+    print(f"        probe stderr: {proc.stderr[-400:]!r}")
+    return None
+
+
+_W_FROM = "                _sol_und + _inc_und\n"
+_W_TO = "                _sol_und + _inc_und + 1.0\n"
+
+
+def t_w1_red() -> None:
+    print("\nW1-RED. the composition check can FAIL — one part perturbed in a "
+          "byte-hashed copy of routes/sizing.py")
+    target = os.path.join(BACKEND_DIR, "routes", "sizing.py")
+    original = open(target, "rb").read()
+    original_hash = hashlib.sha256(original).hexdigest()
+    print(f"        original SHA-256: {original_hash}")
+    text = original.decode("utf-8")
+    n = text.count(_W_FROM)
+    check("(W1-RED) the composed line exists EXACTLY once", n == 1, f"count={n}")
+    if n != 1:
+        return
+    tmpdir = tempfile.mkdtemp(prefix="w1_")
+    backup = os.path.join(tmpdir, "sizing.py.bak")
+    shutil.copyfile(target, backup)
+    try:
+        with open(target, "w", encoding="utf-8") as fh:
+            fh.write(text.replace(_W_FROM, _W_TO))
+        _rm_pycache()
+        red = _probe_w1_via_subprocess()
+        print(f"        perturbed probe: {red}")
+        check("(W1-RED) RED: one dollar added to the composed whole breaks "
+              "the sum — the check genuinely bites",
+              isinstance(red, dict) and red.get("ok") is False, repr(red))
+    finally:
+        shutil.copyfile(backup, target)
+        _rm_pycache()
+    restored_hash = hashlib.sha256(open(target, "rb").read()).hexdigest()
+    check("(W1-RED) RESTORED byte-identical (from the copy, never git)",
+          restored_hash == original_hash, restored_hash)
+    green = _probe_w1_via_subprocess()
+    check("(W1-RED) GREEN AGAIN after the restore",
+          isinstance(green, dict) and green.get("ok") is True, repr(green))
+    shutil.rmtree(tmpdir, ignore_errors=True)
+
+
+def _allowlist_trap(label: str, line: str, table: str, key: str,
+                    probe_payload: str) -> None:
+    """The S2 pattern: remove one allowlist line in a byte-hashed copy of
+    capture.py and show the value VANISH, then restore by hash."""
+    print(f"\n{label}. the allowlist trap — {table}.{key}")
+    target = os.path.join(BACKEND_DIR, "capture.py")
+    original = open(target, "rb").read()
+    original_hash = hashlib.sha256(original).hexdigest()
+    text = original.decode("utf-8")
+    n = text.count(line)
+    check(f"({label}) the entry line exists EXACTLY once", n == 1, f"count={n}")
+    if n != 1:
+        return
+    kept = capture._filtered(table, json.loads(probe_payload))
+    check(f"({label}) GREEN: _filtered KEEPS {key} with the entry in place",
+          key in kept, str(sorted(kept)))
+    tmpdir = tempfile.mkdtemp(prefix="trap_")
+    backup = os.path.join(tmpdir, "capture.py.bak")
+    shutil.copyfile(target, backup)
+    runner = (
+        "import json, sys\n"
+        f"sys.path.insert(0, {BACKEND_DIR!r})\n"
+        "import capture\n"
+        f"out = capture._filtered({table!r}, json.loads({probe_payload!r}))\n"
+        f"print('PROBE:' + json.dumps({{'kept': {key!r} in out}}))\n"
+    )
+    try:
+        with open(target, "w", encoding="utf-8") as fh:
+            fh.write(text.replace(line, ""))
+        _rm_pycache()
+        proc = subprocess.run([sys.executable, "-c", runner],
+                              capture_output=True, text=True, timeout=120)
+        red = next((json.loads(l[len("PROBE:"):])
+                    for l in proc.stdout.splitlines()
+                    if l.startswith("PROBE:")), None)
+        check(f"({label}) RED: without the entry the value VANISHES silently",
+              isinstance(red, dict) and red.get("kept") is False, repr(red))
+    finally:
+        shutil.copyfile(backup, target)
+        _rm_pycache()
+    restored = hashlib.sha256(open(target, "rb").read()).hexdigest()
+    check(f"({label}) RESTORED byte-identical", restored == original_hash,
+          restored)
+    shutil.rmtree(tmpdir, ignore_errors=True)
+
+
+def t_w3_w4_traps() -> None:
+    _allowlist_trap(
+        "W3", '        "show_roi",\n', "jobs", "show_roi",
+        '{"job_id": "j", "show_roi": true}')
+    _allowlist_trap(
+        "W4", '        "undiscounted_savings_25yr",\n', "financial_results",
+        "undiscounted_savings_25yr",
+        '{"job_id": "j", "undiscounted_savings_25yr": 45210.5}')
+
+
 def t_p10_full_year_blocks() -> None:
     """3.13 prompt 2b (D35): full_year is 365 REAL daily blocks, day-cyclic by
     construction. WHY THESE MOVE: the pre-2b branch returned ONE 8,760-step
@@ -1704,6 +1898,8 @@ def main() -> int:
     t_p7()
     t_p8_resolver()
     t_p10_full_year_blocks()
+    t_w2_replacement()
+    t_w3_w4_traps()
 
     client = sizing_route._sb()
     if client is None:
@@ -1728,6 +1924,7 @@ def main() -> int:
         t_u_provenance(r7.get("bat") or {}, (r8 or {}).get("sol_null") or {})
         t_q1_red()
         t_u_red()
+        t_w1_red()
         t_s2_s3(client)
 
     if start is not None:
