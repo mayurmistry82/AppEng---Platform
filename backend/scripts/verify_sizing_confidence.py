@@ -278,6 +278,127 @@ def t6_numbers(solar_response: dict) -> None:
               isinstance(value, (int, float)) and value == value, str(value))
 
 
+def t7_no_battery_index() -> None:
+    """3.14 prompt 2 (F195), OFFLINE: battery_optimiser.optimise_battery
+    returns chosen_index from BOTH of its returns, derived by object IDENTITY
+    against the list it returns. Three cases, none touching the database:
+      (7a) the EARLY return (force_no_battery) — the optimum IS the no-battery
+           baseline and still gets a real index, never None;
+      (7b) the MAIN return with nothing to evaluate — economics pick the
+           baseline, which again gets a real index;
+      (7c) the tie that justifies identity: two catalogue rows with IDENTICAL
+           specs and price produce two candidates equal on usable_kwh AND
+           system_cost. A value matcher cannot say which won; the index must
+           name the very object optimal_battery is. cost_model is stubbed so
+           this stays offline; the LP runs for real."""
+    print("\nT7. the no-battery optimum still gets an index (F195) — offline, "
+          "both returns, plus the tie")
+    import battery_optimiser  # noqa: PLC0415
+
+    def _ok_idx(res: dict) -> bool:
+        ci = res.get("chosen_index")
+        return (isinstance(ci, int) and not isinstance(ci, bool)
+                and 0 <= ci < len(res.get("candidates") or []))
+
+    hours = 8760
+    # Flat 1 kW load, no solar, a TOU shape with an evening peak — enough for
+    # a cheap battery to earn its keep in (7c); irrelevant to (7a)/(7b).
+    load = [1.0] * hours
+    solar = [0.0] * hours
+    rate_24 = [0.15] * 17 + [0.60] * 4 + [0.15] * 3
+    fin = {"performance_ratio_non_temp": 0.88, "discount_rate": 0.055,
+           "analysis_years": 25, "degradation_annual_pct": 0.5,
+           "tariff_escalation_pct": 0.0}
+    common = dict(solar_8760=solar, load_8760=load, rate_24=rate_24, fit=0.05,
+                  export_limit_kw=5.0, fin=fin, solar_kw=5.0, panel_id=None,
+                  panel_count=None, solar_only_net_cost=8000.0, postcode=None,
+                  state=None, installer_id=None, objective="max_npv")
+
+    # (7a) the EARLY return.
+    flags_a: list[str] = []
+    res_a = battery_optimiser.optimise_battery(
+        battery_rows=[], force_no_battery=True, flags=flags_a, **common)
+    print(f"        (7a) force_no_battery: chosen_index={res_a.get('chosen_index')!r} "
+          f"of {len(res_a.get('candidates') or [])} candidate(s); "
+          f"reason={res_a.get('not_economic_reason')!r}")
+    check("(7a) force_no_battery (the early return): chosen_index is an int "
+          "in range — the baseline is a real position, not None",
+          _ok_idx(res_a), repr(res_a.get("chosen_index")))
+    check("(7a) ...and candidates[chosen_index] IS optimal_battery IS "
+          "no_battery_baseline (identity)",
+          _ok_idx(res_a)
+          and res_a["candidates"][res_a["chosen_index"]] is res_a["optimal_battery"]
+          and res_a["optimal_battery"] is res_a["no_battery_baseline"], "")
+    check("(7a) no chosen_index_unresolved flag",
+          not any(str(f).startswith("chosen_index_unresolved") for f in flags_a),
+          str(flags_a))
+
+    # (7b) the MAIN return, baseline by economics (nothing else to evaluate).
+    flags_b: list[str] = []
+    res_b = battery_optimiser.optimise_battery(
+        battery_rows=[], force_no_battery=False, flags=flags_b, **common)
+    print(f"        (7b) no rows: chosen_index={res_b.get('chosen_index')!r} "
+          f"usable_kwh={(res_b.get('optimal_battery') or {}).get('usable_kwh')!r} "
+          f"reason={res_b.get('not_economic_reason')!r}")
+    check("(7b) the main return with the no-battery outcome: chosen_index is "
+          "an int in range, naming the baseline",
+          _ok_idx(res_b)
+          and res_b["candidates"][res_b["chosen_index"]] is res_b["no_battery_baseline"]
+          and res_b["optimal_battery"].get("usable_kwh") == 0.0
+          and isinstance(res_b.get("not_economic_reason"), str),
+          f"{res_b.get('chosen_index')!r} / {res_b.get('not_economic_reason')!r}")
+    check("(7b) no chosen_index_unresolved flag",
+          not any(str(f).startswith("chosen_index_unresolved") for f in flags_b),
+          str(flags_b))
+
+    # (7c) the tie. cost_model stubbed: a fixed incremental cost, offline.
+    twin = {"usable_capacity_kwh": 10.0, "cost_aud": 1000.0,
+            "depth_of_discharge_pct": 100.0, "round_trip_efficiency_pct": 90.0,
+            "max_continuous_charge_kw": 5.0, "max_continuous_discharge_kw": 5.0,
+            "warranty_cycles": 6000}
+    rows = [{"id": "twin-a", "brand": "Twin", "model": "A", **twin},
+            {"id": "twin-b", "brand": "Twin", "model": "B", **twin}]
+    original_cost = battery_optimiser.cost_model.compute_system_cost
+    battery_optimiser.cost_model.compute_system_cost = (
+        lambda **kw: {"net_cost": 8000.0 + 1000.0, "line_items": [], "flags": []})
+    flags_c: list[str] = []
+    try:
+        res_c = battery_optimiser.optimise_battery(
+            battery_rows=rows, force_no_battery=False, flags=flags_c, **common)
+    finally:
+        battery_optimiser.cost_model.compute_system_cost = original_cost
+    cands = res_c.get("candidates") or []
+    opt_c = res_c.get("optimal_battery") or {}
+    ci_c = res_c.get("chosen_index")
+    twins = [c for c in cands if c.get("battery_id") in ("twin-a", "twin-b")]
+    print(f"        (7c) candidates: "
+          f"{[(c.get('battery_id'), c.get('usable_kwh'), c.get('system_cost'), c.get('incremental_npv')) for c in cands]}")
+    print(f"        (7c) optimal={opt_c.get('battery_id')!r} chosen_index={ci_c!r}")
+    check("(7c/premise) the two twins BOTH survived the LP and tie on "
+          "usable_kwh AND system_cost — a value matcher cannot tell them apart",
+          len(twins) == 2
+          and twins[0].get("usable_kwh") == twins[1].get("usable_kwh")
+          and twins[0].get("system_cost") == twins[1].get("system_cost"),
+          f"{[(c.get('battery_id'), c.get('usable_kwh'), c.get('system_cost')) for c in twins]}")
+    check("(7c/premise) a battery WON (the tie is exercised, not the baseline)",
+          opt_c.get("battery_id") in ("twin-a", "twin-b"),
+          repr(opt_c.get("battery_id")))
+    value_matches = [i for i, c in enumerate(cands)
+                     if c.get("usable_kwh") == opt_c.get("usable_kwh")
+                     and c.get("system_cost") == opt_c.get("system_cost")]
+    check("(7c/premise) matching on capacity-and-cost names MORE THAN ONE "
+          "point — the ambiguity identity exists to remove",
+          len(value_matches) >= 2, str(value_matches))
+    check("(7c) chosen_index names THE object optimal_battery is (identity), "
+          "and no other",
+          _ok_idx(res_c) and cands[ci_c] is opt_c
+          and sum(1 for c in cands if c is opt_c) == 1,
+          f"chosen_index={ci_c!r} value_matches={value_matches}")
+    check("(7c) no chosen_index_unresolved flag",
+          not any(str(f).startswith("chosen_index_unresolved") for f in flags_c),
+          str([f for f in flags_c if "chosen_index" in str(f)]))
+
+
 def main() -> int:
     print("verify_sizing_confidence.py — 3.11 prompt 1 (reads live, WRITES NOTHING)\n")
     client = sizing_route._sb()
@@ -291,6 +412,7 @@ def main() -> int:
         t5_legacy()
         if solar_response:
             t6_numbers(solar_response)
+    t7_no_battery_index()
     print(f"\n{'-' * 60}")
     if FAILURES:
         print(f"FAIL: {len(FAILURES)} of {CHECKS_RUN} checks failed:")

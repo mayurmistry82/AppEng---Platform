@@ -463,6 +463,26 @@ def optimise_battery(
         # baseline and an honest reason — doubt travels, it never blocks (D24).
         pool = [no_battery]
 
+    # 3.14 prompt 2 (F195): the returned list is sorted ONCE, here, and BOTH
+    # returns below hand back this same object — chosen_index is derived
+    # against it by object IDENTITY, exactly as solar_optimiser names its own
+    # optimum. Identity, never capacity-and-cost: two candidates can tie on
+    # both, which is why the frontend's value matcher has shown nothing.
+    # optimal is always an element of candidates (it is picked out of pool,
+    # whose members are references into candidates, or it IS no_battery — the
+    # baseline is a real position in this list, never None). Unresolvable is
+    # None plus a flag, never a guessed index.
+    sorted_candidates = sorted(candidates, key=lambda c: c["usable_kwh"])
+
+    def _chosen_index(opt: dict) -> Optional[int]:
+        idx = next((i for i, c in enumerate(sorted_candidates) if c is opt), None)
+        if idx is None:
+            flags.append(
+                "chosen_index_unresolved — the optimum could not be matched to a "
+                "candidates point by identity"
+            )
+        return idx
+
     not_economic_reason = None
     if force_no_battery:
         # Forced by constraint — not an economics outcome.
@@ -470,7 +490,8 @@ def optimise_battery(
             "objective": objective,
             "optimal_battery": no_battery,
             "no_battery_baseline": no_battery,
-            "candidates": sorted(candidates, key=lambda c: c["usable_kwh"]),
+            "candidates": sorted_candidates,
+            "chosen_index": _chosen_index(no_battery),
             "resolution": resolution,
             "solve_seconds": round(solve_seconds, 3),
             "not_economic_reason": "battery excluded by the no-battery constraint.",
@@ -526,7 +547,8 @@ def optimise_battery(
         "objective": objective,
         "optimal_battery": optimal,
         "no_battery_baseline": no_battery,
-        "candidates": sorted(candidates, key=lambda c: c["usable_kwh"]),
+        "candidates": sorted_candidates,
+        "chosen_index": _chosen_index(optimal),
         "resolution": resolution,
         "solve_seconds": round(solve_seconds, 3),
         "not_economic_reason": not_economic_reason,

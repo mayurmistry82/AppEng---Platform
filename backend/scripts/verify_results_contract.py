@@ -875,7 +875,169 @@ def t_r7(client) -> dict:
                   ("solar_kw", "panel_count", "panels_per_plane")),
           repr(bsolar))
     print(f"        battery chosen_solar: {json.dumps(bsolar, default=str)[:200]}")
+
+    # 3.14 prompt 2 (F195/F202, V3): the battery run's chosen_index and
+    # solar_options reach BOTH the row and the response, and they are the
+    # SAME — identity for the dict (the route builds it once), equality both
+    # ways for the int. WHY THESE MOVE: pre-3.14 neither the payload nor the
+    # response carries either key; a route that built two dicts would fail
+    # the identity check even while both copies were equal.
+    b_pts = bopts.get("points") if isinstance(bopts.get("points"), list) else []
+    ci_row, ci_resp = bopts.get("chosen_index"), bat.get("chosen_index")
+    print(f"        battery chosen_index: row={ci_row!r} response={ci_resp!r} "
+          f"of {len(b_pts)} points")
+    check("(V3) battery: chosen_index is an int in range of points on the "
+          "ROW and on the RESPONSE, and row == response == row",
+          isinstance(ci_row, int) and not isinstance(ci_row, bool)
+          and 0 <= ci_row < len(b_pts)
+          and ci_row == ci_resp and ci_resp == ci_row,
+          f"row={ci_row!r} response={ci_resp!r}")
+    check("(V3) battery: points[chosen_index] IS the response's "
+          "optimal_battery (identity) and its usable_kwh == the row's "
+          "battery_kwh",
+          isinstance(ci_row, int) and 0 <= ci_row < len(b_pts)
+          and b_pts[ci_row] is bat.get("optimal_battery")
+          and b_pts[ci_row].get("usable_kwh") == bat_rec[0].get("battery_kwh"),
+          f"point={b_pts[ci_row].get('usable_kwh') if isinstance(ci_row, int) and 0 <= ci_row < len(b_pts) else None!r} "
+          f"row={bat_rec[0].get('battery_kwh')!r}")
+    so_row, so_resp = bopts.get("solar_options"), bat.get("solar_options")
+    print(f"        battery solar_options: row keys="
+          f"{sorted(so_row) if isinstance(so_row, dict) else so_row!r} "
+          f"response keys={sorted(so_resp) if isinstance(so_resp, dict) else so_resp!r} "
+          f"identity={so_row is so_resp}")
+    check("(V3) battery: persisted solar_options IS the response's "
+          "solar_options (identity, both ways)",
+          isinstance(so_row, dict) and so_row is so_resp and so_resp is so_row,
+          f"row id={id(so_row)} response id={id(so_resp)}")
+    so = so_row if isinstance(so_row, dict) else {}
+    s_pts = so.get("points") if isinstance(so.get("points"), list) else []
+    s_ci = so.get("chosen_index")
+    s_ok = (isinstance(s_ci, int) and not isinstance(s_ci, bool)
+            and 0 <= s_ci < len(s_pts))
+    print(f"        battery solar_options: dims={so.get('dimension_keys')!r} "
+          f"points={len(s_pts)} chosen_index={s_ci!r} "
+          f"point.solar_kw={s_pts[s_ci].get('solar_kw') if s_ok else None!r} "
+          f"row.solar_kw={bat_rec[0].get('solar_kw')!r}")
+    check("(V3) battery: solar_options mirrors the solar run's shape — "
+          "dimension_keys ['solar_kw'], a non-empty points list whose every "
+          "point carries solar_kw, score and the layout keys, and an int "
+          "chosen_index in range",
+          so.get("dimension_keys") == ["solar_kw"] and len(s_pts) > 0
+          and all(isinstance(q, dict) and "solar_kw" in q and "score" in q
+                  and "plane_indices" in q and "panels_per_plane" in q
+                  and "panel_count" in q for q in s_pts)
+          and s_ok,
+          f"dims={so.get('dimension_keys')!r} points={len(s_pts)} ci={s_ci!r}")
+    check("(V3) battery: solar_options.points[chosen_index].solar_kw == the "
+          "row's solar_kw == the response's chosen_solar.solar_kw",
+          s_ok and s_pts[s_ci].get("solar_kw") is not None
+          and s_pts[s_ci].get("solar_kw") == bat_rec[0].get("solar_kw")
+          == (bat.get("chosen_solar") or {}).get("solar_kw"),
+          f"point={s_pts[s_ci].get('solar_kw') if s_ok else None!r} "
+          f"row={bat_rec[0].get('solar_kw')!r} "
+          f"response={(bat.get('chosen_solar') or {}).get('solar_kw')!r}")
+    # The solar run itself is UNCHANGED by 3.14 — no solar_options key, and
+    # its curve still sits at top level.
+    check("(V3) solar payload: NO solar_options key (the solar run stores "
+          "its curve at top level, unchanged)",
+          "solar_options" not in sopts and isinstance(sopts.get("points"), list),
+          str(sorted(sopts)))
     return {"sol": sol, "bat": bat}
+
+
+def t_v_persist_flag(client) -> None:
+    """3.14 prompt 2 (D36, V4): persist=false computes and answers but writes
+    NOTHING — no sizing row, no financial row, no jobs.quoted_value_aud — and
+    says so with the flag routes/roof.py already uses. The two FAILED-write
+    flags must be absent: a declined save and a broken save are two facts.
+    Then the SAME call with persist omitted records exactly one insert per
+    endpoint — the pair is what proves the flag does something rather than
+    nothing. The recorded lists are PRINTED so an empty result is visible
+    rather than assumed."""
+    print("\nV4. persist=false writes NOTHING, and persist omitted writes "
+          "exactly one — the pair, both endpoints, recorder in place")
+    caller = _caller_for(client, TOU_JOB)
+    check("(V4) OptimiseRequest.persist and BatteryRequest.persist exist and "
+          "default True — additive, every existing caller unchanged",
+          sizing_route.OptimiseRequest().persist is True
+          and sizing_route.BatteryRequest().persist is True
+          and "persist" in sizing_route.OptimiseRequest.model_fields
+          and "persist" in sizing_route.BatteryRequest.model_fields, "")
+    roof_src = open(os.path.join(BACKEND_DIR, "routes", "roof.py"),
+                    encoding="utf-8").read()
+    check("(V4) the flag string 'not_persisted_by_request' is the one "
+          "routes/roof.py already uses — no second name for one fact",
+          "not_persisted_by_request" in roof_src, "")
+    for label, fn, req_cls, answer_key in (
+        ("solar", sizing_route.optimise_sizing, sizing_route.OptimiseRequest, "optimal"),
+        ("battery", sizing_route.battery_sizing, sizing_route.BatteryRequest, "optimal_battery"),
+    ):
+        resp, rec, fin_rec, quotes = _run_endpoint(
+            fn, req_cls(job_id=TOU_JOB, persist=False), caller)
+        flags = resp.get("flags") or []
+        print(f"        {label} persist=false: sizing inserts recorded = {rec!r}; "
+              f"financial inserts recorded = {fin_rec!r}; "
+              f"quote writes recorded = {quotes!r}")
+        print(f"        {label} persist=false: persisted={resp.get('persisted')!r} "
+              f"financial_persisted={resp.get('financial_persisted')!r} "
+              f"flags={[f for f in flags if 'persist' in str(f)]!r}")
+        check(f"(V4) {label} persist=false: ZERO sizing insert attempts — the "
+              "recorded list is empty",
+              rec == [] and isinstance(rec, list), f"recorded={rec!r}")
+        check(f"(V4) {label} persist=false: ZERO financial insert attempts "
+              "and ZERO writes against jobs.quoted_value_aud",
+              fin_rec == [] and quotes == [],
+              f"financial={fin_rec!r} quotes={quotes!r}")
+        check(f"(V4) {label} persist=false: persisted False and "
+              "financial_persisted False",
+              resp.get("persisted") is False
+              and resp.get("financial_persisted") is False,
+              f"{resp.get('persisted')!r} / {resp.get('financial_persisted')!r}")
+        check(f"(V4) {label} persist=false: 'not_persisted_by_request' in flags",
+              "not_persisted_by_request" in flags, str(flags)[:300])
+        check(f"(V4) {label} persist=false: sizing_result_not_persisted and "
+              "financial_result_not_persisted BOTH ABSENT — a declined save "
+              "is not reported as a broken one",
+              "sizing_result_not_persisted" not in flags
+              and "financial_result_not_persisted" not in flags
+              and "quote_value_not_updated" not in flags,
+              str([f for f in flags if "persisted" in str(f)
+                   or "quote" in str(f)]))
+        check(f"(V4) {label} persist=false: the answer still arrives — "
+              f"{answer_key} is a dict and there is no error",
+              isinstance(resp.get(answer_key), dict) and "error" not in resp,
+              f"keys={sorted(resp)[:12]}")
+        if label == "battery":
+            # With no row, the response is the ONLY place these exist.
+            so = resp.get("solar_options")
+            check("(V4) battery persist=false: the response carries "
+                  "chosen_index (int) and solar_options (dict with points "
+                  "and chosen_index) — the only copy there is",
+                  isinstance(resp.get("chosen_index"), int)
+                  and isinstance(so, dict)
+                  and isinstance(so.get("points"), list)
+                  and "chosen_index" in so,
+                  f"chosen_index={resp.get('chosen_index')!r} "
+                  f"solar_options={type(so)}")
+        # THE PAIR: the same request with persist omitted.
+        resp2, rec2, fin2, q2 = _run_endpoint(fn, req_cls(job_id=TOU_JOB), caller)
+        print(f"        {label} persist omitted: {len(rec2)} sizing insert(s) "
+              f"recorded (job_id={[r.get('job_id') for r in rec2]!r}), "
+              f"{len(fin2)} financial, {len(q2)} quote write(s); "
+              f"persisted={resp2.get('persisted')!r}")
+        check(f"(V4) {label} persist omitted: EXACTLY ONE sizing insert, one "
+              "financial insert and one quote write recorded — the flag does "
+              "something rather than nothing",
+              len(rec2) == 1 and len(fin2) == 1 and len(q2) == 1
+              and rec2[0].get("job_id") == TOU_JOB,
+              f"{len(rec2)} / {len(fin2)} / {len(q2)}")
+        check(f"(V4) {label} persist omitted: persisted True, "
+              "financial_persisted True, and 'not_persisted_by_request' "
+              "ABSENT",
+              resp2.get("persisted") is True
+              and resp2.get("financial_persisted") is True
+              and "not_persisted_by_request" not in (resp2.get("flags") or []),
+              f"{resp2.get('persisted')!r} / {resp2.get('financial_persisted')!r}")
 
 
 def t_r8(client, sol_tou: dict) -> dict:
@@ -1922,6 +2084,7 @@ def main() -> int:
         r7 = t_r7(client)
         r8 = t_r8(client, r7.get("sol") or {})
         t_u_provenance(r7.get("bat") or {}, (r8 or {}).get("sol_null") or {})
+        t_v_persist_flag(client)
         t_q1_red()
         t_u_red()
         t_w1_red()

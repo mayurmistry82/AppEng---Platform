@@ -88,6 +88,12 @@ class OptimiseRequest(BaseModel):
     budget: Optional[float] = None
     # Optional installer constraints (additive; absent/empty ⇒ behaves exactly as today)
     constraints: Optional[dict] = None
+    # 3.14 prompt 2 (D36): False = compute and answer, but write NOTHING — no
+    # sizing row, no financial row, no jobs.quoted_value_aud. The same flag
+    # routes/roof.py already honours (flagged not_persisted_by_request); a
+    # declined write is never reported as a failed one. Additive: absent means
+    # today's behaviour, so every existing caller is untouched.
+    persist: bool = True
 
 
 def _sb() -> Any:
@@ -1061,7 +1067,18 @@ async def optimise_sizing(
         # sentence for its solar+battery recommendation; run_kind says which.
         persisted = False
         financial_persisted = False
-        if body.job_id:
+        if not body.persist:
+            # 3.14 prompt 2 (D36): the caller declined the write. NOTHING is
+            # attempted — not the sizing row, not the financial row, not
+            # jobs.quoted_value_aud — so a rail recompute cannot move the
+            # job's quote value. The flag is the one routes/roof.py's _finish
+            # already uses. sizing_result_not_persisted and
+            # financial_result_not_persisted mean a write FAILED and must not
+            # appear here: a declined save and a broken save are two facts.
+            # Auth and the ownership check ran above, unchanged — this is not
+            # a way past them.
+            flags.append("not_persisted_by_request")
+        elif body.job_id:
             sid = None
             try:
                 sid = capture.save_sizing_result(
@@ -1211,6 +1228,12 @@ class BatteryRequest(BaseModel):
     resolution: str = "full_year"
     # Optional installer constraints (additive; absent/empty ⇒ behaves exactly as today)
     constraints: Optional[dict] = None
+    # 3.14 prompt 2 (D36): False = compute and answer, but write NOTHING — no
+    # sizing row, no financial row, no jobs.quoted_value_aud. The same flag
+    # routes/roof.py already honours (flagged not_persisted_by_request); a
+    # declined write is never reported as a failed one. Additive: absent means
+    # today's behaviour, so every existing caller is untouched.
+    persist: bool = True
 
 
 def _window_hour(value: Any) -> Optional[int]:
@@ -1491,7 +1514,12 @@ async def battery_sizing(
         pr = fin["performance_ratio_non_temp"]
 
         def _solar_chosen(planes_, configs_, panel_, sconstraints_):
-            """Run D1 (optionally constrained) and reconstruct the chosen config's net 8,760."""
+            """Run D1 (optionally constrained) and reconstruct the chosen config's net 8,760.
+
+            3.14 prompt 2 (F202): also hands back the run's score_curve and
+            chosen_index VERBATIM — the value-versus-size curve the search
+            already computed, which used to be discarded on the next line.
+            """
             fl: list[str] = []
             sres = solar_optimiser.optimise(
                 roof_planes=planes_, candidate_configs=configs_, lat=float(lat), lon=float(lon),
@@ -1526,7 +1554,7 @@ async def battery_sizing(
                 generation.system_generation_for_config(net, cfg)["hourly_kwh"]
                 if cfg else [0.0] * solar_optimiser.HOURS
             )
-            return ch, s8760, fl
+            return ch, s8760, fl, sres["score_curve"], sres["chosen_index"]
 
         def _battery_run(s8760, chosen_, panel_, rows_, fix_kwh_, force_nb_, flags_):
             return battery_optimiser.optimise_battery(
@@ -1601,7 +1629,7 @@ async def battery_sizing(
             # 3.12 (2N.1): this run's solar flags — budget_too_low above all —
             # REACH the response; a capped, downsized array must never be
             # silent about why.
-            chosen, solar_8760, solar_run_flags = _solar_chosen(planes, candidate_configs, panel, None)
+            chosen, solar_8760, solar_run_flags, solar_curve, solar_curve_index = _solar_chosen(planes, candidate_configs, panel, None)
             flags.extend(solar_run_flags)
             result = _battery_run(solar_8760, chosen, panel, _filter_rows(body.battery_ids), None, False, flags)
             opt = result["optimal_battery"]
@@ -1612,10 +1640,13 @@ async def battery_sizing(
         else:
             # 3.12 (2N.1): the SHADOW run exists only for the deltas — its
             # flags stay discarded, or every solar flag would appear twice.
-            unc_chosen, unc_solar, _ = _solar_chosen(planes, candidate_configs, panel, None)
+            # 3.14 prompt 2 (F202): the shadow's curve is discarded with its
+            # flags — on a constrained run it is a plausible chart of the
+            # WRONG search, and it must never be the one stored.
+            unc_chosen, unc_solar, _, _, _ = _solar_chosen(planes, candidate_configs, panel, None)
             unc_result = _battery_run(unc_solar, unc_chosen, panel, full_catalogue, None, False, [])
             # The RESULT-BEARING run: its solar flags reach the response.
-            chosen, solar_8760, solar_run_flags = _solar_chosen(con_planes, con_configs, con_panel, con_solar_constraints)
+            chosen, solar_8760, solar_run_flags, solar_curve, solar_curve_index = _solar_chosen(con_planes, con_configs, con_panel, con_solar_constraints)
             flags.extend(solar_run_flags)
             result = _battery_run(solar_8760, chosen, con_panel, _filter_rows(con_batt_ids), fix_kwh, force_nb, flags)
             opt = result["optimal_battery"]
@@ -1641,6 +1672,23 @@ async def battery_sizing(
                 "fix_battery_kwh": constraints.get("fix_battery_kwh"),
                 "force_no_battery": force_nb,
             }
+
+        # 3.14 prompt 2 (F202): the value-versus-size curve the solar search
+        # just computed, KEPT. Built ONCE — this same object goes into the
+        # response and into the persisted evaluated_options.solar_options, so
+        # no gate has to compare two copies. points is the RESULT-BEARING
+        # run's score_curve VERBATIM (never re-sorted, re-rounded or
+        # re-projected); the shadow run's curve was discarded above. The shape
+        # mirrors the solar run's own evaluated_options so prompt 3 reads both
+        # with one implementation. A search that produced no usable
+        # configuration arrives here as an empty points list and chosen_index
+        # None — present, never absent, so a reader can tell "no options"
+        # from "not recorded" (F191).
+        solar_options = {
+            "dimension_keys": ["solar_kw"],
+            "points": solar_curve,
+            "chosen_index": solar_curve_index,
+        }
 
         # 3.11 — same object into the row and the response; see optimise_sizing.
         roof_conf = _roof_confidence(roof, flags)
@@ -1714,7 +1762,18 @@ async def battery_sizing(
         # which.
         persisted = False
         financial_persisted = False
-        if body.job_id:
+        if not body.persist:
+            # 3.14 prompt 2 (D36): the caller declined the write. NOTHING is
+            # attempted — not the sizing row, not the financial row, not
+            # jobs.quoted_value_aud — so a rail recompute cannot move the
+            # job's quote value. The flag is the one routes/roof.py's _finish
+            # already uses. sizing_result_not_persisted and
+            # financial_result_not_persisted mean a write FAILED and must not
+            # appear here: a declined save and a broken save are two facts.
+            # Auth and the ownership check ran above, unchanged — this is not
+            # a way past them.
+            flags.append("not_persisted_by_request")
+        elif body.job_id:
             sid = None
             gen_annual = round(sum(solar_8760), 1)
             export_opt = opt.get("annual_export_kwh")
@@ -1756,6 +1815,15 @@ async def battery_sizing(
                     "evaluated_options": {
                         "dimension_keys": ["battery_id"],
                         "points": result["candidates"],
+                        # 3.14 prompt 2 (F195): which point won — derived by
+                        # the engine against this same list by identity; None
+                        # plus a flag when unresolvable, never a guess. Also
+                        # in the response: with persist=false there is no
+                        # row, so the response is the only place it exists.
+                        "chosen_index": result.get("chosen_index"),
+                        # 3.14 prompt 2 (F202): the solar curve — the SAME
+                        # object the response carries.
+                        "solar_options": solar_options,
                         # 3.13: stored VERBATIM. The battery run's points are
                         # battery candidates, so the chosen solar layout is
                         # not otherwise in this payload at all — this is the
@@ -1872,6 +1940,10 @@ async def battery_sizing(
             "constraint_deltas": constraint_deltas,
             "no_battery_baseline": result["no_battery_baseline"],
             "candidates": result["candidates"],
+            # 3.14 prompt 2: the same chosen_index and the same solar_options
+            # OBJECT the persisted evaluated_options carries.
+            "chosen_index": result.get("chosen_index"),
+            "solar_options": solar_options,
             "resolution": result["resolution"],
             "solve_seconds": result["solve_seconds"],
             "not_economic_reason": result["not_economic_reason"],

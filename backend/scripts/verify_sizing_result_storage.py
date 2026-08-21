@@ -197,7 +197,7 @@ def t_e_refusal() -> None:
         capture._write = original_write
 
 
-def t_f_endpoint_payloads(client) -> None:
+def t_f_endpoint_payloads(client) -> dict | None:
     print("\nTf. both endpoint payloads, BY RUNNING THE WRITERS (F148) — recorder "
           "in place, nothing written")
     owner = (client.table("jobs").select("company_id")
@@ -242,7 +242,7 @@ def t_f_endpoint_payloads(client) -> None:
     check("(f) both endpoints attempted exactly one persist each",
           len(recorded) == 2, f"{len(recorded)} payloads recorded")
     if len(recorded) != 2:
-        return
+        return None
     for label, payload, want_kind, want_dims in (
         ("solar", recorded[0], "solar", ["solar_kw"]),
         ("battery", recorded[1], "solar_battery", ["battery_id"]),
@@ -373,6 +373,49 @@ def t_f_endpoint_payloads(client) -> None:
           isinstance(recorded[1].get("within_budget"), bool),
           repr(recorded[1].get("within_budget")))
 
+    # 3.14 prompt 2 (F195): the battery run names its winner by index, and
+    # the index points at THE ROW — both figures, both directions, and never
+    # None-equals-None. WHY IT MOVES: pre-3.14 the battery payload carries no
+    # chosen_index at all, so the first check fails on a missing key; an
+    # index that named a tied twin or the wrong point fails the next two.
+    b_pts = bopts.get("points") if isinstance(bopts.get("points"), list) else []
+    b_ci = bopts.get("chosen_index")
+    b_ok_idx = (isinstance(b_ci, int) and not isinstance(b_ci, bool)
+                and 0 <= b_ci < len(b_pts))
+    check("(f5) battery: evaluated_options.chosen_index is an int in range "
+          "of points",
+          b_ok_idx, f"chosen_index={b_ci!r} of {len(b_pts)} points")
+    b_pt = b_pts[b_ci] if b_ok_idx else {}
+    print(f"        battery points[{b_ci!r}].usable_kwh={b_pt.get('usable_kwh')!r}"
+          f"  row.battery_kwh={recorded[1].get('battery_kwh')!r}")
+    print(f"        battery points[{b_ci!r}].system_cost={b_pt.get('system_cost')!r}"
+          f"  row.system_cost={recorded[1].get('system_cost')!r}")
+    check("(f5) battery: points[chosen_index].usable_kwh == the row's "
+          "battery_kwh, and the row's battery_kwh == that point's usable_kwh "
+          "(two-sided, neither side None)",
+          b_ok_idx
+          and b_pt.get("usable_kwh") is not None
+          and recorded[1].get("battery_kwh") is not None
+          and b_pt.get("usable_kwh") == recorded[1].get("battery_kwh")
+          and recorded[1].get("battery_kwh") == b_pt.get("usable_kwh"),
+          f"point={b_pt.get('usable_kwh')!r} row={recorded[1].get('battery_kwh')!r}")
+    check("(f5) battery: points[chosen_index].system_cost == the row's "
+          "system_cost, and back again (two-sided, neither side None)",
+          b_ok_idx
+          and b_pt.get("system_cost") is not None
+          and recorded[1].get("system_cost") is not None
+          and b_pt.get("system_cost") == recorded[1].get("system_cost")
+          and recorded[1].get("system_cost") == b_pt.get("system_cost"),
+          f"point={b_pt.get('system_cost')!r} row={recorded[1].get('system_cost')!r}")
+    check("(f5) battery: the response carries the SAME chosen_index",
+          bat_resp.get("chosen_index") == b_ci and b_ok_idx,
+          f"response={bat_resp.get('chosen_index')!r} row={b_ci!r}")
+    check("(f5) battery: no chosen_index_unresolved flag on a resolved run",
+          not any(str(f).startswith("chosen_index_unresolved")
+                  for f in bat_resp.get("flags") or []),
+          str([f for f in bat_resp.get("flags") or []
+               if str(f).startswith("chosen_index_unresolved")]))
+
     # 3.13 prompt 2: the SECOND writer call per endpoint — the financial
     # result linked to the sizing row just written — and the quote update.
     # WHY THESE MOVE: pre-prompt-2 neither endpoint calls
@@ -480,7 +523,186 @@ def t_f_endpoint_payloads(client) -> None:
           and quote_recorded[0][2] == fin_recorded[0].get("system_capex")
           and quote_recorded[1][2] == fin_recorded[1].get("system_capex"),
           f"{quote_recorded}")
+    return {"bat_resp": bat_resp, "bat_payload": recorded[1],
+            "caller": gate_caller}
 
+
+# ── 3.14 prompt 2 (F202) — the stored solar curve is the RESULT-BEARING run's ─
+# UUID-shaped like t_f's: the endpoint refuses to link a financial row to a
+# non-UUID sizing id, which is also what keeps a recorder run off the live
+# tables.
+FAKE_SID_314 = "00000000-0000-4000-8000-0000000314f2"
+
+
+def _recorded_run(coro_fn, request, caller):
+    """Run one endpoint with all three writers recorded and the PVGIS cache
+    put no-opped — restored in a finally. Nothing is written."""
+    recorded: list[dict] = []
+    fin_recorded: list[dict] = []
+    quote_recorded: list[tuple] = []
+    original_save = capture.save_sizing_result
+    original_fin = capture.save_financial_result
+    original_quote = sizing_route._set_quoted_value
+    original_cache = generation._cache_put
+    capture.save_sizing_result = lambda payload: (recorded.append(dict(payload)) or FAKE_SID_314)
+    capture.save_financial_result = lambda payload: (fin_recorded.append(dict(payload)) or "fake-fin-id")
+    sizing_route._set_quoted_value = (
+        lambda client, job_id, company_id, value:
+        (quote_recorded.append((job_id, company_id, value)) or True)
+    )
+    generation._cache_put = lambda *a, **k: None
+    try:
+        resp = asyncio.run(coro_fn(request, caller))
+    finally:
+        capture.save_sizing_result = original_save
+        capture.save_financial_result = original_fin
+        sizing_route._set_quoted_value = original_quote
+        generation._cache_put = original_cache
+    return resp, recorded, fin_recorded, quote_recorded
+
+
+def _solar_options_of(payload: dict) -> tuple[dict, list, object]:
+    opts = payload.get("evaluated_options") if isinstance(payload, dict) else None
+    so = (opts or {}).get("solar_options") if isinstance(opts, dict) else None
+    so = so if isinstance(so, dict) else {}
+    pts = so.get("points") if isinstance(so.get("points"), list) else []
+    return so, pts, so.get("chosen_index")
+
+
+def _idx_ok(ci, pts) -> bool:
+    return isinstance(ci, int) and not isinstance(ci, bool) and 0 <= ci < len(pts)
+
+
+def t_i_result_bearing_curve(client, f_ctx: dict | None) -> None:
+    """3.14 prompt 2 (F202): a battery run now KEEPS the value-versus-size
+    curve its solar search computed. On a constrained run there are TWO solar
+    searches — the shadow run (for the deltas) and the result-bearing run —
+    and the shadow's curve is a perfectly plausible chart of the WRONG search.
+    This pins the stored curve to the result-bearing run by forcing the two to
+    choose DIFFERENT arrays and asserting the stored chosen point is the
+    constrained one. The premise (that they differ) is printed and checked
+    first: if the fixture cannot make them differ, the check below cannot tell
+    shadow from real and it FAILS loudly rather than asserting something
+    weaker (F157)."""
+    print("\nTi. the stored solar curve is the RESULT-BEARING run's, never the "
+          "shadow's (F202) — recorder in place, nothing written")
+    if not f_ctx:
+        check("(i) the unconstrained battery run from Tf is available", False,
+              "Tf did not record both payloads")
+        return
+    unc_payload, unc_resp, caller = (f_ctx["bat_payload"], f_ctx["bat_resp"],
+                                     f_ctx["caller"])
+    unc_so, unc_pts, unc_ci = _solar_options_of(unc_payload)
+    unc_kw = unc_payload.get("solar_kw")
+
+    # The unconstrained run's stored solar_options, first.
+    check("(i/unc) solar_options is present with dimension_keys ['solar_kw'], "
+          "a non-empty points list and an int chosen_index in range",
+          unc_so.get("dimension_keys") == ["solar_kw"] and len(unc_pts) > 0
+          and _idx_ok(unc_ci, unc_pts),
+          f"dims={unc_so.get('dimension_keys')!r} points={len(unc_pts)} "
+          f"chosen_index={unc_ci!r}")
+    check("(i/unc) solar_options IS the response's solar_options object "
+          "(identity, not a copy)",
+          bool(unc_so) and unc_so is unc_resp.get("solar_options"),
+          f"identity={unc_so is unc_resp.get('solar_options')}")
+    check("(i/unc) points[chosen_index].solar_kw == the row's solar_kw",
+          _idx_ok(unc_ci, unc_pts) and unc_kw is not None
+          and unc_pts[unc_ci].get("solar_kw") == unc_kw,
+          f"point={unc_pts[unc_ci].get('solar_kw') if _idx_ok(unc_ci, unc_pts) else None!r} "
+          f"row={unc_kw!r}")
+    check("(i/unc) every stored point carries the layout keys (plane_indices, "
+          "panels_per_plane, panel_count) — the curve is the solar run's own, "
+          "not a projection",
+          bool(unc_pts) and all(
+              isinstance(p, dict) and "plane_indices" in p
+              and "panels_per_plane" in p and "panel_count" in p for p in unc_pts),
+          str(sorted(unc_pts[0]) if unc_pts and isinstance(unc_pts[0], dict) else unc_pts[:1]))
+
+    # Pin the constrained run to an array that is NOT the unconstrained
+    # optimum. fix_solar_kwp builds ONE synthetic config from a panel count
+    # (solar_optimiser: round(kwp * 1000 / panel_watts)), so the pin need not
+    # be a point already on the curve: prefer a second REAL curve point when
+    # the roof offers one, else HALF the optimum's own panel count — the
+    # watts are derived from the optimum point itself, never typed. The live
+    # job's curve is two points (empty + one 23-panel config), so it takes the
+    # second route; which route ran is printed.
+    opt_pt = unc_pts[unc_ci] if _idx_ok(unc_ci, unc_pts) else {}
+    opt_count = int(opt_pt.get("panel_count") or 0)
+    alternatives = [p for p in unc_pts if isinstance(p, dict)
+                    and isinstance(p.get("solar_kw"), (int, float))
+                    and p.get("solar_kw") != unc_kw
+                    and (p.get("panel_count") or 0) > 0]
+    if alternatives:
+        target_kw = max(alternatives, key=lambda p: abs(p["solar_kw"] - unc_kw))["solar_kw"]
+        route = f"a second real curve point ({len(alternatives)} available)"
+    elif opt_count >= 2 and isinstance(unc_kw, (int, float)) and unc_kw > 0:
+        watts = unc_kw * 1000.0 / opt_count
+        target_kw = round((opt_count // 2) * watts / 1000.0, 2)
+        route = (f"half the optimum's own panel count: {opt_count} panels at "
+                 f"{watts:.0f} W -> {opt_count // 2} panels")
+    else:
+        target_kw = None
+        route = "none"
+    check("(i/premise) a DIFFERENT array is derivable from the run's own data "
+          "— a second real curve point, or a smaller pin from the optimum's "
+          "panel_count; without one, shadow and real cannot be told apart",
+          target_kw is not None,
+          f"{len(unc_pts)} points, optimum solar_kw={unc_kw!r} "
+          f"panel_count={opt_count}")
+    if target_kw is None:
+        return
+    print(f"        unconstrained optimum solar_kw = {unc_kw!r} "
+          f"({opt_count} panels); pinning fix_solar_kwp = {target_kw!r} via {route}")
+
+    con_resp, rec, _fin, _q = _recorded_run(
+        sizing_route.battery_sizing,
+        sizing_route.BatteryRequest(job_id=LIVE_JOB,
+                                    constraints={"fix_solar_kwp": target_kw}),
+        caller)
+    check("(i/con) the constrained run attempted exactly one persist — "
+          "recorded, never written",
+          len(rec) == 1, f"{len(rec)} payload(s); error={con_resp.get('error')!r}")
+    if len(rec) != 1:
+        return
+    con_payload = rec[0]
+    con_so, con_pts, con_ci = _solar_options_of(con_payload)
+    con_kw = con_payload.get("solar_kw")
+    resp_kw = (con_resp.get("chosen_solar") or {}).get("solar_kw")
+    print(f"        constrained chosen solar_kw = {con_kw!r} (response "
+          f"chosen_solar.solar_kw = {resp_kw!r}); unconstrained optimum = {unc_kw!r}")
+    check("(i/premise) the CONSTRAINED chosen solar_kw DIFFERS from the "
+          "unconstrained optimum — both printed above; equal would let the "
+          "check below pass by accident (F157)",
+          con_kw is not None and unc_kw is not None and con_kw != unc_kw,
+          f"constrained={con_kw!r} unconstrained={unc_kw!r}")
+    check("(i/con) the constrained run DID perform a shadow run — "
+          "unconstrained_optimum_battery is a dict — so a wrong curve "
+          "genuinely existed to be stored",
+          isinstance(con_resp.get("unconstrained_optimum_battery"), dict),
+          repr(type(con_resp.get("unconstrained_optimum_battery"))))
+    check("(i/con) the row's solar_kw == the response's chosen_solar.solar_kw "
+          "(the constrained choice)",
+          con_kw is not None and con_kw == resp_kw,
+          f"row={con_kw!r} response={resp_kw!r}")
+    check("(i/con) solar_options.chosen_index is an int in range of its points",
+          _idx_ok(con_ci, con_pts),
+          f"chosen_index={con_ci!r} of {len(con_pts)} points")
+    stored_kw = con_pts[con_ci].get("solar_kw") if _idx_ok(con_ci, con_pts) else None
+    print(f"        STORED solar_options.points[{con_ci!r}].solar_kw = {stored_kw!r}"
+          f"   row.solar_kw = {con_kw!r}   unconstrained = {unc_kw!r}")
+    check("(i) THE CHECK: the stored curve's chosen point solar_kw == the "
+          "CONSTRAINED chosen solar (the row's solar_kw)",
+          stored_kw is not None and stored_kw == con_kw,
+          f"stored={stored_kw!r} row={con_kw!r}")
+    check("(i) ...and NOT the unconstrained optimum's — the shadow's curve "
+          "was not the one stored",
+          stored_kw is not None and stored_kw != unc_kw,
+          f"stored={stored_kw!r} unconstrained={unc_kw!r}")
+    check("(i/con) solar_options IS the response's solar_options object "
+          "(identity)",
+          bool(con_so) and con_so is con_resp.get("solar_options"),
+          f"identity={con_so is con_resp.get('solar_options')}")
 
 
 # ── 3.11b prompt 3 — hydration is ORDERED and BOUNDED ────────────────────────
@@ -691,7 +913,8 @@ def main() -> int:
         t_d_vocabulary(client)
     t_e_refusal()
     if client is not None:
-        t_f_endpoint_payloads(client)
+        f_ctx = t_f_endpoint_payloads(client)
+        t_i_result_bearing_curve(client, f_ctx)
     t_g_order_and_limit()
     if client is not None:
         t_h_live_hydration(client)
