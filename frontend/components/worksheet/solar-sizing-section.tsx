@@ -298,6 +298,16 @@ export function SolarSizingSection({
               {view.storedRun.notRecordedNote}
             </p>
           ) : null}
+          {/* 3.14 prompt 4 (F188): where Mayur first saw the problem — the top
+              three array sizes $28 apart with one marked "chosen" on a $6
+              margin. THE SAME sentence the rail's chart caption carries,
+              from the same derivation; a second copy of the wording here is
+              the drift this project deletes. */}
+          {view.storedRun.flatNote ? (
+            <p className="text-caption text-muted-foreground">
+              {view.storedRun.flatNote}
+            </p>
+          ) : null}
         </div>
       ) : null}
 

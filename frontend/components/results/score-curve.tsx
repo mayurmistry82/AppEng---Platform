@@ -58,6 +58,25 @@ const ROW_H = 44;
 const CHART_CHROME = 72;
 
 /**
+ * 3.14 prompt 4 — EVERY PROP BELOW IS OPTIONAL AND DEFAULTS TO TODAY'S
+ * BEHAVIOUR. components/results/results-tab.tsx renders <ScoreCurve
+ * view={view.curve} /> and must keep rendering identically; the results bar
+ * passes the extra two because it has a fraction of the height a tab does.
+ */
+export interface ScoreCurveProps {
+  view: ScoreCurveView;
+  /** Height per bar. Default ROW_H (44) — the Results tab's own row. */
+  rowHeight?: number;
+  /**
+   * A ceiling on the plot area. Past it the plot keeps its natural height and
+   * SCROLLS inside this box, so every option stays reachable and no label is
+   * squeezed — shrinking rows to fit would slice them instead. Unset (the
+   * Results tab) means no ceiling and no scroll container at all.
+   */
+  maxPlotHeight?: number;
+}
+
+/**
  * The two-line category tick: the product on top, its capacity beneath.
  * Rendered as SVG tspans because a recharts tick is inside the <svg>.
  */
@@ -207,17 +226,32 @@ export function ScoreCurveChart({
   );
 }
 
-export function ScoreCurve({ view }: { view: ScoreCurveView }) {
+export function ScoreCurve({ view, rowHeight, maxPlotHeight }: ScoreCurveProps) {
   if (!view.bars) {
     return <p className="text-caption text-muted-foreground">{view.note}</p>;
   }
   const chosen = view.bars.find((b) => b.chosen) ?? null;
   const unnamed = view.bars.filter((b) => b.labelNote !== null);
+  const plotHeight = Math.max(
+    200,
+    view.bars.length * (rowHeight ?? ROW_H) + CHART_CHROME,
+  );
+  const chart = (
+    <ChartContainer height={plotHeight}>
+      <ScoreCurveChart view={view} />
+    </ChartContainer>
+  );
   return (
     <div className="flex flex-col gap-1">
-      <ChartContainer height={Math.max(200, view.bars.length * ROW_H + CHART_CHROME)}>
-        <ScoreCurveChart view={view} />
-      </ChartContainer>
+      {/* No ceiling given, or the plot already fits: the EXACT tree the
+          Results tab has always rendered — no wrapper, no scroll. */}
+      {maxPlotHeight !== undefined && plotHeight > maxPlotHeight ? (
+        <div className="overflow-y-auto" style={{ maxHeight: maxPlotHeight }}>
+          {chart}
+        </div>
+      ) : (
+        chart
+      )}
       <p className="text-caption text-muted-foreground">
         Scored for {view.objectiveLabel ?? "the measure recorded with the run"}
         {chosen ? `; ${chosen.label} was chosen.` : "."}

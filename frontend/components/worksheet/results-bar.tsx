@@ -1,9 +1,11 @@
 "use client";
 
 import * as React from "react";
+import dynamic from "next/dynamic";
 import { ChevronDown, ChevronRight } from "lucide-react";
 import { KpiTile } from "@/components/ui/kpi-tile";
 import { PinChip } from "@/components/ui/override-drawer";
+import type { ScoreCurveProps } from "@/components/results/score-curve";
 import {
   formatKw,
   formatKwh,
@@ -23,6 +25,7 @@ import {
   shouldAutoExpandResultsBar,
   type ResultsBarMetrics,
   type ResultsBarView,
+  type ScoreCurveView,
 } from "@/lib/worksheet";
 
 /**
@@ -83,15 +86,79 @@ import {
 // shared set the Results section and the Results tab use, so the three
 // surfaces cannot disagree about the same stored number again.
 
+/** Shown while the chart chunk is in flight. */
+function CurveLoading() {
+  return (
+    <div className="flex h-full w-full items-center justify-center text-caption text-muted-foreground">
+      Loading the curve…
+    </div>
+  );
+}
+
+/**
+ * Shown if the chunk never arrives (offline, blocked, a 404 after a deploy):
+ * the plain sentence the rail would show without a chart. The bar must never
+ * break because a chunk did not load.
+ */
+function CurveUnavailable() {
+  return (
+    <p className="text-caption text-muted-foreground">
+      The curve could not be loaded. The options this run compared are listed
+      in the Solar sizing section.
+    </p>
+  );
+}
+
+/**
+ * 3.14 prompt 4 — THE SAME ScoreCurve the Results tab renders, never a second
+ * chart (2R.1), reached through next/dynamic with ssr:false so recharts lands
+ * in its OWN chunk instead of the worksheet route's First Load (F47).
+ *
+ * The pattern follows components/charts/plotly-chart.tsx rather than
+ * components/panels/SolarPanel.tsx: that file's one-liner has neither a
+ * loading state nor a failure path, and this prompt requires both — a `.catch`
+ * that resolves to a plain sentence, so a failed chunk degrades quietly
+ * instead of throwing inside React's lazy machinery.
+ *
+ * The bar is numbers-only by default, so a user who never expands never
+ * fetches this. D3's auto-expand means the cost DOES arrive once on a job's
+ * first result — after paint rather than before it, accepted deliberately.
+ */
+const ScoreCurve = dynamic<ScoreCurveProps>(
+  () =>
+    import("@/components/results/score-curve")
+      .then((mod) => mod.ScoreCurve)
+      .catch(() => CurveUnavailable),
+  { ssr: false, loading: () => <CurveLoading /> },
+);
+
+/**
+ * THE FRAME (3.14 prompt 4). The expanded bar is 320px by default and the
+ * chart gets what the tiles and chips leave — nowhere near the seven 44px
+ * rows the Results tab spends. Two things are changed and nothing else: the
+ * rows are DENSER (the rail's solar bars carry a single-line label, so 30px
+ * is comfortable where the tab's two-line product ticks need 44), and past
+ * the space available the plot keeps its natural height and SCROLLS inside
+ * the bar. Every option stays reachable and no label is squeezed; shrinking
+ * the plot to fit would slice them, which is the fault 4e exists to prevent.
+ * NOTHING IN THE SUITE CAN SEE WHAT A BROWSER LAYS OUT (F200) — this is a
+ * stated choice, not a verified one.
+ */
+const RAIL_ROW_HEIGHT = 30;
+
 export function ResultsBar({
   view,
   jobId,
+  curve,
 }: {
   view: ResultsBarView;
   /** 3.14 prompt 3: D3's auto-expand is ONCE PER JOB, so the bar must know
       which job it is looking at. Optional so a caller without one degrades
       to never auto-expanding rather than opening on every load. */
   jobId?: string;
+  /** 3.14 prompt 4: the value-versus-size curve, built by solarCurveView.
+      Optional — without it the chart area keeps its previous behaviour. */
+  curve?: ScoreCurveView;
 }) {
   // First render: the D3 default, derived purely from props so server and
   // client agree. The stored preference is applied in the effect below.
@@ -307,6 +374,11 @@ export function ResultsBar({
     persist({ collapsed, height: chosen });
   }
 
+  // What the chart may occupy: the bar's current height less the tiles, the
+  // chips and the caption stack beneath the plot. A floor keeps it usable at
+  // the smallest drag; past this the plot scrolls rather than shrinking.
+  const railPlotHeight = Math.max(120, height - 210);
+
   const heroValue = view.sized
     ? [
         view.solarKw != null ? formatKw(view.solarKw) : null,
@@ -404,15 +476,24 @@ export function ResultsBar({
           <div className="flex min-h-0 flex-1 flex-col gap-1">
             {/* flex-1 + min-h-0: the ONLY element that absorbs the leftover
                 height, so the bar never has empty space at any drag height. */}
-            {/* 3.13 prompt 4 (E): where the chart will go, NOTHING is
-                promised — the three sentences that used to sit here named
-                shipped rows and went stale on screen. The area stays empty
-                until a real chart fills it. */}
-            <div className="flex min-h-0 flex-1 items-center justify-center rounded-lg border border-border bg-muted">
-              <span className="px-4 text-center text-caption text-muted-foreground">
-                {view.sized ? "" : "Not yet sized"}
-              </span>
-            </div>
+            {curve && view.sized ? (
+              // 3.14 prompt 4: the value-versus-size curve. A run with no
+              // recorded options renders ScoreCurve's own honest sentence —
+              // never an empty axis and never a zero bar.
+              <div className="min-h-0 flex-1 overflow-y-auto">
+                <ScoreCurve
+                  view={curve}
+                  rowHeight={RAIL_ROW_HEIGHT}
+                  maxPlotHeight={railPlotHeight}
+                />
+              </div>
+            ) : (
+              <div className="flex min-h-0 flex-1 items-center justify-center rounded-lg border border-border bg-muted">
+                <span className="px-4 text-center text-caption text-muted-foreground">
+                  {view.sized ? "" : "Not yet sized"}
+                </span>
+              </div>
+            )}
           </div>
         )}
       </div>

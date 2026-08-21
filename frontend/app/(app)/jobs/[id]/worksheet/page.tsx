@@ -13,6 +13,7 @@ import {
   phaseStates,
   resultsBarView,
   resultsView,
+  solarCurveView,
   roofDiagramView,
   sectionStates,
   siteDetailsView,
@@ -122,7 +123,14 @@ export default async function Page({
     <div className="w-full px-6 pb-8">
       {/* 3.14 prompt 3: the job id travels so D3's auto-expand can fire ONCE
           for this job — the bar's own preference key holds no job id. */}
-      <ResultsBar view={resultsBarView(job)} jobId={id} />
+      <ResultsBar
+        view={resultsBarView(job)}
+        jobId={id}
+        // 3.14 prompt 4: the value-versus-size curve, built server-side from
+        // the stored run. The CHART itself is fetched on demand inside the
+        // bar, so recharts stays out of this route's First Load.
+        curve={solarCurveView(job)}
+      />
       <WorksheetBody
         sections={sections}
         phases={phaseStates(job)}

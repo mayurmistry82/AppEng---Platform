@@ -4455,6 +4455,10 @@ export interface StoredSolarRun {
   chosenNote: string | null;
   /** What this run did not record, in words, or null when it recorded it all. */
   notRecordedNote: string | null;
+  /** 3.14 prompt 4 (F188): the tie sentence beneath the options table — THE
+      SAME sentence the rail's chart caption shows, reached through the same
+      solarCurveView -> flatOptionsNote derivation, never a second copy. */
+  flatNote: string | null;
 }
 
 export interface SolarSizingView {
@@ -4627,6 +4631,9 @@ function storedSolarRun(job: unknown): StoredSolarRun | null {
       missing.length > 0
         ? `This run did not record ${joinPhrases(missing)}.`
         : null,
+    // F188: the SAME sentence the chart caption carries — one rule, one
+    // wording, two places on one screen.
+    flatNote: solarCurveView(job).flatNote,
   };
 }
 
@@ -6124,8 +6131,9 @@ const OBJECTIVE_METRICS: Record<string, ObjectiveMetric> = {
  * throws; empty, single-option or junk data yields bars: null plus an honest
  * note, never an empty axis.
  */
-export function scoreCurveView(job: unknown): ScoreCurveView {
-  const none = (note: string): ScoreCurveView => ({
+/** The no-chart shape, with the one honest line that says why. */
+function noCurve(note: string): ScoreCurveView {
+  return {
     bars: null,
     baseline: null,
     baselineNote: null,
@@ -6137,19 +6145,34 @@ export function scoreCurveView(job: unknown): ScoreCurveView {
     ticks: null,
     chosenNote: null,
     flatNote: null,
-  });
-  const sizing = currentSizingResult(job);
-  if (!sizing) return none("This job has not been sized yet.");
-  const eo = asRecord(sizing.evaluated_options);
-  const dims = Array.isArray(eo.dimension_keys) ? eo.dimension_keys : null;
-  const rawPoints = Array.isArray(eo.points) ? eo.points : null;
+  };
+}
+
+/**
+ * 3.14 prompt 4 (2R.1) — THE ONE OPTION-SET BUILDER, over an options OBJECT.
+ *
+ * Both entry points below hand it a `{dimension_keys, points, chosen_index}`
+ * object and the sizing row it came from: `scoreCurveView` passes the run's
+ * own evaluated_options (unchanged in every respect), and `solarCurveView`
+ * passes the ARRAY-SIZE options — which on a battery run live under
+ * evaluated_options.solar_options (3.14 prompt 2). One implementation, two
+ * doors; a second copy of this dispatch is what 2R.1 forbids.
+ */
+function curveFromOptions(
+  options: Record<string, unknown>,
+  sizing: Record<string, unknown>,
+): ScoreCurveView {
+  const dims = Array.isArray(options.dimension_keys)
+    ? options.dimension_keys
+    : null;
+  const rawPoints = Array.isArray(options.points) ? options.points : null;
   if (!dims || !rawPoints) {
-    return none("The evaluated options were not recorded for this run.");
+    return noCurve("The evaluated options were not recorded for this run.");
   }
   const isSolar = dims.length === 1 && dims[0] === "solar_kw";
   const isBattery = dims.length === 1 && dims[0] === "battery_id";
   if (!isSolar && !isBattery) {
-    return none(
+    return noCurve(
       "The evaluated options were not recorded in a shape this chart knows.",
     );
   }
@@ -6167,10 +6190,10 @@ export function scoreCurveView(job: unknown): ScoreCurveView {
       unit: "score",
       lowerIsBetter: false,
       zeroIsCentre: false,
-    }, sizing, eo);
+    }, sizing, options);
     return fallback.bars
       ? fallback
-      : none("The objective this run was scored on was not recorded.");
+      : noCurve("The objective this run was scored on was not recorded.");
   }
   return buildBars(rawPoints, isSolar, {
     label: metric.label,
@@ -6180,7 +6203,88 @@ export function scoreCurveView(job: unknown): ScoreCurveView {
     unit: metric.unit,
     lowerIsBetter: metric.lowerIsBetter,
     zeroIsCentre: metric.zeroIsCentre,
-  }, sizing, eo);
+  }, sizing, options);
+}
+
+export function scoreCurveView(job: unknown): ScoreCurveView {
+  const sizing = currentSizingResult(job);
+  if (!sizing) return noCurve("This job has not been sized yet.");
+  return curveFromOptions(asRecord(sizing.evaluated_options), sizing);
+}
+
+/** What the rail says when a run predates the stored array-size curve. */
+export const SOLAR_CURVE_NOT_RECORDED =
+  "This run did not record the array sizes it compared, so there is no curve to draw.";
+/** ...and when it DID record the set, and the set was empty. */
+export const SOLAR_CURVE_NO_OPTIONS =
+  "This run recorded no array sizes to compare.";
+
+/**
+ * 3.14 prompt 4 — THE VALUE-VERSUS-SIZE CURVE, on BOTH kinds of run.
+ *
+ * A solar run's array-size options are its own top-level evaluated_options; a
+ * battery run's are under solar_options, kept since 3.14 prompt 2 (F202). Both
+ * go through curveFromOptions, so the rail and the Results tab draw with one
+ * implementation.
+ *
+ * THE TWO SILENCES ARE KEPT APART: a run stored before the curve was kept says
+ * it did not RECORD the options, while a run that recorded an empty set says
+ * there were NONE. Never inferred from the other run, never backfilled.
+ */
+export function solarCurveView(job: unknown): ScoreCurveView {
+  const sizing = currentSizingResult(job);
+  if (!sizing) return noCurve("This job has not been sized yet.");
+  const eo = asRecord(sizing.evaluated_options);
+  const options =
+    sizing.run_kind === "solar_battery" ? asRecord(eo.solar_options) : eo;
+  if (!Array.isArray(options.points)) return noCurve(SOLAR_CURVE_NOT_RECORDED);
+  if (options.points.length === 0) return noCurve(SOLAR_CURVE_NO_OPTIONS);
+  // A kW curve or nothing: battery candidates under a kW axis would be a
+  // plausible-looking chart of the wrong thing.
+  const dims = Array.isArray(options.dimension_keys)
+    ? options.dimension_keys
+    : null;
+  if (!dims || dims.length !== 1 || dims[0] !== "solar_kw") {
+    return noCurve(SOLAR_CURVE_NOT_RECORDED);
+  }
+  return curveFromOptions(options, sizing);
+}
+
+/**
+ * F188 — THE TIE SENTENCE, derived once and rendered in two places (the chart
+ * caption and the Solar sizing options table). A second copy of this wording
+ * anywhere is the drift this project deletes.
+ *
+ * On the first real time-of-use job the top three array sizes returned
+ * $17,068.33, $17,062.34 and $17,039.91 — $28 apart across an array a quarter
+ * larger — and one was marked "chosen" on a $6 margin with nothing on screen
+ * saying the runner-up was within a rounding error.
+ *
+ * THE RULE: rank by the run's OWN measure, take the top three, and speak when
+ * their spread is under one percent of the best value. FEWER THAN THREE
+ * OPTIONS SAYS NOTHING — a tie claim needs a top three to compare. A best
+ * value of zero says nothing either: every spread is infinite against zero.
+ */
+export const FLAT_OPTIONS_RATIO = 0.01;
+
+export function flatOptionsNote(
+  values: readonly number[],
+  unit: AxisUnit,
+  lowerIsBetter: boolean,
+): string | null {
+  const finite = values.filter(
+    (v): v is number => typeof v === "number" && Number.isFinite(v),
+  );
+  if (finite.length < 3) return null;
+  const ranked = [...finite].sort((a, b) => (lowerIsBetter ? a - b : b - a));
+  const top = ranked.slice(0, 3);
+  const spread = Math.max(...top) - Math.min(...top);
+  const best = Math.abs(ranked[0]);
+  if (best <= 0 || spread / best >= FLAT_OPTIONS_RATIO) return null;
+  return (
+    `The top options sit within ${formatAxisTick(spread, unit)} of ` +
+    "each other — the choice among them is fine margin, not a cliff."
+  );
 }
 
 function buildBars(
@@ -6341,22 +6445,13 @@ function buildBars(
     zeroCentred,
   );
 
-  // BE HONEST ABOUT FLATNESS: when the best options sit within a trivial
-  // spread, the words say so rather than letting a zoomed axis invent a cliff.
-  let flatNote: string | null = null;
-  const ranked = [...bars].sort((a, b) =>
-    spec.lowerIsBetter ? a.value - b.value : b.value - a.value,
+  // BE HONEST ABOUT FLATNESS (F188) — ONE derivation, used by the chart and
+  // by the Solar sizing options table.
+  const flatNote = flatOptionsNote(
+    bars.map((b) => b.value),
+    spec.unit,
+    spec.lowerIsBetter,
   );
-  if (ranked.length >= 3) {
-    const top = ranked.slice(0, 3).map((b) => b.value);
-    const spread = Math.max(...top) - Math.min(...top);
-    const best = Math.abs(ranked[0].value);
-    if (best > 0 && spread / best < 0.01) {
-      flatNote =
-        `The top options sit within ${formatAxisTick(spread, spec.unit)} of ` +
-        "each other — the choice among them is fine margin, not a cliff.";
-    }
-  }
 
   return {
     bars,

@@ -12,6 +12,11 @@ import assert from "node:assert/strict";
 import {
   PHASE_ORDER,
   CHOSEN_NOT_RECORDED_NOTE,
+  FLAT_OPTIONS_RATIO,
+  SOLAR_CURVE_NOT_RECORDED,
+  SOLAR_CURVE_NO_OPTIONS,
+  flatOptionsNote,
+  solarCurveView,
   RESULTS_BAR_AUTOEXPAND_LIMIT,
   RESULTS_BAR_AUTOEXPAND_STORAGE_KEY,
   RESULTS_BAR_DEFAULT_HEIGHT,
@@ -7642,4 +7647,252 @@ test("3.14-3: both sizing sections render the STORED run through the SAME "
     // Exactly one renderResult definition: a second would be two paths.
     assert.equal((src.match(/function renderResult\(/g) ?? []).length, 1, file);
   }
+});
+
+
+// ── 3.14 prompt 4 — the value-versus-size curve in the rail (F188) ───────────
+
+/**
+ * The SHAPE of run d79e9974's stored solar_options: seven array sizes and the
+ * 25-year value each returned. This is the run F188 was raised from — the top
+ * three within $28 of each other while one was marked chosen on a $6 margin.
+ */
+const D79_SOLAR_POINTS = [
+  { solar_kw: 0.0, npv_25yr: 0, system_cost: 0, simple_payback_years: null, self_sufficiency_pct: 0 },
+  { solar_kw: 1.32, npv_25yr: 8397.60, system_cost: 2100, simple_payback_years: 2.4, self_sufficiency_pct: 18.2 },
+  { solar_kw: 4.84, npv_25yr: 14500.09, system_cost: 4900, simple_payback_years: 3.6, self_sufficiency_pct: 42.7 },
+  { solar_kw: 8.36, npv_25yr: 16925.06, system_cost: 6800, simple_payback_years: 4.1, self_sufficiency_pct: 61.3 },
+  { solar_kw: 9.24, npv_25yr: 17068.33, system_cost: 7248, simple_payback_years: 4.2, self_sufficiency_pct: 64.9 },
+  { solar_kw: 10.12, npv_25yr: 17039.91, system_cost: 7810, simple_payback_years: 4.4, self_sufficiency_pct: 68.1 },
+  { solar_kw: 11.44, npv_25yr: 17062.34, system_cost: 8600, simple_payback_years: 4.6, self_sufficiency_pct: 72.4 },
+];
+
+const D79_OPTIONS = {
+  dimension_keys: ["solar_kw"],
+  chosen_index: 4,
+  points: D79_SOLAR_POINTS,
+};
+
+/** The same options as a run_kind 'solar' row stores them: at the top level. */
+const D79_AS_SOLAR_RUN = {
+  sizing_results: [{
+    sizing_result_id: "s-d79-solar", run_kind: "solar", objective_used: "max_npv",
+    solar_kw: 9.24, battery_kwh: null, system_cost: 7248,
+    annual_solar_generation_kwh: 13820.4,
+    evaluated_options: D79_OPTIONS,
+  }],
+  financial_results: [{ sizing_result_id: "s-d79-solar" }],
+};
+
+/** ...and as a run_kind 'solar_battery' row stores them: under solar_options. */
+const D79_AS_BATTERY_RUN = {
+  sizing_results: [{
+    sizing_result_id: "s-d79-batt", run_kind: "solar_battery", objective_used: "max_npv",
+    solar_kw: 9.24, battery_kwh: 9.83, system_cost: 11868.77,
+    annual_solar_generation_kwh: 13820.4,
+    evaluated_options: {
+      dimension_keys: ["battery_id"],
+      chosen_index: 1,
+      points: [
+        { usable_kwh: 0, model: "No battery", system_cost: 7248, incremental_npv: 0 },
+        { battery_id: "b1", usable_kwh: 9.83, model: "GoodWe Lynx Home F",
+          system_cost: 11868.77, incremental_npv: 2867.22 },
+      ],
+      solar_options: D79_OPTIONS,
+      split: {
+        solar_only: { npv_25yr: 17068.33, simple_payback_years: 4.2, system_cost: 7248 },
+        battery_increment: { incremental_npv: 2867.22, incremental_payback_years: 8.6,
+                             battery_cost: 4620.77 },
+      },
+    },
+  }],
+  financial_results: [{ sizing_result_id: "s-d79-batt" }],
+};
+
+// 4-A. The new entry point on BOTH run kinds, reaching ONE builder.
+test("3.14-4: solarCurveView draws array sizes on BOTH run kinds — a battery "
+  + "run reads solar_options, a solar run reads its own options", () => {
+  const fromSolar = solarCurveView(D79_AS_SOLAR_RUN);
+  const fromBattery = solarCurveView(D79_AS_BATTERY_RUN);
+  // Both are a curve over kW: six real options plus the do-nothing line.
+  for (const [label, view] of [["solar run", fromSolar], ["battery run", fromBattery]] as const) {
+    assert.ok(view.bars, `${label}: a curve was built`);
+    assert.equal(view.bars!.length, 6, `${label}: six options, the baseline is not a bar`);
+    assert.deepEqual(view.bars!.map((b) => b.label),
+      ["1.32 kW", "4.84 kW", "8.36 kW", "9.24 kW", "10.12 kW", "11.44 kW"],
+      `${label}: labelled in kW — battery products here would be the bug`);
+    assert.equal(view.baseline?.label, "No solar", `${label}: the do-nothing line`);
+    assert.equal(view.unit, "aud");
+    assert.equal(view.bars!.filter((b) => b.chosen).length, 1, `${label}: one chosen`);
+    assert.equal(view.bars!.find((b) => b.chosen)?.label, "9.24 kW");
+  }
+  // THE SAME BUILDER: identical options through two doors, identical view.
+  assert.deepEqual(fromBattery, fromSolar,
+    "one implementation — two entry points, not two builders");
+  // And the battery run's OWN chart is still the battery products, untouched.
+  const batteryOwn = scoreCurveView(D79_AS_BATTERY_RUN);
+  assert.deepEqual(batteryOwn.bars!.map((b) => b.label), ["GoodWe Lynx Home F"]);
+  assert.notDeepEqual(batteryOwn.bars, fromBattery.bars,
+    "the Results tab's chart and the rail's are different questions");
+});
+
+// 4-B. The two silences, kept apart.
+test("3.14-4: a run stored before the curve says it did not RECORD the options "
+  + "— distinguishable from a run that recorded NONE", () => {
+  const preCurve = JSON.parse(JSON.stringify(D79_AS_BATTERY_RUN));
+  delete preCurve.sizing_results[0].evaluated_options.solar_options;
+  const missing = solarCurveView(preCurve);
+  assert.equal(missing.bars, null, "no chart");
+  assert.equal(missing.ticks, null, "no axes");
+  assert.equal(missing.note, SOLAR_CURVE_NOT_RECORDED);
+  assert.match(missing.note ?? "", /did not record/);
+
+  const emptySet = JSON.parse(JSON.stringify(D79_AS_BATTERY_RUN));
+  emptySet.sizing_results[0].evaluated_options.solar_options =
+    { dimension_keys: ["solar_kw"], points: [] };
+  const none = solarCurveView(emptySet);
+  assert.equal(none.bars, null);
+  assert.equal(none.note, SOLAR_CURVE_NO_OPTIONS);
+  assert.notEqual(none.note, missing.note,
+    "\"not recorded\" and \"there were none\" are two different facts");
+  console.log(`        not recorded : ${missing.note}`);
+  console.log(`        no options   : ${none.note}`);
+
+  // A battery run whose solar_options somehow carries BATTERY dimensions is
+  // not drawn under a kW axis — a plausible chart of the wrong thing.
+  const wrongDims = JSON.parse(JSON.stringify(D79_AS_BATTERY_RUN));
+  wrongDims.sizing_results[0].evaluated_options.solar_options =
+    { dimension_keys: ["battery_id"], points: [{ usable_kwh: 10, incremental_npv: 1 }] };
+  assert.equal(solarCurveView(wrongDims).bars, null);
+  assert.equal(solarCurveView(wrongDims).note, SOLAR_CURVE_NOT_RECORDED);
+
+  // A run with options but NO chosen marker: every bar drawn, none marked.
+  const noMarker = JSON.parse(JSON.stringify(D79_AS_SOLAR_RUN));
+  delete noMarker.sizing_results[0].evaluated_options.chosen_index;
+  const drawn = solarCurveView(noMarker);
+  assert.equal(drawn.bars!.length, 6, "every option still drawn");
+  assert.ok(drawn.bars!.every((b) => !b.chosen), "none marked");
+  assert.match(drawn.chosenNote ?? "", /did not record which option/);
+
+  // Total for junk, exactly as scoreCurveView is.
+  for (const junk of [null, undefined, 0, "x", [], {}, { sizing_results: [null] }]) {
+    assert.doesNotThrow(() => solarCurveView(junk));
+    assert.equal(solarCurveView(junk).bars, null);
+    assert.ok(solarCurveView(junk).note, "an honest line, never an empty axis");
+  }
+});
+
+// 4-C. F188 ON THE REAL SHAPE — the note fires, and the arithmetic is DERIVED
+// here rather than taken on trust.
+test("3.14-4 F188: the tie sentence fires on run d79e9974's shape, and the "
+  + "SAME sentence reaches the Solar sizing options table", () => {
+  const view = solarCurveView(D79_AS_SOLAR_RUN);
+  assert.ok(view.bars);
+  // Derived, not asserted from the prompt: rank by the run's own measure.
+  const ranked = [...view.bars!.map((b) => b.value)].sort((a, b) => b - a);
+  const top3 = ranked.slice(0, 3);
+  const spread = Math.max(...top3) - Math.min(...top3);
+  const best = Math.abs(ranked[0]);
+  const ratio = spread / best;
+  console.log(`        top three     : ${top3.join(", ")}`);
+  console.log(`        spread        : ${spread}`);
+  console.log(`        best          : ${best}`);
+  console.log(`        ratio         : ${ratio}  (threshold ${FLAT_OPTIONS_RATIO})`);
+  assert.ok(ratio < FLAT_OPTIONS_RATIO,
+    `the top three ARE within the threshold: ${ratio} < ${FLAT_OPTIONS_RATIO}`);
+  assert.ok(view.flatNote, "so the sentence must be produced");
+  console.log(`        flat note     : ${view.flatNote}`);
+  assert.match(view.flatNote ?? "", /fine margin, not a cliff/);
+
+  // (b) THE SAME SENTENCE, in the Solar sizing options table — one rule, one
+  // wording, two places. A second copy of the words is the drift this deletes.
+  const section = solarSizingView({
+    ...D79_AS_SOLAR_RUN,
+    status: "draft", path: null, path_label: null,
+  });
+  assert.ok(section.storedRun);
+  assert.equal(section.storedRun!.flatNote, view.flatNote,
+    "the table's sentence IS the chart's sentence, character for character");
+  // ...and it travels on a battery run's solar table too.
+  const batterySection = solarSizingView({
+    ...D79_AS_BATTERY_RUN,
+    status: "draft", path: null, path_label: null,
+  });
+  assert.equal(batterySection.storedRun!.flatNote, view.flatNote);
+});
+
+// 4-D. THE NEGATIVE CASE — options genuinely far apart say NOTHING.
+test("3.14-4 F188: a curve whose top three are far apart produces NO tie "
+  + "sentence, and fewer than three options never claims a tie", () => {
+  const spread = JSON.parse(JSON.stringify(D79_AS_SOLAR_RUN));
+  spread.sizing_results[0].evaluated_options.points = [
+    { solar_kw: 0, npv_25yr: 0 },
+    { solar_kw: 3, npv_25yr: 5000 },
+    { solar_kw: 6, npv_25yr: 10000 },
+    { solar_kw: 9, npv_25yr: 20000 },
+  ];
+  const view = solarCurveView(spread);
+  const ranked = [...view.bars!.map((b) => b.value)].sort((a, b) => b - a);
+  const top3 = ranked.slice(0, 3);
+  const gap = Math.max(...top3) - Math.min(...top3);
+  const ratio = gap / Math.abs(ranked[0]);
+  console.log(`        far-apart top three: ${top3.join(", ")}  ratio ${ratio}`);
+  assert.ok(ratio >= FLAT_OPTIONS_RATIO, "the premise: these are genuinely far apart");
+  assert.equal(view.flatNote, null, "no tie sentence — there is no tie");
+
+  // The function itself, directly: fewer than three options never speaks.
+  assert.equal(flatOptionsNote([17068.33, 17062.34], "aud", false), null,
+    "a tie claim needs a top three to compare");
+  assert.equal(flatOptionsNote([17068.33], "aud", false), null);
+  assert.equal(flatOptionsNote([], "aud", false), null);
+  // A best of zero says nothing either — every spread is infinite against it.
+  assert.equal(flatOptionsNote([0, 0, 0], "aud", false), null);
+  // And it fires on the real three.
+  assert.ok(flatOptionsNote([17068.33, 17062.34, 17039.91], "aud", false));
+  // lowerIsBetter ranks the OTHER way — three paybacks a hair apart tie too.
+  assert.ok(flatOptionsNote([4.2, 4.201, 4.202, 9.0], "years", true));
+  assert.equal(flatOptionsNote([4.2, 6.0, 9.0], "years", true), null);
+  // Junk never throws and never invents a sentence.
+  for (const junk of [[NaN, NaN, NaN], [Infinity, 1, 2], [1, 2]]) {
+    assert.doesNotThrow(() => flatOptionsNote(junk, "aud", false));
+  }
+});
+
+// 4-E. The chart reaches the rail on demand, and every ScoreCurve prop the
+// rail passes is OPTIONAL so the Results tab renders identically.
+test("3.14-4: the rail imports the SAME ScoreCurve through next/dynamic with "
+  + "ssr:false, and adds only OPTIONAL props", async () => {
+  const [fs, path] = await Promise.all([import("node:fs"), import("node:path")]);
+  const FRONTEND = path.resolve(import.meta.dirname, "..");
+  const bar = fs.readFileSync(
+    path.join(FRONTEND, "components/worksheet/results-bar.tsx"), "utf8");
+  // The SAME component the Results tab uses — not a second chart.
+  assert.match(bar, /import\("@\/components\/results\/score-curve"\)/);
+  assert.match(bar, /dynamic<ScoreCurveProps>\(/);
+  assert.match(bar, /ssr:\s*false/);
+  // recharts must NOT be imported statically anywhere in the worksheet route.
+  assert.ok(!/from "recharts"/.test(bar), "no static recharts in the rail");
+  // A failed chunk degrades to a sentence rather than throwing.
+  assert.match(bar, /\.catch\(\(\) => CurveUnavailable\)/);
+  assert.match(bar, /loading: \(\) => <CurveLoading \/>/);
+
+  // Every prop the rail passes is optional on ScoreCurve.
+  const curve = fs.readFileSync(
+    path.join(FRONTEND, "components/results/score-curve.tsx"), "utf8");
+  const props = curve.slice(curve.indexOf("export interface ScoreCurveProps"));
+  const body = props.slice(0, props.indexOf("\n}"));
+  for (const optional of ["rowHeight?:", "maxPlotHeight?:"]) {
+    assert.ok(body.includes(optional), `${optional} must be optional`);
+  }
+  assert.ok(body.includes("view: ScoreCurveView"), "view stays required");
+  // The Results tab is untouched and still passes ONLY view.
+  const tab = fs.readFileSync(
+    path.join(FRONTEND, "components/results/results-tab.tsx"), "utf8");
+  assert.match(tab, /<ScoreCurve view=\{view\.curve\} \/>/);
+  assert.ok(!tab.includes("rowHeight") && !tab.includes("maxPlotHeight"),
+    "the Results tab passes no new prop, so it renders exactly as before");
+  // The page hands the rail the curve.
+  const page = fs.readFileSync(
+    path.join(FRONTEND, "app/(app)/jobs/[id]/worksheet/page.tsx"), "utf8");
+  assert.match(page, /curve=\{solarCurveView\(job\)\}/);
 });
