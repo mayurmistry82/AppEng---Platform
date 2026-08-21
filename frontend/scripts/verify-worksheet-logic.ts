@@ -1370,17 +1370,31 @@ test("solar retention: a 29-day-old google row is NOT expired", () => {
   assert.equal(view.imageryDate, "2018-11-17");
 });
 
-test("solar retention: the 30-day boundary is NOT yet expired (backend's choice)", () => {
-  // A hair under 30 full days — unambiguously inside the window.
+// The frontend helper reads Date.now() itself, so a test cannot pin the clock
+// and cannot honestly assert the EXACT 30-day boundary. That boundary is
+// asserted deterministically by backend/scripts/verify_solar_retention.py,
+// which freezes its clock. These two assert the behaviour a minute either side
+// of it — what a test with a live clock can legitimately claim.
+test("solar retention: a minute inside 30 days is NOT yet expired", () => {
   const view = addressRoofView(
     emptyJob({
       roof_geometry: [
-        googleRoof({ solar_data_captured_at: daysAgo(30) }),
+        googleRoof({ solar_data_captured_at: daysAgo(30 - 1 / 1440) }),
       ],
     }),
   );
-  // daysAgo(30) is exactly 30*24h ago; expiry requires STRICTLY more.
-  assert.equal(view.solarDataExpired, false, "30 days is not yet expired");
+  assert.equal(view.solarDataExpired, false, "a minute inside 30 days is not expired");
+});
+
+test("solar retention: a minute past 30 days IS expired", () => {
+  const view = addressRoofView(
+    emptyJob({
+      roof_geometry: [
+        googleRoof({ solar_data_captured_at: daysAgo(30 + 1 / 1440) }),
+      ],
+    }),
+  );
+  assert.equal(view.solarDataExpired, true, "a minute past 30 days is expired");
 });
 
 test("solar retention: a manual row aged 400 days is never expired", () => {
