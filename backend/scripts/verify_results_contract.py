@@ -2047,6 +2047,398 @@ def t_p8_resolver() -> None:
           annual == 383.25 and src == "installer", f"{annual!r} / {src!r}")
 
 
+
+# ── 3.14 prompt 5 (D37): the RE-COST — one candidate, the same maths, no shadow run ──
+#
+# A re-cost asks "what is THIS system worth under these inputs", never "which
+# system is best". The constraint machinery already pins a system; what was
+# missing is the right to DECLINE the throwaway unconstrained run that exists
+# only to report constraint_deltas — the rail compares against the STORED run.
+COMPARISON_FLAG = "unconstrained_comparison_not_run_by_request"
+
+
+class _CallCounter:
+    """Wraps a MODULE ATTRIBUTE so every call through it is counted and then
+    delegated to the original; restored in __exit__. routes/sizing.py calls
+    `solar_optimiser.optimise(...)` and `battery_optimiser.optimise_battery(...)`
+    through the module objects, so the route sees the wrapper. This counts
+    RUNS, which a null delta in the response cannot prove — the run could have
+    happened and its result been dropped."""
+
+    def __init__(self, module, name: str):
+        self.module, self.name, self.calls = module, name, 0
+
+    def __enter__(self):
+        self.original = getattr(self.module, self.name)
+
+        def wrapped(*a, **k):
+            self.calls += 1
+            return self.original(*a, **k)
+
+        setattr(self.module, self.name, wrapped)
+        return self
+
+    def __exit__(self, *exc):
+        setattr(self.module, self.name, self.original)
+        return False
+
+
+def _newest_stored_battery_run(client, job_id: str):
+    rows = (client.table("sizing_results").select("*")
+            .eq("job_id", job_id).eq("run_kind", "solar_battery")
+            .order("created_at", desc=True).limit(1).execute().data) or []
+    if not rows:
+        return None, None
+    stored = rows[0]
+    fins = (client.table("financial_results").select("*")
+            .eq("sizing_result_id", stored.get("sizing_result_id"))
+            .order("created_at", desc=True).limit(1).execute().data) or []
+    return stored, (fins[0] if fins else None)
+
+
+def t_x1_recost_reproduces(client) -> dict | None:
+    """THE ACCEPTANCE TEST THE FEATURE TURNS ON: a re-cost with nothing
+    changed reproduces the stored run EXACTLY — solar_kw, the LAYOUT (plane
+    indices and panels per plane, because two configurations can tie on kW),
+    battery, system cost, the split parts, the whole-system annual savings,
+    payback and NPV, and self-sufficiency. Both sets of figures print side by
+    side whether it passes or fails.
+
+    2U.2 — the fixture is read for its INPUTS: the stored run_assumptions are
+    compared with what the endpoint resolves NOW, and if the job has moved
+    (a new tariff, load, roof, panel) the check SKIPS LOUDLY rather than
+    asserting a reproduction of inputs that no longer exist."""
+    print("\nX1. THE RE-COST REPRODUCES THE STORED RUN EXACTLY (D37) — job "
+          "a57e13f1, newest solar_battery run, pinned to its own array and "
+          "battery, compare_to_unconstrained false, persist false")
+    stored, fin = _newest_stored_battery_run(client, TOU_JOB)
+    if stored is None:
+        skip("(X1) a57e13f1 holds no stored solar_battery run.")
+        return None
+    eo = stored.get("evaluated_options") or {}
+    pts = eo.get("points") if isinstance(eo.get("points"), list) else []
+    ci = eo.get("chosen_index")
+    so = eo.get("solar_options") or {}
+    spts = so.get("points") if isinstance(so.get("points"), list) else []
+    sci = so.get("chosen_index")
+    split = eo.get("split") or {}
+    s_only = split.get("solar_only") or {}
+    s_inc = split.get("battery_increment") or {}
+    cs = eo.get("chosen_solar") or {}
+    ra = stored.get("run_assumptions") or {}
+    print(f"        stored run {stored.get('sizing_result_id')} created "
+          f"{stored.get('created_at')}; constraints_applied="
+          f"{ra.get('constraints_applied')!r}")
+    shape_ok = (
+        isinstance(ci, int) and 0 <= ci < len(pts)
+        and isinstance(sci, int) and 0 <= sci < len(spts)
+        and isinstance(pts[ci].get("battery_id"), str)
+        and isinstance(cs.get("plane_indices"), list)
+        and isinstance(cs.get("panels_per_plane"), list)
+        and bool(s_only) and bool(s_inc)
+        and not (ra.get("constraints_applied") or {})
+    )
+    if not shape_ok:
+        skip("(X1) the newest stored run is not in the shape this check "
+             "needs (a 3.14-prompt-2 row with chosen_index, solar_options, "
+             "chosen_solar and split, itself unconstrained) — it was "
+             f"{sorted(eo)}; constraints {ra.get('constraints_applied')!r}.")
+        return None
+    chosen_batt = pts[ci]
+    pin = {"fix_solar_kwp": stored.get("solar_kw"),
+           "battery_ids": [chosen_batt["battery_id"]]}
+    caller = _caller_for(client, TOU_JOB)
+    resp, rec, fin_rec, quotes = _run_endpoint(
+        sizing_route.battery_sizing,
+        sizing_route.BatteryRequest(job_id=TOU_JOB, persist=False,
+                                    compare_to_unconstrained=False,
+                                    constraints=pin),
+        caller)
+    check("(X1) the re-cost attempted NO write — persist false, proven by the "
+          "recorders",
+          rec == [] and fin_rec == [] and quotes == [],
+          f"{rec!r} {fin_rec!r} {quotes!r}")
+    if "error" in resp:
+        check("(X1) the re-cost answered", False, repr(resp.get("error")))
+        return {"pin": pin, "stored": stored}
+
+    # ── THE PREMISE (2U.2): the inputs the stored run was made from are the
+    # inputs the endpoint resolves today. Compared, never assumed.
+    asm = resp.get("assumptions") or {}
+    drift = []
+    for key in ("resolution", "import_rates_24", "fit", "export_limit_kw",
+                "total_load_kwh"):
+        if asm.get(key) != ra.get(key):
+            drift.append((key, ra.get(key), asm.get(key)))
+    sp, ap = ra.get("panel") or {}, asm.get("panel") or {}
+    if (sp.get("id"), sp.get("watts")) != (ap.get("id"), ap.get("watts")):
+        drift.append(("panel", sp, ap))
+    if drift:
+        skip("(X1) the job's inputs have CHANGED since the stored run, so a "
+             "reproduction cannot be asserted against it: "
+             + "; ".join(f"{k}: stored {a!r} -> now {b!r}" for k, a, b in drift))
+        return {"pin": pin, "stored": stored}
+    print("        inputs unchanged since the stored run: resolution, the 24 "
+          "import rates, fit, export limit, annual load and panel all match")
+
+    # ── THE COMPARISON, side by side.
+    opt = resp.get("optimal_battery") or {}
+    rcs = resp.get("chosen_solar") or {}
+    rso = resp.get("solar_options") or {}
+    rspts = rso.get("points") if isinstance(rso.get("points"), list) else []
+    rsci = rso.get("chosen_index")
+    rsp = rspts[rsci] if isinstance(rsci, int) and 0 <= rsci < len(rspts) else {}
+    whole_sav = (
+        round(rsp.get("annual_savings", 0) + opt.get("annual_savings_vs_solar_only", 0), 2)
+        if isinstance(rsp.get("annual_savings"), (int, float))
+        and isinstance(opt.get("annual_savings_vs_solar_only"), (int, float)) else None
+    )
+    whole_npv = (
+        round(rsp.get("npv_25yr", 0) + opt.get("incremental_npv", 0), 2)
+        if isinstance(rsp.get("npv_25yr"), (int, float))
+        and isinstance(opt.get("incremental_npv"), (int, float)) else None
+    )
+    whole_pb = sizing_route._payback_years(opt.get("system_cost"), whole_sav)
+    fin = fin or {}
+    rows = [
+        # label, stored, re-cost
+        ("solar_kw",                 stored.get("solar_kw"),            rcs.get("solar_kw")),
+        ("panel_count",              cs.get("panel_count"),             rcs.get("panel_count")),
+        ("plane_indices",            cs.get("plane_indices"),           rcs.get("plane_indices")),
+        ("panels_per_plane",         cs.get("panels_per_plane"),        rcs.get("panels_per_plane")),
+        ("battery_id",               chosen_batt.get("battery_id"),     opt.get("battery_id")),
+        ("battery model",            chosen_batt.get("model"),          opt.get("model")),
+        ("battery_kwh",              stored.get("battery_kwh"),         opt.get("usable_kwh")),
+        ("system_cost (whole)",      stored.get("system_cost"),         opt.get("system_cost")),
+        ("self_sufficiency_pct",     chosen_batt.get("self_sufficiency_pct"), opt.get("self_sufficiency_pct")),
+        ("solar-only system_cost",   s_only.get("system_cost"),         rcs.get("system_cost_solar_only")),
+        ("solar-only npv_25yr",      s_only.get("npv_25yr"),            rsp.get("npv_25yr")),
+        ("solar-only annual_savings", s_only.get("annual_savings"),     rsp.get("annual_savings")),
+        ("solar-only payback",       s_only.get("simple_payback_years"), rsp.get("simple_payback_years")),
+        ("battery_cost (added)",     s_inc.get("battery_cost"),         opt.get("battery_cost")),
+        ("incremental_npv",          s_inc.get("incremental_npv"),      opt.get("incremental_npv")),
+        ("incremental_payback",      s_inc.get("incremental_payback_years"), opt.get("incremental_payback_years")),
+        ("incremental savings",      s_inc.get("annual_savings_vs_solar_only"), opt.get("annual_savings_vs_solar_only")),
+        ("WHOLE annual_savings (fin row vs solar+increment)", fin.get("annual_savings"), whole_sav),
+        ("WHOLE npv_25_year (fin row vs solar+increment)",    fin.get("npv_25_year"),    whole_npv),
+        ("WHOLE payback_years (fin row vs _payback_years)",   fin.get("payback_years"),  whole_pb),
+    ]
+    print(f"        {'figure':52s} {'STORED':>28s}   {'RE-COST':>28s}")
+    all_equal = True
+    for label, a, b in rows:
+        same = a == b and a is not None
+        all_equal = all_equal and same
+        mark = "=" if same else "≠"
+        print(f"        {label:52s} {str(a):>28s} {mark} {str(b):>28s}")
+    for label, a, b in rows:
+        check(f"(X1) {label}: re-cost == stored", a == b and a is not None,
+              f"stored={a!r} recost={b!r}")
+    check("(X1) no financial row missing: the stored run HAS its financial "
+          "row (the whole-system figures were compared against real values)",
+          bool(fin), "no financial_results row for the stored run")
+    # The recorded facts of the re-cost itself.
+    flags = resp.get("flags") or []
+    check("(X1) the response says where its figures came from: engine_mode "
+          "'sequential' and resolution == the stored dispatch_resolution",
+          resp.get("engine_mode") == "sequential"
+          and resp.get("resolution") == eo.get("dispatch_resolution")
+          and resp.get("resolution") == "full_year",
+          f"{resp.get('engine_mode')!r} / {resp.get('resolution')!r} vs "
+          f"{eo.get('dispatch_resolution')!r}")
+    check("(X1) the comparison was declined BY REQUEST: constraint_deltas "
+          "None, unconstrained_optimum_battery None, and the flag present",
+          resp.get("constraint_deltas") is None
+          and resp.get("unconstrained_optimum_battery") is None
+          and COMPARISON_FLAG in flags,
+          f"{resp.get('constraint_deltas')!r} / "
+          f"{resp.get('unconstrained_optimum_battery')!r} / "
+          f"{[f for f in flags if 'by_request' in str(f)]}")
+    check("(X1) not_persisted_by_request present, and NO failed-write flag",
+          "not_persisted_by_request" in flags
+          and "sizing_result_not_persisted" not in flags
+          and "financial_result_not_persisted" not in flags, str(flags)[:300])
+    check("(X1) no 'not in the active catalogue' flag — the pinned battery "
+          "was found",
+          not any("not in the active catalogue" in str(f) for f in flags),
+          str([f for f in flags if "catalogue" in str(f)]))
+    return {"pin": pin, "stored": stored, "reproduced": all_equal}
+
+
+def t_x2_decline_counted(client, pin: dict | None) -> None:
+    """TEST 3 + TEST 5: the decline SKIPS the shadow run, proven by COUNTING
+    optimiser calls through _CallCounter — and the DEFAULT (field omitted)
+    still performs it and still returns deltas. The pair is what makes a null
+    delta mean 'declined' rather than 'dropped'."""
+    print("\nX2. compare_to_unconstrained: the shadow run COUNTED, both "
+          "endpoints — default omitted vs false")
+    if pin is None:
+        skip("(X2) no pin available from X1 (no usable stored run).")
+        return
+    caller = _caller_for(client, TOU_JOB)
+    kw = pin["fix_solar_kwp"]
+
+    # ── battery endpoint, field OMITTED (the default).
+    with _CallCounter(solar_optimiser, "optimise") as s, \
+            _CallCounter(battery_optimiser, "optimise_battery") as b:
+        on, *_ = _run_endpoint(
+            sizing_route.battery_sizing,
+            sizing_route.BatteryRequest(job_id=TOU_JOB, persist=False,
+                                        constraints=dict(pin)), caller)
+    print(f"        battery, field omitted : solar searches={s.calls} "
+          f"dispatches={b.calls} deltas={type(on.get('constraint_deltas')).__name__} "
+          f"flag={COMPARISON_FLAG in (on.get('flags') or [])}")
+    check("(X5/default) battery, field OMITTED: TWO solar searches and TWO "
+          "dispatches — the shadow run still happens",
+          s.calls == 2 and b.calls == 2, f"{s.calls} / {b.calls}")
+    check("(X5/default) ...and constraint_deltas is a dict, the "
+          "unconstrained optimum present, and the decline flag ABSENT",
+          isinstance(on.get("constraint_deltas"), dict)
+          and isinstance(on.get("unconstrained_optimum_battery"), dict)
+          and COMPARISON_FLAG not in (on.get("flags") or []),
+          f"{on.get('constraint_deltas')!r}")
+    check("(X5/default) the model default is True on BOTH request models",
+          sizing_route.BatteryRequest().compare_to_unconstrained is True
+          and sizing_route.OptimiseRequest().compare_to_unconstrained is True,
+          f"{sizing_route.BatteryRequest().compare_to_unconstrained!r} / "
+          f"{sizing_route.OptimiseRequest().compare_to_unconstrained!r}")
+
+    # ── battery endpoint, DECLINED.
+    with _CallCounter(solar_optimiser, "optimise") as s, \
+            _CallCounter(battery_optimiser, "optimise_battery") as b:
+        off, *_ = _run_endpoint(
+            sizing_route.battery_sizing,
+            sizing_route.BatteryRequest(job_id=TOU_JOB, persist=False,
+                                        compare_to_unconstrained=False,
+                                        constraints=dict(pin)), caller)
+    print(f"        battery, declined      : solar searches={s.calls} "
+          f"dispatches={b.calls} deltas={off.get('constraint_deltas')!r} "
+          f"flag={COMPARISON_FLAG in (off.get('flags') or [])}")
+    check("(X3) battery, DECLINED: ONE solar search and ONE dispatch — the "
+          "unconstrained run was NOT performed (counted, not inferred)",
+          s.calls == 1 and b.calls == 1, f"{s.calls} / {b.calls}")
+    check("(X3) ...constraint_deltas None, unconstrained_optimum_battery "
+          "None, the flag PRESENT",
+          off.get("constraint_deltas") is None
+          and off.get("unconstrained_optimum_battery") is None
+          and COMPARISON_FLAG in (off.get("flags") or []), str(off.get("flags"))[:300])
+    check("(X3) the declined run still dispatched at full_year — D35 stands, "
+          "no shortcut for speed",
+          off.get("resolution") == "full_year"
+          and (off.get("assumptions") or {}).get("resolution") == "full_year",
+          repr(off.get("resolution")))
+    check("(X3) the declined run answers the SAME system the default run "
+          "did — declining the comparison changes nothing about the result",
+          (off.get("chosen_solar") or {}).get("solar_kw") == (on.get("chosen_solar") or {}).get("solar_kw")
+          and (off.get("optimal_battery") or {}).get("battery_id") == (on.get("optimal_battery") or {}).get("battery_id")
+          and (off.get("optimal_battery") or {}).get("system_cost") == (on.get("optimal_battery") or {}).get("system_cost"),
+          f"{(off.get('optimal_battery') or {}).get('system_cost')!r} vs "
+          f"{(on.get('optimal_battery') or {}).get('system_cost')!r}")
+
+    # ── solar endpoint, the same pair.
+    with _CallCounter(solar_optimiser, "optimise") as s:
+        s_on, *_ = _run_endpoint(
+            sizing_route.optimise_sizing,
+            sizing_route.OptimiseRequest(job_id=TOU_JOB, persist=False,
+                                         constraints={"fix_solar_kwp": kw}), caller)
+    n_on = s.calls
+    with _CallCounter(solar_optimiser, "optimise") as s:
+        s_off, *_ = _run_endpoint(
+            sizing_route.optimise_sizing,
+            sizing_route.OptimiseRequest(job_id=TOU_JOB, persist=False,
+                                         compare_to_unconstrained=False,
+                                         constraints={"fix_solar_kwp": kw}), caller)
+    print(f"        solar, field omitted   : solar searches={n_on} "
+          f"deltas={type(s_on.get('constraint_deltas')).__name__}")
+    print(f"        solar, declined        : solar searches={s.calls} "
+          f"deltas={s_off.get('constraint_deltas')!r}")
+    check("(X5/default) solar, field OMITTED: TWO searches and a deltas dict",
+          n_on == 2 and isinstance(s_on.get("constraint_deltas"), dict)
+          and isinstance(s_on.get("unconstrained_optimum"), dict)
+          and COMPARISON_FLAG not in (s_on.get("flags") or []),
+          f"{n_on} / {s_on.get('constraint_deltas')!r}")
+    check("(X3) solar, DECLINED: ONE search, deltas None, unconstrained_optimum "
+          "None, the flag present",
+          s.calls == 1 and s_off.get("constraint_deltas") is None
+          and s_off.get("unconstrained_optimum") is None
+          and COMPARISON_FLAG in (s_off.get("flags") or []),
+          f"{s.calls} / {s_off.get('constraint_deltas')!r}")
+    check("(X2) both responses carry engine_mode 'sequential'; the solar "
+          "response's resolution is None (no dispatch), the battery's "
+          "'full_year'",
+          s_off.get("engine_mode") == "sequential" and "resolution" in s_off
+          and s_off.get("resolution") is None
+          and off.get("engine_mode") == "sequential"
+          and off.get("resolution") == "full_year",
+          f"solar {s_off.get('engine_mode')!r}/{s_off.get('resolution', '<absent>')!r}; "
+          f"battery {off.get('engine_mode')!r}/{off.get('resolution')!r}")
+
+
+def t_x3_flag_absent_unconstrained(client) -> None:
+    """TEST 4 — the pair that makes X2 mean something: with NO constraint
+    active there is no shadow run to decline, so the flag must NOT fire, on
+    either endpoint, even with compare_to_unconstrained false."""
+    print("\nX3. no constraint active + compare_to_unconstrained false: the "
+          "flag does NOT fire (a flag that appears when nothing was declined "
+          "teaches a reader to ignore it)")
+    caller = _caller_for(client, TOU_JOB)
+    with _CallCounter(solar_optimiser, "optimise") as s, \
+            _CallCounter(battery_optimiser, "optimise_battery") as b:
+        bat, rec, *_ = _run_endpoint(
+            sizing_route.battery_sizing,
+            sizing_route.BatteryRequest(job_id=TOU_JOB, persist=False,
+                                        compare_to_unconstrained=False), caller)
+    print(f"        battery unconstrained + declined: searches={s.calls} "
+          f"dispatches={b.calls} flags with 'by_request'="
+          f"{[f for f in bat.get('flags') or [] if 'by_request' in str(f)]}")
+    check("(X4) battery, no constraint: ONE search, ONE dispatch — nothing "
+          "was skipped because nothing extra was ever going to run",
+          s.calls == 1 and b.calls == 1, f"{s.calls} / {b.calls}")
+    check("(X4) battery, no constraint: the decline flag is ABSENT",
+          COMPARISON_FLAG not in (bat.get("flags") or []), str(bat.get("flags"))[:300])
+    check("(X4) battery, no constraint: deltas None (as always when "
+          "unconstrained) and the answer present",
+          bat.get("constraint_deltas") is None
+          and isinstance(bat.get("optimal_battery"), dict) and rec == [], "")
+    with _CallCounter(solar_optimiser, "optimise") as s:
+        sol, *_ = _run_endpoint(
+            sizing_route.optimise_sizing,
+            sizing_route.OptimiseRequest(job_id=TOU_JOB, persist=False,
+                                         compare_to_unconstrained=False), caller)
+    print(f"        solar unconstrained + declined  : searches={s.calls} "
+          f"flags with 'by_request'="
+          f"{[f for f in sol.get('flags') or [] if 'by_request' in str(f)]}")
+    check("(X4) solar, no constraint: ONE search and the decline flag ABSENT",
+          s.calls == 1 and COMPARISON_FLAG not in (sol.get("flags") or []),
+          f"{s.calls} / {str(sol.get('flags'))[:200]}")
+
+
+def t_x4_missing_battery_named(client, pin: dict | None) -> None:
+    """FALLBACK: a pinned battery that is not in the catalogue is NAMED —
+    never silently replaced by an unpinned answer presented as a re-cost."""
+    print("\nX4b. a pinned battery that is NOT in the catalogue is named in a flag")
+    if pin is None:
+        skip("(X4b) no pin available from X1.")
+        return
+    caller = _caller_for(client, TOU_JOB)
+    ghost = "00000000-0000-4000-8000-00000000dead"
+    resp, *_ = _run_endpoint(
+        sizing_route.battery_sizing,
+        sizing_route.BatteryRequest(job_id=TOU_JOB, persist=False,
+                                    compare_to_unconstrained=False,
+                                    constraints={"fix_solar_kwp": pin["fix_solar_kwp"],
+                                                 "battery_ids": [ghost]}), caller)
+    flags = resp.get("flags") or []
+    named = [f for f in flags if "not in the active catalogue" in str(f) and ghost in str(f)]
+    print(f"        flag: {named[:1]!r}; optimal usable_kwh="
+          f"{(resp.get('optimal_battery') or {}).get('usable_kwh')!r}")
+    check("(X4b) the missing battery id is NAMED in a flag",
+          len(named) == 1, str([f for f in flags if "catalogue" in str(f)]))
+    check("(X4b) ...and the engine did NOT quietly search the full catalogue "
+          "instead — only the no-battery baseline was evaluated",
+          (resp.get("optimal_battery") or {}).get("usable_kwh") == 0.0
+          and len(resp.get("candidates") or []) == 1,
+          f"{len(resp.get('candidates') or [])} candidate(s)")
+
 def main() -> int:
     print("verify_results_contract.py — 3.13 prompts 1+2 (writes nothing)\n")
     start = _counts()
@@ -2085,6 +2477,10 @@ def main() -> int:
         r8 = t_r8(client, r7.get("sol") or {})
         t_u_provenance(r7.get("bat") or {}, (r8 or {}).get("sol_null") or {})
         t_v_persist_flag(client)
+        x1 = t_x1_recost_reproduces(client)
+        t_x2_decline_counted(client, (x1 or {}).get("pin"))
+        t_x3_flag_absent_unconstrained(client)
+        t_x4_missing_battery_named(client, (x1 or {}).get("pin"))
         t_q1_red()
         t_u_red()
         t_w1_red()

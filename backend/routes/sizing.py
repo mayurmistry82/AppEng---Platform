@@ -94,6 +94,13 @@ class OptimiseRequest(BaseModel):
     # declined write is never reported as a failed one. Additive: absent means
     # today's behaviour, so every existing caller is untouched.
     persist: bool = True
+    # 3.14 prompt 5 (D37): False = do NOT perform the throwaway unconstrained
+    # run that exists only to report constraint_deltas. The live rail compares
+    # against the STORED run, not an unconstrained optimum, so on its path
+    # that shadow run is pure waste. Additive: True keeps today's behaviour
+    # for every existing caller. Has no effect when no constraint is active —
+    # there is then no shadow run to decline, and no flag fires.
+    compare_to_unconstrained: bool = True
 
 
 def _sb() -> Any:
@@ -728,6 +735,14 @@ def _annual_supply_charge(
     return None, "not stated"
 
 
+# 3.14 prompt 5 (D37): the caller declined the unconstrained comparison, so
+# constraint_deltas and the unconstrained optimum are null BY REQUEST — a
+# recorded fact, never an omission a later reader has to guess at (the F191
+# pattern). Named after not_persisted_by_request, the flag routes/roof.py and
+# both sizing endpoints already use for a caller declining a write.
+COMPARISON_NOT_RUN_FLAG = "unconstrained_comparison_not_run_by_request"
+
+
 def _payback_years(capex: Any, savings: Any) -> Optional[float]:
     """3.13 prompt 2: simple payback for the composed whole system. None when
     the savings are zero or negative — never a negative payback, never an
@@ -1001,21 +1016,32 @@ async def optimise_sizing(
                 "fix_solar_kwp": constraints.get("fix_solar_kwp"),
                 "inverter_id": constraints.get("inverter_id"),
             }
-            unconstrained_run = _run(planes, candidate_configs, panel, None, [])  # throwaway flags
+            # 3.14 prompt 5 (D37): the shadow run exists ONLY for the deltas.
+            # A caller that does not want them (the live rail) declines it,
+            # and the decline is flagged — never a silent null.
+            if body.compare_to_unconstrained:
+                unconstrained_run = _run(planes, candidate_configs, panel, None, [])  # throwaway flags
+            else:
+                unconstrained_run = None
+                flags.append(COMPARISON_NOT_RUN_FLAG)
             result = _run(con_planes, con_configs, con_panel, con_constraints, flags)
             opt = result["optimal"]
-            unconstrained_optimum = unconstrained_run["optimal"]
-            u = unconstrained_optimum
-            constraint_deltas = {
-                "solar_kw": round(opt["solar_kw"] - u["solar_kw"], 3),
-                "npv_25yr": round(opt["npv_25yr"] - u["npv_25yr"], 2),
-                "simple_payback_years": (
-                    round(opt["simple_payback_years"] - u["simple_payback_years"], 2)
-                    if opt["simple_payback_years"] is not None and u["simple_payback_years"] is not None else None
-                ),
-                "self_sufficiency_pct": round(opt["self_sufficiency_pct"] - u["self_sufficiency_pct"], 2),
-                "system_cost": round(opt["system_cost"] - u["system_cost"], 2),
-            }
+            if unconstrained_run is not None:
+                unconstrained_optimum = unconstrained_run["optimal"]
+                u = unconstrained_optimum
+                constraint_deltas = {
+                    "solar_kw": round(opt["solar_kw"] - u["solar_kw"], 3),
+                    "npv_25yr": round(opt["npv_25yr"] - u["npv_25yr"], 2),
+                    "simple_payback_years": (
+                        round(opt["simple_payback_years"] - u["simple_payback_years"], 2)
+                        if opt["simple_payback_years"] is not None and u["simple_payback_years"] is not None else None
+                    ),
+                    "self_sufficiency_pct": round(opt["self_sufficiency_pct"] - u["self_sufficiency_pct"], 2),
+                    "system_cost": round(opt["system_cost"] - u["system_cost"], 2),
+                }
+            else:
+                unconstrained_optimum = None
+                constraint_deltas = None
             score_curve = result["score_curve"]
             constraints_applied = {
                 "panel_id": con_panel.get("id") if panel_constraint_active else None,
@@ -1173,6 +1199,14 @@ async def optimise_sizing(
             "score_curve": score_curve,
             "cost_breakdown": opt.get("cost_breakdown"),
             "chosen_index": result.get("chosen_index"),
+            # 3.14 prompt 5 (D37): a rail recompute persists nothing, so the
+            # RESPONSE must say which engine and which dispatch resolution
+            # produced its figures. The same values the row stores: engine_mode
+            # as the writer writes it, and the resolution under the name the
+            # battery response already uses — None here, because a solar-only
+            # run performs no dispatch at all (F191).
+            "engine_mode": "sequential",
+            "resolution": None,
             # 3.13 prompt 4: the same object persisted as run_assumptions.
             "assumptions": assumptions,
             "failed_planes": result["failed_planes"],
@@ -1234,6 +1268,13 @@ class BatteryRequest(BaseModel):
     # declined write is never reported as a failed one. Additive: absent means
     # today's behaviour, so every existing caller is untouched.
     persist: bool = True
+    # 3.14 prompt 5 (D37): False = do NOT perform the throwaway unconstrained
+    # run that exists only to report constraint_deltas. The live rail compares
+    # against the STORED run, not an unconstrained optimum, so on its path
+    # that shadow run is pure waste. Additive: True keeps today's behaviour
+    # for every existing caller. Has no effect when no constraint is active —
+    # there is then no shadow run to decline, and no flag fires.
+    compare_to_unconstrained: bool = True
 
 
 def _window_hour(value: Any) -> Optional[int]:
@@ -1614,6 +1655,19 @@ async def battery_sizing(
             or constraints.get("fix_solar_kwp") is not None or constraints.get("inverter_id")
         )
         con_batt_ids = constraints.get("battery_ids") or body.battery_ids
+        # 3.14 prompt 5: a pinned battery that is no longer in the active
+        # catalogue is NAMED here. Without this the filter below quietly
+        # yields an empty pool, the engine answers "no battery" with an
+        # economics reason, and a re-cost of a specific system has been
+        # replaced by a different answer with nothing on screen saying so —
+        # the exact silent substitution D37 exists to prevent.
+        if con_batt_ids:
+            _known_ids = {r.get("id") for r in full_catalogue}
+            _missing_ids = [i for i in con_batt_ids if i not in _known_ids]
+            if _missing_ids:
+                flags.append(
+                    f"battery_ids not in the active catalogue — not evaluated: {_missing_ids}"
+                )
         fix_kwh = constraints.get("fix_battery_kwh")
         force_nb = bool(constraints.get("force_no_battery"))
         batt_con_active = bool(constraints.get("battery_ids") or fix_kwh is not None or force_nb)
@@ -1643,25 +1697,38 @@ async def battery_sizing(
             # 3.14 prompt 2 (F202): the shadow's curve is discarded with its
             # flags — on a constrained run it is a plausible chart of the
             # WRONG search, and it must never be the one stored.
-            unc_chosen, unc_solar, _, _, _ = _solar_chosen(planes, candidate_configs, panel, None)
-            unc_result = _battery_run(unc_solar, unc_chosen, panel, full_catalogue, None, False, [])
+            # 3.14 prompt 5 (D37): the shadow run exists ONLY for the deltas,
+            # and it is the EXPENSIVE half — the whole catalogue dispatched
+            # over a full year. A caller that compares against the stored run
+            # instead (the live rail) declines it, flagged, and a re-cost then
+            # costs one solar search over one config plus one dispatch.
+            if body.compare_to_unconstrained:
+                unc_chosen, unc_solar, _, _, _ = _solar_chosen(planes, candidate_configs, panel, None)
+                unc_result = _battery_run(unc_solar, unc_chosen, panel, full_catalogue, None, False, [])
+            else:
+                unc_result = None
+                flags.append(COMPARISON_NOT_RUN_FLAG)
             # The RESULT-BEARING run: its solar flags reach the response.
             chosen, solar_8760, solar_run_flags, solar_curve, solar_curve_index = _solar_chosen(con_planes, con_configs, con_panel, con_solar_constraints)
             flags.extend(solar_run_flags)
             result = _battery_run(solar_8760, chosen, con_panel, _filter_rows(con_batt_ids), fix_kwh, force_nb, flags)
             opt = result["optimal_battery"]
-            unconstrained_optimum_battery = unc_result["optimal_battery"]
-            u = unconstrained_optimum_battery
-            constraint_deltas = {
-                "battery_kwh": round(opt["usable_kwh"] - u["usable_kwh"], 2),
-                "incremental_npv": round(opt["incremental_npv"] - u["incremental_npv"], 2),
-                "incremental_payback_years": (
-                    round(opt["incremental_payback_years"] - u["incremental_payback_years"], 2)
-                    if opt["incremental_payback_years"] is not None and u["incremental_payback_years"] is not None else None
-                ),
-                "self_sufficiency_pct": round(opt["self_sufficiency_pct"] - u["self_sufficiency_pct"], 2),
-                "battery_cost": round(opt["battery_cost"] - u["battery_cost"], 2),
-            }
+            if unc_result is not None:
+                unconstrained_optimum_battery = unc_result["optimal_battery"]
+                u = unconstrained_optimum_battery
+                constraint_deltas = {
+                    "battery_kwh": round(opt["usable_kwh"] - u["usable_kwh"], 2),
+                    "incremental_npv": round(opt["incremental_npv"] - u["incremental_npv"], 2),
+                    "incremental_payback_years": (
+                        round(opt["incremental_payback_years"] - u["incremental_payback_years"], 2)
+                        if opt["incremental_payback_years"] is not None and u["incremental_payback_years"] is not None else None
+                    ),
+                    "self_sufficiency_pct": round(opt["self_sufficiency_pct"] - u["self_sufficiency_pct"], 2),
+                    "battery_cost": round(opt["battery_cost"] - u["battery_cost"], 2),
+                }
+            else:
+                unconstrained_optimum_battery = None
+                constraint_deltas = None
             chosen_solar, used_panel = chosen, con_panel
             constraints_applied = {
                 "panel_id": con_panel.get("id") if panel_constraint_active else None,
@@ -1944,6 +2011,11 @@ async def battery_sizing(
             # OBJECT the persisted evaluated_options carries.
             "chosen_index": result.get("chosen_index"),
             "solar_options": solar_options,
+            # 3.14 prompt 5 (D37): the response already said which dispatch
+            # resolution produced its figures; it now says which engine too,
+            # under the name the row stores. A rail recompute persists
+            # nothing, so this is the only carrier.
+            "engine_mode": "sequential",
             "resolution": result["resolution"],
             "solve_seconds": result["solve_seconds"],
             "not_economic_reason": result["not_economic_reason"],

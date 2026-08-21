@@ -41,6 +41,7 @@ Run:  /opt/anaconda3/bin/python3 backend/scripts/verify_battery_contract.py
 from __future__ import annotations
 
 import asyncio
+import time
 import os
 import re
 import sys
@@ -841,6 +842,122 @@ def t_b5() -> None:
           f"reason={r_win.get('not_economic_reason')!r}")
 
 
+
+# ── B7: THE MEASUREMENT (3.14 prompt 5, D37) ────────────────────────────────
+# A full run and a re-cost on the SAME inputs, timed and printed — never
+# predicted (F144). Bishops Place: job a57e13f1's roof, whose six plane
+# profiles are in pvgis_cache, so cache_misses must be ZERO and the clock can
+# never include a network call. Misses are counted the way the engine counts
+# them: every miss calls generation._cache_put (generation.py, build_plane_
+# profiles), so a recorder on that function IS the miss counter — the battery
+# response carries no cache counter of its own.
+COMPARISON_FLAG = "unconstrained_comparison_not_run_by_request"
+
+
+def _timed_run(coro_fn, request, caller):
+    """(response, seconds, cache_put_calls, persist payloads) — writers and
+    the cache put replaced by recorders, restored in a finally."""
+    recorded: list[dict] = []
+    puts: list[tuple] = []
+    original_save = capture.save_sizing_result
+    original_cache = generation._cache_put
+    capture.save_sizing_result = lambda p: (recorded.append(dict(p)) or "fake-id")
+    generation._cache_put = lambda *a, **k: (puts.append(a[1:5]) or True)
+    t0 = time.perf_counter()
+    try:
+        resp = asyncio.run(coro_fn(request, caller))
+    finally:
+        seconds = time.perf_counter() - t0
+        capture.save_sizing_result = original_save
+        generation._cache_put = original_cache
+    return resp, seconds, len(puts), recorded
+
+
+def t_b7_recost_timing(client) -> None:
+    print("\nB7. THE MEASUREMENT (D37): a full run vs a re-cost, SAME inputs — "
+          "Bishops Place (a57e13f1), cached profiles, full-year dispatch")
+    owner = (client.table("jobs").select("company_id")
+             .eq("job_id", TOU_JOB).limit(1).execute())
+    company_id = (owner.data or [{}])[0].get("company_id")
+    caller = auth.Caller(user_id="gate-runner", email="gate@example.com",
+                         company_id=company_id, role="owner")
+    addr = (client.table("job_customers").select("property_address_full")
+            .eq("job_id", TOU_JOB).limit(1).execute().data or [{}])[0]
+    print(f"        job address: {addr.get('property_address_full')!r}")
+    check("(B7/premise) the timed job IS the Bishops Place roof",
+          "Bishops" in str(addr.get("property_address_full")),
+          repr(addr.get("property_address_full")))
+
+    # (a) the full run: no constraints, the whole catalogue, full-year.
+    full, t_full, misses_full, rec_full = _timed_run(
+        sizing_route.battery_sizing,
+        sizing_route.BatteryRequest(job_id=TOU_JOB, persist=False), caller)
+    opt = full.get("optimal_battery") or {}
+    cs = full.get("chosen_solar") or {}
+    print(f"        (a) FULL RUN : {t_full:8.2f} s   cache_misses={misses_full}  "
+          f"candidates={len(full.get('candidates') or [])}  "
+          f"chosen {cs.get('solar_kw')} kW + {opt.get('model')!r} "
+          f"{opt.get('usable_kwh')} kWh  system_cost={opt.get('system_cost')}")
+    check("(B7) full run: answered, at full_year, nothing written",
+          isinstance(opt.get("system_cost"), (int, float))
+          and full.get("resolution") == "full_year" and rec_full == [],
+          f"error={full.get('error')!r} resolution={full.get('resolution')!r}")
+    check("(B7) full run: cache_misses == 0 — every plane profile came from "
+          "pvgis_cache; the clock includes no network call",
+          misses_full == 0, f"{misses_full} _cache_put call(s)")
+    check("(B7) full run: more than one candidate was dispatched (the whole "
+          "catalogue) — otherwise there is nothing for the re-cost to beat",
+          len(full.get("candidates") or []) > 2,
+          f"{len(full.get('candidates') or [])}")
+    if not isinstance(opt.get("battery_id"), str) or not isinstance(cs.get("solar_kw"), (int, float)):
+        skip("(B7) the full run chose no battery, so a pinned re-cost of "
+             "'its chosen battery' has nothing to pin.")
+        return
+
+    # (b) the re-cost: pinned to (a)'s own array and battery, no shadow run.
+    pin = {"fix_solar_kwp": cs["solar_kw"], "battery_ids": [opt["battery_id"]]}
+    recost, t_recost, misses_recost, rec_recost = _timed_run(
+        sizing_route.battery_sizing,
+        sizing_route.BatteryRequest(job_id=TOU_JOB, persist=False,
+                                    compare_to_unconstrained=False,
+                                    constraints=pin), caller)
+    ropt = recost.get("optimal_battery") or {}
+    rcs = recost.get("chosen_solar") or {}
+    print(f"        (b) RE-COST  : {t_recost:8.2f} s   cache_misses={misses_recost}  "
+          f"candidates={len(recost.get('candidates') or [])}  "
+          f"chosen {rcs.get('solar_kw')} kW + {ropt.get('model')!r} "
+          f"{ropt.get('usable_kwh')} kWh  system_cost={ropt.get('system_cost')}")
+    ratio = (t_full / t_recost) if t_recost > 0 else float("inf")
+    print(f"        RATIO full/re-cost = {ratio:.2f}x   "
+          f"(re-cost is {100 * t_recost / t_full:.1f}% of the full run)")
+    check("(B7) re-cost: cache_misses == 0", misses_recost == 0,
+          f"{misses_recost} _cache_put call(s)")
+    check("(B7) re-cost: nothing written, full_year, the decline flagged",
+          rec_recost == [] and recost.get("resolution") == "full_year"
+          and COMPARISON_FLAG in (recost.get("flags") or [])
+          and recost.get("constraint_deltas") is None,
+          f"resolution={recost.get('resolution')!r} flags="
+          f"{[f for f in recost.get('flags') or [] if 'by_request' in str(f)]}")
+    check("(B7) re-cost: exactly TWO candidates dispatched — the no-battery "
+          "baseline and the pinned battery, not the catalogue",
+          len(recost.get("candidates") or []) == 2,
+          f"{len(recost.get('candidates') or [])}")
+    check("(B7) re-cost: the SAME system the full run chose — array, "
+          "layout, battery and whole-system cost",
+          rcs.get("solar_kw") == cs.get("solar_kw")
+          and rcs.get("plane_indices") == cs.get("plane_indices")
+          and rcs.get("panels_per_plane") == cs.get("panels_per_plane")
+          and ropt.get("battery_id") == opt.get("battery_id")
+          and ropt.get("system_cost") == opt.get("system_cost"),
+          f"{rcs.get('solar_kw')}/{rcs.get('panels_per_plane')}/"
+          f"{ropt.get('battery_id')}/{ropt.get('system_cost')} vs "
+          f"{cs.get('solar_kw')}/{cs.get('panels_per_plane')}/"
+          f"{opt.get('battery_id')}/{opt.get('system_cost')}")
+    check("(B7) THE MEASUREMENT: the re-cost is FASTER than the full run",
+          t_recost < t_full, f"{t_recost:.2f}s vs {t_full:.2f}s")
+    print(f"        TIMING SUMMARY: full={t_full:.2f}s  recost={t_recost:.2f}s  "
+          f"ratio={ratio:.2f}x  cache_misses={misses_full}/{misses_recost}")
+
 def main() -> int:
     print("verify_battery_contract.py — 3.12 prompt 1 (writes nothing)\n")
     start = _counts()
@@ -854,6 +971,7 @@ def main() -> int:
     if client is not None:
         t_live_endpoints(client)
         t_agree_live(client)
+        t_b7_recost_timing(client)
     t_b3()
     t_b4()
     t_b5()
