@@ -5,6 +5,7 @@ import Link from "next/link";
 import { useRouter } from "next/navigation";
 import { Notice } from "@/components/ui/notice";
 import { HoverHelp } from "@/components/ui/tooltip";
+import { Switch } from "@/components/ui/switch";
 import { requestJson } from "@/lib/client-api";
 import { ScoreCurve } from "@/components/results/score-curve";
 import { NoticeStack } from "@/components/ui/notice-stack";
@@ -76,14 +77,16 @@ function RoiPanel({
 
   return (
     <section aria-label="Return on investment">
-      <label className="flex items-center gap-2 text-body text-foreground">
-        <input
-          type="checkbox"
-          role="switch"
+      <div className="flex items-center gap-2 text-body text-foreground">
+        {/* 3.13 prompt 4d: the standard Switch. The checkbox it replaces
+            already carried role="switch" — the announcement is unchanged, the
+            control is now a real switch. The state shown is the state ON THE
+            JOB, never an optimistic guess, and it is disabled while saving. */}
+        <Switch
+          label="Show return on investment"
           checked={view.showRoi}
           disabled={saving}
-          onChange={(e) => void setShowRoi(e.target.checked)}
-          className="h-4 w-4 accent-primary"
+          onChange={(next) => void setShowRoi(next)}
         />
         Show return on investment
         <HoverHelp label="About return on investment">
@@ -92,7 +95,7 @@ function RoiPanel({
           three appear together. The setting is saved on the job and the
           customer report follows it.
         </HoverHelp>
-      </label>
+      </div>
       {error ? (
         <p className="mt-1 text-caption text-destructive">{error}</p>
       ) : null}

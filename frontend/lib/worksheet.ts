@@ -5489,91 +5489,198 @@ export function resultsTabView(job: unknown): ResultsTabView {
   };
 }
 
-// ── The score curve (checklist 3.13 prompt 4b) ───────────────────────────────
+// ── The option comparison chart (3.13 prompt 4b, rebuilt as bars at 4d) ──────
+//
+// WHY BARS AND NOT A LINE (found on screen 2026-08-21): the battery options
+// are DISCRETE PRODUCTS, not points on a continuum. The live fixture holds two
+// different batteries at 12.8 kWh — a Sungrow SBR128 at +$2,344 and a BYD HVS
+// at +$670 — so a connecting line joined two unrelated products and implied
+// that value varies smoothly with capacity. There is no 13.1 kWh battery to
+// buy. The solar options are the same shape: discrete cumulative roof
+// configurations, ordered by size, not samples of a curve.
 
-export interface ScoreCurvePoint {
-  x: number;
-  y: number;
+/** One evaluated option, as a bar. */
+export interface ScoreCurveBar {
+  /** Stable react key — the product id or the size. */
+  key: string;
+  /** THE PRODUCT, primary. Capacity alone cannot tell two products apart. */
+  label: string;
+  /** Capacity, beneath the product name. */
+  subLabel: string | null;
+  /** Set when the product name was not recorded — never a made-up label. */
+  labelNote: string | null;
+  value: number;
+  valueLabel: string;
+  chosen: boolean;
+  /** The do-nothing option: rendered as the reference line, never as a bar. */
+  isBaseline: boolean;
 }
 
 export interface ScoreCurveView {
-  /** null = no chart; `note` says why. Never an empty axis. */
-  points: ScoreCurvePoint[] | null;
+  /** Never contains the baseline. null = no chart; `note` says why. */
+  bars: ScoreCurveBar[] | null;
+  /** The do-nothing option — the line every bar is read against. */
+  baseline: ScoreCurveBar | null;
+  baselineNote: string | null;
   note: string | null;
-  xLabel: string;
-  /** What the vertical axis is showing — always the metric the run's OWN
-      objective was scored on, never a metric it was not optimising. */
-  yLabel: string;
+  /** What the value axis is showing — always the run's OWN objective metric. */
+  valueLabel: string;
+  unit: AxisUnit;
   objectiveLabel: string | null;
-  /** x of the chosen point, or null; chosenNote says why when null. */
-  chosenX: number | null;
+  /**
+   * True ONLY when the measure is a delta against doing nothing, so zero is a
+   * real centre and bars sit either side of it. False for durations and
+   * percentages, where zero is an origin and not a centre — read from the
+   * run's stored objective, never assumed to be NPV.
+   */
+  zeroCentred: boolean;
+  /** Round axis intervals, or null when there is no chart. */
+  ticks: number[] | null;
   chosenNote: string | null;
-  /** BE HONEST ABOUT FLATNESS: when the best and the runners-up sit within a
-      trivial spread, the words say so beside the chart rather than letting a
-      zoomed axis manufacture a cliff. */
   flatNote: string | null;
 }
 
-const OBJECTIVE_METRICS: Record<
-  string,
-  {
-    label: string;
-    solarKey: string;
-    batteryKey: string;
-    yLabel: string;
-    lowerIsBetter: boolean;
-    fmt: (v: number) => string;
+export type AxisUnit = "aud" | "years" | "pct" | "score";
+
+/**
+ * An axis tick, at a precision a person reads. `3202.2155` on an axis is not a
+ * number anyone reads: money is whole dollars with separators, abbreviated
+ * DECIMAL-FREE above ten thousand ($12k, $1M). Junk yields an empty label
+ * rather than a fabricated one. Never returns a decimal point.
+ */
+export function formatAxisTick(value: unknown, unit: AxisUnit = "aud"): string {
+  const n = tariffNum(value);
+  if (n === null) return "";
+  const sign = n < 0 ? "-" : "";
+  const abs = Math.abs(n);
+  if (unit === "years") return `${sign}${Math.round(abs)}`;
+  if (unit === "pct") return `${sign}${Math.round(abs)}%`;
+  // A blended score is 0..1; shown out of 100 so the axis carries whole
+  // numbers a person reads, rather than 0.85 (a decimal) or 0·85 (a fudge).
+  if (unit === "score") return `${sign}${Math.round(abs * 100)}`;
+  if (abs >= 1_000_000) return `${sign}$${Math.round(abs / 1_000_000)}M`;
+  if (abs >= 10_000) return `${sign}$${Math.round(abs / 1000)}k`;
+  return `${sign}$${Math.round(abs).toLocaleString("en-AU")}`;
+}
+
+/**
+ * Round axis intervals spanning the data — the 1 / 2 / 2.5 / 5 / 10 ladder, so
+ * ticks land on numbers a person recognises and the domain is snapped outward
+ * to them (recharts' own ticks land on values like 3202.2155). `includeZero`
+ * forces the base into range for a delta measure.
+ */
+export function niceAxisTicks(
+  min: number,
+  max: number,
+  includeZero = true,
+  target = 5,
+): number[] {
+  let lo = Number.isFinite(min) ? min : 0;
+  let hi = Number.isFinite(max) ? max : 0;
+  if (includeZero) {
+    lo = Math.min(lo, 0);
+    hi = Math.max(hi, 0);
   }
-> = {
+  if (lo === hi) {
+    const pad = Math.abs(lo) > 0 ? Math.abs(lo) * 0.5 : 1;
+    lo -= pad;
+    hi += pad;
+  }
+  const raw = (hi - lo) / Math.max(1, target);
+  const magnitude = Math.pow(10, Math.floor(Math.log10(Math.abs(raw) || 1)));
+  const scaled = raw / magnitude;
+  const step =
+    (scaled <= 1 ? 1 : scaled <= 2 ? 2 : scaled <= 2.5 ? 2.5 : scaled <= 5 ? 5 : 10) *
+    magnitude;
+  const start = Math.floor(lo / step) * step;
+  const end = Math.ceil(hi / step) * step;
+  const ticks: number[] = [];
+  // Guard the loop against a degenerate step; 200 is far more ticks than any
+  // axis renders, so hitting it means the inputs were junk.
+  for (let t = start, i = 0; t <= end + step / 1000 && i < 200; t += step, i++) {
+    // Re-round each tick: floating point turns 0.1 steps into 0.30000000004.
+    ticks.push(Math.round(t / step) * step);
+  }
+  return ticks;
+}
+
+interface ObjectiveMetric {
+  label: string;
+  solarKey: string;
+  batteryKey: string;
+  valueLabelSolar: string;
+  valueLabelBattery: string;
+  unit: AxisUnit;
+  lowerIsBetter: boolean;
+  /** Is zero a real CENTRE for this measure, or merely an origin? */
+  zeroIsCentre: boolean;
+}
+
+const OBJECTIVE_METRICS: Record<string, ObjectiveMetric> = {
   max_npv: {
     label: "maximum NPV",
     solarKey: "npv_25yr",
     batteryKey: "incremental_npv",
-    yLabel: "25-year NPV ($)",
+    valueLabelSolar: "25-year NPV",
+    valueLabelBattery: "Extra 25-year NPV vs no battery",
+    unit: "aud",
     lowerIsBetter: false,
-    fmt: (v) => formatMoney(v),
+    // A delta against doing nothing: negative is meaningful, so zero centres.
+    zeroIsCentre: true,
   },
   min_payback: {
-    label: "minimum payback",
+    label: "shortest payback",
     solarKey: "simple_payback_years",
     batteryKey: "incremental_payback_years",
-    yLabel: "Payback (years)",
+    valueLabelSolar: "Payback (years)",
+    valueLabelBattery: "Payback on the extra spend (years)",
+    unit: "years",
     lowerIsBetter: true,
-    fmt: (v) => formatYears(v),
+    // A duration. Zero is its origin, not a centre — doing nothing has no
+    // payback at all, so there is no zero line to read bars against.
+    zeroIsCentre: false,
   },
   max_self_sufficiency: {
     label: "maximum self-sufficiency",
     solarKey: "self_sufficiency_pct",
     batteryKey: "self_sufficiency_pct",
-    yLabel: "Self-sufficiency (%)",
+    valueLabelSolar: "Self-sufficiency (%)",
+    valueLabelBattery: "Self-sufficiency (%)",
+    unit: "pct",
     lowerIsBetter: false,
-    fmt: (v) => formatPct(v),
+    // An absolute share. Doing nothing already scores a real number, and the
+    // reference line sits THERE, not at zero.
+    zeroIsCentre: false,
   },
   custom: {
     label: "the custom blend",
     solarKey: "score",
     batteryKey: "score",
-    yLabel: "Blended score",
+    valueLabelSolar: "Blended score",
+    valueLabelBattery: "Blended score",
+    unit: "score",
     lowerIsBetter: false,
-    fmt: (v) => `${v}`,
+    zeroIsCentre: false,
   },
 };
 
 /**
- * scoreCurveView (3.13 prompt 4b) — the curve's data, from what is already
- * stored: evaluated_options.points, with dimension_keys saying which run
- * shape this is (never guessed from the point shape). The vertical axis is
- * the figure the job's own objective was scored on. Total: never throws;
- * no points, one point or junk yields points: null plus an honest note.
+ * scoreCurveView (4b, rebuilt 4d) — the bars, derived HERE so the suite can
+ * test them rather than reading them off a rendered chart. Total: never
+ * throws; empty, single-option or junk data yields bars: null plus an honest
+ * note, never an empty axis.
  */
 export function scoreCurveView(job: unknown): ScoreCurveView {
   const none = (note: string): ScoreCurveView => ({
-    points: null,
+    bars: null,
+    baseline: null,
+    baselineNote: null,
     note,
-    xLabel: "",
-    yLabel: "",
+    valueLabel: "",
+    unit: "aud",
     objectiveLabel: null,
-    chosenX: null,
+    zeroCentred: false,
+    ticks: null,
     chosenNote: null,
     flatNote: null,
   });
@@ -5588,55 +5695,111 @@ export function scoreCurveView(job: unknown): ScoreCurveView {
   const isSolar = dims.length === 1 && dims[0] === "solar_kw";
   const isBattery = dims.length === 1 && dims[0] === "battery_id";
   if (!isSolar && !isBattery) {
-    return none("The evaluated options were not recorded in a shape this chart knows.");
+    return none(
+      "The evaluated options were not recorded in a shape this chart knows.",
+    );
   }
   const objective =
     typeof sizing.objective_used === "string" ? sizing.objective_used : null;
   const metric = objective ? OBJECTIVE_METRICS[objective] : undefined;
   if (!metric) {
-    return none("The objective this run was scored on was not recorded.");
+    // An objective the code does not recognise: the values still draw, plainly
+    // labelled, and NEVER with the zero-centred NPV treatment applied blind.
+    const fallback = buildBars(rawPoints, isSolar, {
+      label: null,
+      solarKey: "score",
+      batteryKey: "score",
+      valueLabel: "Score the run was judged on",
+      unit: "score",
+      lowerIsBetter: false,
+      zeroIsCentre: false,
+    }, sizing, eo);
+    return fallback.bars
+      ? fallback
+      : none("The objective this run was scored on was not recorded.");
   }
-  const xKey = isSolar ? "solar_kw" : "usable_kwh";
-  const yKey = isSolar ? metric.solarKey : metric.batteryKey;
+  return buildBars(rawPoints, isSolar, {
+    label: metric.label,
+    solarKey: metric.solarKey,
+    batteryKey: metric.batteryKey,
+    valueLabel: isSolar ? metric.valueLabelSolar : metric.valueLabelBattery,
+    unit: metric.unit,
+    lowerIsBetter: metric.lowerIsBetter,
+    zeroIsCentre: metric.zeroIsCentre,
+  }, sizing, eo);
+}
+
+function buildBars(
+  rawPoints: unknown[],
+  isSolar: boolean,
+  spec: {
+    label: string | null;
+    solarKey: string;
+    batteryKey: string;
+    valueLabel: string;
+    unit: AxisUnit;
+    lowerIsBetter: boolean;
+    zeroIsCentre: boolean;
+  },
+  sizing: Record<string, unknown>,
+  eo: Record<string, unknown>,
+): ScoreCurveView {
+  const sizeKey = isSolar ? "solar_kw" : "usable_kwh";
+  const valueKey = isSolar ? spec.solarKey : spec.batteryKey;
 
   const entries = rawPoints
-    .map((p) => asRecord(p))
-    .map((p) => ({
-      x: tariffNum(p[xKey]),
-      y: tariffNum(p[yKey]),
-      raw: p,
+    .map((p, index) => ({ raw: asRecord(p), index }))
+    .map(({ raw, index }) => ({
+      raw,
+      index,
+      size: tariffNum(raw[sizeKey]),
+      value: tariffNum(raw[valueKey]),
     }))
-    .filter(
-      (e): e is { x: number; y: number; raw: Record<string, unknown> } =>
-        e.x !== null && e.y !== null,
-    )
-    .sort((a, b) => a.x - b.x);
-  if (entries.length < 2) {
-    return none(
-      entries.length === 0
-        ? "The evaluated options were not recorded for this run."
-        : "Only one option was evaluated — there is no curve to draw.",
-    );
+    .filter((e) => e.size !== null)
+    .sort((a, b) => (a.size as number) - (b.size as number));
+
+  // THE BASELINE: doing nothing. Its size is zero by construction.
+  const baselineEntry = entries.find((e) => e.size === 0) ?? null;
+  const optionEntries = entries.filter((e) => e !== baselineEntry);
+
+  const priced = optionEntries.filter((e) => e.value !== null);
+  if (priced.length === 0) {
+    return {
+      bars: null,
+      baseline: null,
+      baselineNote: null,
+      note:
+        optionEntries.length === 0
+          ? "The evaluated options were not recorded for this run."
+          : "This run recorded no value for the measure it was scored on.",
+      valueLabel: spec.valueLabel,
+      unit: spec.unit,
+      objectiveLabel: spec.label,
+      zeroCentred: false,
+      ticks: null,
+      chosenNote: null,
+      flatNote: null,
+    };
   }
 
-  // The chosen point: chosen_index names it exactly for a solar run; a
-  // battery run is matched on capacity AND cost, and a tie marks NOTHING.
-  let chosenX: number | null = null;
+  // ── The chosen option ──
+  let chosenIndex: number | null = null;
   let chosenNote: string | null = null;
   if (isSolar) {
     const idx = eo.chosen_index;
     if (typeof idx === "number" && Number.isInteger(idx) && rawPoints[idx]) {
       const chosenRaw = asRecord(rawPoints[idx]);
-      const match = entries.find((e) => e.raw === chosenRaw);
-      chosenX = match ? match.x : null;
+      const hit = priced.find((e) => e.raw === chosenRaw);
+      chosenIndex = hit ? hit.index : null;
     }
-    if (chosenX === null) {
-      chosenNote = "The chosen option could not be matched to a point.";
+    if (chosenIndex === null) {
+      chosenNote =
+        "This run did not record which option it chose, so none is marked.";
     }
   } else {
     const rowKwh = tariffNum(sizing.battery_kwh);
     const rowCost = tariffNum(sizing.system_cost);
-    const matches = entries.filter(
+    const matches = priced.filter(
       (e) =>
         rowKwh !== null &&
         rowCost !== null &&
@@ -5644,42 +5807,237 @@ export function scoreCurveView(job: unknown): ScoreCurveView {
         tariffNum(e.raw.system_cost) === rowCost,
     );
     if (matches.length === 1) {
-      chosenX = matches[0].x;
+      chosenIndex = matches[0].index;
     } else {
       chosenNote =
         matches.length > 1
-          ? "Two evaluated options tie on capacity and cost, so no single chosen point can be marked."
-          : "The chosen option could not be matched to a point.";
+          ? "Two options tie on capacity and cost, so no single chosen option can be marked."
+          : "This run's chosen option could not be matched to an evaluated option, so none is marked.";
     }
   }
 
-  // Honest flatness: the spread across the best three (by the objective's own
-  // direction). Trivial relative to the best value -> say so in words.
+  const toBar = (
+    e: { raw: Record<string, unknown>; index: number; size: number | null; value: number | null },
+    isBaseline: boolean,
+  ): ScoreCurveBar => {
+    const model = typeof e.raw.model === "string" ? e.raw.model.trim() : "";
+    const sizeLabel = isSolar
+      ? formatKw(e.size)
+      : formatKwh(e.size);
+    // The PRODUCT identifies the bar; capacity is the second line. Where no
+    // product name was recorded the capacity carries the bar and says so —
+    // never an invented name.
+    const named = !isSolar && model !== "" && model.toLowerCase() !== "no battery";
+    // THE BASELINE IS NAMED FOR WHAT IT IS. "0 kWh" as the label on the
+    // reference line tells a reader nothing; "No battery" is the option they
+    // are actually comparing against. The engine's own word is used when it
+    // recorded one.
+    const baselineLabel = isSolar ? "No solar" : model !== "" ? model : "No battery";
+    return {
+      key: `${e.index}`,
+      label: isBaseline ? baselineLabel : named ? model : sizeLabel,
+      subLabel: named ? sizeLabel : null,
+      labelNote:
+        !isSolar && !named && !isBaseline
+          ? "the product was not recorded for this option"
+          : null,
+      value: e.value ?? 0,
+      valueLabel: formatAxisTick(e.value, spec.unit),
+      chosen: chosenIndex !== null && e.index === chosenIndex,
+      isBaseline,
+    };
+  };
+
+  const bars = priced.map((e) => toBar(e, false));
+  // THE CATEGORY AXIS KEYS BARS BY THEIR LABEL, and the tooltip shows that
+  // same string, so two options must never share one. Product names are
+  // unique in the catalogue; two options with NO product name at the same
+  // capacity would otherwise collapse into one category. Numbering them is
+  // honest — they are genuinely different options — where merging is not.
+  const labelCounts = new Map<string, number>();
+  for (const bar of bars) {
+    const n = (labelCounts.get(bar.label) ?? 0) + 1;
+    labelCounts.set(bar.label, n);
+    if (n > 1) bar.label = `${bar.label} (${n})`;
+  }
+  const baseline = baselineEntry ? toBar(baselineEntry, true) : null;
+  const baselineValue = baselineEntry?.value ?? null;
+
+  // WHERE THE REFERENCE LINE SITS, and whether zero is a centre — from the
+  // measure, never assumed. A delta measure centres on zero (the baseline is
+  // zero by construction). An absolute measure references the baseline's own
+  // value, and a measure the baseline cannot have (a payback for doing
+  // nothing) has no reference line at all.
+  const zeroCentred = spec.zeroIsCentre && baselineValue === 0;
+  let baselineNote: string | null = null;
+  if (baseline && baselineValue === null) {
+    baselineNote = isSolar
+      ? "Doing nothing has no payback, so there is no line to read these against."
+      : "Doing nothing has no payback, so there is no line to read these against.";
+  } else if (baseline && !zeroCentred && baselineValue !== null) {
+    baselineNote = `The line is ${baseline.label} — ${formatAxisTick(baselineValue, spec.unit)}.`;
+  }
+
+  const values = bars.map((b) => b.value);
+  const lo = Math.min(...values, zeroCentred ? 0 : Math.min(...values));
+  const hi = Math.max(...values, zeroCentred ? 0 : Math.max(...values));
+  const ticks = niceAxisTicks(
+    baselineValue !== null && !zeroCentred ? Math.min(lo, baselineValue) : lo,
+    baselineValue !== null && !zeroCentred ? Math.max(hi, baselineValue) : hi,
+    zeroCentred,
+  );
+
+  // BE HONEST ABOUT FLATNESS: when the best options sit within a trivial
+  // spread, the words say so rather than letting a zoomed axis invent a cliff.
   let flatNote: string | null = null;
-  const ranked = [...entries].sort((a, b) =>
-    metric.lowerIsBetter ? a.y - b.y : b.y - a.y,
+  const ranked = [...bars].sort((a, b) =>
+    spec.lowerIsBetter ? a.value - b.value : b.value - a.value,
   );
   if (ranked.length >= 3) {
-    const top = ranked.slice(0, 3).map((e) => e.y);
+    const top = ranked.slice(0, 3).map((b) => b.value);
     const spread = Math.max(...top) - Math.min(...top);
-    const best = Math.abs(ranked[0].y);
+    const best = Math.abs(ranked[0].value);
     if (best > 0 && spread / best < 0.01) {
       flatNote =
-        `The top options sit within ${metric.fmt(Math.round(spread * 100) / 100)} ` +
-        `of each other — the choice among them is fine margin, not a cliff.`;
+        `The top options sit within ${formatAxisTick(spread, spec.unit)} of ` +
+        "each other — the choice among them is fine margin, not a cliff.";
     }
   }
 
   return {
-    points: entries.map((e) => ({ x: e.x, y: e.y })),
+    bars,
+    baseline,
+    baselineNote,
     note: null,
-    xLabel: isSolar ? "Solar size (kW)" : "Battery size (kWh)",
-    yLabel: metric.yLabel,
-    objectiveLabel: metric.label,
-    chosenX,
+    valueLabel: spec.valueLabel,
+    unit: spec.unit,
+    objectiveLabel: spec.label,
+    zeroCentred,
+    ticks,
     chosenNote,
     flatNote,
   };
+}
+
+
+// ── The chart's own space requirement (3.13 prompt 4e) ──────────────────────
+//
+// THE FAULT THIS EXISTS TO FIX, found on screen 2026-08-21: the category axis
+// carried a HARDCODED 172px, so "Sigenergy SigenStor Sigen Battery 8.0"
+// rendered as "gy SigenStor Sigen Battery 8.0" and "BYD Battery-Box Premium
+// HVS 12.8" as "attery-Box Premium HVS 12.8" — silently sliced by the axis
+// edge, with the reference label clipped at the top of the plot area.
+//
+// A chart dispatches its own size from an effect, so no static render emits a
+// laid-out SVG and NO TEST CAN SEE A CLIPPED LABEL. The answer is not a better
+// guess at a margin: it is to make the requirement a FUNCTION OF THE LABELS,
+// computed here, where the suite can assert on it. A longer product name next
+// month widens the axis without anyone touching the component.
+
+export const SCORE_CURVE_AXIS = {
+  /** The product line, matching the tick's own fontSize. */
+  fontSize: 12,
+  /** The capacity line beneath it. */
+  subFontSize: 11,
+  /**
+   * Average glyph width as a fraction of font size. Inter's mixed-case
+   * average sits near 0.55; 0.58 is deliberately generous, because the cost
+   * of over-reserving is a little white space and the cost of
+   * under-reserving is the sliced label this replaces.
+   */
+  charWidth: 0.58,
+  /** Gap between the tick text and the plot area. */
+  gap: 12,
+  minWidth: 96,
+  /**
+   * The Results tab is max-w-5xl (1024px) less its px-8 padding. The chart is
+   * responsive, so this is the width the CAP is reasoned against — callers
+   * that know better may pass their own.
+   */
+  assumedChartWidth: 960,
+  /** No axis may eat more than this share of the chart. */
+  maxFraction: 0.42,
+  /** Line height for the reference-line label above the plot area. */
+  referenceLineHeight: 1.7,
+  /** Top margin when there is no reference label to clear. */
+  minTopSpace: 8,
+} as const;
+
+export interface ScoreCurveAxisSpace {
+  /** Pixels the category axis needs for its labels. Never zero or negative. */
+  axisWidth: number;
+  /** Pixels above the plot area so the reference label is never clipped. */
+  topSpace: number;
+  /** Characters the product line may show before it must be truncated. */
+  maxChars: number;
+}
+
+/** One label pair — the product line and the capacity line beneath it. */
+export interface ScoreCurveLabelled {
+  label: string;
+  subLabel?: string | null;
+}
+
+/**
+ * The space the axis needs, DERIVED FROM THE LABELS THEMSELVES. Pure and
+ * total: junk in yields the floor, never a zero, negative or NaN width.
+ */
+export function scoreCurveAxisSpace(
+  bars: readonly ScoreCurveLabelled[] | null | undefined,
+  baselineLabel?: string | null,
+  chartWidth: number = SCORE_CURVE_AXIS.assumedChartWidth,
+): ScoreCurveAxisSpace {
+  const {
+    fontSize, subFontSize, charWidth, gap, minWidth, maxFraction,
+    referenceLineHeight, minTopSpace, assumedChartWidth,
+  } = SCORE_CURVE_AXIS;
+  const usableWidth =
+    typeof chartWidth === "number" && Number.isFinite(chartWidth) && chartWidth > 0
+      ? chartWidth
+      : assumedChartWidth;
+  const cap = Math.max(minWidth, Math.floor(usableWidth * maxFraction));
+
+  const rows = Array.isArray(bars) ? bars : [];
+  let widest = 0;
+  for (const row of rows) {
+    const label = typeof row?.label === "string" ? row.label.trim() : "";
+    const sub = typeof row?.subLabel === "string" ? row.subLabel.trim() : "";
+    widest = Math.max(
+      widest,
+      label.length * fontSize * charWidth,
+      sub.length * subFontSize * charWidth,
+    );
+  }
+
+  const axisWidth = Math.min(cap, Math.max(minWidth, Math.ceil(widest) + gap));
+  // What FITS at the cap — the truncation budget. Never below 4, so a
+  // truncated label always has a character or two before its ellipsis.
+  const maxChars = Math.max(
+    4,
+    Math.floor((cap - gap) / (fontSize * charWidth)),
+  );
+  const hasBaselineLabel =
+    typeof baselineLabel === "string" && baselineLabel.trim() !== "";
+  const topSpace = hasBaselineLabel
+    ? Math.ceil(subFontSize * referenceLineHeight)
+    : minTopSpace;
+
+  return { axisWidth, topSpace, maxChars };
+}
+
+/**
+ * A label trimmed to fit, ending in a real ellipsis. A label that says "…" is
+ * honest about being shortened; one silently sliced by an overflow is not,
+ * and that is the fault 4e fixes. The FULL string still reaches the tooltip.
+ */
+export function truncateLabel(label: unknown, maxChars: number): string {
+  const text = typeof label === "string" ? label : "";
+  const limit =
+    typeof maxChars === "number" && Number.isFinite(maxChars) && maxChars >= 2
+      ? Math.floor(maxChars)
+      : 2;
+  if (text.length <= limit) return text;
+  return `${text.slice(0, limit - 1).trimEnd()}\u2026`;
 }
 
 // ── The return-on-investment toggle (checklist 3.13 prompt 4c, D34) ─────────

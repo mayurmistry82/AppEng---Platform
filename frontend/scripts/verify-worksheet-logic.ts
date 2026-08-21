@@ -88,6 +88,11 @@ import {
   roiFigures,
   ROI_EXPLANATIONS,
   scoreCurveView,
+  scoreCurveAxisSpace,
+  truncateLabel,
+  SCORE_CURVE_AXIS,
+  formatAxisTick,
+  niceAxisTicks,
   resultsTabView,
   elapsedLabel,
   batterySizingView,
@@ -6292,100 +6297,275 @@ test("U3: the bill-eliminated derivation is THE SAME function on both surfaces",
       "and both ARE projectedSpendView's own answer — one derivation");
   }
 });
+// ── 3.13 prompt 4d: BARS, not a line (4d-V1 … 4d-V6) ────────────────────────
+//
+// RESTATED from 4b's U4/U4b, which pinned the LINE shape this prompt deletes.
+// The fault, found on screen 2026-08-21 and reproduced from the live stored
+// run: two different batteries sit at 12.8 kWh with very different answers, so
+// a connecting line joined two unrelated products.
 
-test("U4: score-curve data — solar, battery, empty, one point, junk, and the tie", () => {
-  const solarJob = {
-    sizing_results: [{
-      sizing_result_id: "s1", solar_kw: 9.24, run_kind: "solar",
-      objective_used: "max_npv",
-      evaluated_options: {
-        dimension_keys: ["solar_kw"],
-        chosen_index: 2,
-        points: [
-          { solar_kw: 0, npv_25yr: 0 },
-          { solar_kw: 6.6, npv_25yr: 15000 },
-          { solar_kw: 9.24, npv_25yr: 17068 },
-          { solar_kw: 11.4, npv_25yr: 17040 },
-        ],
-      },
-    }],
-    financial_results: [{ sizing_result_id: "s1" }],
-  };
-  const solar = scoreCurveView(solarJob);
-  assert.ok(solar.points && solar.points.length === 4);
-  assert.equal(solar.chosenX, 9.24, "chosen_index names the point exactly");
-  assert.equal(solar.xLabel, "Solar size (kW)");
-  assert.equal(solar.yLabel, "25-year NPV ($)");
-  assert.equal(solar.flatNote, null,
-    "top three span 2068 on 17068 — NOT trivial, so no flat note here (U4b pins the firing case)");
+/** The live fixture's own battery payload shape, values as stored. */
+const REAL_BATTERY_JOB = {
+  sizing_results: [{
+    sizing_result_id: "s1", run_kind: "solar_battery", objective_used: "max_npv",
+    battery_kwh: 9.83, system_cost: 11868.77,
+    evaluated_options: {
+      dimension_keys: ["battery_id"],
+      points: [
+        { model: "No battery", usable_kwh: 0, incremental_npv: 0, system_cost: 6342 },
+        { model: "Sigenergy SigenStor Sigen Battery 8.0", usable_kwh: 7.8,
+          incremental_npv: 1212.94, system_cost: 12869 },
+        { model: "GoodWe Lynx Home F", usable_kwh: 9.83,
+          incremental_npv: 2867.22, system_cost: 11868.77 },
+        // TWO PRODUCTS AT 12.8 kWh — the pair the line joined.
+        { model: "Sungrow SBR128", usable_kwh: 12.8,
+          incremental_npv: 2344.42, system_cost: 14842 },
+        { model: "BYD Battery-Box Premium HVS 12.8", usable_kwh: 12.8,
+          incremental_npv: 669.83, system_cost: 16342 },
+        { model: "Tesla Powerwall 3", usable_kwh: 13.5,
+          incremental_npv: -3832.69, system_cost: 19842 },
+        { model: "Sungrow SBH200", usable_kwh: 20,
+          incremental_npv: 2673.93, system_cost: 16819.84 },
+      ],
+    },
+  }],
+  financial_results: [{ sizing_result_id: "s1", system_capex: 11868.77 }],
+};
 
-  // A battery run, chosen matched on capacity AND cost.
-  const batteryJob = {
-    sizing_results: [{
-      sizing_result_id: "s1", solar_kw: 9.24, battery_kwh: 9.83,
-      system_cost: 11868.77, run_kind: "solar_battery",
-      objective_used: "max_npv",
-      evaluated_options: {
-        dimension_keys: ["battery_id"],
-        points: [
-          { usable_kwh: 0, incremental_npv: 0, system_cost: 6342 },
-          { usable_kwh: 9.83, incremental_npv: 2867, system_cost: 11868.77 },
-          { usable_kwh: 12.8, incremental_npv: 2100, system_cost: 14842 },
-        ],
-      },
-    }],
-    financial_results: [{ sizing_result_id: "s1" }],
-  };
-  const battery = scoreCurveView(batteryJob);
-  assert.equal(battery.chosenX, 9.83);
-  assert.equal(battery.xLabel, "Battery size (kWh)");
-
-  // THE DELIBERATE TIE: two candidates share capacity and cost — mark NOTHING.
-  const tieJob = JSON.parse(JSON.stringify(batteryJob));
-  tieJob.sizing_results[0].evaluated_options.points.push(
-    { usable_kwh: 9.83, incremental_npv: 2500, system_cost: 11868.77 });
-  const tie = scoreCurveView(tieJob);
-  assert.equal(tie.chosenX, null, "a tie must mark nothing rather than guess");
-  assert.match(tie.chosenNote ?? "", /tie/);
-
-  // Empty, one point, junk: no chart, an honest note, no throw.
-  for (const evaluated of [
-    undefined,
-    { dimension_keys: ["solar_kw"], points: [] },
-    { dimension_keys: ["solar_kw"], points: [{ solar_kw: 6.6, npv_25yr: 1 }] },
-    { dimension_keys: ["solar_kw"], points: "junk" },
-    { points: [{ solar_kw: 1, npv_25yr: 1 }, { solar_kw: 2, npv_25yr: 2 }] },
-  ]) {
-    const v = scoreCurveView({
-      sizing_results: [{ sizing_result_id: "s1", objective_used: "max_npv",
-        evaluated_options: evaluated }],
-    });
-    assert.equal(v.points, null);
-    assert.ok(v.note, "an honest line, never an empty axis");
+test("4d-V1: the axis formatter — round, readable, and never a decimal point", () => {
+  const cases: [unknown, string][] = [
+    [3202.2155, "$3,202"],
+    [-4167.6855, "-$4,168"],
+    [0, "$0"],
+    [999, "$999"],
+    [1000, "$1,000"],
+    [12345, "$12k"],
+    [1234567, "$1M"],
+    [null, ""],
+    [Number.NaN, ""],
+    [Number.POSITIVE_INFINITY, ""],
+  ];
+  for (const [input, expected] of cases) {
+    const out = formatAxisTick(input, "aud");
+    assert.equal(out, expected, `formatAxisTick(${String(input)})`);
+    assert.ok(!out.includes("."),
+      `an axis tick must never carry a decimal point: ${out}`);
   }
-  assert.doesNotThrow(() => scoreCurveView(null));
-  assert.doesNotThrow(() => scoreCurveView({ sizing_results: [{ sizing_result_id: "s1",
-    objective_used: "banana", evaluated_options: { dimension_keys: ["solar_kw"],
-    points: [{ solar_kw: 1, npv_25yr: 1 }, { solar_kw: 2, npv_25yr: 2 }] } }] }));
+  // The other units are whole too.
+  assert.equal(formatAxisTick(3.45, "years"), "3");
+  assert.equal(formatAxisTick(84.12, "pct"), "84%");
+  for (const u of ["years", "pct"] as const) {
+    assert.ok(!formatAxisTick(1234.5678, u).includes("."));
+  }
+  // THE ROUND INTERVAL, on the fixture's own realistic range: the battery NPVs
+  // run -3832.69 … +2867.22, so the ladder picks 2000 and the domain snaps
+  // outward to it, with zero present because the measure is a delta.
+  const ticks = niceAxisTicks(-3832.69, 2867.22, true);
+  assert.deepEqual(ticks, [-4000, -2000, 0, 2000, 4000],
+    "round intervals, not recharts' 3202.2155");
+  assert.ok(ticks.includes(0), "the delta measure's base is on the axis");
+  for (const t of ticks) {
+    assert.ok(!formatAxisTick(t, "aud").includes("."), String(t));
+  }
 });
 
-test("U4b: the flat-spread note fires when the top three genuinely sit within 1%", () => {
-  const v = scoreCurveView({
+test("4d-V2: two products at the SAME capacity are two distinct bars, neither dropped nor merged", () => {
+  const view = scoreCurveView(REAL_BATTERY_JOB);
+  assert.ok(view.bars, `no bars: ${view.note}`);
+  const at128 = view.bars!.filter((b) => b.subLabel === "12.8 kWh");
+  assert.equal(at128.length, 2,
+    "both 12.8 kWh products must survive — merging them is the fault the line hid");
+  assert.notEqual(at128[0].label, at128[1].label, "distinct product labels");
+  assert.deepEqual(
+    at128.map((b) => b.label).sort(),
+    ["BYD Battery-Box Premium HVS 12.8", "Sungrow SBR128"],
+  );
+  assert.notEqual(at128[0].value, at128[1].value,
+    "their values genuinely differ — 2344.42 vs 669.83");
+  assert.notEqual(at128[0].key, at128[1].key, "distinct react keys");
+  // THE PRODUCT identifies the bar; capacity is the second line.
+  const goodwe = view.bars!.find((b) => b.label === "GoodWe Lynx Home F");
+  assert.equal(goodwe?.subLabel, "9.83 kWh");
+  // Ordered by size so the progression still reads.
+  const sizes = view.bars!.map((b) => Number((b.subLabel ?? "0").replace(" kWh", "")));
+  assert.deepEqual(sizes, [...sizes].sort((a, b) => a - b), "ordered by size");
+});
+
+test("4d-V3: the no-battery option is the BASELINE, flagged, and never emitted as a bar", () => {
+  const view = scoreCurveView(REAL_BATTERY_JOB);
+  assert.ok(view.baseline, "the do-nothing option is carried as the baseline");
+  assert.equal(view.baseline!.isBaseline, true);
+  assert.equal(view.baseline!.label, "No battery",
+    "the reference line is named for the option, not \"0 kWh\"");
+  assert.equal(view.baseline!.value, 0, "zero by construction on a delta measure");
+  assert.equal(view.bars!.length, 6, "seven stored points, six bars — the baseline is not one");
+  assert.ok(view.bars!.every((b) => !b.isBaseline),
+    "no bar carries the baseline flag");
+  assert.ok(view.bars!.every((b) => b.value !== 0 || b.label !== "No battery"),
+    "a zero-height bar would be invisible and say nothing");
+});
+
+test("4d-V4: the chosen flag — resolved for solar by chosen_index, NOTHING on a battery tie", () => {
+  const solar = scoreCurveView({
     sizing_results: [{
       sizing_result_id: "s1", run_kind: "solar", objective_used: "max_npv",
       evaluated_options: {
-        dimension_keys: ["solar_kw"], chosen_index: 1,
+        dimension_keys: ["solar_kw"],
+        chosen_index: 4,
         points: [
-          { solar_kw: 9.2, npv_25yr: 17060 },
-          { solar_kw: 10.1, npv_25yr: 17068 },
-          { solar_kw: 11.4, npv_25yr: 17040 },
+          { solar_kw: 0, npv_25yr: 0 },
+          { solar_kw: 1.32, npv_25yr: 8397.6 },
+          { solar_kw: 4.84, npv_25yr: 14500.09 },
+          { solar_kw: 8.36, npv_25yr: 16925.06 },
+          { solar_kw: 9.24, npv_25yr: 17068.33, panel_count: 21 },
+          { solar_kw: 10.12, npv_25yr: 17039.91 },
+        ],
+      },
+    }],
+    financial_results: [{ sizing_result_id: "s1" }],
+  });
+  const chosenSolar = solar.bars!.filter((b) => b.chosen);
+  assert.equal(chosenSolar.length, 1, "exactly one chosen bar");
+  assert.equal(chosenSolar[0].label, "9.24 kW");
+  assert.equal(solar.chosenNote, null);
+  // A DELIBERATE TIE on capacity AND cost: mark none, and say why.
+  const tie = JSON.parse(JSON.stringify(REAL_BATTERY_JOB));
+  tie.sizing_results[0].evaluated_options.points.push({
+    model: "Impostor 9.83", usable_kwh: 9.83, incremental_npv: 999,
+    system_cost: 11868.77,
+  });
+  const tied = scoreCurveView(tie);
+  assert.ok(tied.bars!.every((b) => !b.chosen), "a tie marks NOTHING rather than guessing");
+  assert.match(tied.chosenNote ?? "", /tie/);
+  // The live solar rows carry NO chosen_index at all (they predate 3.13-1) —
+  // that must resolve to no emphasis and an honest line, not a wrong bar.
+  const noIndex = scoreCurveView({
+    sizing_results: [{
+      sizing_result_id: "s1", run_kind: "solar", objective_used: "max_npv",
+      evaluated_options: {
+        dimension_keys: ["solar_kw"],
+        points: [
+          { solar_kw: 0, npv_25yr: 0 },
+          { solar_kw: 9.24, npv_25yr: 17068.33 },
+          { solar_kw: 10.12, npv_25yr: 17039.91 },
         ],
       },
     }],
   });
-  assert.ok(v.flatNote, "a $28 spread on $17k must be named, not dramatised");
-  assert.match(v.flatNote ?? "", /fine margin/);
+  assert.ok(noIndex.bars!.every((b) => !b.chosen));
+  assert.match(noIndex.chosenNote ?? "", /did not record which option/);
 });
+
+test("4d-V5: the base comes from the OBJECTIVE — max_npv centres on zero, min_payback does not", () => {
+  const npv = scoreCurveView(REAL_BATTERY_JOB);
+  assert.equal(npv.zeroCentred, true,
+    "a delta against doing nothing: zero is a real centre and bars sit either side");
+  assert.ok(npv.bars!.some((b) => b.value < 0), "the Tesla is genuinely negative");
+  assert.equal(npv.unit, "aud");
+  assert.match(npv.valueLabel, /NPV/);
+
+  // THE SAME POINTS, scored on payback: zero is NOT a centre. This assertion
+  // fails the moment the code hardcodes the NPV treatment.
+  const payback = JSON.parse(JSON.stringify(REAL_BATTERY_JOB));
+  payback.sizing_results[0].objective_used = "min_payback";
+  for (const [i, p] of payback.sizing_results[0].evaluated_options.points.entries()) {
+    p.incremental_payback_years = i === 0 ? null : 6 + i;
+  }
+  const pb = scoreCurveView(payback);
+  assert.equal(pb.zeroCentred, false,
+    "a duration has an origin, not a centre — doing nothing has no payback at all");
+  assert.equal(pb.unit, "years");
+  assert.match(pb.valueLabel, /years/);
+  assert.match(pb.baselineNote ?? "", /no payback/,
+    "and the missing reference is stated, not silently drawn at zero");
+
+  // Self-sufficiency: the baseline has a REAL non-zero value, so the line sits
+  // there and zero is not the centre.
+  const ss = JSON.parse(JSON.stringify(REAL_BATTERY_JOB));
+  ss.sizing_results[0].objective_used = "max_self_sufficiency";
+  for (const [i, p] of ss.sizing_results[0].evaluated_options.points.entries()) {
+    p.self_sufficiency_pct = i === 0 ? 44.61 : 70 + i;
+  }
+  const sv = scoreCurveView(ss);
+  assert.equal(sv.zeroCentred, false);
+  assert.equal(sv.unit, "pct");
+  assert.equal(sv.baseline!.value, 44.61);
+  assert.match(sv.baselineNote ?? "", /45%/,
+    "the line is labelled with what doing nothing already achieves");
+
+  // An objective the code does not know: plainly labelled, NEVER zero-centred.
+  const unknown = JSON.parse(JSON.stringify(REAL_BATTERY_JOB));
+  unknown.sizing_results[0].objective_used = "banana";
+  for (const p of unknown.sizing_results[0].evaluated_options.points) p.score = 1;
+  const uv = scoreCurveView(unknown);
+  assert.equal(uv.zeroCentred, false, "never silently treated as NPV");
+});
+
+test("4d-V6: totals — empty points, one option, junk, a missing objective", () => {
+  const shell = (evaluated: unknown, objective: unknown = "max_npv") => ({
+    sizing_results: [{ sizing_result_id: "s1", run_kind: "solar_battery",
+      objective_used: objective, evaluated_options: evaluated }],
+    financial_results: [{ sizing_result_id: "s1" }],
+  });
+  for (const evaluated of [
+    undefined,
+    { dimension_keys: ["battery_id"], points: [] },
+    // Only the baseline: no options to compare.
+    { dimension_keys: ["battery_id"], points: [{ model: "No battery", usable_kwh: 0, incremental_npv: 0 }] },
+    { dimension_keys: ["battery_id"], points: "junk" },
+    { points: [{ usable_kwh: 1, incremental_npv: 1 }] },
+    { dimension_keys: ["something_else"], points: [{ x: 1 }] },
+  ]) {
+    const v = scoreCurveView(shell(evaluated));
+    assert.equal(v.bars, null, `expected no chart for ${JSON.stringify(evaluated)}`);
+    assert.ok(v.note, "an honest line, never an empty axis");
+    assert.equal(v.ticks, null);
+  }
+  // A missing objective still draws, plainly labelled — never nothing, never NPV.
+  const noObjective = scoreCurveView(shell({
+    dimension_keys: ["battery_id"],
+    points: [
+      { model: "No battery", usable_kwh: 0, score: 0 },
+      { model: "A", usable_kwh: 10, score: 0.4 },
+      { model: "B", usable_kwh: 12, score: 0.9 },
+    ],
+  }, null));
+  assert.ok(noObjective.bars, "values still draw");
+  assert.equal(noObjective.zeroCentred, false);
+  // A point with no product name: capacity carries it, and it SAYS so.
+  const unnamed = scoreCurveView(shell({
+    dimension_keys: ["battery_id"],
+    points: [
+      { model: "No battery", usable_kwh: 0, incremental_npv: 0 },
+      { usable_kwh: 10, incremental_npv: 500 },
+      { model: "", usable_kwh: 12, incremental_npv: 900 },
+    ],
+  }));
+  assert.equal(unnamed.bars!.length, 2);
+  assert.deepEqual(unnamed.bars!.map((b) => b.label), ["10 kWh", "12 kWh"]);
+  assert.ok(unnamed.bars!.every((b) => b.labelNote !== null),
+    "an unnamed product says so — never a made-up label");
+  for (const junk of [null, undefined, 0, "x", [], {}]) {
+    assert.doesNotThrow(() => scoreCurveView(junk));
+    assert.equal(scoreCurveView(junk).bars, null);
+  }
+});
+
+test("4d-V7: NO LINE MARK REMAINS in the chart component — a chart that joins the dots is the fault", async () => {
+  const [fs, path] = await Promise.all([import("node:fs"), import("node:path")]);
+  const src = fs.readFileSync(
+    path.resolve(import.meta.dirname, "../components/results/score-curve.tsx"),
+    "utf8");
+  const code = src.replace(/\/\*[\s\S]*?\*\//g, "").replace(/^\s*\/\/.*$/gm, "");
+  for (const forbidden of ["<Line", "LineChart", "ReferenceDot", "recharts-line"]) {
+    assert.ok(!code.includes(forbidden),
+      `the component still carries ${forbidden} — the bars must not be joined`);
+  }
+  assert.ok(code.includes("<Bar"), "bars are the mark");
+  assert.ok(code.includes("<ReferenceLine"), "the baseline is a reference line");
+  assert.ok(code.includes("<Cell"), "per-bar emphasis");
+});
+
 
 // ── 3.13-4b test 5: THE CHART IS MEASURED ON WHAT IT RENDERS ─────────────────
 //
@@ -6402,7 +6582,139 @@ test("U4b: the flat-spread note fires when the top three genuinely sit within 1%
 //   (2) a source-level lock on the last hop: score-curve.tsx contains no
 //       hsl( literal at all, so it CANNOT wrap what the hook hands it.
 
-test("chart colours land in a real SVG as exactly one hsl(...) each — rendered through the live hook chain", async () => {
+// ── Test harness: mount a real .tsx component (3.13-4b, shared at 4d) ────────
+//
+// Node cannot strip JSX, so the component is transpiled with the project's own
+// `typescript` package and loaded with a tiny CommonJS shim. ONE definition,
+// two readers — the bar-fill colour probe and the switch checks — because a
+// second copy of a harness drifts exactly like a second copy of anything else.
+async function loadFrontendModule(rel: string): Promise<Record<string, unknown>> {
+  const [{ default: ts }, nodeModule, fs, path] = await Promise.all([
+    import("typescript"),
+    import("node:module"),
+    import("node:fs"),
+    import("node:path"),
+  ]);
+  const FRONTEND = path.resolve(import.meta.dirname, "..");
+  const projectRequire = nodeModule.createRequire(path.join(FRONTEND, "package.json"));
+  const cache = new Map<string, Record<string, unknown>>();
+  const resolveTs = (base: string): string => {
+    for (const ext of ["", ".ts", ".tsx"]) {
+      const candidate = base + ext;
+      if (fs.existsSync(candidate) && fs.statSync(candidate).isFile()) return candidate;
+    }
+    throw new Error(`cannot resolve ${base}`);
+  };
+  const loadTs = (file: string): Record<string, unknown> => {
+    const full = path.resolve(file);
+    const hit = cache.get(full);
+    if (hit) return hit;
+    const js = ts.transpileModule(fs.readFileSync(full, "utf8"), {
+      compilerOptions: {
+        module: ts.ModuleKind.CommonJS,
+        target: ts.ScriptTarget.ES2020,
+        jsx: ts.JsxEmit.ReactJSX,
+        esModuleInterop: true,
+      },
+    }).outputText;
+    const mod = { exports: {} as Record<string, unknown> };
+    const req = (spec: string): unknown => {
+      if (spec === "next-themes") {
+        // Third-party theme hook only — outside a provider it reports no theme
+        // either way; the tokens hook then serves its SSR fallback, which is
+        // the app's own first-render path. The COLOUR path under test is ours.
+        return { useTheme: () => ({ resolvedTheme: "dark" }) };
+      }
+      if (spec.startsWith("@/")) return loadTs(resolveTs(path.join(FRONTEND, spec.slice(2))));
+      if (spec.startsWith(".")) return loadTs(resolveTs(path.resolve(path.dirname(full), spec)));
+      return projectRequire(spec);
+    };
+    cache.set(full, mod.exports);
+    new Function("require", "module", "exports", js)(req, mod, mod.exports);
+    return mod.exports;
+  };
+  return loadTs(resolveTs(path.join(FRONTEND, rel)));
+}
+
+test("4d-V9: the Switch — role, aria-checked, keyboard, and disabled while saving", async () => {
+  const [React, ReactDOMServer, fs, path] = await Promise.all([
+    import("react"),
+    import("react-dom/server"),
+    import("node:fs"),
+    import("node:path"),
+  ]);
+  const mod = await loadFrontendModule("components/ui/switch.tsx");
+  const Switch = mod.Switch as (props: Record<string, unknown>) => {
+    type: unknown;
+    props: Record<string, unknown>;
+  };
+
+  // (a) THE ANNOUNCEMENT, on the rendered markup. The control this replaces
+  // was an <input type="checkbox" role="switch">, which already announced
+  // correctly — this proves that did NOT regress.
+  const off = ReactDOMServer.renderToStaticMarkup(
+    React.createElement(Switch as never, {
+      checked: false, onChange: () => {}, label: "Show return on investment",
+    } as never),
+  );
+  assert.match(off, /role="switch"/);
+  assert.match(off, /aria-checked="false"/);
+  assert.match(off, /aria-label="Show return on investment"/);
+  assert.match(off, /type="button"/,
+    "a native button is what gives Space AND Enter for free");
+  // The ATTRIBUTE, not the substring — the className legitimately carries
+  // Tailwind's `disabled:` variants.
+  assert.ok(!/disabled=""/.test(off), "not disabled unless asked");
+  const on = ReactDOMServer.renderToStaticMarkup(
+    React.createElement(Switch as never, {
+      checked: true, onChange: () => {}, label: "x",
+    } as never),
+  );
+  assert.match(on, /aria-checked="true"/);
+
+  // (b) DISABLED WHILE SAVING — the rendered attribute, not the prop.
+  const saving = ReactDOMServer.renderToStaticMarkup(
+    React.createElement(Switch as never, {
+      checked: false, onChange: () => {}, label: "x", disabled: true,
+    } as never),
+  );
+  assert.match(saving, /disabled=""/);
+
+  // (c) THE TOGGLE ITSELF: call the very handler the button carries. Both
+  // Space and Enter fire a native button's click, so this IS the code path
+  // both keys take — asserted by invoking it, not by trusting it.
+  const seen: boolean[] = [];
+  const el = Switch({ checked: false, onChange: (n: boolean) => seen.push(n), label: "x" });
+  assert.equal(el.type, "button", "the element is a native button");
+  (el.props.onClick as () => void)();
+  const elOn = Switch({ checked: true, onChange: (n: boolean) => seen.push(n), label: "x" });
+  (elOn.props.onClick as () => void)();
+  assert.deepEqual(seen, [true, false], "off toggles on, on toggles off");
+
+  // (d) NOTHING INTERCEPTS THE KEYS. An onKeyDown handling Space/Enter would
+  // double-fire against the native button (Enter on keydown, Space on keyup),
+  // so its ABSENCE is what keeps both keys working exactly once.
+  const src = fs.readFileSync(
+    path.resolve(import.meta.dirname, "../components/ui/switch.tsx"), "utf8");
+  const code = src.replace(/\/\*[\s\S]*?\*\//g, "").replace(/^\s*\/\/.*$/gm, "");
+  assert.ok(!code.includes("onKeyDown"),
+    "no key handler may intercept the native button's Space/Enter");
+  assert.ok(code.includes("motion-reduce:transition-none"),
+    "the slide stops under motion-reduce — the state is carried by position and fill");
+  assert.ok(code.includes("focus-visible:shadow-focus-ring"),
+    "the project's focus ring, not a reimplementation");
+  assert.ok(!/hsl\(|#[0-9a-fA-F]{3,8}\b/.test(code),
+    "existing tokens only — no colour added");
+
+  // (e) THE TAB USES IT, and no checkbox remains.
+  const tab = fs.readFileSync(
+    path.resolve(import.meta.dirname, "../components/results/results-tab.tsx"), "utf8");
+  assert.ok(tab.includes("<Switch"), "the tab renders the standard Switch");
+  assert.ok(!tab.includes('type="checkbox"'), "the checkbox is gone");
+  assert.ok(tab.includes("disabled={saving}"), "disabled while the save is in flight");
+});
+
+test("4d-V8: the emphasised and recessive bar fills land in a real SVG as exactly one hsl(...) each", async () => {
   const [{ default: ts }, nodeModule, fs, path, React, ReactDOMServer] =
     await Promise.all([
       import("typescript"),
@@ -6468,28 +6780,38 @@ test("chart colours land in a real SVG as exactly one hsl(...) each — rendered
   const useChartDefaults = container.useChartDefaults as () => {
     series: string[];
     tokens: Record<string, string>;
+    byRole: Record<string, string>;
   };
+  // The EMPHASIS PAIR, through the real hook chain, rendered as the very
+  // `fill` attributes the bars carry. recharts v3 dispatches its chart size
+  // from a useEffect, so no static render of the chart itself emits the SVG —
+  // this renders the same expressions the Cells use, and the source lock
+  // below proves the component passes them through untouched.
   function Probe(): unknown {
     const d = useChartDefaults();
     return React.createElement(
       "svg",
       null,
-      React.createElement("path", { stroke: d.series[0] }),
-      React.createElement("path", { stroke: d.series[1] }),
+      // the chosen bar, then a recessive one — the two roles 4d added
+      React.createElement("rect", { fill: d.byRole.chosenEmphasis }),
+      React.createElement("rect", { fill: d.byRole.alternative }),
+      React.createElement("path", { stroke: d.tokens["chart-baseline"] }),
       React.createElement("path", { stroke: d.tokens["chart-axis"] }),
-      React.createElement("path", { stroke: d.tokens["chart-grid"] }),
     );
   }
   const html = ReactDOMServer.renderToStaticMarkup(
     React.createElement(Probe as never),
   );
   assert.ok(html.includes("<svg"), html.slice(0, 120));
+  const fills = html.match(/fill="[^"]*"/g) ?? [];
   const strokes = html.match(/stroke="[^"]*"/g) ?? [];
-  assert.equal(strokes.length, 4, `expected 4 rendered strokes: ${strokes}`);
-  for (const attr of strokes) {
+  assert.equal(fills.length, 2, `expected the two bar fills: ${fills}`);
+  assert.notEqual(fills[0], fills[1],
+    "emphasis and recessive must actually differ on screen");
+  for (const attr of [...fills, ...strokes]) {
     const count = (attr.match(/hsl\(/g) ?? []).length;
     assert.equal(count, 1,
-      `RENDERED stroke must contain exactly one hsl( — got ${attr} (hsl(hsl( renders BLACK)`);
+      `RENDERED attribute must contain exactly one hsl( — got ${attr} (hsl(hsl( renders BLACK)`);
   }
   assert.ok(!html.includes("hsl(hsl("), "double-wrap landed in the SVG");
 
@@ -6504,8 +6826,9 @@ test("chart colours land in a real SVG as exactly one hsl(...) each — rendered
     .replace(/^\s*\/\/.*$/gm, "");
   assert.ok(!curveCode.includes("hsl("),
     "score-curve.tsx CODE must not contain an hsl( literal — the tokens arrive already wrapped (the docstring may name the fault; the code may not)");
-  assert.ok(curveSrc.includes("stroke={d.series[0]}"),
-    "the line's stroke is the hook's string, verbatim");
+  assert.ok(
+    curveCode.includes("bar.chosen ? d.byRole.chosenEmphasis : d.byRole.alternative"),
+    "the Cell fill IS the hook's role string, verbatim — nothing wraps it");
 });
 
 // ── 3.13 prompt 4c: the D34 ROI figures (V1-V3) ──────────────────────────────
@@ -6593,4 +6916,260 @@ test("V3: the explanation strings are lib's own, and the component declares none
   assert.ok(tabSrc.includes("view.roi.map("), "one map over the fixed triple");
   assert.ok(!/view\.roi\.(slice|filter|find)\(/.test(tabSrc),
     "no code path can render a subset of the three");
+});
+
+// ── 3.13 prompt 4e: the chart's space is DERIVED, not guessed (4e-W1 … W4) ──
+//
+// The fault: a hardcoded 172px axis sliced two real product names on screen.
+// No static render emits a laid-out SVG, so a clipped label is invisible to
+// this suite — the one computable thing is the REQUIREMENT, asserted here.
+
+/** The two labels that were actually clipped, verbatim from the live run. */
+const CLIPPED_LABELS = [
+  { label: "Sigenergy SigenStor Sigen Battery 8.0", subLabel: "7.8 kWh" },
+  { label: "BYD Battery-Box Premium HVS 12.8", subLabel: "12.8 kWh" },
+  { label: "GoodWe Lynx Home F", subLabel: "9.83 kWh" },
+  { label: "Tesla Powerwall 3", subLabel: "13.5 kWh" },
+];
+
+test("4e-W1: the axis width is a FUNCTION OF THE LABELS — a hardcoded width cannot pass this", () => {
+  const long = scoreCurveAxisSpace(CLIPPED_LABELS, "No battery");
+  const short = scoreCurveAxisSpace(
+    [{ label: "7.8 kWh", subLabel: null }, { label: "20 kWh", subLabel: null }],
+    "No battery",
+  );
+  assert.ok(long.axisWidth > short.axisWidth,
+    `the real clipped labels must need MORE room than short ones: ${long.axisWidth} vs ${short.axisWidth}`);
+  // The width the fault shipped with. The longest real label is 37 characters
+  // at 12px — it cannot fit in 172px, which is exactly why it was sliced.
+  assert.ok(long.axisWidth > 172,
+    `172px is what clipped "Sigenergy SigenStor Sigen Battery 8.0": got ${long.axisWidth}`);
+  // Growing a name grows the axis, with nobody touching the component.
+  const longer = scoreCurveAxisSpace(
+    [...CLIPPED_LABELS, { label: "A Much Longer Product Name Than Any Of These", subLabel: "30 kWh" }],
+    "No battery",
+  );
+  assert.ok(longer.axisWidth > long.axisWidth,
+    `a longer name must widen the axis: ${longer.axisWidth} vs ${long.axisWidth}`);
+  // And the capacity line counts too — it is drawn in the same column.
+  const wideSub = scoreCurveAxisSpace(
+    [{ label: "A", subLabel: "1234567890 1234567890 1234567890 kWh" }], null);
+  assert.ok(wideSub.axisWidth > scoreCurveAxisSpace([{ label: "A", subLabel: "1 kWh" }], null).axisWidth,
+    "the second line is measured, not ignored");
+});
+
+test("4e-W2: beyond the cap a label is truncated with an ellipsis, and the full text survives for the tooltip", () => {
+  const monster = "X".repeat(400);
+  const space = scoreCurveAxisSpace([{ label: monster, subLabel: "9 kWh" }], null);
+  assert.ok(space.axisWidth <= Math.floor(SCORE_CURVE_AXIS.assumedChartWidth * SCORE_CURVE_AXIS.maxFraction),
+    `the axis must never eat more than its share: ${space.axisWidth}`);
+  const shown = truncateLabel(monster, space.maxChars);
+  assert.ok(shown.length < monster.length, "it is shortened");
+  assert.ok(shown.endsWith("…"), `an ellipsis says so: ${shown.slice(-6)}`);
+  assert.equal(shown.length, space.maxChars, "trimmed to exactly the budget");
+  // THE FULL NAME IS STILL THE CATEGORY VALUE, which is what the tooltip
+  // renders — the component looks its bar up by the full label and truncates
+  // only for drawing.
+  const view = scoreCurveView({
+    sizing_results: [{
+      sizing_result_id: "s1", run_kind: "solar_battery", objective_used: "max_npv",
+      battery_kwh: 10, system_cost: 1,
+      evaluated_options: {
+        dimension_keys: ["battery_id"],
+        points: [
+          { model: "No battery", usable_kwh: 0, incremental_npv: 0 },
+          { model: monster, usable_kwh: 10, incremental_npv: 500, system_cost: 1 },
+        ],
+      },
+    }],
+    financial_results: [{ sizing_result_id: "s1" }],
+  });
+  assert.equal(view.bars![0].label, monster,
+    "the view keeps the FULL name — truncation is a drawing concern, not a data one");
+  // A short label is never touched.
+  assert.equal(truncateLabel("GoodWe Lynx Home F", 40), "GoodWe Lynx Home F");
+});
+
+test("4e-W3: totals — empty, single, whitespace-only, and non-string labels never yield a bad width", () => {
+  const cases: Parameters<typeof scoreCurveAxisSpace>[0][] = [
+    [],
+    null,
+    undefined,
+    [{ label: "One only", subLabel: null }],
+    [{ label: "   ", subLabel: "   " }],
+    [{ label: "" }],
+    // Non-strings arriving from junk jsonb.
+    [{ label: 42 as unknown as string, subLabel: {} as unknown as string }],
+    [{ label: null as unknown as string }],
+  ];
+  for (const bars of cases) {
+    const space = scoreCurveAxisSpace(bars, "No battery");
+    assert.ok(Number.isFinite(space.axisWidth) && space.axisWidth > 0,
+      `width must be a positive number, got ${space.axisWidth} for ${JSON.stringify(bars)}`);
+    assert.ok(space.axisWidth >= SCORE_CURVE_AXIS.minWidth, "never below the floor");
+    assert.ok(Number.isFinite(space.topSpace) && space.topSpace > 0);
+    assert.ok(Number.isInteger(space.maxChars) && space.maxChars >= 4);
+    assert.doesNotThrow(() => truncateLabel(undefined, space.maxChars));
+  }
+  // A silly chart width cannot produce a silly axis.
+  for (const width of [0, -100, Number.NaN, Number.POSITIVE_INFINITY]) {
+    const space = scoreCurveAxisSpace(CLIPPED_LABELS, "No battery", width);
+    assert.ok(space.axisWidth > 0 && Number.isFinite(space.axisWidth), String(width));
+  }
+  // truncateLabel with a nonsense budget still returns a string.
+  for (const n of [0, -5, Number.NaN, 1]) {
+    assert.equal(typeof truncateLabel("abcdef", n), "string");
+  }
+});
+
+test("4e-W4: the reference label gets top space whenever there is one to clear", () => {
+  const withLabel = scoreCurveAxisSpace(CLIPPED_LABELS, "No battery");
+  const without = scoreCurveAxisSpace(CLIPPED_LABELS, null);
+  assert.ok(withLabel.topSpace > 0, "the 'No battery' label was clipped at the top before 4e");
+  assert.ok(withLabel.topSpace > without.topSpace,
+    `a reference label needs MORE top room than none: ${withLabel.topSpace} vs ${without.topSpace}`);
+  for (const empty of [null, undefined, "", "   "]) {
+    assert.equal(scoreCurveAxisSpace(CLIPPED_LABELS, empty).topSpace, without.topSpace,
+      "an empty label is no label");
+  }
+  // The live run's own baseline label is a real one.
+  assert.ok(scoreCurveAxisSpace(CLIPPED_LABELS, "No solar").topSpace > 0);
+});
+
+test("4e-W5: the component consumes the derived space — no hardcoded axis width or top margin", async () => {
+  const [fs, path] = await Promise.all([import("node:fs"), import("node:path")]);
+  const src = fs.readFileSync(
+    path.resolve(import.meta.dirname, "../components/results/score-curve.tsx"), "utf8");
+  const code = src.replace(/\/\*[\s\S]*?\*\//g, "").replace(/^\s*\/\/.*$/gm, "");
+  assert.ok(code.includes("scoreCurveAxisSpace("), "the width comes from lib");
+  assert.ok(code.includes("width={space.axisWidth}"), "the axis takes the derived width");
+  assert.ok(code.includes("top: space.topSpace"), "the margin takes the derived top space");
+  assert.ok(!/width=\{\d+\}/.test(code), "no hardcoded axis width may remain");
+  assert.ok(code.includes("truncateLabel(bar.label, maxChars)"),
+    "the tick truncates for drawing only");
+  assert.ok(code.includes('dataKey="label"'),
+    "the category value is the FULL label, so the tooltip shows the whole name");
+  // The 4d correction must not regress: the axis title still sits below the
+  // ticks, and the bottom margin still has room for both.
+  assert.ok(code.includes('position: "insideBottom"') && code.includes("offset: -18"),
+    "the axis title stays clear of the tick labels");
+  assert.ok(code.includes("bottom: 28"), "the bottom margin still holds both");
+});
+
+// ── 3.13 prompt 4f: the chart and the table hover with ONE token (4f-X1…X4) ──
+//
+// The fault: table.tsx hovers a row with `hover:bg-accent`; the chart named no
+// hover colour at all, so recharts painted its own default and the hovered bar
+// went near-white. Two surfaces on one page, one choosing a token and the
+// other choosing nothing.
+
+/**
+ * The token NAME each surface actually resolves, read from each source. Names,
+ * never values: in dark mode `--accent` and `--chart-grid` happen to be the
+ * same triplet, so a value comparison would pass by coincidence while the two
+ * surfaces still named different things.
+ */
+async function hoverTokenNames(): Promise<{ table: string | null; chart: string | null }> {
+  const [fs, path] = await Promise.all([import("node:fs"), import("node:path")]);
+  const FRONTEND = path.resolve(import.meta.dirname, "..");
+  const tableSrc = fs.readFileSync(path.join(FRONTEND, "components/ui/table.tsx"), "utf8");
+  const chartTokensSrc = fs.readFileSync(path.join(FRONTEND, "lib/chart-tokens.ts"), "utf8");
+  // The table's row hover, from the class it ships.
+  const tableHit = /hover:bg-([a-z0-9-]+)/.exec(tableSrc);
+  // The role the chart's hover band reads, from the helper that defines it.
+  // The role may be wrapped (4g applies an alpha to it); what is compared is
+  // still the TOKEN NAME it reads, never the resulting value.
+  const chartHit = /hoverSurface:[^,\n]*tokens\["([a-z0-9-]+)"\]/.exec(chartTokensSrc);
+  return { table: tableHit?.[1] ?? null, chart: chartHit?.[1] ?? null };
+}
+
+test("4f-X1: the chart's hover band and the table's row hover are THE SAME NAMED TOKEN", async () => {
+  const { table, chart } = await hoverTokenNames();
+  console.log(`        table.tsx hover:bg-${table}  ·  chart hoverSurface -> tokens["${chart}"]`);
+  assert.ok(table, "could not read the table's hover token — the reference side must be readable");
+  assert.ok(chart, "could not read the chart's hover role");
+  assert.equal(chart, table,
+    `the chart hovers with "${chart}" while the table hovers with "${table}" — ` +
+    "two surfaces on one page must not choose differently");
+});
+
+test("4f/4g-X2: the hover band RENDERED — exactly one hsl(, and TRANSLUCENT so the gridlines survive", async () => {
+  const [React, ReactDOMServer] = await Promise.all([
+    import("react"), import("react-dom/server"),
+  ]);
+  const container = await loadFrontendModule("components/charts/chart-container.tsx");
+  const useChartDefaults = container.useChartDefaults as () => {
+    byRole: Record<string, string>;
+  };
+  function Probe(): unknown {
+    const d = useChartDefaults();
+    // The very expression the chart hands to the cursor.
+    return React.createElement(
+      "svg", null,
+      React.createElement("rect", { fill: d.byRole.hoverSurface }),
+    );
+  }
+  const html = ReactDOMServer.renderToStaticMarkup(React.createElement(Probe as never));
+  const fill = (html.match(/fill="[^"]*"/g) ?? [])[0] ?? "";
+  console.log(`        rendered hover band: ${fill}`);
+  assert.ok(fill.includes("hsl("), `no colour landed: ${html}`);
+  assert.equal((fill.match(/hsl\(/g) ?? []).length, 1,
+    `hsl(hsl( renders BLACK — got ${fill}`);
+  assert.ok(!html.includes("hsl(hsl("), "double-wrap landed in the SVG");
+
+  // 4g — THE FINISH, and this is the assertion that would have caught the
+  // opaque band before Mayur did. In dark mode `--accent` and `--chart-grid`
+  // are the SAME triplet, so a SOLID band does not sit behind the gridlines,
+  // it absorbs them. A chart cursor must be a translucent wash.
+  const alphaHit = /hsl\([^)]*\/\s*([0-9.]+)\s*\)/.exec(fill);
+  assert.ok(alphaHit, `the hover band must carry an alpha component: ${fill}`);
+  const alpha = Number(alphaHit![1]);
+  console.log(`        hover band alpha: ${alpha}`);
+  assert.ok(Number.isFinite(alpha), `unreadable alpha: ${alphaHit![1]}`);
+  assert.ok(alpha > 0,
+    `an alpha of 0 is an invisible band: ${fill}`);
+  assert.ok(alpha < 1,
+    `an OPAQUE band erases the gridlines it is supposed to sit behind — ` +
+    `dark-mode accent and chart-grid are the same triplet: ${fill}`);
+});
+
+test("4f-X3: the CHOSEN bar keeps its amber when hovered — only the band behind it changes", async () => {
+  const [fs, path] = await Promise.all([import("node:fs"), import("node:path")]);
+  const src = fs.readFileSync(
+    path.resolve(import.meta.dirname, "../components/results/score-curve.tsx"), "utf8");
+  const code = src.replace(/\/\*[\s\S]*?\*\//g, "").replace(/^\s*\/\/.*$/gm, "");
+  // The bar is never repainted on hover: activeBar is explicitly off, so the
+  // resting fill IS the hovered fill. Without this, recharts may substitute an
+  // active shape and the amber would not survive.
+  assert.ok(/activeBar=\{false\}/.test(code),
+    "activeBar={false} is what guarantees the mark keeps its own fill on hover");
+  // And there is exactly ONE fill expression for the bars, so resting and
+  // hovered are the same string by construction rather than by coincidence.
+  const cellFills = code.match(/fill=\{bar\.chosen \? d\.byRole\.chosenEmphasis : d\.byRole\.alternative\}/g) ?? [];
+  assert.equal(cellFills.length, 1, "one fill expression for the bars");
+  assert.ok(!/activeBar=\{\{/.test(code), "no alternative hovered fill may be declared");
+  // The band is a fill on the CURSOR, which recharts draws beneath the bars.
+  assert.ok(/cursor=\{\{ fill: d\.byRole\.hoverSurface \}\}/.test(code),
+    "the hover colour is the cursor band, not a repaint of the mark");
+});
+
+test("4f-X4: the hover token resolves in BOTH modes — no mode-specific value is introduced", async () => {
+  const [fs, path] = await Promise.all([import("node:fs"), import("node:path")]);
+  const FRONTEND = path.resolve(import.meta.dirname, "..");
+  const { chart } = await hoverTokenNames();
+  const globals = fs.readFileSync(path.join(FRONTEND, "app/globals.css"), "utf8");
+  // The same variable is emitted under :root and under .dark — which is what
+  // lets one token serve both surfaces in both modes, exactly as the table
+  // already proves.
+  const declarations = globals.match(new RegExp(`--${chart}:\\s*[^;]+;`, "g")) ?? [];
+  console.log(`        --${chart} declared ${declarations.length}x: ${declarations.join("  ")}`);
+  assert.ok(declarations.length >= 2,
+    `--${chart} must be emitted in both modes, found ${declarations.length}`);
+  // The chart helper reads it live and falls back to the DARK value, matching
+  // every other token it carries — no separate light/dark branch in the chart.
+  const tokensSrc = fs.readFileSync(path.join(FRONTEND, "lib/chart-tokens.ts"), "utf8");
+  assert.ok(tokensSrc.includes(`read("${chart}")`),
+    "the live value is read from the DOM, so the mode is whatever the page is in");
+  assert.ok(new RegExp(`"${chart}":\\s*wrap\\(`).test(tokensSrc),
+    "the fallback is wrapped exactly once, like every other role");
 });
