@@ -120,7 +120,9 @@ export default async function Page({
 
   return (
     <div className="w-full px-6 pb-8">
-      <ResultsBar view={resultsBarView(job)} />
+      {/* 3.14 prompt 3: the job id travels so D3's auto-expand can fire ONCE
+          for this job — the bar's own preference key holds no job id. */}
+      <ResultsBar view={resultsBarView(job)} jobId={id} />
       <WorksheetBody
         sections={sections}
         phases={phaseStates(job)}

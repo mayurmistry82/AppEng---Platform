@@ -39,8 +39,13 @@ import {
  * needs doing first) and 200 with an `error` key on an internal fault. The
  * component branches on the BODY.
  *
- * Opening a worksheet never fires a run on its own — a revisit renders the
- * stored result's existence quietly; automatic recompute is 3.14's, deliberately.
+ * Opening a worksheet never fires a run on its own. 3.14 prompt 3 (F206):
+ * A REVISIT RENDERS THE STORED RUN — the section's body comes from what the
+ * database already holds, and the button's reply is only what makes it update
+ * without waiting for a refresh. ONE rendering path (renderResult), fed from
+ * two places; before this the body lived in React state alone, so navigating
+ * to Results and back left an eighteen-second re-run as the only way to see a
+ * stored answer again.
  */
 
 function saveErrorCopy(kind: ApiErrorKind, status: number, message: string) {
@@ -276,6 +281,25 @@ export function SolarSizingSection({
       {result
         ? renderResult(result, keptResult ? "Re-optimised recommendation" : null)
         : null}
+
+      {/* 3.14 prompt 3 (F206): the STORED run — the same renderResult, fed
+          from the job rather than from a reply, and shown only when this
+          visit has no fresh one of its own. */}
+      {!result && !keptResult && view.storedRun ? (
+        <div className="flex flex-col gap-2">
+          {renderResult(view.storedRun.run, null)}
+          {view.storedRun.chosenNote ? (
+            <p className="text-caption text-muted-foreground">
+              {view.storedRun.chosenNote}
+            </p>
+          ) : null}
+          {view.storedRun.notRecordedNote ? (
+            <p className="text-caption text-muted-foreground">
+              {view.storedRun.notRecordedNote}
+            </p>
+          ) : null}
+        </div>
+      ) : null}
 
       <div className="flex items-center gap-3">
         <Button onClick={run} disabled={running}>

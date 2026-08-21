@@ -56,6 +56,12 @@ import {
  * never a warning, and never paraphrased (prompt 1 made those sentences plain
  * English in the engine precisely so no second copy exists here, F161).
  *
+ * 3.14 prompt 3 (F206): A REVISIT RENDERS THE STORED RUN. The body comes
+ * from what the database already holds and the button's reply only makes it
+ * update immediately — ONE rendering path (renderResult) fed from two places.
+ * Before this the body lived in React state alone, so leaving the page and
+ * coming back left a full re-run as the only way to see a stored answer.
+ *
  * WHAT IS DELIBERATELY ABSENT: no Advanced options (coupling is 4.9, backup
  * reserve SoC 4.5, VPP 4.6, grid-charge 4.7), no Pin/constrain dropdown
  * (6.1/6.3), and no budget badge (the response carries no within_budget and a
@@ -295,6 +301,25 @@ export function BatterySizingSection({
       ) : null}
 
       {result ? renderResult(result) : null}
+
+      {/* 3.14 prompt 3 (F206): the STORED run — the same renderResult, fed
+          from the job rather than from a reply, shown only when this visit
+          has no fresh one of its own. */}
+      {!result && view.storedRun ? (
+        <div className="flex flex-col gap-2">
+          {renderResult(view.storedRun.run)}
+          {view.storedRun.chosenNote ? (
+            <p className="text-caption text-muted-foreground">
+              {view.storedRun.chosenNote}
+            </p>
+          ) : null}
+          {view.storedRun.notRecordedNote ? (
+            <p className="text-caption text-muted-foreground">
+              {view.storedRun.notRecordedNote}
+            </p>
+          ) : null}
+        </div>
+      ) : null}
 
       <div className="flex items-center gap-3">
         <Button onClick={run} disabled={running}>

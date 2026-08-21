@@ -11,9 +11,17 @@ import assert from "node:assert/strict";
 
 import {
   PHASE_ORDER,
+  CHOSEN_NOT_RECORDED_NOTE,
+  RESULTS_BAR_AUTOEXPAND_LIMIT,
+  RESULTS_BAR_AUTOEXPAND_STORAGE_KEY,
   RESULTS_BAR_DEFAULT_HEIGHT,
   RESULTS_BAR_MIN_HEIGHT,
   RESULTS_BAR_STRIP,
+  VALUE_ORIGIN_ALL_SOLAR_LABEL,
+  VALUE_ORIGIN_NOT_RECORDED_LABEL,
+  parseAutoExpandedJobs,
+  rememberAutoExpandedJob,
+  shouldAutoExpandResultsBar,
   PATH_RULES,
   SECTIONS,
   clampResultsBarHeight,
@@ -130,6 +138,7 @@ import {
   siteDetailsView,
   worksheetErrorCopy,
   type JobDetailLike,
+  type ResultsBarView,
   type WorksheetSectionSpec,
 } from "../lib/worksheet.ts";
 import type { ApiErrorKind } from "../lib/jobs.ts";
@@ -392,6 +401,7 @@ test("resultsBarDefaultCollapsed: true when unsized, false when sized", () => {
       selfSufficiencyPct: null,
       splitSolarNpv: null,
       splitBatteryNpv: null,
+      valueOrigin: { kind: "all-solar", label: VALUE_ORIGIN_ALL_SOLAR_LABEL },
     }),
     false,
   );
@@ -4871,6 +4881,8 @@ test("3.11b: two sizing rows, newest FIRST in the array — the newest run wins"
     selfSufficiencyPct: null,
     splitSolarNpv: null,
     splitBatteryNpv: null,
+    // A run with NO battery in it at all — words, never a bare dash (F205).
+    valueOrigin: { kind: "all-solar", label: VALUE_ORIGIN_ALL_SOLAR_LABEL },
   });
   assert.equal(completeOf("solar-sizing", job), true);
   // THE HONEST UN-TICK — row 3.11b, answer 1, decided by Mayur 2026-08-19. A
@@ -7186,4 +7198,448 @@ test("4f-X4: the hover token resolves in BOTH modes — no mode-specific value i
     "the live value is read from the DOM, so the mode is whatever the page is in");
   assert.ok(new RegExp(`"${chart}":\\s*wrap\\(`).test(tokensSrc),
     "the fallback is wrapped exactly once, like every other role");
+});
+
+
+// ── 3.14 prompt 3 — the stored run REACHES THE SCREEN (F206), the fifth
+// tile's three answers (F205), and D3's once-only auto-expand ───────────────
+
+/**
+ * A realistic stored SOLAR run — the shape routes/sizing.py's solar writer
+ * persists: the row's own figures plus evaluated_options carrying the score
+ * curve and the chosen marker.
+ */
+const SOLAR_CURVE_POINTS = [
+  { solar_kw: 0, system_cost: 0, npv_25yr: 0, simple_payback_years: null,
+    self_sufficiency_pct: 0, panel_count: 0, plane_indices: [], panels_per_plane: [] },
+  { solar_kw: 9.24, system_cost: 7248, npv_25yr: 17068.33, simple_payback_years: 4.2,
+    self_sufficiency_pct: 84.1, panel_count: 21, plane_indices: [0], panels_per_plane: [21] },
+  { solar_kw: 10.12, system_cost: 7810, npv_25yr: 17039.91, simple_payback_years: 4.4,
+    self_sufficiency_pct: 85.3, panel_count: 23, plane_indices: [0], panels_per_plane: [23] },
+];
+
+const STORED_SOLAR_RUN = {
+  sizing_result_id: "s-solar",
+  created_at: "2026-08-21T01:00:00Z",
+  run_kind: "solar",
+  solar_kw: 9.24,
+  battery_kwh: null,
+  system_cost: 7248,
+  annual_solar_generation_kwh: 13820.4,
+  within_budget: true,
+  evaluated_options: {
+    dimension_keys: ["solar_kw"],
+    chosen_index: 1,
+    points: SOLAR_CURVE_POINTS,
+    dispatch_resolution: null,
+  },
+};
+
+/** A realistic stored BATTERY run, carrying 3.14 prompt 2's chosen_index and
+    solar_options as well as 3.13 prompt 3's split. */
+const STORED_BATTERY_RUN = {
+  sizing_result_id: "s-batt",
+  created_at: "2026-08-21T02:00:00Z",
+  run_kind: "solar_battery",
+  solar_kw: 9.24,
+  battery_kwh: 9.83,
+  system_cost: 11868.77,
+  annual_solar_generation_kwh: 13820.4,
+  within_budget: false,
+  evaluated_options: {
+    dimension_keys: ["battery_id"],
+    chosen_index: 1,
+    points: [
+      { usable_kwh: 0, model: "No battery", system_cost: 7248, battery_cost: 0,
+        incremental_npv: 0, incremental_payback_years: null, self_sufficiency_pct: 30.45 },
+      { battery_id: "b1", usable_kwh: 9.83, model: "GoodWe Lynx Home F",
+        system_cost: 11868.77, battery_cost: 4620.77, incremental_npv: 2867.22,
+        incremental_payback_years: 8.6, self_sufficiency_pct: 84.1 },
+      { battery_id: "b2", usable_kwh: 13.5, model: "Tesla Powerwall",
+        system_cost: 16000, battery_cost: 8752, incremental_npv: -900,
+        incremental_payback_years: null, self_sufficiency_pct: 90.2 },
+    ],
+    chosen_solar: { solar_kw: 9.24, panel_count: 21, plane_indices: [0], panels_per_plane: [21] },
+    solar_options: { dimension_keys: ["solar_kw"], chosen_index: 1, points: SOLAR_CURVE_POINTS },
+    split: {
+      solar_only: { annual_savings: 1800, npv_25yr: 17068.33,
+                    simple_payback_years: 4.2, system_cost: 7248 },
+      battery_increment: { annual_savings_vs_solar_only: 300, incremental_npv: 2867.22,
+                           incremental_payback_years: 8.6, battery_cost: 4620.77 },
+    },
+    dispatch_resolution: "full_year",
+  },
+};
+
+// 3a. THE F206 REGRESSION: a stored run and NO fresh reply renders the whole
+// body. Every field the solar section's renderResult displays is asserted.
+test("3.14-3 F206: a STORED solar run with no response carries the whole body", () => {
+  const view = solarSizingView(emptyJob({ sizing_results: [STORED_SOLAR_RUN] }));
+  assert.equal(view.alreadySized, true);
+  const stored = view.storedRun;
+  assert.ok(stored, "the stored run reaches the section — this is F206");
+  // The reply's own shape, so the section has ONE rendering path.
+  assert.equal(stored.run.ok, true);
+  assert.equal(stored.run.needsRoofInput, false);
+  assert.equal(stored.run.errorMessage, null);
+  // Every headline field renderResult reads.
+  assert.deepEqual(stored.run.headline, {
+    solarKw: "9.24 kW",
+    panelCount: "21 panels",
+    annualGenerationKwh: "13,820 kWh",
+    systemCost: "$7,248",
+    payback: "4.2 yr",
+    npv: "$17,068",
+    selfSufficiencyPct: "84.1%",
+  });
+  // The options table, every column, with the winner marked from the marker.
+  assert.equal(stored.run.options.length, 3);
+  assert.deepEqual(stored.run.options[1], {
+    label: "9.24 kW",
+    cost: "$7,248",
+    payback: "4.2 yr",
+    npv: "$17,068",
+    selfSufficiency: "84.1%",
+    chosen: true,
+  });
+  assert.equal(stored.run.options[0].label, "No system",
+    "the empty reference row is labelled, never 0 kW");
+  assert.equal(stored.run.options.filter((o) => o.chosen).length, 1,
+    "exactly one chosen row");
+  assert.equal(stored.chosenNote, null, "a marked run says nothing about markers");
+  assert.equal(stored.notRecordedNote, null, "this run recorded everything shown");
+});
+
+// 3b. The SAME for the battery section — and the solar section on a battery
+// run reads that run's SOLAR half, never its battery candidates.
+test("3.14-3 F206: a STORED battery run carries the whole body, both sections", () => {
+  const job = emptyJob({ sizing_results: [STORED_BATTERY_RUN] });
+  const battery = batterySizingView(job).storedRun;
+  assert.ok(battery, "the battery section renders from the stored run");
+  assert.deepEqual(battery.run.headline, {
+    model: "GoodWe Lynx Home F",
+    usableKwh: "9.83 kWh",
+    batteryCost: "$4,621",
+    systemCost: "$11,869",
+    payback: "8.6 yr",
+    npv: "$2,867",
+    selfSufficiencyPct: "84.1%",
+  });
+  assert.equal(battery.run.noBattery, false);
+  assert.deepEqual(battery.run.chosenSolar, {
+    solarKw: "9.24 kW",
+    annualGenerationKwh: "13,820 kWh",
+    systemCostSolarOnly: "$7,248",
+  });
+  assert.equal(battery.run.options.length, 3);
+  assert.deepEqual(battery.run.options[1], {
+    label: "9.83 kWh",
+    model: "GoodWe Lynx Home F",
+    systemCost: "$11,869",
+    payback: "8.6 yr",
+    npv: "$2,867",
+    selfSufficiency: "84.1%",
+    chosen: true,
+  });
+  assert.equal(battery.run.options[0].label, "No battery",
+    "the baseline is labelled, never 0 kWh");
+  // The engine's own within_budget flag, READ from the row, never recomputed.
+  assert.equal(battery.run.withinBudget, false);
+  assert.equal(battery.chosenNote, null);
+
+  // The SOLAR section on the same run: the solar curve, the solar-only cost —
+  // not the battery candidates and not the whole-system cost.
+  const solar = solarSizingView(job).storedRun;
+  assert.ok(solar, "the solar section renders from a battery run too");
+  assert.equal(solar.run.headline?.solarKw, "9.24 kW");
+  assert.equal(solar.run.headline?.systemCost, "$7,248",
+    "the SOLAR-ONLY cost from split.solar_only — never the row's whole-system $11,869");
+  assert.equal(solar.run.headline?.panelCount, "21 panels");
+  assert.equal(solar.run.headline?.selfSufficiencyPct, "84.1%");
+  assert.equal(solar.run.options.length, 3);
+  assert.deepEqual(solar.run.options.map((o) => o.label),
+    ["No system", "9.24 kW", "10.12 kW"],
+    "the SOLAR curve's rows — a battery candidate in this table would be the bug");
+  assert.equal(solar.run.options[1].chosen, true);
+});
+
+// 3c. THE PAIR (2U.4): storedRun is non-null EXACTLY when alreadySized.
+test("3.14-3: storedRun and alreadySized agree by construction, both sections", () => {
+  const cases: JobDetailLike[] = [
+    emptyJob({ sizing_results: [] }),
+    emptyJob({ sizing_results: [STORED_SOLAR_RUN] }),
+    emptyJob({ sizing_results: [STORED_BATTERY_RUN] }),
+    emptyJob({ sizing_results: [{ solar_kw: null, battery_kwh: null }] }),
+    emptyJob({ sizing_results: [{ solar_kw: 6.6, battery_kwh: 0 }] }),
+    emptyJob(unsafe<Partial<JobDetailLike>>({ sizing_results: "nonsense" })),
+  ];
+  for (const job of cases) {
+    const s = solarSizingView(job);
+    assert.equal(s.storedRun !== null, s.alreadySized, "solar pair");
+    const b = batterySizingView(job);
+    assert.equal(b.storedRun !== null, b.alreadySized, "battery pair");
+  }
+  // Junk of every shape: total, never throws.
+  for (const junk of [null, undefined, 42, "x", [], {}, { sizing_results: [null] }]) {
+    assert.doesNotThrow(() => solarSizingView(junk));
+    assert.doesNotThrow(() => batterySizingView(junk));
+  }
+});
+
+// 3d. THE HONEST DEGRADATION (F195): a pre-marker run marks NOTHING and says so.
+test("3.14-3 F195: a pre-marker stored run marks no chosen option and says so", () => {
+  const preMarker = JSON.parse(JSON.stringify(STORED_SOLAR_RUN));
+  delete preMarker.evaluated_options.chosen_index;
+  const stored = solarSizingView(emptyJob({ sizing_results: [preMarker] })).storedRun;
+  assert.ok(stored);
+  // EVERY option still renders — the run's comparison is not hidden.
+  assert.equal(stored.run.options.length, 3);
+  assert.ok(stored.run.options.every((o) => !o.chosen),
+    "not one row is flagged chosen — never inferred by matching numbers");
+  assert.equal(stored.chosenNote, CHOSEN_NOT_RECORDED_NOTE);
+  assert.match(stored.chosenNote ?? "", /did not record which option/);
+  // And what else it could not state is named plainly, never substituted.
+  assert.equal(stored.run.headline?.panelCount, null);
+  assert.equal(stored.run.headline?.selfSufficiencyPct, "—");
+  assert.match(stored.notRecordedNote ?? "", /panel count/);
+  assert.match(stored.notRecordedNote ?? "", /self-sufficiency/);
+  // A NEVER-RECORDED payback is an em-dash, NOT "no payback within the
+  // analysis period" — that sentence is a MEANING and would be a substitution.
+  assert.equal(stored.run.headline?.payback, "—");
+  assert.match(stored.notRecordedNote ?? "", /the payback/);
+
+  // The battery side degrades the same way.
+  const preMarkerBattery = JSON.parse(JSON.stringify(STORED_BATTERY_RUN));
+  delete preMarkerBattery.evaluated_options.chosen_index;
+  const b = batterySizingView(emptyJob({ sizing_results: [preMarkerBattery] })).storedRun;
+  assert.ok(b);
+  assert.equal(b.run.options.length, 3);
+  assert.ok(b.run.options.every((o) => !o.chosen));
+  assert.equal(b.chosenNote, CHOSEN_NOT_RECORDED_NOTE);
+  // The stored SPLIT still supplies the incremental figures, so the headline
+  // does not collapse just because the marker is missing.
+  assert.equal(b.run.headline?.npv, "$2,867");
+  assert.equal(b.run.headline?.payback, "8.6 yr");
+  assert.equal(b.run.headline?.model, "—", "no marker, so no model is claimed");
+});
+
+// 3e. A no-battery stored run: the outcome shows, the engine's reason does not
+// exist in storage and is named as not recorded rather than reworded.
+test("3.14-3: a stored NO-BATTERY run says so, and admits the reason is unrecorded", () => {
+  const none = JSON.parse(JSON.stringify(STORED_BATTERY_RUN));
+  none.battery_kwh = 0;
+  none.system_cost = 7248;
+  none.evaluated_options.chosen_index = 0;
+  const stored = batterySizingView(emptyJob({ sizing_results: [none] })).storedRun;
+  assert.ok(stored);
+  assert.equal(stored.run.noBattery, true);
+  assert.equal(stored.run.headline?.usableKwh, "No battery", "never \"0 kWh\"");
+  assert.equal(stored.run.notEconomicReason, null,
+    "not a stored column — the heading alone, never a reworded stand-in");
+  assert.match(stored.notRecordedNote ?? "", /why no battery was recommended/);
+});
+
+// ── F205: the fifth tile's three answers, one test each ─────────────────────
+
+const VALUE_ORIGIN_SOLAR_ONLY = emptyJob({
+  sizing_results: [STORED_SOLAR_RUN],
+});
+const VALUE_ORIGIN_SPLIT = emptyJob({ sizing_results: [STORED_BATTERY_RUN] });
+const VALUE_ORIGIN_PRE_SPLIT = emptyJob({
+  sizing_results: [{
+    sizing_result_id: "s-old", run_kind: "solar_battery",
+    solar_kw: 6.6, battery_kwh: 13.5, system_cost: 20000,
+    evaluated_options: { dimension_keys: ["battery_id"], points: [] },
+  }],
+});
+
+test("3.14-3 F205 (i): a run with no battery in it says ALL SOLAR, in words", () => {
+  const view = resultsBarView(VALUE_ORIGIN_SOLAR_ONLY);
+  assert.equal(view.sized, true);
+  assert.equal(view.valueOrigin.kind, "all-solar");
+  assert.equal(view.valueOrigin.label, VALUE_ORIGIN_ALL_SOLAR_LABEL);
+  // The point of F205: NOT a bare dash. An em-dash used as punctuation inside
+  // a sentence is fine; a tile whose whole content is "—" is the defect.
+  assert.notEqual(view.valueOrigin.label.trim(), "—");
+  assert.ok(/[a-z]{3}/i.test(view.valueOrigin.label), "it says something in words");
+  assert.match(view.valueOrigin.label, /solar/i);
+});
+
+test("3.14-3 F205 (ii): a recorded split shows both parts, content unchanged", () => {
+  const view = resultsBarView(VALUE_ORIGIN_SPLIT);
+  assert.equal(view.sized, true);
+  assert.equal(view.valueOrigin.kind, "split");
+  // 3.13's CONTENT, untouched — only the tile's LABEL moved.
+  assert.equal(view.valueOrigin.label, "$17,068 + $2,867");
+  assert.equal(
+    view.valueOrigin.kind === "split" ? view.valueOrigin.solarNpv : null, 17068.33);
+  assert.equal(
+    view.valueOrigin.kind === "split" ? view.valueOrigin.batteryNpv : null, 2867.22);
+});
+
+test("3.14-3 F205 (iii): a battery run stored before the split says NOT RECORDED", () => {
+  const view = resultsBarView(VALUE_ORIGIN_PRE_SPLIT);
+  assert.equal(view.sized, true);
+  assert.equal(view.valueOrigin.kind, "not-recorded");
+  assert.equal(view.valueOrigin.label, VALUE_ORIGIN_NOT_RECORDED_LABEL);
+  assert.notEqual(view.valueOrigin.label.trim(), "—");
+  assert.ok(/[a-z]{3}/i.test(view.valueOrigin.label), "it says something in words");
+  assert.match(view.valueOrigin.label, /not record/i);
+});
+
+test("3.14-3 F205: the three answers are three DIFFERENT outcomes, and a $0 "
+  + "battery is NOT collapsed into all-solar", () => {
+  const kinds = [VALUE_ORIGIN_SOLAR_ONLY, VALUE_ORIGIN_SPLIT, VALUE_ORIGIN_PRE_SPLIT]
+    .map((job) => {
+      const v = resultsBarView(job);
+      return v.sized ? v.valueOrigin.kind : "unsized";
+    });
+  assert.deepEqual(kinds, ["all-solar", "split", "not-recorded"]);
+  assert.equal(new Set(kinds).size, 3, "merge any two and this test is testing nothing");
+  const labels = [VALUE_ORIGIN_SOLAR_ONLY, VALUE_ORIGIN_SPLIT, VALUE_ORIGIN_PRE_SPLIT]
+    .map((job) => {
+      const v = resultsBarView(job);
+      return v.sized ? v.valueOrigin.label : "unsized";
+    });
+  console.log(`        all solar    : ${labels[0]}`);
+  console.log(`        a split      : ${labels[1]}`);
+  console.log(`        not recorded : ${labels[2]}`);
+  assert.equal(new Set(labels).size, 3, "three answers, three different words");
+
+  // THE DISTINCTION THAT MATTERS: a battery WAS evaluated and added $0. That
+  // is a real answer and stays a split — never "no battery in this run".
+  const zeroAdds = JSON.parse(JSON.stringify(STORED_BATTERY_RUN));
+  zeroAdds.battery_kwh = 0;
+  zeroAdds.evaluated_options.split.battery_increment.incremental_npv = 0;
+  const zeroView = resultsBarView(emptyJob({ sizing_results: [zeroAdds] }));
+  assert.equal(zeroView.sized, true);
+  assert.equal(zeroView.valueOrigin.kind, "split",
+    "a battery considered and worth $0 is an ANSWER, not an absence");
+  assert.equal(zeroView.valueOrigin.label, "$17,068 + $0");
+  assert.notEqual(zeroView.valueOrigin.label, VALUE_ORIGIN_ALL_SOLAR_LABEL);
+});
+
+// ── D3's auto-expand, once per job ──────────────────────────────────────────
+
+const SIZED_VIEW = resultsBarView(VALUE_ORIGIN_SPLIT);
+
+test("3.14-3 D3: a sized job with no marker auto-expands ONCE, then never again", () => {
+  assert.equal(SIZED_VIEW.sized, true);
+  // First visit: no marker -> it opens itself.
+  assert.equal(shouldAutoExpandResultsBar(SIZED_VIEW, "job-1", []), true);
+  // The marker written by that visit.
+  const marked = rememberAutoExpandedJob([], "job-1");
+  assert.deepEqual(marked, ["job-1"]);
+  // Second visit: the preference wins, whatever it says.
+  assert.equal(shouldAutoExpandResultsBar(SIZED_VIEW, "job-1", marked), false);
+  // A DIFFERENT job still gets its own first-result moment.
+  assert.equal(shouldAutoExpandResultsBar(SIZED_VIEW, "job-2", marked), true);
+  // Marking twice never duplicates and never re-opens.
+  const twice = rememberAutoExpandedJob(marked, "job-1");
+  assert.deepEqual(twice, ["job-1"]);
+  assert.equal(shouldAutoExpandResultsBar(SIZED_VIEW, "job-1", twice), false);
+});
+
+test("3.14-3 D3: an UNSIZED job never auto-expands, and neither does a missing id", () => {
+  assert.equal(shouldAutoExpandResultsBar({ sized: false }, "job-1", []), false,
+    "nothing to reveal, so nothing opens");
+  for (const id of [null, undefined, ""]) {
+    assert.equal(shouldAutoExpandResultsBar(SIZED_VIEW, id, []), false,
+      "an id that cannot be marked would open on EVERY load");
+  }
+  // Total for junk views, exactly as resultsBarDefaultCollapsed is.
+  for (const junk of [null, undefined, 42, "x", {}]) {
+    assert.doesNotThrow(() =>
+      shouldAutoExpandResultsBar(unsafe<ResultsBarView>(junk), "j", []));
+    assert.equal(shouldAutoExpandResultsBar(unsafe<ResultsBarView>(junk), "j", []), false);
+  }
+});
+
+test("3.14-3 D3: junk in EITHER storage key cannot throw and cannot auto-expand twice", () => {
+  const JUNK = ["", "not json", "null", "42", '"a string"', "{}", '{"collapsed":true}',
+    "[]", "[1,2,3]", '[null]', '[{"job":"x"}]', '["", ""]', "[[]]"];
+  for (const raw of JUNK) {
+    assert.doesNotThrow(() => parseAutoExpandedJobs(raw), raw);
+    const ids = parseAutoExpandedJobs(raw);
+    assert.ok(Array.isArray(ids), raw);
+    assert.ok(ids.every((id) => typeof id === "string" && id !== ""), raw);
+  }
+  assert.doesNotThrow(() => parseAutoExpandedJobs(null));
+  assert.deepEqual(parseAutoExpandedJobs(null), []);
+  // Junk in the PREFERENCE key is unchanged and still self-heals to no
+  // preference — the two keys are parsed independently, which is why the
+  // marker got its own key rather than widening that shape.
+  for (const raw of JUNK) {
+    assert.doesNotThrow(() => parseResultsBarPreference(raw), raw);
+  }
+  assert.equal(parseResultsBarPreference('{"collapsed":true,"height":96}'), null);
+  // Duplicates collapse; a real id inside junk still survives.
+  assert.deepEqual(parseAutoExpandedJobs('["a","a","b",7,null,""]'), ["a", "b"]);
+  // The set is bounded — a marker set is a convenience, not a record.
+  const many = Array.from({ length: RESULTS_BAR_AUTOEXPAND_LIMIT + 50 }, (_, i) => `j${i}`);
+  const capped = parseAutoExpandedJobs(JSON.stringify(many));
+  assert.equal(capped.length, RESULTS_BAR_AUTOEXPAND_LIMIT);
+  assert.equal(capped[capped.length - 1], `j${many.length - 1}`, "the NEWEST are kept");
+  const grown = rememberAutoExpandedJob(capped, "brand-new");
+  assert.equal(grown.length, RESULTS_BAR_AUTOEXPAND_LIMIT);
+  assert.equal(grown[grown.length - 1], "brand-new");
+  assert.equal(shouldAutoExpandResultsBar(SIZED_VIEW, "brand-new", grown), false);
+  // The key is versioned and is NOT the preference key.
+  assert.match(RESULTS_BAR_AUTOEXPAND_STORAGE_KEY, /\.v\d+$/);
+  assert.notEqual(RESULTS_BAR_AUTOEXPAND_STORAGE_KEY, "enrgengine.worksheet.results-bar.v1");
+});
+
+test("3.14-3 D3: the component writes the MARKER on auto-expand and never the "
+  + "preference — which is what lets a later collapse stick", async () => {
+  const [fs, path] = await Promise.all([import("node:fs"), import("node:path")]);
+  const FRONTEND = path.resolve(import.meta.dirname, "..");
+  const bar = fs.readFileSync(
+    path.join(FRONTEND, "components/worksheet/results-bar.tsx"), "utf8");
+  // The auto-expand block: collapse is overridden and the MARKER key written.
+  const block = bar.slice(bar.indexOf("shouldAutoExpandResultsBar("));
+  const end = block.indexOf("// A suspect measurement");
+  const autoExpand = block.slice(0, end > 0 ? end : 800);
+  assert.ok(autoExpand.includes("setCollapsed(false)"),
+    "the bar opens itself in place — the same state the Chart toggle sets");
+  assert.ok(autoExpand.includes("RESULTS_BAR_AUTOEXPAND_STORAGE_KEY"),
+    "the job is marked, so it can never open itself twice");
+  assert.ok(!autoExpand.includes("persist("),
+    "the one-time override must NOT rewrite the preference, or a later "
+    + "collapse would be fighting a value this wrote");
+  // A collapse afterwards DOES persist — through the existing toggle.
+  assert.ok(/function toggleCollapsed\(\)[\s\S]{0,220}persist\(\{ collapsed: next/.test(bar),
+    "toggleCollapsed persists the user's choice, so it wins from then on");
+  // Not a dialog, not an overlay (D3's amendment, clause 1).
+  assert.ok(!/Dialog|Modal|role="dialog"/.test(bar), "no dialog, no overlay");
+  // Every storage touch is wrapped.
+  const touches = (bar.match(/window\.localStorage\./g) ?? []).length;
+  const tries = (bar.match(/try \{/g) ?? []).length;
+  assert.ok(touches >= 3, `expected reads and writes, found ${touches}`);
+  assert.ok(tries >= touches - 1,
+    `every storage touch is wrapped: ${touches} touches, ${tries} try blocks`);
+  // The page hands the bar the job id — without it nothing can auto-expand.
+  const page = fs.readFileSync(
+    path.join(FRONTEND, "app/(app)/jobs/[id]/worksheet/page.tsx"), "utf8");
+  assert.match(page, /<ResultsBar[^>]*jobId=\{id\}/);
+});
+
+test("3.14-3: both sizing sections render the STORED run through the SAME "
+  + "renderResult the reply uses — one path, two sources", async () => {
+  const [fs, path] = await Promise.all([import("node:fs"), import("node:path")]);
+  const FRONTEND = path.resolve(import.meta.dirname, "..");
+  for (const [file, guard] of [
+    ["components/worksheet/solar-sizing-section.tsx", "!result && !keptResult && view.storedRun"],
+    ["components/worksheet/battery-sizing-section.tsx", "!result && view.storedRun"],
+  ] as const) {
+    const src = fs.readFileSync(path.join(FRONTEND, file), "utf8");
+    assert.ok(src.includes(guard), `${file}: the stored body shows only with no fresh reply`);
+    assert.ok(src.includes("renderResult(view.storedRun.run"),
+      `${file}: ONE rendering path — the stored run goes through renderResult`);
+    assert.ok(src.includes("view.storedRun.chosenNote"),
+      `${file}: the no-marker sentence reaches the screen`);
+    assert.ok(src.includes("view.storedRun.notRecordedNote"),
+      `${file}: what the run did not record reaches the screen`);
+    // Exactly one renderResult definition: a second would be two paths.
+    assert.equal((src.match(/function renderResult\(/g) ?? []).length, 1, file);
+  }
 });

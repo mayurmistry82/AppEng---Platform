@@ -12,11 +12,15 @@ import {
   formatYears,
   RESULTS_BAR_DEFAULT_HEIGHT,
   RESULTS_BAR_MIN_HEIGHT,
+  RESULTS_BAR_AUTOEXPAND_STORAGE_KEY,
   RESULTS_BAR_STORAGE_KEY,
   clampResultsBarHeight,
+  parseAutoExpandedJobs,
+  rememberAutoExpandedJob,
   resultsBarCeiling,
   parseResultsBarPreference,
   resultsBarDefaultCollapsed,
+  shouldAutoExpandResultsBar,
   type ResultsBarMetrics,
   type ResultsBarView,
 } from "@/lib/worksheet";
@@ -50,9 +54,17 @@ import {
  *     every screen); a sized job starts expanded;
  *   - the collapsed flag AND the dragged height then persist across loads and
  *     across jobs — it is a preference about the bar, not about a job.
- *   D3's third clause, auto-expand on the first completed run, is deliberately
- *   NOT built: nothing can produce a sizing result until 3.11/3.12, so it
- *   could not be tested. Moved to 3.14 with Mayur.
+ *   - D3's third clause, AUTO-EXPAND ON THE FIRST COMPLETED RUN, is built at
+ *     3.14 prompt 3 (it needed a job that can produce a result). Per D3's
+ *     2026-08-14 amendment it fires ONCE PER JOB and the saved preference
+ *     wins thereafter: the bar opens itself the first time this job has a
+ *     result so the installer meets the chart, the job id is marked, and if
+ *     the installer then collapses it that sticks. It is the SAME in-place
+ *     bar expanding — not a dialog, not an overlay, no animation of its own.
+ *     The marker lives in its OWN versioned key; the preference key keeps its
+ *     shape and its self-heal untouched. The one-time override does NOT
+ *     rewrite the preference — only a real toggle, drag or keyboard commit
+ *     does, which is what lets the preference win from then on.
  *
  * HYDRATION: storage is read in an EFFECT, never in a useState initialiser or
  * during render — a render-time read makes the server HTML disagree with the
@@ -71,7 +83,16 @@ import {
 // shared set the Results section and the Results tab use, so the three
 // surfaces cannot disagree about the same stored number again.
 
-export function ResultsBar({ view }: { view: ResultsBarView }) {
+export function ResultsBar({
+  view,
+  jobId,
+}: {
+  view: ResultsBarView;
+  /** 3.14 prompt 3: D3's auto-expand is ONCE PER JOB, so the bar must know
+      which job it is looking at. Optional so a caller without one degrades
+      to never auto-expanding rather than opening on every load. */
+  jobId?: string;
+}) {
   // First render: the D3 default, derived purely from props so server and
   // client agree. The stored preference is applied in the effect below.
   const [collapsed, setCollapsed] = React.useState(() =>
@@ -158,6 +179,33 @@ export function ResultsBar({ view }: { view: ResultsBarView }) {
       lastUserChosenHeight.current = stored.height;
     }
 
+    // D3's auto-expand, ONCE PER JOB (2026-08-14 amendment). It runs AFTER
+    // the stored preference is applied because it deliberately overrides a
+    // stored `collapsed: true` that one time — and it writes only the marker,
+    // never the preference, so a later collapse is the last word. Every
+    // storage touch is wrapped: junk, a full store or no store at all leaves
+    // the bar exactly as the preference found it.
+    let autoExpanded: string[] = [];
+    try {
+      autoExpanded = parseAutoExpandedJobs(
+        window.localStorage.getItem(RESULTS_BAR_AUTOEXPAND_STORAGE_KEY),
+      );
+    } catch {
+      autoExpanded = [];
+    }
+    if (shouldAutoExpandResultsBar(view, jobId, autoExpanded) && jobId) {
+      setCollapsed(false);
+      try {
+        window.localStorage.setItem(
+          RESULTS_BAR_AUTOEXPAND_STORAGE_KEY,
+          JSON.stringify(rememberAutoExpandedJob(autoExpanded, jobId)),
+        );
+      } catch {
+        // A marker, not data. If it cannot be written the bar may open once
+        // more on a later visit — far better than throwing on a render path.
+      }
+    }
+
     // A suspect measurement leaves BOTH maxHeight and height alone — the bar
     // keeps its default rather than being shrunk by a reading we do not trust.
     if (ceiling === null) return;
@@ -169,7 +217,10 @@ export function ResultsBar({ view }: { view: ResultsBarView }) {
         metrics.containerTop ?? 0,
       ),
     );
-  }, [measure]);
+    // `view.sized` is in the deps deliberately: the first completed run
+    // arrives through router.refresh(), not a reload, so the auto-expand has
+    // to be able to fire when the prop flips from unsized to sized.
+  }, [measure, view, jobId]);
 
   // A shorter window lowers the ceiling; the current height follows it down so
   // the worksheet strip stays visible.
@@ -327,15 +378,15 @@ export function ResultsBar({ view }: { view: ResultsBarView }) {
                   : "—"
               }
             />
+            {/* 3.14 prompt 3 (F205), label decided by Mayur 2026-08-21. The
+                THREE cases are discriminated in lib/worksheet.ts, not here —
+                a solar-only run said "—", which reads as "we could not work
+                this out" when the truth is that there is no battery in this
+                recommendation at all. The component renders the label it is
+                given and decides nothing. */}
             <KpiTile
-              label="NPV: solar part + battery part"
-              value={
-                view.sized &&
-                view.splitSolarNpv != null &&
-                view.splitBatteryNpv != null
-                  ? `${formatMoney(view.splitSolarNpv)} + ${formatMoney(view.splitBatteryNpv)}`
-                  : "—"
-              }
+              label="Where the value comes from"
+              value={view.sized ? view.valueOrigin.label : "—"}
             />
           </div>
           <div className="flex flex-wrap items-center gap-1.5">

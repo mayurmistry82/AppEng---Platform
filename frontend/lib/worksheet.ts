@@ -752,7 +752,62 @@ export type ResultsBarView =
           battery adds. null on a solar-only run or a pre-split row. */
       splitSolarNpv: number | null;
       splitBatteryNpv: number | null;
+      /** 3.14 prompt 3 (F205): WHERE THE VALUE COMES FROM, decided here so
+          the suite can assert it and the tile only renders a label. */
+      valueOrigin: ResultsBarValueOrigin;
     };
+
+/**
+ * 3.14 prompt 3 (F205) — the fifth tile's three genuinely different answers.
+ *
+ * "all-solar" and "not-recorded" are NOT the same fact and must never be
+ * collapsed into one dash: the first says this recommendation contains no
+ * battery at all, the second says a battery run was stored before the split
+ * existed and its parts cannot be stated. A battery that WAS evaluated and
+ * added $0 is a third thing again — a real answer — and stays a "split" whose
+ * battery half is zero, never "all-solar".
+ */
+export type ResultsBarValueOrigin =
+  | { kind: "all-solar"; label: string }
+  | { kind: "split"; label: string; solarNpv: number; batteryNpv: number }
+  | { kind: "not-recorded"; label: string };
+
+/** The words for a run with no battery in it at all. */
+export const VALUE_ORIGIN_ALL_SOLAR_LABEL =
+  "All solar — no battery in this run";
+/** The words for a battery run stored before the split was recorded. */
+export const VALUE_ORIGIN_NOT_RECORDED_LABEL =
+  "This run did not record the split";
+
+/**
+ * THE DISCRIMINATION, from the stored row alone.
+ *
+ * The order is deliberate: a recorded split is the strongest evidence and
+ * wins outright. Otherwise `battery_kwh == null` IS "no battery was in this
+ * run" — the solar writer stores null rather than 0 for exactly this reason
+ * (F134's shape) — while a battery run (0 or a number) with no readable split
+ * is a run whose parts were never written down. Total: never throws.
+ */
+function resultsBarValueOrigin(
+  sizing: Record<string, unknown>,
+  split: Record<string, unknown>,
+): ResultsBarValueOrigin {
+  const solarNpv = tariffNum(asRecord(split.solar_only).npv_25yr);
+  const batteryNpv = tariffNum(asRecord(split.battery_increment).incremental_npv);
+  if (solarNpv !== null && batteryNpv !== null) {
+    // The tile's CONTENT is unchanged from 3.13 — only its label moved.
+    return {
+      kind: "split",
+      label: `${formatMoney(solarNpv)} + ${formatMoney(batteryNpv)}`,
+      solarNpv,
+      batteryNpv,
+    };
+  }
+  if (sizing.battery_kwh == null) {
+    return { kind: "all-solar", label: VALUE_ORIGIN_ALL_SOLAR_LABEL };
+  }
+  return { kind: "not-recorded", label: VALUE_ORIGIN_NOT_RECORDED_LABEL };
+}
 
 /**
  * Discriminated on `sized` — the component branches on this, never on the
@@ -788,6 +843,7 @@ export function resultsBarView(job: unknown): ResultsBarView {
     selfSufficiencyPct: storedSelfSufficiencyPct(latest, eo),
     splitSolarNpv: tariffNum(asRecord(split.solar_only).npv_25yr),
     splitBatteryNpv: tariffNum(asRecord(split.battery_increment).incremental_npv),
+    valueOrigin: resultsBarValueOrigin(latest, split),
   };
 }
 
@@ -2062,6 +2118,79 @@ export function parseResultsBarPreference(
   // broken screen with no way out through the UI.
   if (record.height <= RESULTS_BAR_MIN_HEIGHT) return null;
   return { collapsed: record.collapsed, height: record.height };
+}
+
+/**
+ * 3.14 prompt 3 (D3, amended 2026-08-14) — THE PER-JOB AUTO-EXPAND MARKER.
+ *
+ * A SEPARATE key, deliberately: RESULTS_BAR_STORAGE_KEY holds one global
+ * {collapsed, height} with no job id in it, and its parser carries a
+ * deliberate self-heal. Widening that shape to carry a set of job ids would
+ * put the self-heal and the marker in one parser, where a surprise in either
+ * discards both.
+ */
+export const RESULTS_BAR_AUTOEXPAND_STORAGE_KEY =
+  "enrgengine.worksheet.results-bar.autoexpanded.v1";
+
+/** The most recent job ids kept. A marker set is a convenience, not a record:
+    the oldest fall off rather than growing without bound. */
+export const RESULTS_BAR_AUTOEXPAND_LIMIT = 200;
+
+/**
+ * Parse the marker set DEFENSIVELY — storage is user-writable and may hold
+ * anything, including a shape from a future version. Any surprise yields an
+ * EMPTY set (which simply means "this job has not auto-expanded yet"), and it
+ * never throws. Non-string and empty entries are dropped, duplicates
+ * collapsed; the manner parseResultsBarPreference set.
+ */
+export function parseAutoExpandedJobs(raw: string | null): string[] {
+  if (typeof raw !== "string" || raw === "") return [];
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(raw);
+  } catch {
+    return [];
+  }
+  if (!Array.isArray(parsed)) return [];
+  const out: string[] = [];
+  for (const value of parsed) {
+    if (typeof value === "string" && value !== "" && !out.includes(value)) {
+      out.push(value);
+    }
+  }
+  return out.slice(-RESULTS_BAR_AUTOEXPAND_LIMIT);
+}
+
+/** The set with this job marked — moved to the end, never duplicated. */
+export function rememberAutoExpandedJob(
+  ids: readonly string[],
+  jobId: string,
+): string[] {
+  const kept = ids.filter(
+    (id) => typeof id === "string" && id !== "" && id !== jobId,
+  );
+  return [...kept, jobId].slice(-RESULTS_BAR_AUTOEXPAND_LIMIT);
+}
+
+/**
+ * D3's third clause, ONCE ONLY: the bar opens itself on a job's first
+ * completed run so the installer meets the chart, and never again. The stored
+ * collapsed preference is overridden that ONE time; if the installer then
+ * collapses the bar, the job is already marked and the preference wins
+ * thereafter.
+ *
+ * An unsized job never auto-expands (there is nothing to reveal), and a
+ * missing job id never does either — a marker with no id could never be
+ * written, so it would open on every load.
+ */
+export function shouldAutoExpandResultsBar(
+  view: ResultsBarView,
+  jobId: string | null | undefined,
+  autoExpanded: readonly string[],
+): boolean {
+  if (view?.sized !== true) return false;
+  if (typeof jobId !== "string" || jobId === "") return false;
+  return !autoExpanded.includes(jobId);
 }
 
 // ── Error copy ───────────────────────────────────────────────────────────────
@@ -4303,6 +4432,31 @@ export interface SolarRunResult {
   engineFlags: string[];
 }
 
+/**
+ * 3.14 prompt 3 (F195/F206) — THE ONE SENTENCE for a run that did not record
+ * which option it chose. Eight of the runs stored before 2026-08-21 carry no
+ * chosen-option marker at all, and their chosen row CANNOT be identified: the
+ * honest answer is to mark none and say so. Never inferred by matching
+ * numbers (two options can tie on both), never backfilled.
+ */
+export const CHOSEN_NOT_RECORDED_NOTE =
+  "This run did not record which option it chose, so none is marked.";
+
+/**
+ * THE STORED SOLAR RUN the section renders on a revisit (F206).
+ *
+ * `run` is a SolarRunResult — the SAME shape the button's reply produces — so
+ * the section has ONE rendering path fed from two places rather than two
+ * paths that must be kept in step.
+ */
+export interface StoredSolarRun {
+  run: SolarRunResult;
+  /** CHOSEN_NOT_RECORDED_NOTE when this run carries no marker, else null. */
+  chosenNote: string | null;
+  /** What this run did not record, in words, or null when it recorded it all. */
+  notRecordedNote: string | null;
+}
+
 export interface SolarSizingView {
   /** From pathRule(job.path): "optimise" | "pinned" | "none" | null. */
   solarMode: PathRule["solarMode"] | null;
@@ -4316,7 +4470,164 @@ export interface SolarSizingView {
   /** The newest stored sizing row's solar_kw, for the revisit case. */
   storedSolarKw: number | null;
   alreadySized: boolean;
+  /** 3.14 prompt 3 (F206): the WHOLE stored result, so a revisit renders the
+      body rather than a one-line note. Non-null EXACTLY when alreadySized —
+      both are `currentSizingResult` plus a readable solar_kw. */
+  storedRun: StoredSolarRun | null;
   notices: RoofNoticeView[];
+}
+
+/**
+ * The first source that actually CARRIES the key, and whether any did.
+ *
+ * The distinction matters for payback alone: formatYears(null) is the real
+ * sentence "no payback within the analysis period", so a figure that was
+ * never recorded must not travel through it — that would substitute a meaning
+ * for an absence. `has: false` renders an em-dash and is named in
+ * notRecordedNote instead.
+ */
+function pickStored(
+  key: string,
+  sources: Array<Record<string, unknown> | null>,
+): { has: boolean; value: unknown } {
+  for (const source of sources) {
+    if (source && Object.prototype.hasOwnProperty.call(source, key)) {
+      return { has: true, value: source[key] };
+    }
+  }
+  return { has: false, value: null };
+}
+
+/** "a, b and c" — for naming what a run did not record. */
+function joinPhrases(items: string[]): string {
+  if (items.length <= 1) return items[0] ?? "";
+  return `${items.slice(0, -1).join(", ")} and ${items[items.length - 1]}`;
+}
+
+/** The chosen index of a stored options list, or null. NEVER a number match. */
+function storedChosenIndex(
+  container: Record<string, unknown>,
+  points: unknown[],
+): number | null {
+  const idx = container.chosen_index;
+  return typeof idx === "number" &&
+    Number.isInteger(idx) &&
+    idx >= 0 &&
+    idx < points.length
+    ? idx
+    : null;
+}
+
+/**
+ * THE STORED SOLAR RUN, built from what is already on the job (F206).
+ *
+ * WHICH CURVE: a run_kind 'solar' row stores its score curve at the top level
+ * of evaluated_options; a run_kind 'solar_battery' row's top-level points are
+ * BATTERY candidates and its solar curve sits under solar_options (3.14
+ * prompt 2, F202). Reading the wrong one would put battery rows in a solar
+ * table, so the run kind picks the container — never a guess at the shape.
+ *
+ * WHICH COST: on a battery run the row's system_cost is the WHOLE system's,
+ * so the solar-only figures come from evaluated_options.split.solar_only —
+ * the parts 3.13 prompt 3 stored for exactly this purpose. Nothing here is
+ * recomputed and nothing is borrowed from another run: the financial row is
+ * reached through currentFinancialResult, which matches by sizing_result_id.
+ */
+function storedSolarRun(job: unknown): StoredSolarRun | null {
+  const sizing = currentSizingResult(job);
+  if (sizing === null) return null;
+  const solarKw = tariffNum(sizing.solar_kw);
+  if (solarKw === null) return null; // agrees with alreadySized by construction
+
+  const eo = asRecord(sizing.evaluated_options);
+  const isBattery = sizing.run_kind === "solar_battery";
+  const curve = isBattery ? asRecord(eo.solar_options) : eo;
+  const points = Array.isArray(curve.points) ? curve.points : [];
+  const chosenIndex = storedChosenIndex(curve, points);
+  const chosen = chosenIndex !== null ? asRecord(points[chosenIndex]) : null;
+  const solarOnly = isBattery
+    ? asRecord(asRecord(eo.split).solar_only)
+    : null;
+  const chosenSolar = isBattery ? asRecord(eo.chosen_solar) : null;
+  const fin = isBattery ? null : currentFinancialResult(job);
+
+  const panels = pickStored("panel_count", [chosen, chosenSolar]);
+  const panelsNum = tariffNum(panels.value);
+  const cost = pickStored("system_cost", [
+    isBattery ? solarOnly : (sizing as Record<string, unknown>),
+  ]);
+  const costNum = tariffNum(cost.value);
+  const gen = tariffNum(sizing.annual_solar_generation_kwh);
+  const payback = pickStored("simple_payback_years", [chosen, solarOnly]);
+  const paybackFin = payback.has
+    ? payback
+    : pickStored("payback_years", [fin]);
+  const npv = pickStored("npv_25yr", [chosen, solarOnly]);
+  const npvFin = npv.has ? npv : pickStored("npv_25_year", [fin]);
+  const npvNum = tariffNum(npvFin.value);
+  // Self-sufficiency: for a solar run this IS storedSelfSufficiencyPct, the
+  // derivation resultsView and the results bar already share; for a battery
+  // run that helper answers for the WHOLE system, so the solar half comes
+  // from this run's own solar curve point.
+  const selfNum = isBattery
+    ? tariffNum(pickStored("self_sufficiency_pct", [chosen]).value)
+    : storedSelfSufficiencyPct(sizing, eo);
+
+  const headline: SolarHeadline = {
+    solarKw: fmtKw(solarKw),
+    panelCount: panelsNum !== null ? `${Math.round(panelsNum)} panels` : null,
+    annualGenerationKwh:
+      gen !== null ? `${Math.round(gen).toLocaleString("en-AU")} kWh` : "—",
+    systemCost: costNum !== null ? fmtAud(costNum) : "—",
+    payback: paybackFin.has ? fmtYears(paybackFin.value) : "—",
+    npv: npvNum !== null ? fmtAud(npvNum) : "—",
+    selfSufficiencyPct: selfNum !== null ? fmtPct(selfNum) : "—",
+  };
+
+  const options: SolarOptionRow[] = [];
+  for (let i = 0; i < points.length; i++) {
+    const row = asRecord(points[i]);
+    const kw = tariffNum(row.solar_kw);
+    if (kw === null) continue;
+    const rowCost = tariffNum(row.system_cost);
+    const rowNpv = tariffNum(row.npv_25yr);
+    const rowSelf = tariffNum(row.self_sufficiency_pct);
+    options.push({
+      label: kw > 0 ? fmtKw(kw) : "No system",
+      cost: rowCost !== null ? fmtAud(rowCost) : "—",
+      payback: fmtYears(row.simple_payback_years),
+      npv: rowNpv !== null ? fmtAud(rowNpv) : "—",
+      selfSufficiency: rowSelf !== null ? fmtPct(rowSelf) : "—",
+      // ONLY the recorded marker. Never a capacity/cost match (F195).
+      chosen: chosenIndex === i,
+    });
+  }
+
+  const missing: string[] = [];
+  if (options.length === 0) missing.push("the options it compared");
+  if (panelsNum === null) missing.push("the panel count");
+  if (!paybackFin.has) missing.push("the payback");
+  if (npvNum === null) missing.push("the 25-year NPV");
+  if (selfNum === null) missing.push("the self-sufficiency");
+
+  return {
+    run: {
+      ok: true,
+      needsRoofInput: false,
+      errorMessage: null,
+      headline,
+      options,
+      // Engine flags are not stored on a sizing row — a stored run has none
+      // to show, and inventing any would be a second source (F161).
+      engineFlags: [],
+    },
+    chosenNote:
+      options.length > 0 && chosenIndex === null ? CHOSEN_NOT_RECORDED_NOTE : null,
+    notRecordedNote:
+      missing.length > 0
+        ? `This run did not record ${joinPhrases(missing)}.`
+        : null,
+  };
 }
 
 const NO_PAYBACK = "no payback within the analysis period";
@@ -4429,6 +4740,7 @@ export function solarSizingView(job: unknown): SolarSizingView {
     canPin,
     storedSolarKw,
     alreadySized: storedSolarKw !== null,
+    storedRun: storedSolarRun(job),
     notices,
   };
 }
@@ -4613,12 +4925,30 @@ export interface BatteryRunResult {
   withinBudget: boolean | null;
 }
 
+/**
+ * THE STORED BATTERY RUN the section renders on a revisit (F206). `run` is a
+ * BatteryRunResult — the SAME shape the button's reply produces — so the
+ * section keeps ONE rendering path fed from two places.
+ */
+export interface StoredBatteryRun {
+  run: BatteryRunResult;
+  /** CHOSEN_NOT_RECORDED_NOTE when this run carries no marker, else null. */
+  chosenNote: string | null;
+  /** What this run did not record, in words, or null. */
+  notRecordedNote: string | null;
+}
+
 export interface BatterySizingView {
   /** From pathRule(job.path): "size" | "none" | null. */
   batteryMode: PathRule["batteryMode"] | null;
   /** The CURRENT stored result's battery_kwh, for the revisit case. */
   storedBatteryKwh: number | null;
   alreadySized: boolean;
+  /** 3.14 prompt 3 (F206): the WHOLE stored result. Non-null EXACTLY when
+      alreadySized — both are `currentSizingResult` plus a readable
+      battery_kwh, which is what keeps this section's tick, its predicate and
+      its body from ever disagreeing. */
+  storedRun: StoredBatteryRun | null;
   /** 3.13 prompt 3 (H/F184): whether the JOB has a budget at all. A job with
       no cap has nothing to be within, so the run's within_budget flag renders
       only when this is true — a badge on an uncapped job is noise. */
@@ -4641,6 +4971,129 @@ function fmtKwh(value: number): string {
  * run, the current recommendation contains no battery, so both go false
  * together. Two rules for one idea is what 2R.1 forbids.
  */
+/**
+ * THE STORED BATTERY RUN, built from what is already on the job (F206).
+ *
+ * THE INCREMENTAL FIGURES ARE NOT ON THE FINANCIAL ROW. That row holds the
+ * WHOLE system's payback and NPV; this section shows what the BATTERY adds.
+ * So they come from the chosen candidate, else from
+ * evaluated_options.split.battery_increment — the parts 3.13 prompt 3 stored.
+ * Reading the financial row here would put a whole-system number under a
+ * label that says incremental, which is the class of quiet mismatch this
+ * codebase keeps deleting.
+ */
+function storedBatteryRun(job: unknown): StoredBatteryRun | null {
+  const sizing = currentSizingResult(job);
+  if (sizing === null) return null;
+  const usableKwh = tariffNum(sizing.battery_kwh);
+  if (usableKwh === null) return null; // agrees with alreadySized
+
+  const eo = asRecord(sizing.evaluated_options);
+  const points = Array.isArray(eo.points) ? eo.points : [];
+  const chosenIndex = storedChosenIndex(eo, points);
+  const chosen = chosenIndex !== null ? asRecord(points[chosenIndex]) : null;
+  const split = asRecord(eo.split);
+  const increment = asRecord(split.battery_increment);
+  const solarOnly = asRecord(split.solar_only);
+  const noBattery = usableKwh === 0;
+
+  const model = pickStored("model", [chosen]);
+  const battCost = tariffNum(
+    pickStored("battery_cost", [chosen, increment]).value,
+  );
+  const sysCost = tariffNum(sizing.system_cost);
+  const payback = pickStored("incremental_payback_years", [chosen, increment]);
+  const npvNum = tariffNum(
+    pickStored("incremental_npv", [chosen, increment]).value,
+  );
+  // The SAME derivation resultsView and the results bar use, so the bar's
+  // figure and the section's can never disagree on one screen.
+  const selfNum = storedSelfSufficiencyPct(sizing, eo);
+
+  const headline: BatteryHeadline = {
+    model:
+      typeof model.value === "string" && model.value ? model.value : "—",
+    usableKwh: usableKwh > 0 ? fmtKwh(usableKwh) : "No battery",
+    batteryCost: battCost !== null ? fmtAud(battCost) : "—",
+    systemCost: sysCost !== null ? fmtAud(sysCost) : "—",
+    payback: payback.has ? fmtYears(payback.value) : "—",
+    npv: npvNum !== null ? fmtAud(npvNum) : "—",
+    selfSufficiencyPct: selfNum !== null ? fmtPct(selfNum) : "—",
+  };
+
+  // The solar THIS run chose — its layout is stored under chosen_solar, its
+  // solar-only cost under split.solar_only, and the generation on the row.
+  const cs = asRecord(eo.chosen_solar);
+  const csKw = tariffNum(pickStored("solar_kw", [cs, sizing]).value);
+  let chosenSolar: BatteryChosenSolar | null = null;
+  if (csKw !== null) {
+    const csGen = tariffNum(sizing.annual_solar_generation_kwh);
+    const csCost = tariffNum(pickStored("system_cost", [solarOnly]).value);
+    chosenSolar = {
+      solarKw: fmtKw(csKw),
+      annualGenerationKwh:
+        csGen !== null ? `${Math.round(csGen).toLocaleString("en-AU")} kWh` : "—",
+      systemCostSolarOnly: csCost !== null ? fmtAud(csCost) : "—",
+    };
+  }
+
+  const options: BatteryOptionRow[] = [];
+  for (let i = 0; i < points.length; i++) {
+    const row = asRecord(points[i]);
+    const kwh = tariffNum(row.usable_kwh);
+    if (kwh === null) continue;
+    const rowCost = tariffNum(row.system_cost);
+    const rowNpv = tariffNum(row.incremental_npv);
+    const rowSelf = tariffNum(row.self_sufficiency_pct);
+    options.push({
+      label: kwh > 0 ? fmtKwh(kwh) : "No battery",
+      model: typeof row.model === "string" && row.model ? row.model : "—",
+      systemCost: rowCost !== null ? fmtAud(rowCost) : "—",
+      payback: fmtYears(row.incremental_payback_years),
+      npv: rowNpv !== null ? fmtAud(rowNpv) : "—",
+      selfSufficiency: rowSelf !== null ? fmtPct(rowSelf) : "—",
+      // ONLY the recorded marker — never a capacity-and-cost match (F195).
+      chosen: chosenIndex === i,
+    });
+  }
+
+  const missing: string[] = [];
+  if (options.length === 0) missing.push("the options it compared");
+  if (!noBattery && model.value === undefined) missing.push("which battery it chose");
+  if (battCost === null && !noBattery) missing.push("the battery's added cost");
+  if (!payback.has) missing.push("the incremental payback");
+  if (npvNum === null) missing.push("the incremental NPV");
+  if (selfNum === null) missing.push("the self-sufficiency");
+  // not_economic_reason is NOT a stored column — a stored no-battery run can
+  // say THAT no battery was recommended but never the engine's own why.
+  if (noBattery) missing.push("why no battery was recommended");
+
+  return {
+    run: {
+      ok: true,
+      needsRoofInput: false,
+      errorMessage: null,
+      headline,
+      chosenSolar,
+      options,
+      noBattery,
+      // Never stored; the section renders the heading alone rather than a
+      // reworded stand-in (F161).
+      notEconomicReason: null,
+      engineFlags: [],
+      // The row stores the engine's own flag — read, never recomputed.
+      withinBudget:
+        typeof sizing.within_budget === "boolean" ? sizing.within_budget : null,
+    },
+    chosenNote:
+      options.length > 0 && chosenIndex === null ? CHOSEN_NOT_RECORDED_NOTE : null,
+    notRecordedNote:
+      missing.length > 0
+        ? `This run did not record ${joinPhrases(missing)}.`
+        : null,
+  };
+}
+
 export function batterySizingView(job: unknown): BatterySizingView {
   const detail = asRecord(job);
   const rule = pathRule(detail.path);
@@ -4650,6 +5103,7 @@ export function batterySizingView(job: unknown): BatterySizingView {
     batteryMode: rule ? rule.batteryMode : null,
     storedBatteryKwh,
     alreadySized: storedBatteryKwh !== null,
+    storedRun: storedBatteryRun(job),
     // 3.13 prompt 3 (H): the same coerced read objectiveBudgetView uses — a
     // stored cap that parses to a positive number is a budget; anything else
     // is "no cap".
