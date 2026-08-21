@@ -4400,7 +4400,14 @@ export function customUnitNotices(response: unknown): RoofNoticeView[] {
  * to hold — the exact shape D29 rejected. If a figure looks wrong on screen,
  * the fix is in the stored value or the resolver, never a key added here.
  */
-export const SOLAR_SIZING_REQUEST_KEYS = ["job_id", "constraints"] as const;
+export const SOLAR_SIZING_REQUEST_KEYS = [
+  "job_id",
+  "constraints",
+  // 3.14 prompt 6 (D37): the rail's re-cost declines persistence and the
+  // throwaway comparison. Both are OptimiseRequest fields (prompts 2 and 5).
+  "persist",
+  "compare_to_unconstrained",
+] as const;
 
 /** One row of the options table, formatted for reading, not for arithmetic. */
 export interface SolarOptionRow {
@@ -4880,7 +4887,13 @@ export function solarRunResult(response: unknown): SolarRunResult {
  * verify_sizing_request_contract.py holds this mechanically, against
  * BatteryRequest.model_fields.
  */
-export const BATTERY_SIZING_REQUEST_KEYS = ["job_id", "constraints"] as const;
+export const BATTERY_SIZING_REQUEST_KEYS = [
+  "job_id",
+  "constraints",
+  // 3.14 prompt 6 (D37): see SOLAR_SIZING_REQUEST_KEYS.
+  "persist",
+  "compare_to_unconstrained",
+] as const;
 
 /** One row of the battery options table — for reading, not for arithmetic. */
 export interface BatteryOptionRow {
@@ -6670,4 +6683,682 @@ export function roiFigures(
       explanation: ROI_EXPLANATIONS.total,
     },
   ];
+}
+
+
+// ── The live results rail (checklist 3.14 prompt 6, D37) ─────────────────────
+//
+// THE RAIL ANSWERS "WHAT DID THAT CHANGE DO". Two paths, two different kinds
+// of thing, and the rail never confuses them:
+//
+//   INSTANT — an objective or budget-cap save. The stored run evaluated every
+//   option and stored each one's own 25-year value, payback, self-sufficiency
+//   and cost, so re-ranking against a new objective or re-filtering against a
+//   new cap is arithmetic over data already on the job. Exact, no request.
+//
+//   A RE-COST — a save that changes the physics (roof, site, load, tariff).
+//   The endpoint is asked for THIS system under the new inputs: persist
+//   false, compare_to_unconstrained false, constraints pinning the stored
+//   run's own array and battery. Full-year resolution (D35), ~9 s (prompt 5).
+//
+// THE RAIL NEVER RE-SEARCHES. It never asks whether a different system is
+// better — the Size buttons do that. Nothing it computes is saved, so the
+// LABEL on screen is the only thing that can say where a figure came from.
+// Everything below is pure, so the suite asserts on every state; the
+// component only renders.
+
+/** What kind of change a section announced when it saved. */
+export type SizingInputChangeKind =
+  /** The engine's objective, blend weight or budget cap — INSTANT. */
+  | "objective-budget"
+  /** Anything the engine re-costs from scratch: roof, site, load, tariff. */
+  | "physics";
+
+export interface SizingInputChange {
+  kind: SizingInputChangeKind;
+  /** Which section announced it — for the label, never for logic. */
+  section: string;
+  /** The objective the save left stored (objective-budget only). */
+  objective?: string | null;
+  /** The blend weight, for a custom objective (objective-budget only). */
+  customWeight?: number | null;
+  /** The cap the save left stored; null = no cap (objective-budget only). */
+  budgetAud?: number | null;
+  /** Monotonic, so a second identical save still announces. */
+  seq: number;
+}
+
+/** What a SECTION announces on a persisted save — the body adds `section`
+    and `seq`. A section that is unsure whether the engine reads what it
+    saved stays silent: the rail then shows the stored run, honestly labelled. */
+export type SizingInputSave = Omit<SizingInputChange, "seq" | "section">;
+
+/** The five tiles, as numbers — null where the run does not carry one. */
+export interface RailFigures {
+  solarKw: number | null;
+  batteryKwh: number | null;
+  paybackYears: number | null;
+  npv: number | null;
+  selfSufficiencyPct: number | null;
+  /** "whole-system" is the figure the bar always showed; "solar-only" is
+      what a re-rank can honestly state once the array has moved. */
+  basis: "whole-system" | "solar-only";
+}
+
+export interface RailDelta {
+  label: string;
+  before: string;
+  after: string;
+  /** "+$1,204" / "−0.3 yr" / "no change" — the change between them. */
+  change: string;
+  direction: "up" | "down" | "none";
+}
+
+/** Where the new figures came from — the ONLY carrier, since nothing is saved. */
+export interface RailProvenance {
+  engineMode: string | null;
+  /** The battery response's own word ("full_year"); null on a solar-only
+      run, which performs no dispatch (F191). */
+  resolution: string | null;
+  label: string;
+}
+
+export const RAIL_NOT_SAVED = "Not saved — press Size to commit.";
+
+/**
+ * THE BASELINE the rail recomputes against — the STORED run, read once from
+ * the job into a serialisable shape the client component can hold.
+ */
+export interface RailBaseline {
+  /** The current sizing row's id: a new row means a new baseline, and any
+      client-side recompute belongs to the old one and is dropped. */
+  sizingResultId: string | null;
+  runKind: "solar" | "solar_battery" | null;
+  figures: RailFigures;
+  /** The stored solar-only parts (split.solar_only on a battery run, the
+      chosen point on a solar run) — what a moved-array re-rank compares. */
+  solarOnly: { npv: number | null; paybackYears: number | null;
+               annualSavings: number | null; selfSufficiencyPct: number | null;
+               systemCost: number | null };
+  chosen: {
+    solarKw: number | null;
+    planeIndices: number[] | null;
+    panelsPerPlane: number[] | null;
+    batteryId: string | null;
+    batteryKwh: number | null;
+    batteryModel: string | null;
+  };
+  /** The stored ARRAY-SIZE options (solar_options on a battery run). */
+  solarPoints: Record<string, unknown>[] | null;
+  solarChosenIndex: number | null;
+  /** The stored BATTERY candidates (battery runs only). */
+  batteryPoints: Record<string, unknown>[] | null;
+  batteryChosenIndex: number | null;
+  objective: string | null;
+  budgetAud: number | null;
+  /** The endpoint that produced the run — the one a re-cost asks. */
+  endpoint: "/api/sizing/battery" | "/api/sizing/optimise" | null;
+}
+
+function railIndex(container: Record<string, unknown>, points: unknown[]): number | null {
+  const idx = container.chosen_index;
+  return typeof idx === "number" && Number.isInteger(idx) && idx >= 0 && idx < points.length
+    ? idx
+    : null;
+}
+
+export function railBaselineView(job: unknown): RailBaseline {
+  const bar = resultsBarView(job);
+  const sizing = currentSizingResult(job);
+  const eo = asRecord(sizing?.evaluated_options);
+  const runKind =
+    sizing?.run_kind === "solar" || sizing?.run_kind === "solar_battery"
+      ? sizing.run_kind
+      : null;
+  const isBattery = runKind === "solar_battery";
+  const solarContainer = isBattery ? asRecord(eo.solar_options) : eo;
+  const solarPoints = Array.isArray(solarContainer.points)
+    ? solarContainer.points.map((p) => asRecord(p))
+    : null;
+  const solarChosenIndex = solarPoints ? railIndex(solarContainer, solarPoints) : null;
+  const batteryPoints = isBattery && Array.isArray(eo.points)
+    ? eo.points.map((p) => asRecord(p))
+    : null;
+  const batteryChosenIndex = batteryPoints ? railIndex(eo, batteryPoints) : null;
+  const chosenBattery = batteryPoints && batteryChosenIndex !== null
+    ? batteryPoints[batteryChosenIndex]
+    : null;
+  const chosenSolarPoint = solarPoints && solarChosenIndex !== null
+    ? solarPoints[solarChosenIndex]
+    : null;
+  const cs = isBattery ? asRecord(eo.chosen_solar) : chosenSolarPoint ?? {};
+  const so = isBattery
+    ? asRecord(asRecord(eo.split).solar_only)
+    : chosenSolarPoint ?? {};
+  const detail = asObject(job);
+  return {
+    sizingResultId:
+      typeof sizing?.sizing_result_id === "string" ? sizing.sizing_result_id : null,
+    runKind,
+    figures: bar.sized
+      ? {
+          solarKw: bar.solarKw,
+          batteryKwh: bar.batteryKwh,
+          paybackYears: bar.paybackYears,
+          npv: bar.npv,
+          selfSufficiencyPct: bar.selfSufficiencyPct,
+          basis: "whole-system",
+        }
+      : { solarKw: null, batteryKwh: null, paybackYears: null, npv: null,
+          selfSufficiencyPct: null, basis: "whole-system" },
+    solarOnly: {
+      npv: tariffNum(so.npv_25yr),
+      paybackYears: tariffNum(so.simple_payback_years),
+      annualSavings: tariffNum(so.annual_savings),
+      selfSufficiencyPct: tariffNum(chosenSolarPoint?.self_sufficiency_pct),
+      systemCost: tariffNum(so.system_cost),
+    },
+    chosen: {
+      solarKw: tariffNum(sizing?.solar_kw),
+      planeIndices: Array.isArray(cs.plane_indices)
+        ? cs.plane_indices.filter((i): i is number => typeof i === "number")
+        : null,
+      panelsPerPlane: Array.isArray(cs.panels_per_plane)
+        ? cs.panels_per_plane.filter((i): i is number => typeof i === "number")
+        : null,
+      batteryId:
+        typeof chosenBattery?.battery_id === "string" ? chosenBattery.battery_id : null,
+      batteryKwh: tariffNum(sizing?.battery_kwh),
+      batteryModel:
+        typeof chosenBattery?.model === "string" ? chosenBattery.model : null,
+    },
+    solarPoints,
+    solarChosenIndex,
+    batteryPoints,
+    batteryChosenIndex,
+    objective:
+      typeof detail.objective === "string" && detail.objective ? detail.objective : null,
+    budgetAud: (() => {
+      const b = tariffNum(detail.budget_aud);
+      return b !== null && b > 0 ? b : null;
+    })(),
+    endpoint:
+      runKind === "solar_battery"
+        ? "/api/sizing/battery"
+        : runKind === "solar"
+          ? "/api/sizing/optimise"
+          : null,
+  };
+}
+
+/**
+ * THE REQUEST BUILDER — pure, so the suite can hold its key set against the
+ * declared constants. Pins the STORED run's own system: the array by kW
+ * (fix_solar_kwp) and the battery by id; a stored no-battery outcome pins
+ * force_no_battery rather than inventing an id. Returns null when there is
+ * nothing to pin — the rail then says so rather than searching.
+ */
+export function railRecostRequest(
+  baseline: RailBaseline,
+  jobId: string,
+): Record<string, unknown> | null {
+  if (baseline.endpoint === null || baseline.chosen.solarKw === null) return null;
+  const constraints: Record<string, unknown> = {
+    fix_solar_kwp: baseline.chosen.solarKw,
+  };
+  if (baseline.runKind === "solar_battery") {
+    if (baseline.chosen.batteryId) {
+      constraints.battery_ids = [baseline.chosen.batteryId];
+    } else if (baseline.chosen.batteryKwh === 0) {
+      constraints.force_no_battery = true;
+    } else {
+      return null; // a battery run with no identifiable battery cannot be pinned
+    }
+  }
+  return {
+    job_id: jobId,
+    constraints,
+    persist: false,
+    compare_to_unconstrained: false,
+  };
+}
+
+/** The declared key set for the endpoint a baseline would call. */
+export function railRequestKeysFor(baseline: RailBaseline): readonly string[] {
+  return baseline.runKind === "solar_battery"
+    ? BATTERY_SIZING_REQUEST_KEYS
+    : SOLAR_SIZING_REQUEST_KEYS;
+}
+
+// ── The state the bar renders ───────────────────────────────────────────────
+
+export type RailState =
+  /** The stored run's figures, labelled as stored. */
+  | { kind: "stored" }
+  /** Re-ranked INSTANTLY from the stored options — no request was made. */
+  | {
+      kind: "reranked";
+      trigger: SizingInputChange;
+      before: RailFigures;
+      after: RailFigures;
+      deltas: RailDelta[];
+      arrayMoved: boolean;
+      batteryStale: boolean;
+      note: string;
+      notSaved: string;
+    }
+  /** The instant path could not answer — and says why, rather than
+      re-costing and calling it instant. */
+  | { kind: "rerank-unavailable"; trigger: SizingInputChange; reason: string }
+  /** A re-cost is in flight — the RunProgress indicator, reused. */
+  | { kind: "recosting"; trigger: SizingInputChange; startedAt: number }
+  /** A re-cost answered: before, after, the change, and its provenance. */
+  | {
+      kind: "recosted";
+      trigger: SizingInputChange;
+      before: RailFigures;
+      after: RailFigures;
+      deltas: RailDelta[];
+      provenance: RailProvenance;
+      notSaved: string;
+    }
+  /** A re-cost did not complete — the stored figures stand, and it says so. */
+  | { kind: "failed"; trigger: SizingInputChange; reason: string; canRetry: boolean };
+
+export const RAIL_STATE_KINDS = [
+  "stored", "reranked", "rerank-unavailable", "recosting", "recosted", "failed",
+] as const;
+
+function railChange(
+  label: string,
+  before: number | null,
+  after: number | null,
+  fmt: (v: unknown) => string,
+  unit: "aud" | "years" | "pct" | "kw" | "kwh",
+): RailDelta {
+  const none: RailDelta = {
+    label, before: fmt(before), after: fmt(after), change: "no change", direction: "none",
+  };
+  if (before === null || after === null) {
+    return { ...none, change: before === after ? "no change" : "—" };
+  }
+  const diff = Math.round((after - before) * 100) / 100;
+  if (diff === 0) return none;
+  const sign = diff > 0 ? "+" : "−";
+  const abs = Math.abs(diff);
+  const body =
+    unit === "aud" ? `$${Math.round(abs).toLocaleString("en-AU")}`
+    : unit === "years" ? `${abs} yr`
+    : unit === "pct" ? `${abs} pts`
+    : unit === "kw" ? `${abs} kW`
+    : `${abs} kWh`;
+  return {
+    label, before: fmt(before), after: fmt(after),
+    change: `${sign}${body}`, direction: diff > 0 ? "up" : "down",
+  };
+}
+
+export function railDeltas(before: RailFigures, after: RailFigures): RailDelta[] {
+  return [
+    railChange("Solar", before.solarKw, after.solarKw, formatKw, "kw"),
+    railChange("Battery", before.batteryKwh, after.batteryKwh, formatKwh, "kwh"),
+    railChange("Payback", before.paybackYears, after.paybackYears, formatYears, "years"),
+    railChange("NPV", before.npv, after.npv, formatMoney, "aud"),
+    railChange("Self-sufficiency", before.selfSufficiencyPct, after.selfSufficiencyPct, formatPct, "pct"),
+  ];
+}
+
+// ── The instant path ────────────────────────────────────────────────────────
+
+/** The engine's own ranking rule for the ARRAY options (solar_optimiser):
+    max_npv → npv_25yr; min_payback → shortest payback, no payback worst;
+    max_self_sufficiency → self_sufficiency_pct. A custom blend was scored
+    with the OLD weight and cannot be re-ranked here. */
+function solarScore(point: Record<string, unknown>, objective: string): number | null {
+  if (objective === "max_npv") return tariffNum(point.npv_25yr);
+  if (objective === "max_self_sufficiency") return tariffNum(point.self_sufficiency_pct);
+  if (objective === "min_payback") {
+    const pb = tariffNum(point.simple_payback_years);
+    return pb === null ? -1e18 : -pb;
+  }
+  return null;
+}
+
+/** The engine's own rule for the BATTERY candidates (battery_optimiser),
+    over a pool already filtered by the cap. */
+function pickBattery(
+  pool: Record<string, unknown>[],
+  objective: string,
+  noBattery: Record<string, unknown>,
+): Record<string, unknown> | null {
+  if (pool.length === 0) return null;
+  if (objective === "max_npv") {
+    return pool.reduce((best, c) =>
+      (tariffNum(c.incremental_npv) ?? -Infinity) > (tariffNum(best.incremental_npv) ?? -Infinity) ? c : best);
+  }
+  if (objective === "max_self_sufficiency") {
+    return pool.reduce((best, c) =>
+      (tariffNum(c.self_sufficiency_pct) ?? -Infinity) > (tariffNum(best.self_sufficiency_pct) ?? -Infinity) ? c : best);
+  }
+  if (objective === "min_payback") {
+    const viable = pool.filter(
+      (c) => (tariffNum(c.usable_kwh) ?? 0) > 0
+        && (tariffNum(c.incremental_npv) ?? 0) > 0
+        && tariffNum(c.incremental_payback_years) !== null,
+    );
+    if (viable.length === 0) return noBattery;
+    return viable.reduce((best, c) =>
+      (tariffNum(c.incremental_payback_years) as number) < (tariffNum(best.incremental_payback_years) as number) ? c : best);
+  }
+  return null;
+}
+
+/**
+ * RE-RANK from the stored options — no request, no solving (D37 clauses 1-3).
+ *
+ * THE CAVEAT THAT KEEPS IT HONEST: sizing is SEQUENTIAL. The objective chose
+ * the array first and the battery was solved around THAT array. So:
+ *   - the array does not move: the battery candidates are comparable, and
+ *     a new cap or objective may pick a different one — exact, stored;
+ *   - the array MOVES: the new array's own stored SOLAR-ONLY figures are
+ *     shown (exact), and the battery figures are marked as belonging to the
+ *     previous array, needing a full Size. They are never re-ranked.
+ */
+export function railRerank(
+  baseline: RailBaseline,
+  change: SizingInputChange,
+): RailState {
+  const objective = change.objective ?? baseline.objective ?? "max_npv";
+  const budget =
+    change.budgetAud === undefined ? baseline.budgetAud : change.budgetAud;
+  const unavailable = (reason: string): RailState =>
+    ({ kind: "rerank-unavailable", trigger: change, reason });
+  if (!baseline.solarPoints || baseline.solarPoints.length === 0) {
+    return unavailable(
+      "This run did not record the options it compared, so the change cannot be answered from stored data — press Size to run it.",
+    );
+  }
+  if (objective === "custom") {
+    return unavailable(
+      "A custom blend scores the options with its weight, which the stored run used a different value for — press Size to run it.",
+    );
+  }
+  if (!VALID_OBJECTIVES.includes(objective as (typeof VALID_OBJECTIVES)[number])) {
+    return unavailable(`The objective ${JSON.stringify(objective)} is not one the engine ranks by.`);
+  }
+  const real = baseline.solarPoints.filter((p) => (tariffNum(p.solar_kw) ?? 0) > 0);
+  const inBudget = budget === null
+    ? real
+    : real.filter((p) => (tariffNum(p.system_cost) ?? Infinity) <= budget);
+  if (inBudget.length === 0) {
+    return unavailable(
+      "No stored array fits the new budget cap; the engine's answer under it needs a full Size.",
+    );
+  }
+  let top: Record<string, unknown> | null = null;
+  let topScore = -Infinity;
+  for (const p of inBudget) {
+    const s = solarScore(p, objective);
+    if (s !== null && s > topScore) { top = p; topScore = s; }
+  }
+  if (!top) {
+    return unavailable("The stored options carry no value for that objective.");
+  }
+  const topKw = tariffNum(top.solar_kw);
+  const sameKw = topKw !== null && topKw === baseline.chosen.solarKw;
+  const sameLayout =
+    !Array.isArray(top.panels_per_plane) || baseline.chosen.panelsPerPlane === null
+      ? sameKw
+      : JSON.stringify(top.panels_per_plane) === JSON.stringify(baseline.chosen.panelsPerPlane);
+  const arrayMoved = !(sameKw && sameLayout);
+  const before = baseline.figures;
+  const notSaved = RAIL_NOT_SAVED;
+
+  if (arrayMoved) {
+    // The new array's OWN stored figures — solar only, exactly as stored.
+    const solarBefore: RailFigures = {
+      solarKw: baseline.chosen.solarKw,
+      batteryKwh: null,
+      paybackYears: baseline.solarOnly.paybackYears,
+      npv: baseline.solarOnly.npv,
+      selfSufficiencyPct: baseline.solarOnly.selfSufficiencyPct,
+      basis: "solar-only",
+    };
+    const after: RailFigures = {
+      solarKw: topKw,
+      batteryKwh: null,
+      paybackYears: tariffNum(top.simple_payback_years),
+      npv: tariffNum(top.npv_25yr),
+      selfSufficiencyPct: tariffNum(top.self_sufficiency_pct),
+      basis: "solar-only",
+    };
+    const isBattery = baseline.runKind === "solar_battery";
+    return {
+      kind: "reranked",
+      trigger: change,
+      before: solarBefore,
+      after,
+      deltas: railDeltas(solarBefore, after),
+      arrayMoved: true,
+      batteryStale: isBattery,
+      note: isBattery
+        ? `Under this objective the top array is ${formatKw(topKw)} rather than ${formatKw(baseline.chosen.solarKw)}. Its solar figures are the run's own, exact; the battery figures still belong to the ${formatKw(baseline.chosen.solarKw)} array and need a full Size to resolve.`
+        : `Under this objective the top array is ${formatKw(topKw)} rather than ${formatKw(baseline.chosen.solarKw)} — the run's own stored figures for it.`,
+      notSaved,
+    };
+  }
+
+  // The array stands. On a battery run the candidates are comparable — re-filter
+  // and re-rank them; on a solar run nothing moves at all.
+  if (baseline.runKind !== "solar_battery" || !baseline.batteryPoints) {
+    return {
+      kind: "reranked", trigger: change, before, after: before,
+      deltas: railDeltas(before, before), arrayMoved: false, batteryStale: false,
+      note: "That change moves nothing — the stored run is still the answer.",
+      notSaved,
+    };
+  }
+  const noBattery = baseline.batteryPoints.find((c) => tariffNum(c.usable_kwh) === 0) ?? null;
+  const pool0 = budget === null
+    ? baseline.batteryPoints
+    : baseline.batteryPoints.filter((c) => (tariffNum(c.system_cost) ?? Infinity) <= budget);
+  const pool = pool0.length > 0 ? pool0 : noBattery ? [noBattery] : [];
+  const pick = noBattery ? pickBattery(pool, objective, noBattery) : null;
+  if (!pick) {
+    return unavailable("The stored battery candidates cannot be re-ranked for that objective.");
+  }
+  const pickId = typeof pick.battery_id === "string" ? pick.battery_id : null;
+  const sameBattery =
+    pickId === baseline.chosen.batteryId
+    && tariffNum(pick.usable_kwh) === baseline.chosen.batteryKwh;
+  if (sameBattery) {
+    return {
+      kind: "reranked", trigger: change, before, after: before,
+      deltas: railDeltas(before, before), arrayMoved: false, batteryStale: false,
+      note: "That change moves nothing — the stored run is still the answer.",
+      notSaved,
+    };
+  }
+  // A different battery, solved around the SAME array: compose the whole
+  // exactly as the route does (solar part + increment), from stored parts.
+  const incSav = tariffNum(pick.annual_savings_vs_solar_only);
+  const incNpv = tariffNum(pick.incremental_npv);
+  const wholeSav = baseline.solarOnly.annualSavings !== null && incSav !== null
+    ? Math.round((baseline.solarOnly.annualSavings + incSav) * 100) / 100 : null;
+  const wholeNpv = baseline.solarOnly.npv !== null && incNpv !== null
+    ? Math.round((baseline.solarOnly.npv + incNpv) * 100) / 100 : null;
+  const cost = tariffNum(pick.system_cost);
+  const after: RailFigures = {
+    solarKw: baseline.chosen.solarKw,
+    batteryKwh: tariffNum(pick.usable_kwh),
+    paybackYears: cost !== null && wholeSav !== null && wholeSav > 0
+      ? Math.round((cost / wholeSav) * 100) / 100 : null,
+    npv: wholeNpv,
+    selfSufficiencyPct: tariffNum(pick.self_sufficiency_pct),
+    basis: "whole-system",
+  };
+  const model = typeof pick.model === "string" ? pick.model : "a different battery";
+  return {
+    kind: "reranked", trigger: change, before, after,
+    deltas: railDeltas(before, after), arrayMoved: false, batteryStale: false,
+    note: `Under this change the top battery is ${model} (${formatKwh(after.batteryKwh)}) around the same ${formatKw(baseline.chosen.solarKw)} array — the run's own stored figures for it.`,
+    notSaved,
+  };
+}
+
+// ── The re-cost path ────────────────────────────────────────────────────────
+
+export const RAIL_DECLINE_FLAG = "unconstrained_comparison_not_run_by_request";
+
+/**
+ * A re-cost RESPONSE → the rail state. Trusts nothing it cannot check:
+ *   - an error body, or no figures → failed, with the engine's own words;
+ *   - the decline flag present AND constraint deltas present → contradictory,
+ *     failed, trust neither;
+ *   - the answer is not the pinned system (a different array, a different or
+ *     missing battery) → failed: the engine substituted, which a re-cost must
+ *     never present as its own answer;
+ *   - otherwise: before/after, the change, and WHERE the figures came from.
+ */
+export function railRecostState(
+  baseline: RailBaseline,
+  change: SizingInputChange,
+  response: unknown,
+): RailState {
+  const body = asRecord(response);
+  const failed = (reason: string): RailState =>
+    ({ kind: "failed", trigger: change, reason, canRetry: true });
+  if (typeof body.error === "string" && body.error) return failed(body.error);
+  if (body.needs_roof_input === true) {
+    return failed("The engine has no usable roof to re-cost on.");
+  }
+  const flags = Array.isArray(body.flags) ? body.flags.map(String) : [];
+  const declined = flags.includes(RAIL_DECLINE_FLAG);
+  if (declined && body.constraint_deltas != null) {
+    return failed(
+      "The engine reported both that the comparison was declined and a comparison result — contradictory, so neither is shown.",
+    );
+  }
+  if (!declined) {
+    return failed("The engine did not confirm it skipped the comparison run, so this answer is not shown as a re-cost.");
+  }
+  if (flags.some((f) => f.includes("not in the active catalogue"))) {
+    return failed("The stored battery is no longer in the catalogue, so this system cannot be re-costed as it stands.");
+  }
+  const isBattery = baseline.runKind === "solar_battery";
+  let after: RailFigures;
+  let answeredKw: number | null;
+  if (isBattery) {
+    const opt = asRecord(body.optimal_battery);
+    const cs = asRecord(body.chosen_solar);
+    const so = asRecord(body.solar_options);
+    const pts = Array.isArray(so.points) ? so.points.map((p) => asRecord(p)) : [];
+    const ci = railIndex(so, pts);
+    const sp = ci !== null ? pts[ci] : {};
+    answeredKw = tariffNum(cs.solar_kw);
+    const kwh = tariffNum(opt.usable_kwh);
+    const battId = typeof opt.battery_id === "string" ? opt.battery_id : null;
+    if (answeredKw === null || kwh === null) return failed("The engine returned no figures.");
+    if (battId !== baseline.chosen.batteryId || kwh !== baseline.chosen.batteryKwh) {
+      return failed("The engine answered with a different battery from the stored run's, so this is not a re-cost of the stored system.");
+    }
+    const incSav = tariffNum(opt.annual_savings_vs_solar_only);
+    const incNpv = tariffNum(opt.incremental_npv);
+    const solSav = tariffNum(sp.annual_savings);
+    const solNpv = tariffNum(sp.npv_25yr);
+    const wholeSav = solSav !== null && incSav !== null
+      ? Math.round((solSav + incSav) * 100) / 100 : null;
+    const cost = tariffNum(opt.system_cost);
+    after = {
+      solarKw: answeredKw,
+      batteryKwh: kwh,
+      paybackYears: cost !== null && wholeSav !== null && wholeSav > 0
+        ? Math.round((cost / wholeSav) * 100) / 100 : null,
+      npv: solNpv !== null && incNpv !== null
+        ? Math.round((solNpv + incNpv) * 100) / 100 : null,
+      selfSufficiencyPct: tariffNum(opt.self_sufficiency_pct),
+      basis: "whole-system",
+    };
+  } else {
+    const opt = asRecord(body.optimal);
+    answeredKw = tariffNum(opt.solar_kw);
+    if (answeredKw === null) return failed("The engine returned no figures.");
+    after = {
+      solarKw: answeredKw,
+      batteryKwh: null,
+      paybackYears: tariffNum(opt.simple_payback_years),
+      npv: tariffNum(opt.npv_25yr),
+      selfSufficiencyPct: tariffNum(opt.self_sufficiency_pct),
+      basis: "whole-system",
+    };
+  }
+  if (answeredKw !== baseline.chosen.solarKw) {
+    return failed("The engine answered with a different array from the stored run's, so this is not a re-cost of the stored system.");
+  }
+  const engineMode = typeof body.engine_mode === "string" ? body.engine_mode : null;
+  const resolution = typeof body.resolution === "string" ? body.resolution : null;
+  if (engineMode === null) {
+    return failed("The engine did not say which engine produced these figures, so they are not shown.");
+  }
+  if (isBattery && resolution === null) {
+    return failed("The engine did not say which dispatch resolution produced these figures, so they are not shown.");
+  }
+  return {
+    kind: "recosted",
+    trigger: change,
+    before: baseline.figures,
+    after,
+    deltas: railDeltas(baseline.figures, after),
+    provenance: railProvenance(engineMode, resolution, isBattery),
+    notSaved: RAIL_NOT_SAVED,
+  };
+}
+
+export function railProvenance(
+  engineMode: string | null,
+  resolution: string | null,
+  isBattery: boolean,
+): RailProvenance {
+  const engine = engineMode === "sequential" ? "the sequential engine" : `engine "${engineMode}"`;
+  const dispatch = !isBattery
+    ? "no battery dispatch (solar only)"
+    : resolution === "full_year"
+      ? "full-year dispatch, all 365 days"
+      : `dispatch resolution "${resolution}"`;
+  return {
+    engineMode,
+    resolution,
+    label: `Re-costed by ${engine}, ${dispatch}. ${RAIL_NOT_SAVED}`,
+  };
+}
+
+/** What a failed, timed-out or expired re-cost leaves on screen. */
+export function railFailedState(change: SizingInputChange, reason: string): RailState {
+  return { kind: "failed", trigger: change, reason, canRetry: true };
+}
+
+/** The one line beneath the tiles, per state — derived here so the suite
+    can assert that every recomputed state says "not saved" and the stored
+    state never does. */
+export function railStatusLine(state: RailState): string | null {
+  switch (state.kind) {
+    case "stored":
+      return null;
+    case "reranked":
+      return `${state.note} Re-ranked from the run's stored options — no new solve. ${state.notSaved}`;
+    case "rerank-unavailable":
+      return `${state.reason} Nothing here is saved.`;
+    case "recosting":
+      return "Re-costing the stored system under the new inputs — full-year dispatch, nothing is saved.";
+    case "recosted":
+      return state.provenance.label;
+    case "failed":
+      return `The recompute did not complete — ${state.reason} The stored run's figures are shown.${state.canRetry ? " Try again." : ""}`;
+  }
+}
+
+/** The figures a tile shows under a state — stored, or the after figures. */
+export function railFiguresFor(state: RailState, stored: RailFigures): RailFigures {
+  if (state.kind === "reranked" || state.kind === "recosted") return state.after;
+  return stored;
 }

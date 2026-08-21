@@ -23,6 +23,7 @@ import {
   objectiveSaveNotices,
   type ObjectiveBudgetView,
   type RoofNoticeView,
+  type SizingInputSave,
 } from "@/lib/worksheet";
 
 /**
@@ -72,9 +73,14 @@ function fromView(view: ObjectiveBudgetView): FormState {
 export function ObjectiveBudgetSection({
   view,
   jobId,
+  onSaved,
 }: {
   view: ObjectiveBudgetView;
   jobId: string;
+  /** 3.14 prompt 6 (D37): called after a PERSISTED save so the results rail
+      can answer "what did that change do". Optional — absent means silent,
+      and the rail keeps showing the stored run. */
+  onSaved?: (change: SizingInputSave) => void;
 }) {
   const router = useRouter();
   const [form, setForm] = React.useState<FormState>(() => fromView(view));
@@ -157,6 +163,14 @@ export function ObjectiveBudgetSection({
         return;
       }
       setSavedTick(true);
+      // 3.14 prompt 6: the INSTANT path — the values now stored, so the rail
+      // re-ranks the run's stored options with no request at all (D37).
+      onSaved?.({
+        kind: "objective-budget",
+        objective: form.objective || baseline.objective || null,
+        customWeight: form.objective === "custom" ? form.weight : null,
+        budgetAud: form.budget.trim() === "" ? null : Number(form.budget),
+      });
       router.refresh();
     } finally {
       setSaving(false);

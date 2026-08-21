@@ -12,6 +12,18 @@ import assert from "node:assert/strict";
 import {
   PHASE_ORDER,
   CHOSEN_NOT_RECORDED_NOTE,
+  RAIL_DECLINE_FLAG,
+  RAIL_NOT_SAVED,
+  RAIL_STATE_KINDS,
+  railBaselineView,
+  railFailedState,
+  railRecostRequest,
+  railRecostState,
+  railRequestKeysFor,
+  railRerank,
+  railStatusLine,
+  type RailState,
+  type SizingInputChange,
   FLAT_OPTIONS_RATIO,
   SOLAR_CURVE_NOT_RECORDED,
   SOLAR_CURVE_NO_OPTIONS,
@@ -4834,7 +4846,12 @@ test("3.11: the predicates — solar_kw ticks Solar sizing, battery_kwh:null lea
 });
 
 test("3.11: SOLAR_SIZING_REQUEST_KEYS — the D29 restraint, held locally too", () => {
-  assert.deepEqual([...SOLAR_SIZING_REQUEST_KEYS].sort(), ["constraints", "job_id"]);
+  // 3.14 prompt 6 (D37): the rail's re-cost declines persistence and the
+  // throwaway comparison, so the constant gained those two fields. Both are
+  // real OptimiseRequest fields (prompts 2 and 5); the builder test below
+  // holds the rail's body to EXACTLY this set.
+  assert.deepEqual([...SOLAR_SIZING_REQUEST_KEYS].sort(),
+    ["compare_to_unconstrained", "constraints", "job_id", "persist"]);
   for (const forbidden of ["objective", "custom_weight", "budget",
                            "equipment_panel_id", "equipment_inverter_id",
                            "equipment_battery_id", "installer_id"]) {
@@ -5342,7 +5359,9 @@ test("3.12: the notices are ONE function with two doors, not a copy", () => {
 });
 
 test("3.12: BATTERY_SIZING_REQUEST_KEYS — the D29 restraint, held locally too", () => {
-  assert.deepEqual([...BATTERY_SIZING_REQUEST_KEYS].sort(), ["constraints", "job_id"]);
+  // 3.14 prompt 6 (D37): see SOLAR_SIZING_REQUEST_KEYS above.
+  assert.deepEqual([...BATTERY_SIZING_REQUEST_KEYS].sort(),
+    ["compare_to_unconstrained", "constraints", "job_id", "persist"]);
   // The solar list plus the two this endpoint additionally accepts and which
   // are ALSO stored on the job: the battery ids (3.10) and the tariff (3.8).
   for (const forbidden of ["objective", "custom_weight", "budget",
@@ -7622,10 +7641,15 @@ test("3.14-3 D3: the component writes the MARKER on auto-expand and never the "
   assert.ok(touches >= 3, `expected reads and writes, found ${touches}`);
   assert.ok(tries >= touches - 1,
     `every storage touch is wrapped: ${touches} touches, ${tries} try blocks`);
-  // The page hands the bar the job id — without it nothing can auto-expand.
+  // The job id reaches the bar — without it nothing can auto-expand. Since
+  // 3.14 prompt 6 the BODY hosts the bar: the page hands the body the id and
+  // the body hands it on.
   const page = fs.readFileSync(
     path.join(FRONTEND, "app/(app)/jobs/[id]/worksheet/page.tsx"), "utf8");
-  assert.match(page, /<ResultsBar[^>]*jobId=\{id\}/);
+  assert.match(page, /<WorksheetBody[\s\S]*jobId=\{id\}/);
+  const bodySrc = fs.readFileSync(
+    path.join(FRONTEND, "components/worksheet/worksheet-body.tsx"), "utf8");
+  assert.match(bodySrc, /<ResultsBar[\s\S]*?jobId=\{jobId\}/);
 });
 
 test("3.14-3: both sizing sections render the STORED run through the SAME "
@@ -7891,8 +7915,335 @@ test("3.14-4: the rail imports the SAME ScoreCurve through next/dynamic with "
   assert.match(tab, /<ScoreCurve view=\{view\.curve\} \/>/);
   assert.ok(!tab.includes("rowHeight") && !tab.includes("maxPlotHeight"),
     "the Results tab passes no new prop, so it renders exactly as before");
-  // The page hands the rail the curve.
+  // The page hands the rail the curve — since 3.14 prompt 6 via the body,
+  // which hosts the bar.
   const page = fs.readFileSync(
     path.join(FRONTEND, "app/(app)/jobs/[id]/worksheet/page.tsx"), "utf8");
-  assert.match(page, /curve=\{solarCurveView\(job\)\}/);
+  assert.match(page, /curve: solarCurveView\(job\)/);
+  const bodySrc = fs.readFileSync(
+    path.join(FRONTEND, "components/worksheet/worksheet-body.tsx"), "utf8");
+  assert.match(bodySrc, /curve=\{resultsBar\.curve\}/);
+});
+
+
+// ── 3.14 prompt 6 — the live rail (D37) ─────────────────────────────────────
+//
+// Every rail state is derived in lib; these tests hold the union, the
+// request builder, the instant path's sequential-sizing caveat, the failed
+// path, and the not-saved labelling — with NO request ever made on the
+// instant path (a fetch counter proves it).
+
+/** A stored battery run in the shape prompts 2-5 persist, as a full job. */
+const RAIL_JOB = {
+  status: "draft", path: "B", path_label: "Solar + battery",
+  objective: "max_npv", budget_aud: null,
+  sizing_results: [STORED_BATTERY_RUN],
+  financial_results: [{
+    sizing_result_id: "s-batt", system_capex: 11868.77, annual_savings: 2136.56,
+    payback_years: 5.55, npv_25_year: 19935.55,
+  }],
+};
+const RAIL_BASELINE = railBaselineView(RAIL_JOB);
+const CHANGE = (over: Partial<SizingInputChange> = {}): SizingInputChange => ({
+  kind: "objective-budget", section: "objective-budget", seq: 1, ...over,
+});
+
+async function withFetchCounter<T>(fn: () => T): Promise<{ value: T; fetches: number }> {
+  const g = globalThis as { fetch?: typeof fetch };
+  const original = g.fetch;
+  let fetches = 0;
+  g.fetch = ((...args: Parameters<typeof fetch>) => {
+    fetches += 1;
+    return original ? original(...args) : Promise.reject(new Error("no fetch"));
+  }) as typeof fetch;
+  try {
+    return { value: fn(), fetches };
+  } finally {
+    g.fetch = original;
+  }
+}
+
+// 6-A. THE REQUEST BUILDER: exactly the declared keys, pinned to the stored run.
+test("3.14-6: the re-cost request carries EXACTLY the declared keys, persist false, "
+  + "compare_to_unconstrained false, pinned to the stored run's own system", () => {
+  const body = railRecostRequest(RAIL_BASELINE, "job-1");
+  assert.ok(body, "a stored battery run can be pinned");
+  const sent = new Set(Object.keys(body));
+  const declared = new Set(railRequestKeysFor(RAIL_BASELINE));
+  console.log(`        builder keys : ${[...sent].sort().join(", ")}`);
+  console.log(`        constant     : ${[...declared].sort().join(", ")}`);
+  assert.deepEqual([...sent].sort(), [...declared].sort(),
+    "the key set IS the constant — both directions");
+  for (const k of sent) assert.ok(declared.has(k), `${k} not declared`);
+  for (const k of declared) assert.ok(sent.has(k), `${k} declared but not sent`);
+  assert.equal(body.persist, false);
+  assert.equal(body.compare_to_unconstrained, false);
+  assert.equal(body.job_id, "job-1");
+  // Pinned values equal the stored run's — both directions.
+  const c = body.constraints as Record<string, unknown>;
+  assert.equal(c.fix_solar_kwp, STORED_BATTERY_RUN.solar_kw);
+  assert.equal(STORED_BATTERY_RUN.solar_kw, c.fix_solar_kwp);
+  const chosen = STORED_BATTERY_RUN.evaluated_options.points[STORED_BATTERY_RUN.evaluated_options.chosen_index];
+  assert.deepEqual(c.battery_ids, [chosen.battery_id]);
+  assert.equal(chosen.battery_id, (c.battery_ids as string[])[0]);
+  assert.ok(!("force_no_battery" in c), "a real battery is pinned by id, not by force_no_battery");
+  // The solar-run shape pins the array only, against ITS constant.
+  const solarBase = railBaselineView({ ...RAIL_JOB, sizing_results: [STORED_SOLAR_RUN] });
+  const solarBody = railRecostRequest(solarBase, "job-1");
+  assert.ok(solarBody);
+  assert.deepEqual(Object.keys(solarBody).sort(), [...railRequestKeysFor(solarBase)].sort());
+  assert.deepEqual(solarBody.constraints, { fix_solar_kwp: STORED_SOLAR_RUN.solar_kw });
+  assert.equal(solarBase.endpoint, "/api/sizing/optimise");
+  assert.equal(RAIL_BASELINE.endpoint, "/api/sizing/battery");
+  // A stored NO-BATTERY outcome pins force_no_battery, never an invented id.
+  const none = JSON.parse(JSON.stringify(STORED_BATTERY_RUN));
+  none.battery_kwh = 0; none.evaluated_options.chosen_index = 0;
+  const noneBody = railRecostRequest(railBaselineView({ ...RAIL_JOB, sizing_results: [none] }), "j");
+  assert.deepEqual(noneBody?.constraints, { fix_solar_kwp: 9.24, force_no_battery: true });
+  // Nothing to pin -> null, never an unpinned search.
+  assert.equal(railRecostRequest(railBaselineView({ sizing_results: [] }), "j"), null);
+});
+
+// 6-B. EVERY STATE, DISTINCT.
+test("3.14-6: the rail's states are a discriminated union and every kind is "
+  + "reachable and distinct", () => {
+  const physics = CHANGE({ kind: "physics", section: "tariff-network" });
+  const good = {
+    flags: [RAIL_DECLINE_FLAG, "not_persisted_by_request"],
+    engine_mode: "sequential", resolution: "full_year", constraint_deltas: null,
+    chosen_solar: { solar_kw: 9.24 },
+    optimal_battery: { battery_id: "b1", usable_kwh: 9.83, system_cost: 12000,
+      annual_savings_vs_solar_only: 300, incremental_npv: 2900, self_sufficiency_pct: 85 },
+    solar_options: { chosen_index: 1, points: [{}, { annual_savings: 1800, npv_25yr: 17100 }] },
+  };
+  const states: RailState[] = [
+    { kind: "stored" },
+    railRerank(RAIL_BASELINE, CHANGE({ objective: "max_npv" })),
+    railRerank(RAIL_BASELINE, CHANGE({ objective: "custom", customWeight: 0.3 })),
+    { kind: "recosting", trigger: physics, startedAt: 1 },
+    railRecostState(RAIL_BASELINE, physics, good),
+    railFailedState(physics, "the engine did not answer."),
+  ];
+  const kinds = states.map((s) => s.kind);
+  console.log(`        states: ${kinds.join(" · ")}`);
+  assert.deepEqual(kinds, [...RAIL_STATE_KINDS],
+    "one of each kind, in the declared order");
+  assert.equal(new Set(kinds).size, RAIL_STATE_KINDS.length,
+    "merge any two and this test is testing nothing");
+  // And every status line differs too — the words are the product.
+  const lines = states.map((s) => railStatusLine(s));
+  assert.equal(lines[0], null, "the stored state has NO recompute line");
+  assert.equal(new Set(lines.slice(1)).size, lines.length - 1,
+    "every recomputed state says something different");
+  for (const line of lines.slice(1)) assert.ok(line && line.length > 20);
+});
+
+// 6-C. THE RE-RANK PAIR — the heart of it. Both from stored data, no fetch.
+test("3.14-6 D37: a re-rank that does NOT move the array leaves the battery live; "
+  + "one that DOES move it marks the battery as the previous array's — no "
+  + "request made", async () => {
+  // max_npv is the stored objective: nothing moves.
+  const same = await withFetchCounter(() =>
+    railRerank(RAIL_BASELINE, CHANGE({ objective: "max_npv", budgetAud: null })));
+  assert.equal(same.fetches, 0, "the instant path never fetches");
+  const s = same.value;
+  assert.equal(s.kind, "reranked");
+  if (s.kind !== "reranked") return;
+  console.log(`        unmoved : arrayMoved=${s.arrayMoved} batteryStale=${s.batteryStale} `
+    + `after=${s.after.solarKw} kW + ${s.after.batteryKwh} kWh basis=${s.after.basis}`);
+  console.log(`                  ${s.note}`);
+  assert.equal(s.arrayMoved, false);
+  assert.equal(s.batteryStale, false, "the battery figures stay LIVE");
+  assert.deepEqual(s.after, s.before, "the delta is zero");
+  assert.ok(s.deltas.every((d) => d.direction === "none" && d.change === "no change"));
+  assert.match(s.note, /moves nothing/);
+  assert.equal(s.after.basis, "whole-system");
+
+  // max_self_sufficiency ranks the 10.12 kW array above 9.24: the array MOVES.
+  const moved = await withFetchCounter(() =>
+    railRerank(RAIL_BASELINE, CHANGE({ objective: "max_self_sufficiency", seq: 2 })));
+  assert.equal(moved.fetches, 0, "still no fetch");
+  const m = moved.value;
+  assert.equal(m.kind, "reranked");
+  if (m.kind !== "reranked") return;
+  console.log(`        moved   : arrayMoved=${m.arrayMoved} batteryStale=${m.batteryStale} `
+    + `after=${m.after.solarKw} kW basis=${m.after.basis} npv=${m.after.npv} self=${m.after.selfSufficiencyPct}`);
+  console.log(`                  ${m.note}`);
+  assert.equal(m.arrayMoved, true);
+  assert.equal(m.batteryStale, true, "the battery was solved around the PREVIOUS array");
+  assert.equal(m.after.solarKw, 10.12, "the newly-top array");
+  assert.equal(m.after.basis, "solar-only", "its OWN stored solar figures, nothing composed");
+  assert.equal(m.after.npv, 17039.91, "exact — the run stored it");
+  assert.equal(m.after.selfSufficiencyPct, 85.3);
+  assert.equal(m.after.batteryKwh, null, "no battery figure is claimed for the new array");
+  assert.equal(m.before.basis, "solar-only", "compared against the OLD array's solar-only parts");
+  assert.equal(m.before.npv, 17068.33);
+  assert.match(m.note, /belong to the 9\.24 kW array/);
+  assert.match(m.note, /full Size/);
+  // The two outcomes are genuinely different states of the same kind.
+  assert.notDeepEqual(
+    { a: s.arrayMoved, b: s.batteryStale, f: s.after },
+    { a: m.arrayMoved, b: m.batteryStale, f: m.after });
+
+  // A budget cap that cuts the chosen battery re-ranks the CANDIDATES around
+  // the SAME array — live, exact, composed from stored parts.
+  const capped = railRerank(RAIL_BASELINE, CHANGE({ objective: "max_npv", budgetAud: 8000, seq: 3 }));
+  assert.equal(capped.kind, "reranked");
+  if (capped.kind === "reranked") {
+    console.log(`        capped  : arrayMoved=${capped.arrayMoved} after=${capped.after.solarKw} kW + ${capped.after.batteryKwh} kWh npv=${capped.after.npv}`);
+    assert.equal(capped.arrayMoved, false);
+    assert.equal(capped.after.batteryKwh, 0, "only the no-battery candidate fits $8,000");
+    assert.equal(capped.after.npv, 17068.33, "solar NPV + $0 increment");
+    assert.equal(capped.batteryStale, false);
+  }
+  // A custom blend cannot be re-ranked from stored scores: unavailable, named.
+  const custom = railRerank(RAIL_BASELINE, CHANGE({ objective: "custom", customWeight: 0.2, seq: 4 }));
+  assert.equal(custom.kind, "rerank-unavailable");
+  // A run with no stored options: unavailable, NOT a re-cost called instant.
+  const bare = railBaselineView({ sizing_results: [{ sizing_result_id: "x", run_kind: "solar_battery",
+    solar_kw: 6.6, battery_kwh: 10, evaluated_options: { dimension_keys: ["battery_id"], points: [] } }] });
+  const none = railRerank(bare, CHANGE({ objective: "max_npv", seq: 5 }));
+  assert.equal(none.kind, "rerank-unavailable");
+  assert.match(none.kind === "rerank-unavailable" ? none.reason : "", /did not record/);
+});
+
+// 6-D. A FAILED RE-COST returns to the stored figures and says so.
+test("3.14-6: a failed re-cost keeps the stored figures and says the attempt "
+  + "failed — and contradictions or substitutions are refused, not guessed", () => {
+  const physics = CHANGE({ kind: "physics", section: "tariff-network" });
+  const failed = railFailedState(physics, "the engine did not answer.");
+  assert.equal(failed.kind, "failed");
+  assert.equal(failed.canRetry, true);
+  const line = railStatusLine(failed) ?? "";
+  console.log(`        failed line: ${line}`);
+  assert.match(line, /did not complete/);
+  assert.match(line, /stored run's figures are shown/);
+  assert.match(line, /Try again/);
+  // From a response: an error body, a contradiction, a substituted battery,
+  // a missing provenance — every one FAILED, never a half-updated figure.
+  const ok = {
+    flags: [RAIL_DECLINE_FLAG], engine_mode: "sequential", resolution: "full_year",
+    constraint_deltas: null, chosen_solar: { solar_kw: 9.24 },
+    optimal_battery: { battery_id: "b1", usable_kwh: 9.83, system_cost: 12000,
+      annual_savings_vs_solar_only: 300, incremental_npv: 2900, self_sufficiency_pct: 85 },
+    solar_options: { chosen_index: 1, points: [{}, { annual_savings: 1800, npv_25yr: 17100 }] },
+  };
+  const cases: [string, unknown][] = [
+    ["error body", { error: "Internal error in the battery optimiser." }],
+    ["contradiction: declined AND deltas", { ...ok, constraint_deltas: { battery_kwh: 0 } }],
+    ["no decline flag", { ...ok, flags: [] }],
+    ["different battery", { ...ok, optimal_battery: { ...ok.optimal_battery, battery_id: "b2", usable_kwh: 13.5 } }],
+    ["different array", { ...ok, chosen_solar: { solar_kw: 10.12 } }],
+    ["battery gone from catalogue", { ...ok, flags: [RAIL_DECLINE_FLAG, "battery_ids not in the active catalogue — not evaluated: ['b1']"] }],
+    ["no engine_mode", { ...ok, engine_mode: undefined }],
+    ["no resolution", { ...ok, resolution: undefined }],
+    ["junk", null],
+  ];
+  for (const [label, resp] of cases) {
+    const st = railRecostState(RAIL_BASELINE, physics, resp);
+    assert.equal(st.kind, "failed", label);
+    console.log(`        ${label.padEnd(34)} -> ${st.kind === "failed" ? st.reason.slice(0, 70) : ""}`);
+  }
+  // And the healthy shape is a re-cost, with its provenance spelled out.
+  const good = railRecostState(RAIL_BASELINE, physics, ok);
+  assert.equal(good.kind, "recosted");
+  if (good.kind === "recosted") {
+    assert.equal(good.after.solarKw, 9.24);
+    assert.equal(good.after.batteryKwh, 9.83);
+    assert.equal(good.after.npv, 20000, "17100 + 2900, composed as the route composes");
+    assert.equal(good.after.paybackYears, 5.71, "12000 / 2100, rounded as _payback_years rounds");
+    assert.equal(good.provenance.engineMode, "sequential");
+    assert.equal(good.provenance.resolution, "full_year");
+    assert.match(good.provenance.label, /sequential engine/);
+    assert.match(good.provenance.label, /full-year dispatch/);
+    assert.deepEqual(good.before, RAIL_BASELINE.figures, "before IS the stored run");
+    const npv = good.deltas.find((d) => d.label === "NPV");
+    assert.equal(npv?.change, "+$64");
+    assert.equal(npv?.direction, "up");
+  }
+});
+
+// 6-E. NEVER "SAVED": the not-saved words on every recomputed state, absent on stored.
+test("3.14-6: the not-saved labelling is on EVERY recomputed state and absent on "
+  + "the stored state", () => {
+  const physics = CHANGE({ kind: "physics", section: "energy-data" });
+  const ok = {
+    flags: [RAIL_DECLINE_FLAG], engine_mode: "sequential", resolution: "full_year",
+    chosen_solar: { solar_kw: 9.24 },
+    optimal_battery: { battery_id: "b1", usable_kwh: 9.83, system_cost: 12000,
+      annual_savings_vs_solar_only: 300, incremental_npv: 2900, self_sufficiency_pct: 85 },
+    solar_options: { chosen_index: 1, points: [{}, { annual_savings: 1800, npv_25yr: 17100 }] },
+  };
+  const recomputed: RailState[] = [
+    railRerank(RAIL_BASELINE, CHANGE({ objective: "max_npv" })),
+    railRerank(RAIL_BASELINE, CHANGE({ objective: "max_self_sufficiency" })),
+    railRerank(RAIL_BASELINE, CHANGE({ objective: "custom" })),
+    { kind: "recosting", trigger: physics, startedAt: 1 },
+    railRecostState(RAIL_BASELINE, physics, ok),
+    railFailedState(physics, "x."),
+  ];
+  for (const st of recomputed) {
+    const line = railStatusLine(st) ?? "";
+    assert.ok(/not saved|nothing is saved|Nothing here is saved|stored run's figures are shown/i.test(line),
+      `${st.kind}: "${line}"`);
+    assert.ok(!/\bsaved\b(?! —)/.test(line.replace(/not saved|nothing is saved|Nothing here is saved/gi, "")),
+      `${st.kind} must never read as "saved"`);
+  }
+  assert.equal(railStatusLine({ kind: "stored" }), null, "stored: no recompute line at all");
+  for (const st of recomputed) {
+    if (st.kind === "reranked" || st.kind === "recosted") {
+      assert.equal(st.notSaved, RAIL_NOT_SAVED);
+    }
+  }
+  assert.match(RAIL_NOT_SAVED, /press Size to commit/i);
+});
+
+// 6-F. WHICH SECTIONS ANNOUNCE — the list derived from what the endpoints read.
+test("3.14-6: exactly the sections the engine reads announce a save; the bar is "
+  + "hosted by the body; the sizing routes are untouched", async () => {
+  const [fs, path] = await Promise.all([import("node:fs"), import("node:path")]);
+  const FRONTEND = path.resolve(import.meta.dirname, "..");
+  const read = (f: string) => fs.readFileSync(path.join(FRONTEND, f), "utf8");
+  const announcing: [string, string, number][] = [
+    // file, kind, number of announce sites
+    ["components/worksheet/address-roof-section.tsx", "physics", 2],
+    ["components/worksheet/site-details-section.tsx", "physics", 1],
+    ["components/worksheet/energy-data-section.tsx", "physics", 3],
+    ["components/worksheet/tariff-network-section.tsx", "physics", 1],
+    ["components/worksheet/objective-budget-section.tsx", "objective-budget", 1],
+  ];
+  for (const [file, kind, sites] of announcing) {
+    const s = read(file);
+    assert.equal((s.match(/onSaved\?\.\(/g) ?? []).length, sites, `${file}: announce sites`);
+    assert.ok(s.includes(`kind: "${kind}"`), `${file}: kind ${kind}`);
+    assert.ok(/onSaved\?: \(change: SizingInputSave\) => void;/.test(s), `${file}: optional prop`);
+  }
+  // SILENT by decision: equipment (the endpoints read roof.selected_panel and
+  // the company catalogue, never jobs.equipment_*), and the two Size sections
+  // (they create a NEW stored run, which resets the rail by id).
+  for (const file of [
+    "components/worksheet/equipment-specs-section.tsx",
+    "components/worksheet/solar-sizing-section.tsx",
+    "components/worksheet/battery-sizing-section.tsx",
+    "components/worksheet/job-edit-button.tsx",
+  ]) {
+    assert.ok(!read(file).includes("onSaved"), `${file} stays silent`);
+  }
+  const body = read("components/worksheet/worksheet-body.tsx");
+  assert.equal((body.match(/onSaved=\{announce\(section\.id\)\}/g) ?? []).length, 5,
+    "the body threads the callback to exactly five sections");
+  assert.match(body, /<ResultsBar[\s\S]*change=\{change\}/, "the body hosts the bar and hands it the change");
+  const page = read("app/(app)/jobs/[id]/worksheet/page.tsx");
+  assert.ok(!page.includes("<ResultsBar"), "page.tsx no longer renders the bar itself");
+  assert.match(page, /baseline: railBaselineView\(job\)/);
+  // The bar: no debounce, no timer, reuses RunProgress, posts the builder's body.
+  const bar = read("components/worksheet/results-bar.tsx");
+  assert.ok(!/setTimeout|debounce/.test(bar), "the trigger is a save, never a keystroke (D37)");
+  assert.match(bar, /<RunProgress startedAt=\{rail\.startedAt\} \/>/);
+  assert.match(bar, /railRecostRequest\(baseline, jobId\)/);
+  assert.match(bar, /requestJson<Record<string, unknown>>\(\s*"POST",\s*baseline\.endpoint,\s*body,?\s*\)/);
+  // The API routes forward unaltered — no whitelist was added.
+  for (const route of ["app/api/sizing/optimise/route.ts", "app/api/sizing/battery/route.ts"]) {
+    assert.ok(!/persist|compare_to_unconstrained/.test(read(route)), `${route} untouched`);
+  }
 });

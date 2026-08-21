@@ -40,6 +40,7 @@ import {
   type RoofDiagramReason,
   type RoofDiagramView,
   type RoofNoticeView,
+  type SizingInputSave,
 } from "@/lib/worksheet";
 import type { ApiErrorKind } from "@/lib/jobs";
 
@@ -140,12 +141,17 @@ function fmtMetres(value: number | null): string {
 export function AddressRoofSection({
   view,
   jobId,
+  onSaved,
   isOpen,
   showsMultiDwellingCaution = false,
   diagram,
 }: {
   view: AddressRoofView;
   jobId: string;
+  /** 3.14 prompt 6 (D37): called after a PERSISTED save so the results rail
+      can answer "what did that change do". Optional — absent means silent,
+      and the rail keeps showing the stored run. */
+  onSaved?: (change: SizingInputSave) => void;
   isOpen: boolean;
   /** F99 (3.4b) — derived ONCE in siteDetailsView; this section only renders it,
       beside the roof numbers the warning is about. */
@@ -209,6 +215,7 @@ export function AddressRoofSection({
       }
       const data = result.data ?? {};
       if (data.persisted === false) setUnsaved(true);
+      else onSaved?.({ kind: "physics" }); // a new roof: the engine re-costs
       const cc = data.site_cross_check;
       if (typeof cc === "object" && cc !== null) {
         const c = cc as Record<string, unknown>;
@@ -284,6 +291,7 @@ export function AddressRoofSection({
       }
       const data = result.data ?? {};
       if (data.persisted === false) setUnsaved(true);
+      else onSaved?.({ kind: "physics" }); // a new roof: the engine re-costs
       closeForm();
       router.refresh();
     } finally {

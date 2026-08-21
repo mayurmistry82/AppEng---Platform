@@ -1,6 +1,5 @@
 import Link from "next/link";
 import { AlertTriangle } from "lucide-react";
-import { ResultsBar } from "@/components/worksheet/results-bar";
 import { WorksheetBody } from "@/components/worksheet/worksheet-body";
 import { apiGet } from "@/lib/api-server";
 import { getJob } from "@/lib/job-server";
@@ -11,6 +10,7 @@ import {
   equipmentSpecsView,
   objectiveBudgetView,
   phaseStates,
+  railBaselineView,
   resultsBarView,
   resultsView,
   solarCurveView,
@@ -121,17 +121,17 @@ export default async function Page({
 
   return (
     <div className="w-full px-6 pb-8">
-      {/* 3.14 prompt 3: the job id travels so D3's auto-expand can fire ONCE
-          for this job — the bar's own preference key holds no job id. */}
-      <ResultsBar
-        view={resultsBarView(job)}
-        jobId={id}
-        // 3.14 prompt 4: the value-versus-size curve, built server-side from
-        // the stored run. The CHART itself is fetched on demand inside the
-        // bar, so recharts stays out of this route's First Load.
-        curve={solarCurveView(job)}
-      />
+      {/* 3.14 prompt 6 (D37): the body renders the bar, first, in this same
+          position — it hosts the one piece of state a section's save
+          announces through. The bar's view (3.3), curve (prompt 4) and the
+          rail's baseline are all built server-side from the stored run; the
+          chart chunk is still fetched on demand inside the bar (F47). */}
       <WorksheetBody
+        resultsBar={{
+          view: resultsBarView(job),
+          curve: solarCurveView(job),
+          baseline: railBaselineView(job),
+        }}
         sections={sections}
         phases={phaseStates(job)}
         addressRoof={addressRoofView(job)}

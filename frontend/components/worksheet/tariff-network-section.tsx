@@ -26,6 +26,7 @@ import {
   type RoofNoticeView,
   type TariffNetworkView,
   type TariffWindowFormRow,
+  type SizingInputSave,
 } from "@/lib/worksheet";
 
 /**
@@ -95,9 +96,14 @@ function saveErrorCopy(kind: ApiErrorKind, status: number, message: string) {
 export function TariffNetworkSection({
   view,
   jobId,
+  onSaved,
 }: {
   view: TariffNetworkView;
   jobId: string;
+  /** 3.14 prompt 6 (D37): called after a PERSISTED save so the results rail
+      can answer "what did that change do". Optional — absent means silent,
+      and the rail keeps showing the stored run. */
+  onSaved?: (change: SizingInputSave) => void;
 }) {
   const router = useRouter();
   const [form, setForm] = React.useState<FormState>(() => fromView(view));
@@ -248,6 +254,7 @@ export function TariffNetworkSection({
       setSaveNotices(notices);
       if (result.data.saved === false) return; // never reads as success
       setSavedTick(true);
+      onSaved?.({ kind: "physics" }); // tariff, feed-in, export limit: re-cost
       router.refresh();
     } finally {
       setSaving(false);

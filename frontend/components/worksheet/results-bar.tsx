@@ -5,13 +5,21 @@ import dynamic from "next/dynamic";
 import { ChevronDown, ChevronRight } from "lucide-react";
 import { KpiTile } from "@/components/ui/kpi-tile";
 import { PinChip } from "@/components/ui/override-drawer";
+import { RunProgress } from "@/components/ui/run-progress";
 import type { ScoreCurveProps } from "@/components/results/score-curve";
+import { requestJson } from "@/lib/client-api";
 import {
   formatKw,
   formatKwh,
   formatMoney,
   formatPct,
   formatYears,
+  railFailedState,
+  railFiguresFor,
+  railRecostRequest,
+  railRecostState,
+  railRerank,
+  railStatusLine,
   RESULTS_BAR_DEFAULT_HEIGHT,
   RESULTS_BAR_MIN_HEIGHT,
   RESULTS_BAR_AUTOEXPAND_STORAGE_KEY,
@@ -23,9 +31,13 @@ import {
   parseResultsBarPreference,
   resultsBarDefaultCollapsed,
   shouldAutoExpandResultsBar,
+  type RailBaseline,
+  type RailDelta,
+  type RailState,
   type ResultsBarMetrics,
   type ResultsBarView,
   type ScoreCurveView,
+  type SizingInputChange,
 } from "@/lib/worksheet";
 
 /**
@@ -146,10 +158,26 @@ const ScoreCurve = dynamic<ScoreCurveProps>(
  */
 const RAIL_ROW_HEIGHT = 30;
 
+/**
+ * 3.14 prompt 6 (D37) — THE LIVE RAIL. The bar answers "what did that change
+ * do": INSTANTLY from the stored options on an objective/budget save, and
+ * by RE-COSTING the stored system (persist false, compare_to_unconstrained
+ * false, pinned) on a physics save. Every state is derived in lib
+ * (RailState) and this component only renders it. It NEVER re-searches, it
+ * saves NOTHING, and the status line beneath the tiles is the only carrier
+ * of where a recomputed figure came from — so it is always present on a
+ * recomputed state and never on the stored one.
+ *
+ * A new stored run (a Size) changes the baseline's sizing_result_id; any
+ * client-side recompute belonged to the old run and is dropped, never shown
+ * beside the new one.
+ */
 export function ResultsBar({
   view,
   jobId,
   curve,
+  baseline,
+  change,
 }: {
   view: ResultsBarView;
   /** 3.14 prompt 3: D3's auto-expand is ONCE PER JOB, so the bar must know
@@ -159,7 +187,73 @@ export function ResultsBar({
   /** 3.14 prompt 4: the value-versus-size curve, built by solarCurveView.
       Optional — without it the chart area keeps its previous behaviour. */
   curve?: ScoreCurveView;
+  /** 3.14 prompt 6: the stored run the rail recomputes against. */
+  baseline?: RailBaseline;
+  /** 3.14 prompt 6: the last announced save, or null. */
+  change?: SizingInputChange | null;
 }) {
+  const [rail, setRail] = React.useState<RailState>({ kind: "stored" });
+  // The change the rail has already acted on — a new seq acts once.
+  const actedSeq = React.useRef(0);
+  // The baseline the current rail state belongs to.
+  const railBaselineId = React.useRef<string | null>(baseline?.sizingResultId ?? null);
+
+  const recost = React.useCallback(
+    async (trigger: SizingInputChange) => {
+      if (!baseline || !jobId) {
+        setRail(railFailedState(trigger, "the rail has no stored run to re-cost."));
+        return;
+      }
+      const body = railRecostRequest(baseline, jobId);
+      if (body === null || baseline.endpoint === null) {
+        setRail(railFailedState(trigger, "the stored run has no system that can be pinned."));
+        return;
+      }
+      setRail({ kind: "recosting", trigger, startedAt: Date.now() });
+      const result = await requestJson<Record<string, unknown>>(
+        "POST",
+        baseline.endpoint,
+        body,
+      );
+      // A later change superseded this one while it was in flight.
+      if (actedSeq.current !== trigger.seq) return;
+      if (!result.ok) {
+        setRail(
+          railFailedState(
+            trigger,
+            result.kind === "auth"
+              ? "your session has expired — sign in again."
+              : result.message || "the engine did not answer.",
+          ),
+        );
+        return;
+      }
+      setRail(railRecostState(baseline, trigger, result.data));
+    },
+    [baseline, jobId],
+  );
+
+  // A NEW STORED RUN supersedes anything the rail computed against the old one.
+  React.useEffect(() => {
+    const id = baseline?.sizingResultId ?? null;
+    if (id !== railBaselineId.current) {
+      railBaselineId.current = id;
+      setRail({ kind: "stored" });
+    }
+  }, [baseline?.sizingResultId]);
+
+  // A SAVE ANNOUNCED: act on it once.
+  React.useEffect(() => {
+    if (!change || change.seq === actedSeq.current) return;
+    actedSeq.current = change.seq;
+    if (!baseline) return; // nothing to recompute against — stays stored
+    if (change.kind === "objective-budget") {
+      setRail(railRerank(baseline, change));
+    } else {
+      void recost(change);
+    }
+  }, [change, baseline, recost]);
+
   // First render: the D3 default, derived purely from props so server and
   // client agree. The stored preference is applied in the effect below.
   const [collapsed, setCollapsed] = React.useState(() =>
@@ -379,10 +473,38 @@ export function ResultsBar({
   // the smallest drag; past this the plot scrolls rather than shrinking.
   const railPlotHeight = Math.max(120, height - 210);
 
+  // The figures the tiles show: the stored run's, or the rail's "after".
+  const storedFigures = baseline?.figures ?? {
+    solarKw: view.sized ? view.solarKw : null,
+    batteryKwh: view.sized ? view.batteryKwh : null,
+    paybackYears: view.sized ? view.paybackYears : null,
+    npv: view.sized ? view.npv : null,
+    selfSufficiencyPct: view.sized ? view.selfSufficiencyPct : null,
+    basis: "whole-system" as const,
+  };
+  const shown = railFiguresFor(rail, storedFigures);
+  const recomputed = rail.kind === "reranked" || rail.kind === "recosted";
+  const deltas: RailDelta[] = recomputed ? rail.deltas : [];
+  const deltaFor = (label: string): RailDelta | null =>
+    deltas.find((d) => d.label === label) ?? null;
+  const tileDelta = (label: string, fallback: string): React.ReactNode => {
+    const d = deltaFor(label);
+    if (!d) return fallback;
+    return d.direction === "none"
+      ? `was ${d.before} · no change`
+      : `was ${d.before} · ${d.change}`;
+  };
+  const tileSign = (label: string, higherIsBetter: boolean) => {
+    const d = deltaFor(label);
+    if (!d || d.direction === "none") return undefined;
+    return (d.direction === "up") === higherIsBetter ? "positive" : "negative";
+  };
+  const statusLine = railStatusLine(rail);
+
   const heroValue = view.sized
     ? [
-        view.solarKw != null ? formatKw(view.solarKw) : null,
-        view.batteryKwh != null ? formatKwh(view.batteryKwh) : null,
+        shown.solarKw != null ? formatKw(shown.solarKw) : null,
+        shown.batteryKwh != null ? formatKwh(shown.batteryKwh) : null,
       ]
         .filter(Boolean)
         .join(" + ") || "—"
@@ -421,34 +543,55 @@ export function ResultsBar({
             (no flex-1 here — the chart below gets that). */}
         <div className="flex shrink-0 flex-col gap-2 overflow-y-auto">
           <div className="grid grid-cols-5 gap-2">
+            {/* 3.14 prompt 6: before-and-after. A recomputed state shows the
+                new figure with "was X · +Y" beneath it; the stored state
+                keeps its caption. The hero tile's battery line is marked
+                when a re-rank moved the array (D37 clause 3). */}
             <KpiTile
               className="col-span-1"
               label="Recommended system"
               value={heroValue}
-              delta={view.sized ? "latest sizing run" : "—"}
-            />
-            <KpiTile
-              label="Payback"
-              value={
-                view.sized && view.paybackYears != null
-                  ? formatYears(view.paybackYears)
-                  : "—"
+              delta={
+                !view.sized
+                  ? "—"
+                  : rail.kind === "reranked" && rail.batteryStale
+                    ? `solar re-ranked · battery from the ${formatKw(storedFigures.solarKw)} array, not resolved`
+                    : recomputed
+                      ? `was ${[
+                          storedFigures.solarKw != null ? formatKw(storedFigures.solarKw) : null,
+                          storedFigures.batteryKwh != null ? formatKwh(storedFigures.batteryKwh) : null,
+                        ].filter(Boolean).join(" + ") || "—"} · not saved`
+                      : "latest sizing run"
               }
             />
             <KpiTile
-              label="NPV"
-              value={view.sized && view.npv != null ? formatMoney(view.npv) : "—"}
+              label={shown.basis === "solar-only" ? "Payback (solar only)" : "Payback"}
+              value={
+                view.sized && shown.paybackYears != null
+                  ? formatYears(shown.paybackYears)
+                  : "—"
+              }
+              delta={tileDelta("Payback", "")}
+              deltaSign={tileSign("Payback", false)}
+            />
+            <KpiTile
+              label={shown.basis === "solar-only" ? "NPV (solar only)" : "NPV"}
+              value={view.sized && shown.npv != null ? formatMoney(shown.npv) : "—"}
+              delta={tileDelta("NPV", "")}
+              deltaSign={tileSign("NPV", true)}
             />
             {/* 3.13 prompt 4 (E): read from the SAME stored derivations the
                 Results section uses — the bar showed dashes eight lines above
                 a section showing 84.1%, on one screen. */}
             <KpiTile
-              label="Self-sufficiency"
+              label={shown.basis === "solar-only" ? "Self-sufficiency (solar only)" : "Self-sufficiency"}
               value={
-                view.sized && view.selfSufficiencyPct != null
-                  ? formatPct(view.selfSufficiencyPct)
+                view.sized && shown.selfSufficiencyPct != null
+                  ? formatPct(shown.selfSufficiencyPct)
                   : "—"
               }
+              delta={tileDelta("Self-sufficiency", "")}
+              deltaSign={tileSign("Self-sufficiency", true)}
             />
             {/* 3.14 prompt 3 (F205), label decided by Mayur 2026-08-21. The
                 THREE cases are discriminated in lib/worksheet.ts, not here —
@@ -461,6 +604,38 @@ export function ResultsBar({
               value={view.sized ? view.valueOrigin.label : "—"}
             />
           </div>
+          {/* 3.14 prompt 6: THE ONE LINE that says where the figures came
+              from and that nothing is saved — derived per state in lib, so
+              the suite holds it present on every recomputed state and
+              absent on the stored one. While re-costing, the 3.13 progress
+              indicator, unchanged. */}
+          {rail.kind === "recosting" ? (
+            <div className="flex items-center gap-2">
+              <RunProgress startedAt={rail.startedAt} />
+              <span className="text-caption text-muted-foreground">{statusLine}</span>
+            </div>
+          ) : statusLine ? (
+            <div className="flex flex-wrap items-center gap-2">
+              <span
+                className={
+                  rail.kind === "failed"
+                    ? "text-caption text-destructive"
+                    : "text-caption text-muted-foreground"
+                }
+              >
+                {statusLine}
+              </span>
+              {rail.kind === "failed" && rail.canRetry ? (
+                <button
+                  type="button"
+                  onClick={() => void recost(rail.trigger)}
+                  className="rounded-md border border-border px-2 py-0.5 text-caption text-foreground transition hover:bg-accent hover:text-accent-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+                >
+                  Try again
+                </button>
+              ) : null}
+            </div>
+          ) : null}
           <div className="flex flex-wrap items-center gap-1.5">
             <PinChip>reserve —</PinChip>
             <PinChip>VPP —</PinChip>

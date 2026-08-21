@@ -15,7 +15,7 @@ import {
 } from "@/components/ui/select";
 import { requestJson } from "@/lib/client-api";
 import { clientActionErrorCopy } from "@/lib/jobs";
-import type { SiteDetailsView } from "@/lib/worksheet";
+import type { SiteDetailsView, SizingInputSave } from "@/lib/worksheet";
 
 /**
  * Site details (checklist 3.4b) — site-visit fields, governed by D5: Mayur's
@@ -108,9 +108,14 @@ const BOUNDS: Partial<Record<keyof FormState, { min: number; max: number; label:
 export function SiteDetailsSection({
   view,
   jobId,
+  onSaved,
 }: {
   view: SiteDetailsView;
   jobId: string;
+  /** 3.14 prompt 6 (D37): called after a PERSISTED save so the results rail
+      can answer "what did that change do". Optional — absent means silent,
+      and the rail keeps showing the stored run. */
+  onSaved?: (change: SizingInputSave) => void;
 }) {
   const router = useRouter();
   const [form, setForm] = React.useState<FormState>(() => fromView(view));
@@ -180,6 +185,7 @@ export function SiteDetailsSection({
         return; // values intact, no navigation
       }
       setSavedTick(true);
+      onSaved?.({ kind: "physics" }); // site state/postcode price the system
       router.refresh();
     } finally {
       setSaving(false);

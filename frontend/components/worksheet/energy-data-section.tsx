@@ -43,6 +43,7 @@ import {
   type LoadPreviewView,
   type RoofNoticeView,
   type SurveyAnswers,
+  type SizingInputSave,
 } from "@/lib/worksheet";
 import type { ApiErrorKind } from "@/lib/jobs";
 
@@ -148,9 +149,14 @@ interface DemandRecorded {
 export function EnergyDataSection({
   view,
   jobId,
+  onSaved,
 }: {
   view: EnergyDataView;
   jobId: string;
+  /** 3.14 prompt 6 (D37): called after a PERSISTED save so the results rail
+      can answer "what did that change do". Optional — absent means silent,
+      and the rail keeps showing the stored run. */
+  onSaved?: (change: SizingInputSave) => void;
 }) {
   const router = useRouter();
   const [busy, setBusy] = React.useState<"interval" | "bill" | "demand" | null>(null);
@@ -222,6 +228,7 @@ export function EnergyDataSection({
           corrected: false,
         });
       }
+      onSaved?.({ kind: "physics" }); // a new load series: the engine re-costs
       router.refresh();
     } finally {
       setBusy(null);
@@ -248,6 +255,7 @@ export function EnergyDataSection({
       setBill(parsed);
       setBillCorrecting(false);
       setCorr(parsed.correction);
+      onSaved?.({ kind: "physics" }); // the bill feeds load AND tariff fallbacks
       router.refresh(); // the bills row is persisted server-side
     } finally {
       setBusy(null);
@@ -364,6 +372,7 @@ export function EnergyDataSection({
         surveyIncluded: anyAnswer,
         corrected: edited.totalKwh || edited.periodDays || edited.dailyAvgKwh,
       });
+      onSaved?.({ kind: "physics" }); // a new load profile: the engine re-costs
       router.refresh(); // completeness reads the DATABASE
     } finally {
       setBusy(null);

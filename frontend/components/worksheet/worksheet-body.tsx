@@ -13,6 +13,7 @@ import { BatterySizingSection } from "@/components/worksheet/battery-sizing-sect
 import { EnergyDataSection } from "@/components/worksheet/energy-data-section";
 import { EquipmentSpecsSection } from "@/components/worksheet/equipment-specs-section";
 import { ObjectiveBudgetSection } from "@/components/worksheet/objective-budget-section";
+import { ResultsBar } from "@/components/worksheet/results-bar";
 import { ResultsSection } from "@/components/worksheet/results-section";
 import { SiteDetailsSection } from "@/components/worksheet/site-details-section";
 import { SolarSizingSection } from "@/components/worksheet/solar-sizing-section";
@@ -24,7 +25,12 @@ import {
   type EnergyDataView,
   type EquipmentSpecsView,
   type ObjectiveBudgetView,
+  type RailBaseline,
+  type ResultsBarView,
   type ResultsView,
+  type ScoreCurveView,
+  type SizingInputChange,
+  type SizingInputSave,
   type RoofDiagramView,
   type SiteDetailsView,
   type SolarSizingView,
@@ -65,6 +71,14 @@ import {
  *             renders here as a plain <details> matching the section shell with
  *             the NEUTRAL empty tick. Unreachable for the four real draft jobs;
  *             revisited at 3.3b.
+ *
+ * 3.14 prompt 6 (D37): THE BODY HOSTS THE RESULTS BAR, so the smallest thing
+ * that lets a section tell the rail "I saved, and here is what kind of change
+ * it was" is one piece of React state here and one optional `onSaved` prop
+ * on each announcing section. No context, no store, no fingerprinting of the
+ * job's data (that would be a second implementation of what the engine reads
+ * — 2R.1). The bar renders first, exactly where page.tsx used to render it,
+ * so nothing on the worksheet moves.
  */
 
 export interface WorksheetBodySection {
@@ -89,6 +103,7 @@ export function WorksheetBody({
   batterySizing,
   results,
   jobId,
+  resultsBar,
 }: {
   sections: readonly WorksheetBodySection[];
   phases: readonly [PhaseNodeState, PhaseNodeState, PhaseNodeState, PhaseNodeState];
@@ -119,7 +134,26 @@ export function WorksheetBody({
       once it completes, Incentives and Summary & finish unlock behind it. */
   results?: ResultsView;
   jobId?: string;
+  /** 3.14 prompt 6: the results bar's stored view, curve and rail baseline.
+      Optional — without it the body renders no bar, exactly as before. */
+  resultsBar?: {
+    view: ResultsBarView;
+    curve: ScoreCurveView;
+    baseline: RailBaseline;
+  };
 }) {
+  // The announcement: set by an announcing section on a persisted save, read
+  // by the bar. `seq` makes a repeated identical save announce again.
+  const [change, setChange] = React.useState<SizingInputChange | null>(null);
+  const seq = React.useRef(0);
+  const announce = React.useCallback(
+    (section: string) => (save: SizingInputSave) => {
+      seq.current += 1;
+      setChange({ ...save, section, seq: seq.current });
+    },
+    [],
+  );
+
   const [openIds, setOpenIds] = React.useState<Record<string, boolean>>(() => {
     const active = sections.find((s) => s.state === "active");
     return active ? { [active.id]: true } : {};
@@ -157,15 +191,16 @@ export function WorksheetBody({
           isOpen={!!openIds[section.id]}
           showsMultiDwellingCaution={siteDetails?.showsMultiDwellingCaution ?? false}
           diagram={roofDiagram}
+          onSaved={announce(section.id)}
         />
       ) : section.id === "site-details" && siteDetails && jobId ? (
-        <SiteDetailsSection view={siteDetails} jobId={jobId} />
+        <SiteDetailsSection view={siteDetails} jobId={jobId} onSaved={announce(section.id)} />
       ) : section.id === "energy-data" && energyData && jobId ? (
-        <EnergyDataSection view={energyData} jobId={jobId} />
+        <EnergyDataSection view={energyData} jobId={jobId} onSaved={announce(section.id)} />
       ) : section.id === "tariff-network" && tariffNetwork && jobId ? (
-        <TariffNetworkSection view={tariffNetwork} jobId={jobId} />
+        <TariffNetworkSection view={tariffNetwork} jobId={jobId} onSaved={announce(section.id)} />
       ) : section.id === "objective-budget" && objectiveBudget && jobId ? (
-        <ObjectiveBudgetSection view={objectiveBudget} jobId={jobId} />
+        <ObjectiveBudgetSection view={objectiveBudget} jobId={jobId} onSaved={announce(section.id)} />
       ) : section.id === "equipment-specs" && equipmentSpecs && jobId ? (
         <EquipmentSpecsSection view={equipmentSpecs} jobId={jobId} />
       ) : section.id === "solar-sizing" && solarSizing && jobId ? (
@@ -221,6 +256,17 @@ export function WorksheetBody({
   }
 
   return (
+    <>
+      {/* 3.14 prompt 6: the bar, first — the same position page.tsx gave it. */}
+      {resultsBar ? (
+        <ResultsBar
+          view={resultsBar.view}
+          jobId={jobId}
+          curve={resultsBar.curve}
+          baseline={resultsBar.baseline}
+          change={change}
+        />
+      ) : null}
     <div className="mt-3">
       {/* Toolbar — wireframe `.wtoolbar` */}
       <div className="flex items-center gap-2">
@@ -264,5 +310,6 @@ export function WorksheetBody({
         })}
       </div>
     </div>
+    </>
   );
 }
