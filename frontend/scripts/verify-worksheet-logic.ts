@@ -13,6 +13,18 @@ import {
   PHASE_ORDER,
   CHOSEN_NOT_RECORDED_NOTE,
   RAIL_DECLINE_FLAG,
+  RAIL_SELF_SUFFICIENCY_CURRENT_ONLY,
+  RAIL_SPLIT_CURRENT_ONLY,
+  parseRunHistory,
+  railCompareView,
+  railComparability,
+  railHistoryMeta,
+  railHistoryNotice,
+  railPickerState,
+  railRerankedCurve,
+  rankSolarPoints,
+  type RailHistoryRun,
+  type RailRunMeta,
   RAIL_NOT_SAVED,
   RAIL_STATE_KINDS,
   railBaselineView,
@@ -8246,4 +8258,297 @@ test("3.14-6: exactly the sections the engine reads announce a save; the bar is 
   for (const route of ["app/api/sizing/optimise/route.ts", "app/api/sizing/battery/route.ts"]) {
     assert.ok(!/persist|compare_to_unconstrained/.test(read(route)), `${route} untouched`);
   }
+});
+
+
+// ── 3.14 prompt 8 — the chart follows the rail (F210), and the baseline ───────
+
+const HISTORY_PAYLOAD = {
+  job_id: "job-1",
+  runs: [
+    { sizing_result_id: "s-batt", created_at: "2026-08-21T02:00:00Z", run_kind: "solar_battery",
+      engine_mode: "sequential", objective_used: "max_npv", dispatch_resolution: "full_year",
+      solar_kw: 9.24, battery_kwh: 9.83, system_cost: 11868.77, self_consumption_ratio: 0.5425,
+      has_chosen_marker: true, has_solar_curve: true, financial_result_id: "f1",
+      payback_years: 5.55, npv_25_year: 19935.55, undiscounted_savings_25yr: 56539.32 },
+    { sizing_result_id: "s-old", created_at: "2026-08-20T05:00:00Z", run_kind: "solar_battery",
+      engine_mode: "sequential", objective_used: "max_npv", dispatch_resolution: null,
+      solar_kw: 6.6, battery_kwh: 13.5, system_cost: 16000, self_consumption_ratio: 0.61,
+      has_chosen_marker: false, has_solar_curve: false, financial_result_id: "f0",
+      payback_years: 7.1, npv_25_year: 15000, undiscounted_savings_25yr: 40000 },
+    { sizing_result_id: "s-nofin", created_at: "2026-08-19T05:00:00Z", run_kind: "solar",
+      engine_mode: "sequential", objective_used: "min_payback", dispatch_resolution: null,
+      solar_kw: 4.84, battery_kwh: null, system_cost: 4900, self_consumption_ratio: null,
+      has_chosen_marker: false, has_solar_curve: false, financial_result_id: null,
+      payback_years: null, npv_25_year: null, undiscounted_savings_25yr: null },
+  ],
+  total: 3, returned: 3, limit: 25, offset: 0, truncated: false,
+};
+const HISTORY = parseRunHistory(HISTORY_PAYLOAD);
+// The prompt-3 fixture carries no objective_used / engine_mode (they were not
+// what it tested); the compare is ABOUT those facts, so this run states them
+// the way every run since 3.11b is stored.
+const SCORED_BATTERY_RUN = {
+  ...STORED_BATTERY_RUN, objective_used: "max_npv", engine_mode: "sequential",
+};
+const RAIL_JOB8 = { ...RAIL_JOB, sizing_results: [SCORED_BATTERY_RUN] };
+const RAIL_BASELINE8 = railBaselineView(RAIL_JOB8);
+const CURRENT_META: RailRunMeta = RAIL_BASELINE8.meta;
+
+// 8-A. THE CHART RE-RANKS WITH THE RAIL — four respects, all different.
+test("3.14-8 F210: the re-ranked chart differs from the stored one in top "
+  + "option, axis measure, caption AND highlighted bar — from the same points", () => {
+  const stored = solarCurveView(RAIL_JOB8);
+  const change = CHANGE({ objective: "max_self_sufficiency" });
+  const rail = railRerank(RAIL_BASELINE8, change);
+  const reranked = railRerankedCurve(RAIL_BASELINE8, change);
+  assert.ok(stored.bars && reranked?.bars, "both views draw");
+  // (1) the same stored points — same bars, same count, same labels.
+  assert.deepEqual(reranked.bars.map((b) => b.label), stored.bars.map((b) => b.label),
+    "the SAME stored points, not a second set");
+  // (2) a different top option, and it is the RAIL's own pick — one ranking.
+  // Typed wide on purpose: assert.equal narrows a literal, and the later
+  // `!==` between the two must stay a real comparison, not a dead one.
+  const storedTop: string | undefined = stored.bars.find((b) => b.chosen)?.label;
+  const rerankTop: string | undefined = reranked.bars.find((b) => b.chosen)?.label;
+  assert.equal(storedTop, "9.24 kW");
+  assert.equal(rerankTop, "10.12 kW");
+  assert.notEqual(rerankTop, storedTop, "(2) a different highlighted bar");
+  assert.equal(rail.kind, "reranked");
+  assert.equal(rail.kind === "reranked" ? formatKw(rail.after.solarKw) : null, rerankTop,
+    "the chart highlights EXACTLY the array the rail names");
+  // (3) a different axis measure.
+  const storedAxis: string = stored.valueLabel;
+  const rerankAxis: string = reranked.valueLabel;
+  assert.equal(storedAxis, "25-year NPV");
+  assert.equal(rerankAxis, "Self-sufficiency (%)");
+  assert.notEqual(rerankAxis, storedAxis, "(3) the axis follows the objective");
+  assert.equal(reranked.unit, "pct");
+  assert.notEqual(reranked.unit, stored.unit);
+  // (4) a caption naming the APPLIED objective and the stored one.
+  assert.equal(stored.objectiveLabel, "maximum NPV");
+  assert.match(reranked.objectiveLabel ?? "", /maximum self-sufficiency/);
+  assert.match(reranked.objectiveLabel ?? "", /re-ranked now/);
+  assert.match(reranked.objectiveLabel ?? "", /scored for maximum NPV/);
+  assert.notEqual(reranked.objectiveLabel, stored.objectiveLabel, "(4) the caption");
+  assert.match(reranked.chosenNote ?? "", /10\.12 kW is the top array/);
+  assert.match(reranked.chosenNote ?? "", /Nothing here is saved/);
+  console.log(`        stored  : top=${storedTop} axis=${stored.valueLabel} caption="${stored.objectiveLabel}"`);
+  console.log(`        reranked: top=${rerankTop} axis=${reranked.valueLabel} caption="${reranked.objectiveLabel}"`);
+  // A test that passes when only one respect changes is not testing this:
+  // Fresh reads: assert.equal narrows the consts above to their literals,
+  // which would make these comparisons dead in the type system.
+  const respects = [
+    reranked.bars.find((b) => b.chosen)?.label !== stored.bars.find((b) => b.chosen)?.label,
+    reranked.valueLabel !== stored.valueLabel,
+    reranked.objectiveLabel !== stored.objectiveLabel,
+    reranked.bars.findIndex((b) => b.chosen) !== stored.bars.findIndex((b) => b.chosen),
+  ];
+  assert.equal(respects.filter(Boolean).length, 4, `all four must differ: ${respects}`);
+  // The same objective re-applied changes NOTHING but the caption — the
+  // highlighted bar and the axis are identical to the stored view.
+  const same = railRerankedCurve(RAIL_BASELINE8, CHANGE({ objective: "max_npv" }));
+  assert.equal(same?.bars?.find((b) => b.chosen)?.label, storedTop);
+  assert.equal(same?.valueLabel, stored.valueLabel);
+  // ONE ranking: rankSolarPoints is what both consult.
+  const r = rankSolarPoints(RAIL_BASELINE8.solarPoints, "max_self_sufficiency", null);
+  assert.ok(r.ok && r.topIndex === reranked.bars.findIndex((b) => b.chosen) + 1,
+    "the chart's chosen bar is the ranking's topIndex (bars omit the baseline point)");
+});
+
+// 8-B. THE TIE SENTENCE FOLLOWS THE MEASURE.
+test("3.14-8 F210: the tie sentence is recomputed against the applied measure — "
+  + "a tie on value is not a tie on payback", () => {
+  // Ties on 25-year value (within $28) and NOT on payback (2.4 vs 4.2 vs 4.6 yr).
+  const tiedOnValue = {
+    ...RAIL_JOB,
+    sizing_results: [{
+      ...STORED_SOLAR_RUN, objective_used: "max_npv", engine_mode: "sequential",
+      evaluated_options: {
+        dimension_keys: ["solar_kw"], chosen_index: 2,
+        points: [
+          { solar_kw: 0, npv_25yr: 0, simple_payback_years: null, self_sufficiency_pct: 0, system_cost: 0 },
+          { solar_kw: 1.32, npv_25yr: 17040, simple_payback_years: 2.4, self_sufficiency_pct: 18, system_cost: 2100 },
+          { solar_kw: 9.24, npv_25yr: 17068, simple_payback_years: 4.2, self_sufficiency_pct: 65, system_cost: 7248 },
+          { solar_kw: 11.44, npv_25yr: 17062, simple_payback_years: 4.6, self_sufficiency_pct: 72, system_cost: 8600 },
+        ],
+      },
+    }],
+  };
+  const base = railBaselineView(tiedOnValue);
+  const onValue = railRerankedCurve(base, CHANGE({ objective: "max_npv" }));
+  const onPayback = railRerankedCurve(base, CHANGE({ objective: "min_payback" }));
+  assert.ok(onValue?.bars && onPayback?.bars);
+  console.log(`        max_npv     : flatNote = ${onValue.flatNote}`);
+  console.log(`        min_payback : flatNote = ${onPayback.flatNote}`);
+  assert.ok(onValue.flatNote, "the three tie on value — the sentence appears");
+  assert.match(onValue.flatNote ?? "", /\$28/);
+  assert.equal(onPayback.flatNote, null,
+    "2.4 / 4.2 / 4.6 years is no tie — the sentence must NOT be carried over");
+  assert.equal(onPayback.bars.find((b) => b.chosen)?.label, "1.32 kW", "shortest payback wins");
+  assert.equal(onValue.bars.find((b) => b.chosen)?.label, "9.24 kW");
+});
+
+// 8-C. THE COMPARABILITY VERDICT — one outcome per reason, all distinct.
+test("3.14-8 D33: the comparability verdict names each reason — five distinct "
+  + "outcomes", () => {
+  const same: RailRunMeta = { ...CURRENT_META, sizingResultId: "b" };
+  const cases: [string, RailRunMeta][] = [
+    ["fully comparable", same],
+    ["different engine", { ...same, engineMode: "combined" }],
+    ["different resolution", { ...same, dispatchResolution: "representative_days" }],
+    ["resolution not recorded", { ...same, dispatchResolution: null }],
+    ["different objective", { ...same, objectiveUsed: "min_payback" }],
+  ];
+  const outcomes = cases.map(([label, meta]) => {
+    const v = railComparability(CURRENT_META, meta);
+    const key = v.comparable ? "comparable" : v.reasons.map((r) => r.kind).join("+");
+    console.log(`        ${label.padEnd(24)} -> ${key.padEnd(24)} ${v.headline.slice(0, 80)}`);
+    return key;
+  });
+  assert.deepEqual(outcomes, [
+    "comparable", "engine-differs", "resolution-differs", "resolution-not-recorded",
+    "objective-differs",
+  ]);
+  assert.equal(new Set(outcomes).size, 5, "five distinct outcomes");
+  // The engine is the HEADLINE when several reasons apply.
+  const worst = railComparability(CURRENT_META, {
+    ...same, engineMode: "combined", dispatchResolution: null, objectiveUsed: "custom",
+  });
+  assert.equal(worst.reasons.length, 3);
+  assert.equal(worst.reasons[0].kind, "engine-differs");
+  assert.match(worst.headline, /Different engines/);
+  // A recorded silence is never read as full_year.
+  const silent = railComparability(CURRENT_META, { ...same, dispatchResolution: null });
+  assert.match(silent.reasons[0].text, /recorded silence/);
+  assert.ok(!/like-for-like: same/i.test(silent.headline));
+  // Both runs are STATED, with the objective and the engine beside each.
+  assert.match(worst.currentLabel, /sequential engine/);
+  assert.match(worst.currentLabel, /maximum NPV/);
+  assert.match(worst.baselineLabel, /combined engine/);
+  assert.match(worst.baselineLabel, /dispatch resolution not recorded/);
+});
+
+// 8-D. THE SPLIT TILE against a historical baseline.
+test("3.14-8: against a historical baseline the split tile says it is current-"
+  + "only, and NEVER shows the current run's split; self-sufficiency says the "
+  + "history does not carry it", () => {
+  const old = HISTORY.runs.find((r) => r.sizingResultId === "s-old") as RailHistoryRun;
+  const current = resultsBarView(RAIL_JOB8);
+  const splitLabel = current.sized ? current.valueOrigin.label : "—";
+  assert.equal(splitLabel, "$17,068 + $2,867", "the current run HAS a split");
+  const last = railCompareView(RAIL_BASELINE8, null, { kind: "stored" }, splitLabel);
+  const hist = railCompareView(RAIL_BASELINE8, old, { kind: "stored" }, splitLabel);
+  console.log(`        last run   : split tile = ${last.splitTile.text}`);
+  console.log(`        historical : split tile = ${hist.splitTile.text}`);
+  assert.equal(last.baseline, "last-run");
+  assert.equal(last.splitTile.available, true);
+  assert.equal(last.splitTile.text, splitLabel);
+  assert.equal(hist.baseline, "historical");
+  assert.equal(hist.splitTile.available, false);
+  assert.equal(hist.splitTile.text, RAIL_SPLIT_CURRENT_ONLY);
+  assert.notEqual(hist.splitTile.text, splitLabel, "never the current split beside a baseline");
+  assert.ok(!hist.splitTile.text.includes("$"), "words, not a figure, and not a dash");
+  assert.notEqual(hist.splitTile.text.trim(), "—");
+  // The deltas read against the HISTORICAL run's figures.
+  assert.equal(hist.before.solarKw, 6.6);
+  assert.equal(hist.before.batteryKwh, 13.5);
+  assert.equal(hist.before.npv, 15000);
+  assert.equal(hist.after.solarKw, 9.24);
+  const npv = hist.deltas.find((d) => d.label === "NPV");
+  assert.equal(npv?.change, "+$4,936");
+  // Self-sufficiency is NOT in the history (self-consumption is a different
+  // measure) — null baseline, and the tile says so.
+  assert.equal(hist.before.selfSufficiencyPct, null);
+  assert.equal(hist.selfSufficiencyNote, RAIL_SELF_SUFFICIENCY_CURRENT_ONLY);
+  assert.equal(old.selfConsumptionRatio, 0.61, "the added field is parsed…");
+  assert.notEqual(old.selfConsumptionRatio, hist.after.selfSufficiencyPct,
+    "…and is never presented as self-sufficiency");
+  assert.ok(hist.comparability && !hist.comparability.comparable);
+  assert.equal(hist.comparability.reasons[0].kind, "resolution-not-recorded");
+  // A baseline with NO financial row: absent, not borrowed, not zero.
+  const nofin = HISTORY.runs.find((r) => r.sizingResultId === "s-nofin") as RailHistoryRun;
+  const h2 = railCompareView(RAIL_BASELINE8, nofin, { kind: "stored" }, splitLabel);
+  assert.equal(h2.before.npv, null);
+  assert.equal(h2.before.paybackYears, null);
+  assert.equal(h2.deltas.find((d) => d.label === "NPV")?.change, "—");
+});
+
+// 8-E. TRUNCATION IS ADMITTED.
+test("3.14-8: a truncated history says the list is partial; a complete one "
+  + "says nothing", () => {
+  const complete = parseRunHistory(HISTORY_PAYLOAD);
+  const partial = parseRunHistory({ ...HISTORY_PAYLOAD, total: 40, truncated: true });
+  console.log(`        complete : ${railHistoryNotice(complete)}`);
+  console.log(`        partial  : ${railHistoryNotice(partial)}`);
+  assert.equal(railHistoryNotice(complete), null);
+  const line = railHistoryNotice(partial);
+  assert.ok(line, "a partial list ADMITS it");
+  assert.match(line ?? "", /newest 3 of 40/);
+  assert.match(line ?? "", /partial/);
+  const picker = railPickerState(partial, "s-batt", null);
+  assert.equal(picker.kind, "ready");
+  assert.equal(picker.kind === "ready" ? picker.notice : null, line,
+    "the picker carries the admission");
+  // Junk never throws and never claims completeness it cannot know: a
+  // `total` below the rows returned is read as the rows returned.
+  for (const junk of [null, {}, { runs: "x" }, { runs: [null, 3, { sizing_result_id: "" }] }]) {
+    assert.doesNotThrow(() => parseRunHistory(junk));
+    assert.deepEqual(parseRunHistory(junk).runs, []);
+  }
+  assert.equal(parseRunHistory({ runs: HISTORY_PAYLOAD.runs, total: 1 }).total, 3);
+});
+
+// 8-F. ONE RUN: no picker, and the reason.
+test("3.14-8: a one-run job offers no picker and says why; a failed history "
+  + "says it could not load and never offers a shorter list", () => {
+  const one = parseRunHistory({ ...HISTORY_PAYLOAD, runs: [HISTORY_PAYLOAD.runs[0]], total: 1, returned: 1 });
+  const p = railPickerState(one, "s-batt", null);
+  console.log(`        one run  : ${p.kind} — ${p.kind === "ready" ? "" : p.reason}`);
+  assert.equal(p.kind, "nothing-to-compare");
+  assert.match(p.kind === "nothing-to-compare" ? p.reason : "", /one run/);
+  assert.match(p.kind === "nothing-to-compare" ? p.reason : "", /nothing to compare against yet/);
+  const failed = railPickerState(null, "s-batt", "HTTP 503");
+  console.log(`        failed   : ${failed.kind} — ${failed.kind === "ready" ? "" : failed.reason}`);
+  assert.equal(failed.kind, "history-unavailable");
+  assert.match(failed.kind === "history-unavailable" ? failed.reason : "", /could not be loaded/);
+  assert.match(failed.kind === "history-unavailable" ? failed.reason : "", /last run/);
+  // The picker EXCLUDES the current run — it is what the others compare against.
+  const ready = railPickerState(HISTORY, "s-batt", null);
+  assert.equal(ready.kind, "ready");
+  assert.deepEqual(ready.kind === "ready" ? ready.choices.map((r) => r.sizingResultId) : [],
+    ["s-old", "s-nofin"]);
+  // The selection is session-scoped: a history meta is built from the run
+  // itself, so a superseded selection stays exactly what it was.
+  const meta = railHistoryMeta(HISTORY.runs[1]);
+  assert.equal(meta.sizingResultId, "s-old");
+  assert.equal(meta.dispatchResolution, null);
+});
+
+// 8-G. The wiring: the bar fetches the history from the ENDPOINT, swaps the
+// curve on a re-rank, and the chart component is untouched.
+test("3.14-8: the bar reads the history from GET /api/sizing/runs, swaps in the "
+  + "re-ranked curve, and neither chart component nor Results tab changed", async () => {
+  const [fs, path] = await Promise.all([import("node:fs"), import("node:path")]);
+  const FRONTEND = path.resolve(import.meta.dirname, "..");
+  const read = (f: string) => fs.readFileSync(path.join(FRONTEND, f), "utf8");
+  const bar = read("components/worksheet/results-bar.tsx");
+  assert.match(bar, /\/api\/sizing\/runs\?/, "the history comes from the lean endpoint");
+  assert.ok(!/sizing_results/.test(bar), "never from the job payload's child table");
+  assert.match(bar, /railRerankedCurve\(baseline, rail\.trigger\)/);
+  assert.match(bar, /view=\{shownCurve\}/);
+  assert.match(bar, /railCompareView\(/);
+  // Every storage WRITE in the bar targets one of the two prompt-3 keys —
+  // the preference and the auto-expand marker. The selection is never one.
+  const writes = bar.match(/localStorage\.setItem\(\s*([A-Z_]+)/g) ?? [];
+  assert.ok(writes.length >= 2, "the two prompt-3 writes still exist");
+  assert.ok(writes.every((w) => /RESULTS_BAR_(AUTOEXPAND_)?STORAGE_KEY/.test(w)),
+    `the baseline selection is session state, never stored: ${writes}`);
+  assert.ok(!/setItem\([^)]*selected/i.test(bar));
+  // The prompt-6 guards still hold.
+  assert.ok(!/setTimeout|debounce/.test(bar));
+  // Untouched files.
+  const S = "/private/tmp/claude-501/-Volumes-OWC1TB-enrgengine/73611770-76c2-46c1-9e72-9baf6b5f2509/scratchpad/p4";
+  assert.ok(!read("components/results/score-curve.tsx").includes("railRerank"),
+    "the chart component knows nothing of the rail — the re-rank is in the VIEW");
 });

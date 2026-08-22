@@ -14,11 +14,16 @@ import {
   formatMoney,
   formatPct,
   formatYears,
+  parseRunHistory,
+  railCompareView,
   railFailedState,
   railFiguresFor,
+  railPickerState,
   railRecostRequest,
   railRecostState,
   railRerank,
+  railRerankedCurve,
+  railRunLabel,
   railStatusLine,
   RESULTS_BAR_DEFAULT_HEIGHT,
   RESULTS_BAR_MIN_HEIGHT,
@@ -33,6 +38,8 @@ import {
   shouldAutoExpandResultsBar,
   type RailBaseline,
   type RailDelta,
+  type RailHistory,
+  type RailHistoryRun,
   type RailState,
   type ResultsBarMetrics,
   type ResultsBarView,
@@ -193,6 +200,39 @@ export function ResultsBar({
   change?: SizingInputChange | null;
 }) {
   const [rail, setRail] = React.useState<RailState>({ kind: "stored" });
+  // 3.14 prompt 8: THE BASELINE. The job's run history from the lean
+  // endpoint (never the job payload, which caps child tables at twenty and
+  // says so only in the log), and the run selected to compare against.
+  // SESSION-SCOPED BY DECISION: nothing is stored, and a selection that is
+  // later superseded simply stays selected — it never jumps.
+  const [history, setHistory] = React.useState<RailHistory | null>(null);
+  const [historyError, setHistoryError] = React.useState<string | null>(null);
+  const [selectedId, setSelectedId] = React.useState<string | null>(null);
+
+  React.useEffect(() => {
+    if (!jobId) return;
+    let cancelled = false;
+    (async () => {
+      try {
+        const res = await fetch(
+          `/api/sizing/runs?${new URLSearchParams({ job_id: jobId, limit: "100" })}`,
+          { cache: "no-store", headers: { Accept: "application/json" } },
+        );
+        if (cancelled) return;
+        if (!res.ok) {
+          setHistoryError(res.status === 401 ? "your session has expired" : `HTTP ${res.status}`);
+          return;
+        }
+        setHistory(parseRunHistory(await res.json()));
+        setHistoryError(null);
+      } catch {
+        if (!cancelled) setHistoryError("the request did not complete");
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [jobId]);
   // The change the rail has already acted on — a new seq acts once.
   const actedSeq = React.useRef(0);
   // The baseline the current rail state belongs to.
@@ -484,7 +524,24 @@ export function ResultsBar({
   };
   const shown = railFiguresFor(rail, storedFigures);
   const recomputed = rail.kind === "reranked" || rail.kind === "recosted";
-  const deltas: RailDelta[] = recomputed ? rail.deltas : [];
+  // 3.14 prompt 8: every delta reads against the SELECTED baseline.
+  const picker = railPickerState(history, baseline?.meta.sizingResultId ?? null, historyError);
+  const selected: RailHistoryRun | null =
+    picker.kind === "ready" && selectedId
+      ? picker.choices.find((r) => r.sizingResultId === selectedId) ?? null
+      : null;
+  const compare = baseline
+    ? railCompareView(baseline, selected, rail, view.sized ? view.valueOrigin.label : "—")
+    : null;
+  const comparing = compare !== null && compare.baseline === "historical";
+  const deltas: RailDelta[] = compare
+    ? (comparing || recomputed ? compare.deltas : [])
+    : [];
+  // The chart follows the rail: a re-rank re-ranks the SAME points for the
+  // applied objective (F210); otherwise the stored curve, as prompt 4 wired it.
+  const rerankedCurve =
+    rail.kind === "reranked" && baseline ? railRerankedCurve(baseline, rail.trigger) : null;
+  const shownCurve = rerankedCurve ?? curve;
   const deltaFor = (label: string): RailDelta | null =>
     deltas.find((d) => d.label === label) ?? null;
   const tileDelta = (label: string, fallback: string): React.ReactNode => {
@@ -556,11 +613,11 @@ export function ResultsBar({
                   ? "—"
                   : rail.kind === "reranked" && rail.batteryStale
                     ? `solar re-ranked · battery from the ${formatKw(storedFigures.solarKw)} array, not resolved`
-                    : recomputed
+                    : recomputed || comparing
                       ? `was ${[
-                          storedFigures.solarKw != null ? formatKw(storedFigures.solarKw) : null,
-                          storedFigures.batteryKwh != null ? formatKwh(storedFigures.batteryKwh) : null,
-                        ].filter(Boolean).join(" + ") || "—"} · not saved`
+                          compare?.before.solarKw != null ? formatKw(compare.before.solarKw) : null,
+                          compare?.before.batteryKwh != null ? formatKwh(compare.before.batteryKwh) : null,
+                        ].filter(Boolean).join(" + ") || "—"}${recomputed ? " · not saved" : " · the selected baseline"}`
                       : "latest sizing run"
               }
             />
@@ -590,8 +647,12 @@ export function ResultsBar({
                   ? formatPct(shown.selfSufficiencyPct)
                   : "—"
               }
-              delta={tileDelta("Self-sufficiency", "")}
-              deltaSign={tileSign("Self-sufficiency", true)}
+              delta={
+                compare?.selfSufficiencyNote && comparing
+                  ? compare.selfSufficiencyNote
+                  : tileDelta("Self-sufficiency", "")
+              }
+              deltaSign={comparing ? undefined : tileSign("Self-sufficiency", true)}
             />
             {/* 3.14 prompt 3 (F205), label decided by Mayur 2026-08-21. The
                 THREE cases are discriminated in lib/worksheet.ts, not here —
@@ -599,11 +660,80 @@ export function ResultsBar({
                 this out" when the truth is that there is no battery in this
                 recommendation at all. The component renders the label it is
                 given and decides nothing. */}
+            {/* 3.14 prompt 8: against a historical baseline the split is NOT
+                in the history read, and the current run's split must never
+                sit beside a baseline as though it belonged to the comparison
+                — the tile says so, in words, never a dash. */}
             <KpiTile
               label="Where the value comes from"
-              value={view.sized ? view.valueOrigin.label : "—"}
+              value={
+                !view.sized
+                  ? "—"
+                  : compare && !compare.splitTile.available
+                    ? compare.splitTile.text
+                    : view.valueOrigin.label
+              }
             />
           </div>
+          {/* 3.14 prompt 8: THE BASELINE CONTROL — one comparison mechanism,
+              defaulting to the last run. A one-run job says why there is
+              nothing to choose; a failed history says so rather than
+              offering a shorter list; a partial list ADMITS it. */}
+          {view.sized && baseline ? (
+            <div className="flex flex-wrap items-center gap-2">
+              <label className="text-caption text-muted-foreground" htmlFor="rail-baseline">
+                Compared against
+              </label>
+              {picker.kind === "ready" ? (
+                <select
+                  id="rail-baseline"
+                  value={selectedId ?? ""}
+                  onChange={(e) => setSelectedId(e.target.value || null)}
+                  className="rounded-md border border-border bg-card px-2 py-1 text-caption text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+                >
+                  <option value="">the last run</option>
+                  {picker.choices.map((r) => (
+                    <option key={r.sizingResultId} value={r.sizingResultId}>
+                      {railRunLabel({
+                        sizingResultId: r.sizingResultId, createdAt: r.createdAt,
+                        runKind: r.runKind, engineMode: r.engineMode,
+                        dispatchResolution: r.dispatchResolution, objectiveUsed: r.objectiveUsed,
+                      })}
+                    </option>
+                  ))}
+                </select>
+              ) : (
+                <span className="text-caption text-muted-foreground">{picker.reason}</span>
+              )}
+              {picker.kind === "ready" && picker.notice ? (
+                <span className="text-caption text-destructive">{picker.notice}</span>
+              ) : null}
+            </div>
+          ) : null}
+          {compare && comparing && compare.comparability ? (
+            <div className="flex flex-col gap-0.5">
+              <span className="text-caption text-muted-foreground">
+                Current: {compare.currentLabel}
+              </span>
+              <span className="text-caption text-muted-foreground">
+                Baseline: {compare.baselineLabel}
+              </span>
+              {/* The verdict. Every reason, plainly — a different engine is
+                  the headline of the comparison, not a footnote (D33). */}
+              {compare.comparability.comparable ? (
+                <span className="text-caption text-muted-foreground">
+                  {compare.comparability.headline}
+                </span>
+              ) : (
+                compare.comparability.reasons.map((r) => (
+                  <span key={r.kind} className="text-caption text-destructive">
+                    {r.text}
+                  </span>
+                ))
+              )}
+            </div>
+          ) : null}
+
           {/* 3.14 prompt 6: THE ONE LINE that says where the figures came
               from and that nothing is saved — derived per state in lib, so
               the suite holds it present on every recomputed state and
@@ -651,13 +781,14 @@ export function ResultsBar({
           <div className="flex min-h-0 flex-1 flex-col gap-1">
             {/* flex-1 + min-h-0: the ONLY element that absorbs the leftover
                 height, so the bar never has empty space at any drag height. */}
-            {curve && view.sized ? (
+            {shownCurve && view.sized ? (
               // 3.14 prompt 4: the value-versus-size curve. A run with no
               // recorded options renders ScoreCurve's own honest sentence —
-              // never an empty axis and never a zero bar.
+              // never an empty axis and never a zero bar. 3.14 prompt 8: on a
+              // re-rank this is the re-ranked view (F210).
               <div className="min-h-0 flex-1 overflow-y-auto">
                 <ScoreCurve
-                  view={curve}
+                  view={shownCurve}
                   rowHeight={RAIL_ROW_HEIGHT}
                   maxPlotHeight={railPlotHeight}
                 />

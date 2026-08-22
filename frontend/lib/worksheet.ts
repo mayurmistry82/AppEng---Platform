@@ -6798,6 +6798,21 @@ export interface RailBaseline {
   budgetAud: number | null;
   /** The endpoint that produced the run — the one a re-cost asks. */
   endpoint: "/api/sizing/battery" | "/api/sizing/optimise" | null;
+  /** 3.14 prompt 8: the current run's own identity facts — what a
+      comparison against an earlier run is judged on (D33). */
+  meta: RailRunMeta;
+}
+
+/** The facts that decide whether two runs are like-for-like. */
+export interface RailRunMeta {
+  sizingResultId: string | null;
+  createdAt: string | null;
+  runKind: string | null;
+  engineMode: string | null;
+  /** null = NOT RECORDED (every run stored before 2026-08-20) — a recorded
+      silence, never assumed to be full_year. */
+  dispatchResolution: string | null;
+  objectiveUsed: string | null;
 }
 
 function railIndex(container: Record<string, unknown>, points: unknown[]): number | null {
@@ -6888,6 +6903,19 @@ export function railBaselineView(job: unknown): RailBaseline {
         : runKind === "solar"
           ? "/api/sizing/optimise"
           : null,
+    meta: {
+      sizingResultId:
+        typeof sizing?.sizing_result_id === "string" ? sizing.sizing_result_id : null,
+      createdAt: typeof sizing?.created_at === "string" ? sizing.created_at : null,
+      runKind,
+      engineMode: typeof sizing?.engine_mode === "string" ? sizing.engine_mode : null,
+      dispatchResolution:
+        typeof eo.dispatch_resolution === "string" && eo.dispatch_resolution
+          ? eo.dispatch_resolution
+          : null,
+      objectiveUsed:
+        typeof sizing?.objective_used === "string" ? sizing.objective_used : null,
+    },
   };
 }
 
@@ -7010,6 +7038,58 @@ export function railDeltas(before: RailFigures, after: RailFigures): RailDelta[]
 
 // ── The instant path ────────────────────────────────────────────────────────
 
+/**
+ * 3.14 prompt 8 (F210) — THE ONE SOLAR RANKING, shared by the rail's re-rank
+ * and the rail's chart. The chart highlighting one array while the rail
+ * names another was the fault; a second ranking anywhere is the fault again.
+ */
+export type SolarRanking =
+  | { ok: true; topIndex: number; top: Record<string, unknown>; objective: string }
+  | { ok: false; reason: string };
+
+export function rankSolarPoints(
+  points: readonly Record<string, unknown>[] | null,
+  objective: string,
+  budget: number | null,
+): SolarRanking {
+  if (!points || points.length === 0) {
+    return {
+      ok: false,
+      reason: "This run did not record the options it compared, so the change cannot be answered from stored data — press Size to run it.",
+    };
+  }
+  if (objective === "custom") {
+    return {
+      ok: false,
+      reason: "A custom blend scores the options with its weight, which the stored run used a different value for — press Size to run it.",
+    };
+  }
+  if (!VALID_OBJECTIVES.includes(objective as (typeof VALID_OBJECTIVES)[number])) {
+    return { ok: false, reason: `The objective ${JSON.stringify(objective)} is not one the engine ranks by.` };
+  }
+  let topIndex = -1;
+  let topScore = -Infinity;
+  let anyReal = false;
+  for (let i = 0; i < points.length; i++) {
+    const p = points[i];
+    if ((tariffNum(p.solar_kw) ?? 0) <= 0) continue;
+    if (budget !== null && (tariffNum(p.system_cost) ?? Infinity) > budget) continue;
+    anyReal = true;
+    const s = solarScore(p, objective);
+    if (s !== null && s > topScore) { topIndex = i; topScore = s; }
+  }
+  if (!anyReal) {
+    return {
+      ok: false,
+      reason: "No stored array fits the new budget cap; the engine's answer under it needs a full Size.",
+    };
+  }
+  if (topIndex < 0) {
+    return { ok: false, reason: "The stored options carry no value for that objective." };
+  }
+  return { ok: true, topIndex, top: points[topIndex], objective };
+}
+
 /** The engine's own ranking rule for the ARRAY options (solar_optimiser):
     max_npv → npv_25yr; min_payback → shortest payback, no payback worst;
     max_self_sufficiency → self_sufficiency_pct. A custom blend was scored
@@ -7073,37 +7153,10 @@ export function railRerank(
     change.budgetAud === undefined ? baseline.budgetAud : change.budgetAud;
   const unavailable = (reason: string): RailState =>
     ({ kind: "rerank-unavailable", trigger: change, reason });
-  if (!baseline.solarPoints || baseline.solarPoints.length === 0) {
-    return unavailable(
-      "This run did not record the options it compared, so the change cannot be answered from stored data — press Size to run it.",
-    );
-  }
-  if (objective === "custom") {
-    return unavailable(
-      "A custom blend scores the options with its weight, which the stored run used a different value for — press Size to run it.",
-    );
-  }
-  if (!VALID_OBJECTIVES.includes(objective as (typeof VALID_OBJECTIVES)[number])) {
-    return unavailable(`The objective ${JSON.stringify(objective)} is not one the engine ranks by.`);
-  }
-  const real = baseline.solarPoints.filter((p) => (tariffNum(p.solar_kw) ?? 0) > 0);
-  const inBudget = budget === null
-    ? real
-    : real.filter((p) => (tariffNum(p.system_cost) ?? Infinity) <= budget);
-  if (inBudget.length === 0) {
-    return unavailable(
-      "No stored array fits the new budget cap; the engine's answer under it needs a full Size.",
-    );
-  }
-  let top: Record<string, unknown> | null = null;
-  let topScore = -Infinity;
-  for (const p of inBudget) {
-    const s = solarScore(p, objective);
-    if (s !== null && s > topScore) { top = p; topScore = s; }
-  }
-  if (!top) {
-    return unavailable("The stored options carry no value for that objective.");
-  }
+  // ONE ranking, shared with the chart (F210).
+  const ranked = rankSolarPoints(baseline.solarPoints, objective, budget);
+  if (!ranked.ok) return unavailable(ranked.reason);
+  const top = ranked.top;
   const topKw = tariffNum(top.solar_kw);
   const sameKw = topKw !== null && topKw === baseline.chosen.solarKw;
   const sameLayout =
@@ -7361,4 +7414,368 @@ export function railStatusLine(state: RailState): string | null {
 export function railFiguresFor(state: RailState, stored: RailFigures): RailFigures {
   if (state.kind === "reranked" || state.kind === "recosted") return state.after;
   return stored;
+}
+
+
+// ── 3.14 prompt 8 — the chart follows the rail (F210), and the baseline ───────
+
+/**
+ * THE CHART, RE-RANKED WITH THE RAIL. The SAME stored points through the SAME
+ * builder the Results tab uses, but with the APPLIED objective's measure on
+ * the axis and the rail's own top option highlighted — found by the one
+ * shared ranking, never a second one. The tie sentence is recomputed by
+ * buildBars against the new measure: a tie on 25-year value is not a tie on
+ * payback. The caption names the objective being applied AND the one the run
+ * was scored for, so a re-ranked chart can never pass for a stored one.
+ * Returns null when there is nothing to re-rank (the rail says why).
+ */
+export function railRerankedCurve(
+  baseline: RailBaseline,
+  change: SizingInputChange,
+): ScoreCurveView | null {
+  const objective = change.objective ?? baseline.objective ?? "max_npv";
+  const budget =
+    change.budgetAud === undefined ? baseline.budgetAud : change.budgetAud;
+  const ranked = rankSolarPoints(baseline.solarPoints, objective, budget);
+  if (!ranked.ok || !baseline.solarPoints) return null;
+  const view = curveFromOptions(
+    {
+      dimension_keys: ["solar_kw"],
+      points: baseline.solarPoints,
+      // The rail's top option IS the highlighted bar.
+      chosen_index: ranked.topIndex,
+    },
+    { objective_used: objective },
+  );
+  if (!view.bars) return view;
+  const applied = OBJECTIVE_METRICS[objective]?.label ?? objective;
+  const scoredFor =
+    (baseline.meta.objectiveUsed && OBJECTIVE_METRICS[baseline.meta.objectiveUsed]?.label)
+    ?? baseline.meta.objectiveUsed
+    ?? "an unrecorded objective";
+  const topKw = formatKw(tariffNum(ranked.top.solar_kw));
+  return {
+    ...view,
+    // The ScoreCurve caption reads "Scored for {objectiveLabel}; {chosen} was
+    // chosen." — this label makes that sentence say which objective is being
+    // APPLIED, and that it is not the stored one.
+    objectiveLabel: `${applied} — re-ranked now; the run was scored for ${scoredFor}`,
+    chosenNote: `Re-ranked from the stored options for ${applied}: ${topKw} is the top array under it. The run itself was scored for ${scoredFor}${
+      baseline.chosen.solarKw !== null ? ` and chose ${formatKw(baseline.chosen.solarKw)}` : ""
+    }. Nothing here is saved.`,
+  };
+}
+
+// ── The history (GET /api/sizing/runs) ──────────────────────────────────────
+
+/** One run as the history endpoint summarises it — the LEAN half only. */
+export interface RailHistoryRun {
+  sizingResultId: string;
+  createdAt: string | null;
+  runKind: string | null;
+  engineMode: string | null;
+  dispatchResolution: string | null;
+  objectiveUsed: string | null;
+  solarKw: number | null;
+  batteryKwh: number | null;
+  systemCost: number | null;
+  /** The share of GENERATION consumed on site. NOT self-sufficiency — that
+      figure is in the heavy half and is not in the history read. */
+  selfConsumptionRatio: number | null;
+  hasChosenMarker: boolean;
+  hasSolarCurve: boolean;
+  /** null = no financial row for this run; its figures are then absent. */
+  financialResultId: string | null;
+  paybackYears: number | null;
+  npv: number | null;
+  undiscountedSavings25yr: number | null;
+}
+
+export interface RailHistory {
+  runs: RailHistoryRun[];
+  total: number;
+  returned: number;
+  truncated: boolean;
+}
+
+/** Parse the endpoint's envelope defensively — junk yields an empty,
+    untruncated history, and never throws. */
+export function parseRunHistory(payload: unknown): RailHistory {
+  const body = asRecord(payload);
+  const raw = Array.isArray(body.runs) ? body.runs : [];
+  const runs: RailHistoryRun[] = [];
+  for (const r of raw) {
+    const row = asRecord(r);
+    if (typeof row.sizing_result_id !== "string" || !row.sizing_result_id) continue;
+    runs.push({
+      sizingResultId: row.sizing_result_id,
+      createdAt: typeof row.created_at === "string" ? row.created_at : null,
+      runKind: typeof row.run_kind === "string" ? row.run_kind : null,
+      engineMode: typeof row.engine_mode === "string" ? row.engine_mode : null,
+      dispatchResolution:
+        typeof row.dispatch_resolution === "string" && row.dispatch_resolution
+          ? row.dispatch_resolution
+          : null,
+      objectiveUsed: typeof row.objective_used === "string" ? row.objective_used : null,
+      solarKw: tariffNum(row.solar_kw),
+      batteryKwh: tariffNum(row.battery_kwh),
+      systemCost: tariffNum(row.system_cost),
+      selfConsumptionRatio: tariffNum(row.self_consumption_ratio),
+      hasChosenMarker: row.has_chosen_marker === true,
+      hasSolarCurve: row.has_solar_curve === true,
+      financialResultId:
+        typeof row.financial_result_id === "string" ? row.financial_result_id : null,
+      paybackYears: tariffNum(row.payback_years),
+      npv: tariffNum(row.npv_25_year),
+      undiscountedSavings25yr: tariffNum(row.undiscounted_savings_25yr),
+    });
+  }
+  const total = tariffNum(body.total);
+  return {
+    runs,
+    total: total !== null && total >= runs.length ? Math.round(total) : runs.length,
+    returned: runs.length,
+    truncated: body.truncated === true,
+  };
+}
+
+/** The line that ADMITS a partial list — the reason the endpoint carries
+    `total` and `truncated` at all. null when the list is complete. */
+export function railHistoryNotice(history: RailHistory): string | null {
+  if (!history.truncated) return null;
+  return `Showing the newest ${history.returned} of ${history.total} runs — the list is partial; older runs are not offered here.`;
+}
+
+/** What the baseline control does, and why. */
+export type RailPickerState =
+  | { kind: "ready"; choices: RailHistoryRun[]; notice: string | null }
+  | { kind: "nothing-to-compare"; reason: string }
+  | { kind: "history-unavailable"; reason: string };
+
+export function railPickerState(
+  history: RailHistory | null,
+  currentId: string | null,
+  error: string | null,
+): RailPickerState {
+  if (error) {
+    return {
+      kind: "history-unavailable",
+      reason: `The run history could not be loaded (${error}) — the figures read against the last run.`,
+    };
+  }
+  if (!history) {
+    return { kind: "history-unavailable", reason: "The run history is still loading." };
+  }
+  // Every run that is not the current one is a candidate baseline.
+  const choices = history.runs.filter((r) => r.sizingResultId !== currentId);
+  if (choices.length === 0) {
+    return {
+      kind: "nothing-to-compare",
+      reason:
+        history.total <= 1
+          ? "This job has one run, so there is nothing to compare against yet."
+          : "No earlier run is available to compare against.",
+    };
+  }
+  return { kind: "ready", choices, notice: railHistoryNotice(history) };
+}
+
+/** A history run's headline figures as the rail's before-figures. The
+    self-sufficiency figure is NOT in the history read (what it carries is
+    self-consumption, a different measure), so it is honestly null. */
+export function railHistoryFigures(run: RailHistoryRun): RailFigures {
+  return {
+    solarKw: run.solarKw,
+    batteryKwh: run.batteryKwh,
+    paybackYears: run.paybackYears,
+    npv: run.npv,
+    selfSufficiencyPct: null,
+    basis: "whole-system",
+  };
+}
+
+// ── Comparability (D33) ─────────────────────────────────────────────────────
+
+export type RailIncomparability =
+  | { kind: "engine-differs"; text: string }
+  | { kind: "resolution-differs"; text: string }
+  | { kind: "resolution-not-recorded"; text: string }
+  | { kind: "objective-differs"; text: string };
+
+export interface RailComparability {
+  comparable: boolean;
+  reasons: RailIncomparability[];
+  /** The one-line verdict. */
+  headline: string;
+  /** "<date> · <kind> · <objective> · <engine> · <resolution>" for each. */
+  currentLabel: string;
+  baselineLabel: string;
+}
+
+function railObjectiveWords(o: string | null): string {
+  if (o === null) return "objective not recorded";
+  return OBJECTIVE_METRICS[o]?.label ?? o;
+}
+
+function railResolutionWords(r: string | null): string {
+  if (r === null) return "dispatch resolution not recorded";
+  if (r === "full_year") return "full-year dispatch (365 real days)";
+  if (r === "representative_days") return "twelve representative days";
+  return `dispatch "${r}"`;
+}
+
+function railDateWords(iso: string | null): string {
+  if (!iso) return "date not recorded";
+  const t = new Date(iso).getTime();
+  if (!Number.isFinite(t)) return iso;
+  return new Date(t).toLocaleString("en-AU", {
+    day: "numeric", month: "short", year: "numeric", hour: "2-digit", minute: "2-digit",
+  });
+}
+
+export function railRunLabel(meta: RailRunMeta): string {
+  return [
+    railDateWords(meta.createdAt),
+    meta.runKind === "solar_battery" ? "solar + battery" : meta.runKind === "solar" ? "solar only" : "kind not recorded",
+    railObjectiveWords(meta.objectiveUsed),
+    meta.engineMode ? `${meta.engineMode} engine` : "engine not recorded",
+    railResolutionWords(meta.dispatchResolution),
+  ].join(" · ");
+}
+
+export function railHistoryMeta(run: RailHistoryRun): RailRunMeta {
+  return {
+    sizingResultId: run.sizingResultId,
+    createdAt: run.createdAt,
+    runKind: run.runKind,
+    engineMode: run.engineMode,
+    dispatchResolution: run.dispatchResolution,
+    objectiveUsed: run.objectiveUsed,
+  };
+}
+
+/**
+ * THE VERDICT. Every reason two runs are not like-for-like is named — never
+ * implied, never collapsed into one. Order is the order of seriousness: a
+ * different engine is the headline of a comparison, not a footnote (D33).
+ */
+export function railComparability(current: RailRunMeta, baseline: RailRunMeta): RailComparability {
+  const reasons: RailIncomparability[] = [];
+  if (current.engineMode !== baseline.engineMode) {
+    reasons.push({
+      kind: "engine-differs",
+      text: `Different engines: the current run came from ${current.engineMode ?? "an unrecorded engine"} and the baseline from ${baseline.engineMode ?? "an unrecorded engine"}. These are different kinds of answer.`,
+    });
+  }
+  const cr = current.dispatchResolution;
+  const br = baseline.dispatchResolution;
+  if (cr === null || br === null) {
+    const which =
+      cr === null && br === null ? "Neither run" : cr === null ? "The current run" : "The baseline";
+    reasons.push({
+      kind: "resolution-not-recorded",
+      text: `${which} recorded its dispatch resolution — a recorded silence, not a full-year run. Whether the two dispatched alike cannot be stated.`,
+    });
+  } else if (cr !== br) {
+    reasons.push({
+      kind: "resolution-differs",
+      text: `Different dispatch resolutions: the current run solved ${railResolutionWords(cr)} and the baseline ${railResolutionWords(br)}. They are not like-for-like.`,
+    });
+  }
+  if (current.objectiveUsed !== baseline.objectiveUsed) {
+    reasons.push({
+      kind: "objective-differs",
+      text: `Different objectives: the current run was scored for ${railObjectiveWords(current.objectiveUsed)} and the baseline for ${railObjectiveWords(baseline.objectiveUsed)} — each has its own notion of "best".`,
+    });
+  }
+  const comparable = reasons.length === 0;
+  return {
+    comparable,
+    reasons,
+    headline: comparable
+      ? "Like-for-like: same engine, same dispatch resolution, same objective."
+      : reasons[0].text,
+    currentLabel: railRunLabel(current),
+    baselineLabel: railRunLabel(baseline),
+  };
+}
+
+// ── The compare view the bar renders ────────────────────────────────────────
+
+export const RAIL_SPLIT_CURRENT_ONLY =
+  "The split is only available for the current run — the history carries the headline figures, not the parts behind them.";
+export const RAIL_SELF_SUFFICIENCY_CURRENT_ONLY =
+  "Baseline self-sufficiency is not in the history read (it carries self-consumption, a different measure) — shown for the current run only.";
+
+export interface RailCompareView {
+  /** What the figures are read against. */
+  baseline: "last-run" | "historical";
+  before: RailFigures;
+  after: RailFigures;
+  deltas: RailDelta[];
+  comparability: RailComparability | null;
+  /** The fifth tile: the split, or the sentence saying it is current-only. */
+  splitTile: { available: boolean; text: string };
+  /** The fourth tile's caveat against a historical baseline, or null. */
+  selfSufficiencyNote: string | null;
+  /** Both runs, stated. */
+  currentLabel: string | null;
+  baselineLabel: string | null;
+}
+
+/**
+ * EVERY DELTA READS AGAINST THE SELECTED BASELINE. With no selection the
+ * rail compares as before (the last stored run). With a historical run
+ * selected, the before-figures are that run's headline figures and the
+ * after-figures are whatever the rail currently shows — the stored run, a
+ * re-rank, or a re-cost.
+ *
+ * A solar-only re-rank (the array moved) cannot be read against a history
+ * run: the history carries whole-system figures and not the solar-only
+ * parts, so the re-rank keeps its own before-figures and the view says so
+ * through `selfSufficiencyNote`'s neighbour — the comparability block still
+ * names the two runs.
+ */
+export function railCompareView(
+  baseline: RailBaseline,
+  selected: RailHistoryRun | null,
+  state: RailState,
+  storedSplitLabel: string,
+): RailCompareView {
+  const after = railFiguresFor(state, baseline.figures);
+  if (selected === null) {
+    const before =
+      state.kind === "reranked" || state.kind === "recosted" ? state.before : baseline.figures;
+    return {
+      baseline: "last-run",
+      before,
+      after,
+      deltas: state.kind === "reranked" || state.kind === "recosted" ? state.deltas : railDeltas(before, before),
+      comparability: null,
+      splitTile: { available: true, text: storedSplitLabel },
+      selfSufficiencyNote: null,
+      currentLabel: null,
+      baselineLabel: null,
+    };
+  }
+  const solarOnly = after.basis === "solar-only";
+  const before = solarOnly
+    ? (state.kind === "reranked" ? state.before : baseline.figures)
+    : railHistoryFigures(selected);
+  const comparability = railComparability(baseline.meta, railHistoryMeta(selected));
+  return {
+    baseline: "historical",
+    before,
+    after,
+    deltas: railDeltas(before, after),
+    comparability,
+    // NEVER the current run's split beside a historical baseline — it
+    // belongs to one side of the comparison, not to the comparison.
+    splitTile: { available: false, text: RAIL_SPLIT_CURRENT_ONLY },
+    selfSufficiencyNote: solarOnly
+      ? "A solar-only re-rank reads against the current run's own solar figures; the historical baseline applies to whole-system figures."
+      : RAIL_SELF_SUFFICIENCY_CURRENT_ONLY,
+    currentLabel: comparability.currentLabel,
+    baselineLabel: comparability.baselineLabel,
+  };
 }

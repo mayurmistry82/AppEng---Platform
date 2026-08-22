@@ -67,6 +67,11 @@ RUNS_PAGE_MAX = 100
 _RUNS_SELECT = (
     "sizing_result_id,created_at,run_kind,engine_mode,engine_version,"
     "objective_used,solar_kw,battery_kwh,system_cost,"
+    # 3.14 prompt 8: the ONE field added for the compare — a scalar column
+    # already on the row. NOTE WHAT IT IS: the share of GENERATION consumed
+    # on site, which is NOT self-sufficiency (the share of LOAD met) — that
+    # figure lives inside evaluated_options and stays in the heavy half.
+    "self_consumption_ratio,"
     "annual_solar_generation_kwh,within_budget,"
     "dispatch_resolution:evaluated_options->>dispatch_resolution,"
     "chosen_index:evaluated_options->chosen_index,"
@@ -114,6 +119,7 @@ def _run_summary(row: dict) -> dict:
         "solar_kw": row.get("solar_kw"),
         "battery_kwh": row.get("battery_kwh"),
         "system_cost": row.get("system_cost"),
+        "self_consumption_ratio": row.get("self_consumption_ratio"),
         "annual_solar_generation_kwh": row.get("annual_solar_generation_kwh"),
         "within_budget": row.get("within_budget"),
         # Whether the run recorded WHICH option it chose. A key that is absent
