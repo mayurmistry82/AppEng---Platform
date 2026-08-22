@@ -31,6 +31,176 @@ import solar_optimiser
 router = APIRouter()
 
 
+# ── The run history (3.14 prompt 7) ──────────────────────────────────────────
+#
+# WHY THIS EXISTS RATHER THAN A BIGGER HYDRATION LIMIT. GET /api/job/{id}
+# hydrates every child table at routes/job.py's _HYDRATION_LIMIT = 20 rows and
+# records the truncation to Sentry and the log — NEVER to the response. Job
+# a57e13f1 already holds 16 runs; at 21 the worksheet would silently stop
+# seeing the oldest with nothing on screen to say so, which is exactly what
+# that constant's own docstring warns about. Raising it trades one silent
+# problem for a heavy one: every run carries its evaluated options with a full
+# cost breakdown per candidate, to populate a list that needs a date and a
+# handful of numbers.
+#
+# SO THE COUNT IS PART OF THE ANSWER. A bounded payload that cannot say it is
+# bounded is indistinguishable from a complete one — `total` and `truncated`
+# are what make this endpoint honest, and they are the reason it exists.
+#
+# LEAN END TO END, not lean-after-stripping: the select projects the JSON
+# PATHS it needs (dispatch_resolution, the chosen marker, one probe into each
+# points array) instead of fetching evaluated_options and discarding it, so
+# the heavy half never crosses the wire in either direction.
+RUNS_PAGE_DEFAULT = 25
+RUNS_PAGE_MAX = 100
+
+# The projection. Aliased paths keep the heavy blobs out of the read entirely:
+#   dispatch_resolution   the mode the run dispatched at, or null (F191)
+#   chosen_index          present-and-non-null IFF the run recorded its winner
+#   solar_curve_probe     points[0].solar_kw — non-null only on a run_kind
+#                         'solar' row, whose points ARE the array-size curve
+#   battery_curve_probe   the same probe into solar_options (3.14 prompt 2),
+#                         where a run_kind 'solar_battery' row keeps its curve
+# financial_results is EMBEDDED over the foreign key, so the pairing is
+# sizing_result_id BY CONSTRUCTION — never the newest unmatched row, the
+# defect 3.13 removed and which must not reappear here.
+_RUNS_SELECT = (
+    "sizing_result_id,created_at,run_kind,engine_mode,engine_version,"
+    "objective_used,solar_kw,battery_kwh,system_cost,"
+    "annual_solar_generation_kwh,within_budget,"
+    "dispatch_resolution:evaluated_options->>dispatch_resolution,"
+    "chosen_index:evaluated_options->chosen_index,"
+    "solar_curve_probe:evaluated_options->points->0->>solar_kw,"
+    "battery_curve_probe:evaluated_options->solar_options->points->0->>solar_kw,"
+    "financial_results(financial_result_id,created_at,payback_years,"
+    "npv_25_year,undiscounted_savings_25yr)"
+)
+
+# What a summary may NEVER carry. The compare screen fetches these for the two
+# runs a person actually opens, not for every run in a list.
+RUNS_FORBIDDEN_KEYS = frozenset({
+    "evaluated_options", "run_assumptions", "points", "solar_options",
+    "chosen_cost_breakdown", "cost_breakdown", "split", "candidates",
+    "score_curve", "chosen_solar",
+})
+
+
+def _run_summary(row: dict) -> dict:
+    """One stored run → one lean history entry. Every derived field is a fact
+    about what the run RECORDED, never a guess at what it meant."""
+    fins = row.get("financial_results") or []
+    if isinstance(fins, dict):  # a to-one embed, defensively
+        fins = [fins]
+    # The newest of this run's OWN financial rows. The embed already scopes
+    # them to this sizing_result_id; append-only means there can be more than
+    # one, and the newest is the current one.
+    fin = None
+    if fins:
+        fin = max(
+            (f for f in fins if isinstance(f, dict)),
+            key=lambda f: str(f.get("created_at") or ""),
+            default=None,
+        )
+    return {
+        "sizing_result_id": row.get("sizing_result_id"),
+        "created_at": row.get("created_at"),
+        "run_kind": row.get("run_kind"),
+        "engine_mode": row.get("engine_mode"),
+        "engine_version": row.get("engine_version"),
+        "objective_used": row.get("objective_used"),
+        # Present-and-null on a run stored before the mode was recorded, so a
+        # reader can say "not recorded" rather than guess (F191).
+        "dispatch_resolution": row.get("dispatch_resolution"),
+        "solar_kw": row.get("solar_kw"),
+        "battery_kwh": row.get("battery_kwh"),
+        "system_cost": row.get("system_cost"),
+        "annual_solar_generation_kwh": row.get("annual_solar_generation_kwh"),
+        "within_budget": row.get("within_budget"),
+        # Whether the run recorded WHICH option it chose. A key that is absent
+        # and a key that is null both mean the same thing here: no usable
+        # marker, so the compare marks none rather than inferring one (F195).
+        "has_chosen_marker": row.get("chosen_index") is not None,
+        # Whether it kept an array-size curve at all — a solar run's own
+        # points, or a battery run's solar_options (F202).
+        "has_solar_curve": (
+            row.get("solar_curve_probe") is not None
+            or row.get("battery_curve_probe") is not None
+        ),
+        # The MATCHING financial row's figures. A run whose financial row is
+        # missing keeps the run and loses the figures — never borrowed from
+        # another run, never filled with zeroes. financial_result_id null is
+        # what distinguishes "no row" from "a row whose figures are null".
+        "financial_result_id": (fin or {}).get("financial_result_id"),
+        "payback_years": (fin or {}).get("payback_years"),
+        "npv_25_year": (fin or {}).get("npv_25_year"),
+        "undiscounted_savings_25yr": (fin or {}).get("undiscounted_savings_25yr"),
+    }
+
+
+@router.get("/api/sizing/runs")
+async def sizing_runs(
+    job_id: str,
+    limit: int = RUNS_PAGE_DEFAULT,
+    offset: int = 0,
+    caller: Caller = Depends(require_company),
+):
+    """One job's sizing history, newest first — lean, counted and paged.
+
+    AUTHENTICATION AND OWNERSHIP ARE THE SIBLINGS' — the same
+    `require_company` dependency and the same imported `_get_company_job`, so
+    a foreign job and an absent job answer IDENTICALLY (3.11b made those two
+    byte-identical on purpose, and a new endpoint that distinguishes them
+    would undo it quietly) and a transport failure answers 503, never 404.
+
+    ORDER IS DETERMINISTIC: created_at DESC then sizing_result_id DESC. A
+    timestamp alone is not deterministic when two rows share it — the log is
+    append-only and two runs a second apart are already in this database — so
+    the tie breaks on the primary key, which is unique by definition and
+    therefore a total order.
+    """
+    client = _sb()
+    if client is None:
+        # A read with nothing to read from. The same 503 the ownership helper
+        # raises for "could not check" — never a 200 with an empty history,
+        # which would read as "this job has no runs".
+        raise HTTPException(status_code=503, detail="Database unavailable")
+    # Ownership BEFORE any read of the job's runs — the sizing endpoints' rule.
+    _get_company_job(client, job_id, caller.company_id)
+
+    page = max(1, min(int(limit), RUNS_PAGE_MAX))
+    start = max(0, int(offset))
+    try:
+        res = (
+            client.table("sizing_results")
+            .select(_RUNS_SELECT, count="exact")
+            .eq("job_id", job_id)
+            .order("created_at", desc=True)
+            .order("sizing_result_id", desc=True)
+            .range(start, start + page - 1)
+            .execute()
+        )
+    except Exception as exc:  # noqa: BLE001
+        sentry_sdk.capture_exception(exc)
+        raise HTTPException(status_code=503, detail="Database unavailable") from None
+
+    rows = getattr(res, "data", None) or []
+    total = getattr(res, "count", None)
+    total = int(total) if isinstance(total, int) else len(rows)
+    runs = [_run_summary(r) for r in rows if isinstance(r, dict)]
+    return {
+        "job_id": job_id,
+        "runs": runs,
+        # THE COUNT IS PART OF THE ANSWER: how many the job HAS, beside the
+        # page being returned, so a caller can always tell a complete list
+        # from a bounded one without inferring it from the page size.
+        "total": total,
+        "returned": len(runs),
+        "limit": page,
+        "offset": start,
+        "truncated": start + len(runs) < total,
+    }
+
+
 class SizingRequest(BaseModel):
     bill_data: dict[str, Any]
     solar_data: dict[str, Any]

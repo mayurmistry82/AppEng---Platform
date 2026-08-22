@@ -51,6 +51,12 @@ def check(name: str, condition: bool, detail: str = "") -> None:
 
 LIVE_JOB = "456e0242-17f9-4b2a-8faa-f664ddd9eed9"
 ENDPOINTS = ("/api/sizing/optimise", "/api/sizing/battery")
+# 3.14 prompt 7: the run history is a GET beside the two POSTs, and it is
+# authenticated by the SAME dependency and the SAME ownership helper.
+RUNS = "/api/sizing/runs"
+# The job with a real history (16 runs at the time of writing) — read for its
+# SHAPE, never for a count typed into this file (2U.2).
+HISTORY_JOB = "a57e13f1-24f2-48e3-b816-8a08cb6b2fed"
 
 client_http = TestClient(main.app, raise_server_exceptions=False)
 
@@ -97,6 +103,15 @@ def t1_auth_layer() -> None:
         r = client_http.post(path, json={"job_id": LIVE_JOB})
         check(f"(1a) {path} with NO Authorization header -> 401",
               r.status_code == 401, f"{r.status_code} {r.text[:80]}")
+    # 3.14 prompt 7: the GET is not a special case — same layer, same answers.
+    r = client_http.get(RUNS, params={"job_id": LIVE_JOB})
+    check(f"(1a) {RUNS} with NO Authorization header -> 401",
+          r.status_code == 401, f"{r.status_code} {r.text[:80]}")
+    for header in ("Bearer", "Basic xyz", "Bearer "):
+        r = client_http.get(RUNS, params={"job_id": LIVE_JOB},
+                            headers={"Authorization": header})
+        check(f"(1b) {RUNS} malformed header {header!r} -> 401",
+              r.status_code == 401, f"{r.status_code} {r.text[:80]}")
     for header in ("Bearer", "Basic xyz", "Bearer "):
         r = client_http.post(ENDPOINTS[0], json={},
                              headers={"Authorization": header})
@@ -116,6 +131,23 @@ def t1_auth_layer() -> None:
         auth._validate_token, auth._lookup_company = orig_validate, orig_lookup
     check("(1c) valid token with company_id None -> 403",
           r.status_code == 403, f"{r.status_code} {r.text[:80]}")
+
+    # 3.14 prompt 7: a caller with no company is refused the SAME way on the
+    # history read — and with the SAME body, not merely the same status.
+    orig_validate, orig_lookup = auth._validate_token, auth._lookup_company
+    auth._validate_token = lambda token: {"user_id": "u-1c", "email": "c@example.com"}
+    auth._lookup_company = lambda user_id: (None, None)
+    try:
+        r_runs = client_http.get(RUNS, params={"job_id": LIVE_JOB},
+                                 headers={"Authorization": "Bearer gate-1c-runs-token"})
+    finally:
+        auth._validate_token, auth._lookup_company = orig_validate, orig_lookup
+    print(f"        POST 403 body: {r.text}")
+    print(f"        GET  403 body: {r_runs.text}")
+    check(f"(1c) {RUNS} with company_id None -> 403, byte-identical to the "
+          "siblings' refusal",
+          r_runs.status_code == 403 and r_runs.text == r.text,
+          f"{r_runs.status_code} {r_runs.text[:80]}")
 
 
 def _as_company_a():
@@ -151,6 +183,36 @@ def t2_ownership() -> None:
         r_down = client_http.post(ENDPOINTS[0], json={"job_id": LIVE_JOB})
         check("(2c) a transport failure -> 503, never 404 and never 200",
               r_down.status_code == 503, f"{r_down.status_code} {r_down.text[:80]}")
+
+        # ── 3.14 prompt 7: THE SAME THREE ANSWERS on the history read. The
+        # foreign/absent pair is compared BODY TO BODY, not read off the code.
+        sizing_route._sb = lambda: _OwnershipStub("foreign")
+        g_foreign = client_http.get(RUNS, params={"job_id": LIVE_JOB})
+        sizing_route._sb = lambda: _OwnershipStub("absent")
+        g_absent = client_http.get(RUNS, params={"job_id": LIVE_JOB})
+        print(f"        runs foreign: {g_foreign.status_code} {g_foreign.text}")
+        print(f"        runs absent : {g_absent.status_code} {g_absent.text}")
+        check(f"(2a) {RUNS}: a job owned by company-B -> 404 for company-A",
+              g_foreign.status_code == 404,
+              f"{g_foreign.status_code} {g_foreign.text[:80]}")
+        check(f"(2b) {RUNS}: an absent job -> 404",
+              g_absent.status_code == 404,
+              f"{g_absent.status_code} {g_absent.text[:80]}")
+        check(f"(2b) {RUNS}: the two 404 responses are IDENTICAL in status AND "
+              "body — existence never leaks from the new endpoint either",
+              g_foreign.status_code == g_absent.status_code
+              and g_foreign.text == g_absent.text,
+              f"{g_foreign.status_code}/{g_foreign.text!r} vs "
+              f"{g_absent.status_code}/{g_absent.text!r}")
+        check("(2b) ...and identical to the POST siblings' 404 body, so the "
+              "three endpoints cannot be told apart by their refusals",
+              g_foreign.text == r_foreign.text,
+              f"{g_foreign.text!r} vs {r_foreign.text!r}")
+
+        sizing_route._sb = lambda: _OwnershipStub("transport")
+        g_down = client_http.get(RUNS, params={"job_id": LIVE_JOB})
+        check(f"(2c) {RUNS}: a transport failure -> 503, never 404 and never 200",
+              g_down.status_code == 503, f"{g_down.status_code} {g_down.text[:80]}")
     finally:
         sizing_route._sb = orig_sb
         _clear_overrides()
@@ -240,12 +302,256 @@ def t4_ordering() -> None:
         _clear_overrides()
 
 
+def _as_owner_of(job_id: str):
+    """A caller whose company genuinely owns `job_id`, read from the database."""
+    real_client = sizing_route._sb()
+    if real_client is None:
+        return None
+    owner = (real_client.table("jobs").select("company_id")
+             .eq("job_id", job_id).limit(1).execute())
+    company_id = (owner.data or [{}])[0].get("company_id")
+    if not company_id:
+        return None
+    main.app.dependency_overrides[auth.require_company] = lambda: auth.Caller(
+        user_id="gate-runner", email="gate@example.com",
+        company_id=company_id, role="owner")
+    return company_id
+
+
+def t6_runs_contract() -> None:
+    """3.14 prompt 7 — the history read: LEAN, COUNTED, DETERMINISTIC, and an
+    empty history is an empty list rather than a 404."""
+    print("\nT6. the run history — lean, counted, ordered, and never a 404 "
+          "for a job with no runs")
+    company_id = _as_owner_of(HISTORY_JOB)
+    if company_id is None:
+        check("(6) the live job's owning company was read", False,
+              "env not configured or job absent")
+        return
+    try:
+        r = client_http.get(RUNS, params={"job_id": HISTORY_JOB})
+        check("(6) authenticated owner + real job -> 200",
+              r.status_code == 200, f"{r.status_code} {r.text[:120]}")
+        if r.status_code != 200:
+            return
+        body = r.json()
+        runs = body.get("runs") or []
+        total = body.get("total")
+        print(f"        total={total} returned={body.get('returned')} "
+              f"limit={body.get('limit')} offset={body.get('offset')} "
+              f"truncated={body.get('truncated')}")
+        check("(6) the envelope carries the job id, the page and the TOTAL",
+              body.get("job_id") == HISTORY_JOB
+              and isinstance(total, int) and isinstance(runs, list)
+              and body.get("returned") == len(runs)
+              and isinstance(body.get("truncated"), bool),
+              str({k: v for k, v in body.items() if k != "runs"}))
+        # 2U.2: the count is DERIVED here, not typed into this file.
+        real_client = sizing_route._sb()
+        actual = (real_client.table("sizing_results")
+                  .select("sizing_result_id", count="exact")
+                  .eq("job_id", HISTORY_JOB).limit(1).execute().count)
+        check("(6) total == the number of rows the table actually holds for "
+              "this job — counted here, never quoted",
+              total == actual, f"endpoint {total} vs database {actual}")
+
+        # ── (6a) THE LEAN GUARANTEE. Every heavy key, at every depth.
+        blob = json.dumps(body)
+        present = sorted(k for k in sizing_route.RUNS_FORBIDDEN_KEYS if f'"{k}"' in blob)
+        print(f"        forbidden keys anywhere in the response: {present or 'none'}")
+        check("(6a) the response carries NONE of the heavy keys — no evaluated "
+              "options, no cost breakdown, no run assumptions",
+              present == [], f"found {present}")
+        if runs:
+            keys = sorted(runs[0])
+            print(f"        one run's fields ({len(keys)}): {keys}")
+            check("(6a) every run carries the SAME field set — a summary with "
+                  "a variable shape is one a reader cannot rely on",
+                  all(sorted(x) == keys for x in runs), "")
+            for field in ("sizing_result_id", "created_at", "run_kind",
+                          "engine_mode", "objective_used", "dispatch_resolution",
+                          "solar_kw", "system_cost", "has_chosen_marker",
+                          "has_solar_curve", "payback_years", "npv_25_year",
+                          "undiscounted_savings_25yr", "financial_result_id"):
+                check(f"(6a) every run carries {field}",
+                      all(field in x for x in runs), f"missing from some run")
+            # F191: recorded-as-absent, not omitted.
+            check("(6a) dispatch_resolution is PRESENT on every run, null on "
+                  "those stored before it was recorded",
+                  all("dispatch_resolution" in x for x in runs)
+                  and any(x["dispatch_resolution"] is None for x in runs),
+                  str(sorted({str(x["dispatch_resolution"]) for x in runs})))
+            check("(6a) has_chosen_marker is a bool on every run, and this "
+                  "job holds BOTH answers — the flag is not constant",
+                  all(isinstance(x["has_chosen_marker"], bool) for x in runs)
+                  and len({x["has_chosen_marker"] for x in runs}) == 2,
+                  str(sorted({x["has_chosen_marker"] for x in runs})))
+            check("(6a) has_solar_curve is a bool on every run, and this job "
+                  "holds BOTH answers",
+                  all(isinstance(x["has_solar_curve"], bool) for x in runs)
+                  and len({x["has_solar_curve"] for x in runs}) == 2,
+                  str(sorted({x["has_solar_curve"] for x in runs})))
+            # A run with no financial row keeps the run and loses the figures.
+            missing_fin = [x for x in runs if x["financial_result_id"] is None]
+            print(f"        runs with no financial row: {len(missing_fin)} of {len(runs)}")
+            check("(6a) a run whose financial row is missing still APPEARS, "
+                  "with its figures null rather than borrowed or zeroed",
+                  all(x["payback_years"] is None and x["npv_25_year"] is None
+                      and x["undiscounted_savings_25yr"] is None
+                      for x in missing_fin),
+                  str([(x["sizing_result_id"], x["npv_25_year"]) for x in missing_fin][:3]))
+
+        # ── (6b) THE COUNT IS HONEST: a page smaller than the history.
+        small = client_http.get(RUNS, params={"job_id": HISTORY_JOB, "limit": 3})
+        sb = small.json()
+        print(f"        limit=3 -> returned={sb.get('returned')} total={sb.get('total')} "
+              f"truncated={sb.get('truncated')}")
+        check("(6b) with limit=3 the LIST is short but the TOTAL still says "
+              "how many exist — the whole reason this endpoint exists",
+              small.status_code == 200 and len(sb.get("runs") or []) == 3
+              and sb.get("total") == actual and sb.get("returned") == 3
+              and sb.get("truncated") is True and actual > 3,
+              f"returned={sb.get('returned')} total={sb.get('total')} "
+              f"truncated={sb.get('truncated')} actual={actual}")
+        check("(6b) the full page reports truncated FALSE — a complete list "
+              "and a bounded one are distinguishable both ways",
+              body.get("truncated") is False and body.get("returned") == actual,
+              f"{body.get('truncated')} / {body.get('returned')} vs {actual}")
+        over = client_http.get(RUNS, params={"job_id": HISTORY_JOB, "limit": 10_000})
+        check("(6b) limit is clamped to the stated maximum, never unbounded",
+              over.status_code == 200
+              and over.json().get("limit") == sizing_route.RUNS_PAGE_MAX,
+              f"{over.json().get('limit')} vs max {sizing_route.RUNS_PAGE_MAX}")
+        deflt = client_http.get(RUNS, params={"job_id": HISTORY_JOB, "limit": 0})
+        check("(6b) a nonsense limit floors at 1 rather than returning nothing",
+              deflt.status_code == 200 and deflt.json().get("limit") == 1,
+              str(deflt.json().get("limit")))
+
+        # ── (6c) ORDER. Newest first, and the page boundary does not drop or
+        # duplicate a row — the property that a tie-break exists to protect.
+        ids = [x["sizing_result_id"] for x in runs]
+        stamps = [x["created_at"] for x in runs]
+        check("(6c) newest first by created_at",
+              stamps == sorted(stamps, reverse=True), str(stamps[:3]))
+        page1 = client_http.get(RUNS, params={"job_id": HISTORY_JOB, "limit": 5, "offset": 0}).json()
+        page2 = client_http.get(RUNS, params={"job_id": HISTORY_JOB, "limit": 5, "offset": 5}).json()
+        paged = [x["sizing_result_id"] for x in page1["runs"] + page2["runs"]]
+        check("(6c) two consecutive pages reproduce the single-page order "
+              "exactly — no row dropped, none seen twice",
+              paged == ids[:10] and len(set(paged)) == 10,
+              f"{paged[:3]}... vs {ids[:3]}...")
+    finally:
+        _clear_overrides()
+
+
+def t7_runs_tiebreak_and_empty() -> None:
+    """(7a) 2U.2 — the tie is CONSTRUCTED, not hoped for: no two live runs
+    share a created_at today, so a stub serves rows that do. (7b) a job with
+    no runs is an empty list and a zero, never a 404."""
+    print("\nT7. a constructed timestamp tie, and the empty history")
+    _as_company_a()
+    orig_sb = sizing_route._sb
+    SHARED = "2026-08-22T01:00:00+00:00"
+    tied_rows = [
+        {"sizing_result_id": "aaaaaaaa-0000-4000-8000-000000000001",
+         "created_at": SHARED, "run_kind": "solar", "financial_results": []},
+        {"sizing_result_id": "cccccccc-0000-4000-8000-000000000003",
+         "created_at": SHARED, "run_kind": "solar", "financial_results": []},
+        {"sizing_result_id": "bbbbbbbb-0000-4000-8000-000000000002",
+         "created_at": SHARED, "run_kind": "solar", "financial_results": []},
+    ]
+
+    class _RunsStub:
+        """jobs -> owned by company-A; sizing_results -> the tied rows, with
+        the ORDER the endpoint asked for actually applied, so the assertion
+        tests the endpoint's ordering rather than the stub's."""
+
+        def __init__(self, rows):
+            self.rows, self.table_name, self.orders = rows, None, []
+
+        def table(self, name):
+            self.table_name = name
+            self.orders = []
+            return self
+
+        def select(self, *_a, **_k):
+            self.counting = _k.get("count") == "exact"
+            return self
+
+        def eq(self, *_a, **_k):
+            return self
+
+        def limit(self, *_a, **_k):
+            return self
+
+        def order(self, column, desc=False, **_k):
+            self.orders.append((column, desc))
+            return self
+
+        def range(self, start, end):
+            self.window = (start, end)
+            return self
+
+        def execute(self):
+            if self.table_name == "jobs":
+                return _Result([{"job_id": "j", "company_id": "company-A"}])
+            rows = list(self.rows)
+            for column, desc in reversed(self.orders):
+                rows.sort(key=lambda r: str(r.get(column) or ""), reverse=bool(desc))
+            start, end = getattr(self, "window", (0, len(rows) - 1))
+            out = rows[start:end + 1]
+            res = _Result(out)
+            res.count = len(rows)
+            return res
+
+    try:
+        stub = _RunsStub(tied_rows)
+        sizing_route._sb = lambda: stub
+        r = client_http.get(RUNS, params={"job_id": "j"})
+        body = r.json()
+        ids = [x["sizing_result_id"] for x in body.get("runs") or []]
+        print(f"        three runs sharing {SHARED}")
+        print(f"        order applied by the endpoint: {stub.orders}")
+        print(f"        ids returned: {[i[:8] for i in ids]}")
+        check("(7a) the endpoint asks for created_at DESC and then breaks the "
+              "tie on sizing_result_id DESC — a timestamp alone is not a "
+              "total order",
+              stub.orders == [("created_at", True), ("sizing_result_id", True)],
+              str(stub.orders))
+        check("(7a) three runs sharing one timestamp come back in a "
+              "DETERMINISTIC order (the id, descending)",
+              ids == sorted(ids, reverse=True) and len(ids) == 3,
+              str(ids))
+        again = client_http.get(RUNS, params={"job_id": "j"}).json()
+        check("(7a) ...and the same order on a second identical request",
+              [x["sizing_result_id"] for x in again["runs"]] == ids, "")
+
+        # (7b) the empty history.
+        empty = _RunsStub([])
+        sizing_route._sb = lambda: empty
+        r_empty = client_http.get(RUNS, params={"job_id": "j"})
+        eb = r_empty.json()
+        print(f"        empty history -> {r_empty.status_code} {json.dumps(eb)}")
+        check("(7b) a job with NO runs -> 200 with an empty list and a total "
+              "of zero, NEVER a 404 (the job exists; its history is empty, "
+              "and those are different facts)",
+              r_empty.status_code == 200 and eb.get("runs") == []
+              and eb.get("total") == 0 and eb.get("returned") == 0
+              and eb.get("truncated") is False,
+              f"{r_empty.status_code} {eb}")
+    finally:
+        sizing_route._sb = orig_sb
+        _clear_overrides()
+
+
 def main_() -> int:
     print("verify_sizing_auth.py — 3.11 prompt 1b (TestClient, writes nothing)\n")
     t1_auth_layer()
     t2_ownership()
     t3_t5_happy_and_identity()
     t4_ordering()
+    t6_runs_contract()
+    t7_runs_tiebreak_and_empty()
     print(f"\n{'-' * 60}")
     if FAILURES:
         print(f"FAIL: {len(FAILURES)} of {CHECKS_RUN} checks failed:")
