@@ -13,8 +13,10 @@ import {
   PHASE_ORDER,
   CHOSEN_NOT_RECORDED_NOTE,
   RAIL_DECLINE_FLAG,
-  RAIL_SELF_SUFFICIENCY_CURRENT_ONLY,
+  RAIL_SELF_SUFFICIENCY_NOT_RECORDED,
   RAIL_SPLIT_CURRENT_ONLY,
+  legacySelfSufficiencyByMatch,
+  storedSelfSufficiencyPct,
   parseRunHistory,
   railCompareView,
   railComparability,
@@ -8268,17 +8270,17 @@ const HISTORY_PAYLOAD = {
   runs: [
     { sizing_result_id: "s-batt", created_at: "2026-08-21T02:00:00Z", run_kind: "solar_battery",
       engine_mode: "sequential", objective_used: "max_npv", dispatch_resolution: "full_year",
-      solar_kw: 9.24, battery_kwh: 9.83, system_cost: 11868.77, self_consumption_ratio: 0.5425,
+      solar_kw: 9.24, battery_kwh: 9.83, system_cost: 11868.77, self_sufficiency_pct: 84.12,
       has_chosen_marker: true, has_solar_curve: true, financial_result_id: "f1",
       payback_years: 5.55, npv_25_year: 19935.55, undiscounted_savings_25yr: 56539.32 },
     { sizing_result_id: "s-old", created_at: "2026-08-20T05:00:00Z", run_kind: "solar_battery",
       engine_mode: "sequential", objective_used: "max_npv", dispatch_resolution: null,
-      solar_kw: 6.6, battery_kwh: 13.5, system_cost: 16000, self_consumption_ratio: 0.61,
+      solar_kw: 6.6, battery_kwh: 13.5, system_cost: 16000, self_sufficiency_pct: null,
       has_chosen_marker: false, has_solar_curve: false, financial_result_id: "f0",
       payback_years: 7.1, npv_25_year: 15000, undiscounted_savings_25yr: 40000 },
     { sizing_result_id: "s-nofin", created_at: "2026-08-19T05:00:00Z", run_kind: "solar",
       engine_mode: "sequential", objective_used: "min_payback", dispatch_resolution: null,
-      solar_kw: 4.84, battery_kwh: null, system_cost: 4900, self_consumption_ratio: null,
+      solar_kw: 4.84, battery_kwh: null, system_cost: 4900, self_sufficiency_pct: null,
       has_chosen_marker: false, has_solar_curve: false, financial_result_id: null,
       payback_years: null, npv_25_year: null, undiscounted_savings_25yr: null },
   ],
@@ -8457,13 +8459,11 @@ test("3.14-8: against a historical baseline the split tile says it is current-"
   assert.equal(hist.after.solarKw, 9.24);
   const npv = hist.deltas.find((d) => d.label === "NPV");
   assert.equal(npv?.change, "+$4,936");
-  // Self-sufficiency is NOT in the history (self-consumption is a different
-  // measure) — null baseline, and the tile says so.
+  // 3.14 prompt 9: this baseline recorded no marker, so its self-sufficiency
+  // is a recorded silence — null, and the tile says not recorded.
   assert.equal(hist.before.selfSufficiencyPct, null);
-  assert.equal(hist.selfSufficiencyNote, RAIL_SELF_SUFFICIENCY_CURRENT_ONLY);
-  assert.equal(old.selfConsumptionRatio, 0.61, "the added field is parsed…");
-  assert.notEqual(old.selfConsumptionRatio, hist.after.selfSufficiencyPct,
-    "…and is never presented as self-sufficiency");
+  assert.equal(hist.selfSufficiencyNote, RAIL_SELF_SUFFICIENCY_NOT_RECORDED);
+  assert.ok(!("selfConsumptionRatio" in old), "self-consumption is gone from the history");
   assert.ok(hist.comparability && !hist.comparability.comparable);
   assert.equal(hist.comparability.reasons[0].kind, "resolution-not-recorded");
   // A baseline with NO financial row: absent, not borrowed, not zero.
@@ -8551,4 +8551,170 @@ test("3.14-8: the bar reads the history from GET /api/sizing/runs, swaps in the 
   const S = "/private/tmp/claude-501/-Volumes-OWC1TB-enrgengine/73611770-76c2-46c1-9e72-9baf6b5f2509/scratchpad/p4";
   assert.ok(!read("components/results/score-curve.tsx").includes("railRerank"),
     "the chart component knows nothing of the rail — the re-rank is in the VIEW");
+});
+
+
+// ── 3.14 prompt 9 — ONE rule for which option a run chose (2R.1, F195) ───────
+
+/** A battery run whose chosen candidate has a TWIN — two candidates equal on
+    usable_kwh AND system_cost — with the marker pointing at one of them. */
+const TIED_BATTERY_RUN = {
+  sizing_result_id: "s-tie", run_kind: "solar_battery", objective_used: "max_npv",
+  engine_mode: "sequential", solar_kw: 9.24, battery_kwh: 9.83, system_cost: 11868.77,
+  evaluated_options: {
+    dimension_keys: ["battery_id"],
+    chosen_index: 2,
+    points: [
+      { usable_kwh: 0, model: "No battery", system_cost: 6342, self_sufficiency_pct: 44.61 },
+      { battery_id: "twin-a", usable_kwh: 9.83, model: "Twin A", system_cost: 11868.77, self_sufficiency_pct: 80.0 },
+      { battery_id: "twin-b", usable_kwh: 9.83, model: "Twin B", system_cost: 11868.77, self_sufficiency_pct: 84.12 },
+    ],
+  },
+};
+
+// 9-A. THE MARKER WINS where the numeric match returns null on a tie.
+test("3.14-9 F195: a marker pointing at one of two candidates tied on capacity "
+  + "AND cost resolves — where the numeric match alone returns null", () => {
+  const eo = TIED_BATTERY_RUN.evaluated_options;
+  const legacy = legacySelfSufficiencyByMatch(TIED_BATTERY_RUN, eo);
+  const marker = storedSelfSufficiencyPct(TIED_BATTERY_RUN, eo);
+  console.log(`        tie: numeric match -> ${legacy}   marker-first -> ${marker}`);
+  assert.equal(legacy, null, "the premise: the old rule cannot tell the twins apart");
+  assert.equal(marker, 84.12, "the marker names Twin B, and its figure is read");
+  // It flows through every reader: the bar, the Results section, the stored
+  // battery section — one derivation, four callers.
+  const job = { ...RAIL_JOB, sizing_results: [TIED_BATTERY_RUN] };
+  const bar = resultsBarView(job);
+  assert.equal(bar.sized ? bar.selfSufficiencyPct : null, 84.12);
+  assert.equal(batterySizingView(job).storedRun?.run.headline?.selfSufficiencyPct, "84.12%");
+  assert.equal(railBaselineView(job).figures.selfSufficiencyPct, 84.12);
+  // The solar branch is the same rule, unchanged: the marker names the point.
+  assert.equal(storedSelfSufficiencyPct(STORED_SOLAR_RUN, STORED_SOLAR_RUN.evaluated_options), 84.1);
+});
+
+// 9-B. THE LEGACY FALLBACK, unchanged for pre-marker runs.
+test("3.14-9: a pre-marker battery run still resolves by the capacity-and-cost "
+  + "match exactly as before, and a pre-marker tie is still null", () => {
+  const pre = JSON.parse(JSON.stringify(STORED_BATTERY_RUN));
+  delete pre.evaluated_options.chosen_index;
+  const eo = pre.evaluated_options;
+  const viaRule = storedSelfSufficiencyPct(pre, eo);
+  const viaLegacy = legacySelfSufficiencyByMatch(pre, eo);
+  console.log(`        pre-marker: rule -> ${viaRule}   legacy -> ${viaLegacy}`);
+  assert.equal(viaLegacy, 84.1, "the premise: the numeric match resolves this run");
+  assert.equal(viaRule, 84.1, "the rule answers through the fallback — unchanged");
+  const preBar = resultsBarView({ ...RAIL_JOB, sizing_results: [pre] });
+  assert.equal(preBar.sized ? preBar.selfSufficiencyPct : null, 84.1);
+  // A pre-marker TIE is still null — the fallback never guesses.
+  const preTie = JSON.parse(JSON.stringify(TIED_BATTERY_RUN));
+  delete preTie.evaluated_options.chosen_index;
+  assert.equal(storedSelfSufficiencyPct(preTie, preTie.evaluated_options), null);
+  // A pre-marker SOLAR run recorded nothing to read.
+  const preSolar = JSON.parse(JSON.stringify(STORED_SOLAR_RUN));
+  delete preSolar.evaluated_options.chosen_index;
+  assert.equal(storedSelfSufficiencyPct(preSolar, preSolar.evaluated_options), null);
+});
+
+// 9-C. A CORRUPT MARKER yields null AND the fallback does not fire.
+test("3.14-9: a corrupt marker yields null and does NOT fall through to the "
+  + "numeric match — which would have answered", () => {
+  // A run where the numeric match WOULD resolve (unique twin-free chosen
+  // candidate), so a null can only mean the fallback was not consulted.
+  const base = JSON.parse(JSON.stringify(STORED_BATTERY_RUN));
+  assert.equal(legacySelfSufficiencyByMatch(base, base.evaluated_options), 84.1,
+    "the premise: the match WOULD answer on this run");
+  const cases: [string, unknown][] = [
+    ["out of range (99)", 99],
+    ["negative", -1],
+    ["not an integer", 1.5],
+    ["a string", "1"],
+    ["a boolean", true],
+  ];
+  for (const [label, idx] of cases) {
+    const run = JSON.parse(JSON.stringify(base));
+    run.evaluated_options.chosen_index = idx;
+    const got = storedSelfSufficiencyPct(run, run.evaluated_options);
+    console.log(`        corrupt marker ${label.padEnd(20)} -> ${got}  (match would give 84.1)`);
+    assert.equal(got, null, label);
+    assert.doesNotThrow(() => resultsBarView({ ...RAIL_JOB, sizing_results: [run] }));
+  }
+  // A marker naming a point with NO figure: null, not the match's 84.1.
+  const noFigure = JSON.parse(JSON.stringify(base));
+  delete noFigure.evaluated_options.points[1].self_sufficiency_pct;
+  const gotNoFigure = storedSelfSufficiencyPct(noFigure, noFigure.evaluated_options);
+  console.log(`        marker at a point with no figure -> ${gotNoFigure}  (match would give null too — so the twin proves it):`);
+  assert.equal(gotNoFigure, null);
+  // And the decisive twin: the marker names a point with no figure while the
+  // numeric match would find a DIFFERENT, unique, figured candidate.
+  const decisive = JSON.parse(JSON.stringify(TIED_BATTERY_RUN));
+  decisive.evaluated_options.points[2] = { battery_id: "twin-b", usable_kwh: 9.83, model: "Twin B", system_cost: 11868.77 };
+  decisive.evaluated_options.points[1].system_cost = 99999; // twin-a no longer matches the row
+  decisive.evaluated_options.points.push({ battery_id: "c", usable_kwh: 9.83, model: "C", system_cost: 11868.77, self_sufficiency_pct: 70 });
+  decisive.evaluated_options.chosen_index = 2;
+  assert.equal(legacySelfSufficiencyByMatch(decisive, decisive.evaluated_options), null,
+    "(two rows now match the row's figures — a tie — so use a cleaner fixture)");
+  decisive.evaluated_options.points.pop();
+  assert.equal(legacySelfSufficiencyByMatch(decisive, decisive.evaluated_options), null);
+  decisive.evaluated_options.points[2].system_cost = 11868.77;
+  decisive.evaluated_options.points[1] = { battery_id: "twin-a", usable_kwh: 9.83, model: "Twin A", system_cost: 11868.77, self_sufficiency_pct: 80 };
+  decisive.evaluated_options.points[2] = { battery_id: "twin-b", usable_kwh: 9.83, model: "Twin B", system_cost: 55555 };
+  // Now: marker -> Twin B (no figure); the match -> Twin A uniquely (80).
+  assert.equal(legacySelfSufficiencyByMatch(decisive, decisive.evaluated_options), 80,
+    "the premise: the match would answer 80");
+  const got = storedSelfSufficiencyPct(decisive, decisive.evaluated_options);
+  console.log(`        marker names a figureless point, match would say 80 -> ${got}`);
+  assert.equal(got, null, "the fallback did NOT fire — a corrupt marker is not hidden behind a plausible number");
+});
+
+// 9-D. self_consumption_ratio appears NOWHERE in the feature.
+test("3.14-9: self_consumption_ratio and selfConsumptionRatio appear nowhere in "
+  + "the history endpoint, the lib or the bar", async () => {
+  const [fs, path] = await Promise.all([import("node:fs"), import("node:path")]);
+  const FRONTEND = path.resolve(import.meta.dirname, "..");
+  const read = (f: string) => fs.readFileSync(path.join(FRONTEND, f), "utf8");
+  assert.ok(!read("lib/worksheet.ts").includes("selfConsumptionRatio"));
+  assert.ok(!read("lib/worksheet.ts").includes("self_consumption_ratio"));
+  assert.ok(!read("components/worksheet/results-bar.tsx").includes("elfConsumption"));
+  assert.ok(!read("components/worksheet/results-bar.tsx").includes("self_consumption"));
+  // The endpoint's projection and summary — by name, in the route source.
+  const route = read("../backend/routes/sizing.py");
+  const runsBlock = route.slice(route.indexOf("_RUNS_SELECT = ("), route.indexOf("@router.get(\"/api/sizing/runs\")"));
+  assert.ok(!runsBlock.includes("self_consumption_ratio"), "not in the history projection or summary");
+  assert.ok(runsBlock.includes("self_sufficiency_pct"), "the tile's quantity is what travels");
+  assert.ok(runsBlock.includes("_chosen_self_sufficiency"), "projected by the marker");
+  // The parser reads the new field and nothing of the old.
+  const parsed = parseRunHistory(HISTORY_PAYLOAD);
+  assert.equal(parsed.runs[0].selfSufficiencyPct, 84.12);
+  assert.ok(!("selfConsumptionRatio" in parsed.runs[0]));
+});
+
+// 9-E. THE TILE COMPARES — two outcomes.
+test("3.14-9: self-sufficiency compares against a historical baseline that "
+  + "recorded a marker, and says not-recorded against one that did not", () => {
+  const splitLabel = "$17,068 + $2,867";
+  const withMarker: RailHistoryRun = {
+    ...(HISTORY.runs.find((r) => r.sizingResultId === "s-old") as RailHistoryRun),
+    sizingResultId: "s-marked", selfSufficiencyPct: 76.6, hasChosenMarker: true,
+    dispatchResolution: "full_year",
+  };
+  const compared = railCompareView(RAIL_BASELINE8, withMarker, { kind: "stored" }, splitLabel);
+  const ss = compared.deltas.find((d) => d.label === "Self-sufficiency");
+  console.log(`        marked baseline   : before=${compared.before.selfSufficiencyPct} after=${compared.after.selfSufficiencyPct} change=${ss?.change} note=${compared.selfSufficiencyNote}`);
+  assert.equal(compared.before.selfSufficiencyPct, 76.6);
+  assert.equal(compared.after.selfSufficiencyPct, 84.1);
+  assert.equal(ss?.change, "+7.5 pts");
+  assert.equal(ss?.direction, "up");
+  assert.equal(compared.selfSufficiencyNote, null, "a real comparison — no caveat");
+
+  const silent = HISTORY.runs.find((r) => r.sizingResultId === "s-old") as RailHistoryRun;
+  const notRecorded = railCompareView(RAIL_BASELINE8, silent, { kind: "stored" }, splitLabel);
+  const ss2 = notRecorded.deltas.find((d) => d.label === "Self-sufficiency");
+  console.log(`        pre-marker baseline: before=${notRecorded.before.selfSufficiencyPct} change=${ss2?.change} note=${notRecorded.selfSufficiencyNote}`);
+  assert.equal(notRecorded.before.selfSufficiencyPct, null);
+  assert.equal(notRecorded.selfSufficiencyNote, RAIL_SELF_SUFFICIENCY_NOT_RECORDED);
+  assert.match(notRecorded.selfSufficiencyNote ?? "", /not recorded/);
+  assert.ok(!/—$/.test(notRecorded.selfSufficiencyNote ?? ""), "never a dash alone");
+  // Two distinct outcomes.
+  assert.notEqual(compared.selfSufficiencyNote, notRecorded.selfSufficiencyNote);
+  assert.notEqual(ss?.change, ss2?.change);
 });

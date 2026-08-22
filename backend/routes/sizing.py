@@ -53,6 +53,11 @@ router = APIRouter()
 # the heavy half never crosses the wire in either direction.
 RUNS_PAGE_DEFAULT = 25
 RUNS_PAGE_MAX = 100
+# How many option indices the self-sufficiency projection covers. The
+# catalogue holds six batteries (+ the baseline) and a roof at most a handful
+# of planes (+ the empty config); a marker at or beyond this reads as NULL
+# and is flagged, never silently — see _run_summary.
+RUNS_CHOSEN_INDEX_MAX = 16
 
 # The projection. Aliased paths keep the heavy blobs out of the read entirely:
 #   dispatch_resolution   the mode the run dispatched at, or null (F191)
@@ -67,11 +72,6 @@ RUNS_PAGE_MAX = 100
 _RUNS_SELECT = (
     "sizing_result_id,created_at,run_kind,engine_mode,engine_version,"
     "objective_used,solar_kw,battery_kwh,system_cost,"
-    # 3.14 prompt 8: the ONE field added for the compare — a scalar column
-    # already on the row. NOTE WHAT IT IS: the share of GENERATION consumed
-    # on site, which is NOT self-sufficiency (the share of LOAD met) — that
-    # figure lives inside evaluated_options and stays in the heavy half.
-    "self_consumption_ratio,"
     "annual_solar_generation_kwh,within_budget,"
     "dispatch_resolution:evaluated_options->>dispatch_resolution,"
     "chosen_index:evaluated_options->chosen_index,"
@@ -79,6 +79,17 @@ _RUNS_SELECT = (
     "battery_curve_probe:evaluated_options->solar_options->points->0->>solar_kw,"
     "financial_results(financial_result_id,created_at,payback_years,"
     "npv_25_year,undiscounted_savings_25yr)"
+    # 3.14 prompt 9: THE CHOSEN OPTION'S SELF-SUFFICIENCY, projected by the
+    # marker. PostgREST cannot index a JSON array by another column's value,
+    # so the projection names each index as its own SCALAR and _run_summary
+    # picks the one chosen_index points at — still no array crosses the
+    # wire. A run with no marker gets NULL: a recorded silence, never a value
+    # found by matching capacity and cost in SQL — a second matching rule in
+    # a second language is exactly what this prompt removes.
+    + "".join(
+        f",ss_{i}:evaluated_options->points->{i}->>self_sufficiency_pct"
+        for i in range(RUNS_CHOSEN_INDEX_MAX)
+    )
 )
 
 # What a summary may NEVER carry. The compare screen fetches these for the two
@@ -88,6 +99,26 @@ RUNS_FORBIDDEN_KEYS = frozenset({
     "chosen_cost_breakdown", "cost_breakdown", "split", "candidates",
     "score_curve", "chosen_solar",
 })
+
+
+def _chosen_self_sufficiency(row: dict) -> Optional[float]:
+    ci = row.get("chosen_index")
+    if not isinstance(ci, int) or isinstance(ci, bool) or ci < 0:
+        return None
+    if ci >= RUNS_CHOSEN_INDEX_MAX:
+        sentry_sdk.capture_message(
+            f"[sizing/runs] chosen_index {ci} beyond the projected range "
+            f"{RUNS_CHOSEN_INDEX_MAX} on {row.get('sizing_result_id')}"
+        )
+        return None
+    raw = row.get(f"ss_{ci}")
+    if raw is None:
+        return None
+    try:
+        value = float(raw)
+    except (TypeError, ValueError):
+        return None
+    return value if math.isfinite(value) else None
 
 
 def _run_summary(row: dict) -> dict:
@@ -119,13 +150,18 @@ def _run_summary(row: dict) -> dict:
         "solar_kw": row.get("solar_kw"),
         "battery_kwh": row.get("battery_kwh"),
         "system_cost": row.get("system_cost"),
-        "self_consumption_ratio": row.get("self_consumption_ratio"),
         "annual_solar_generation_kwh": row.get("annual_solar_generation_kwh"),
         "within_budget": row.get("within_budget"),
         # Whether the run recorded WHICH option it chose. A key that is absent
         # and a key that is null both mean the same thing here: no usable
         # marker, so the compare marks none rather than inferring one (F195).
         "has_chosen_marker": row.get("chosen_index") is not None,
+        # 3.14 prompt 9: the CHOSEN option's self-sufficiency, by the marker
+        # and only by the marker — the same rule the frontend's
+        # storedSelfSufficiencyPct applies. NULL when there is no marker,
+        # when it points outside the projected range, or when the point it
+        # names carries no figure. Never matched by numbers here.
+        "self_sufficiency_pct": _chosen_self_sufficiency(row),
         # Whether it kept an array-size curve at all — a solar run's own
         # points, or a battery run's solar_options (F202).
         "has_solar_curve": (

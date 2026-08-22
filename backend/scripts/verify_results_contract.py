@@ -2439,6 +2439,107 @@ def t_x4_missing_battery_named(client, pin: dict | None) -> None:
           and len(resp.get("candidates") or []) == 1,
           f"{len(resp.get('candidates') or [])} candidate(s)")
 
+
+# ── 3.14 prompt 9 — THE 2Q.1 GATE: the two languages must agree ──────────────
+#
+# The history endpoint projects the chosen option's self-sufficiency in SQL
+# (by the marker, via fixed-index scalars) and the frontend derives it in
+# TypeScript (storedSelfSufficiencyPct, marker first). Both sides are RUN —
+# the Python endpoint and the TypeScript derivation over node (the
+# verify_objective_contract bridge) — never parsed (F148), and the figures are
+# compared both ways for every marker-bearing run on the live fixture job.
+def t_y_two_languages_agree(client) -> None:
+    """A skip here goes through skip(), which counts it — NOT a pass."""
+    print("\nY. self-sufficiency by the marker — SQL projection vs TypeScript "
+          "derivation, every marker-bearing run on a57e13f1, both directions")
+    caller = _caller_for(client, TOU_JOB)
+    # The Python side: the endpoint, RUN.
+    page = asyncio.run(sizing_route.sizing_runs(
+        job_id=TOU_JOB, limit=sizing_route.RUNS_PAGE_MAX, offset=0, caller=caller))
+    runs = page.get("runs") or []
+    check("(Y) the endpoint answered with the whole history (not truncated)",
+          page.get("truncated") is False and len(runs) == page.get("total"),
+          f"returned={page.get('returned')} total={page.get('total')} "
+          f"truncated={page.get('truncated')}")
+    # The job payload the frontend derives from, RUN through the same route
+    # the worksheet uses; it hydrates child tables at _HYDRATION_LIMIT.
+    job = asyncio.run(job_route.get_job(TOU_JOB, caller))
+    rows = job.get("sizing_results") or []
+    if len(rows) != len(runs):
+        skip("(Y) the job payload hydrates "
+             f"{len(rows)} sizing rows but the history holds {len(runs)} — the "
+             "payload is capped at _HYDRATION_LIMIT, so the two sides cannot be "
+             "compared run-for-run today.")
+        return
+    frontend = os.path.abspath(os.path.join(BACKEND_DIR, "..", "frontend"))
+    with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False) as fh:
+        json.dump(rows, fh, default=str)
+        rows_path = fh.name
+    script = (
+        'import { storedSelfSufficiencyPct } from "./lib/worksheet.ts"; '
+        'import { readFileSync } from "node:fs"; '
+        f"const rows = JSON.parse(readFileSync({rows_path!r}, 'utf8')); "
+        "const out = {}; "
+        "for (const r of rows) { out[r.sizing_result_id] = "
+        "storedSelfSufficiencyPct(r, r.evaluated_options ?? {}); } "
+        "console.log(JSON.stringify(out));"
+    )
+    try:
+        proc = subprocess.run(
+            ["node", "--experimental-strip-types", "--input-type=module", "-e", script],
+            cwd=frontend, capture_output=True, text=True, timeout=120,
+        )
+    except FileNotFoundError:
+        skip("(Y) node is not available, so the TypeScript side cannot be RUN.")
+        return
+    finally:
+        os.unlink(rows_path)
+    if proc.returncode != 0:
+        check("(Y) node ran the TypeScript derivation", False,
+              (proc.stderr or "").strip()[:300])
+        return
+    ts_side = json.loads(proc.stdout.strip())
+    py_side = {r["sizing_result_id"]: r.get("self_sufficiency_pct") for r in runs}
+    marked = {r["sizing_result_id"] for r in runs if r.get("has_chosen_marker")}
+    print(f"        {'run':10s} {'marker':7s} {'SQL projection':>16s} {'TS derivation':>16s}")
+    for r in runs:
+        sid = r["sizing_result_id"]
+        print(f"        {sid[:8]:10s} {str(sid in marked):7s} "
+              f"{str(py_side.get(sid)):>16s} {str(ts_side.get(sid)):>16s}")
+    py_marked = {sid: py_side.get(sid) for sid in marked}
+    ts_marked = {sid: ts_side.get(sid) for sid in marked}
+    print(f"        SQL, marker runs : {py_marked}")
+    print(f"        TS,  marker runs : {ts_marked}")
+    check("(Y/premise) the fixture job holds marker-bearing runs AND pre-marker "
+          "runs — both branches are exercised",
+          0 < len(marked) < len(runs), f"{len(marked)} of {len(runs)} marked")
+    check("(Y) for every marker-bearing run: SQL == TypeScript",
+          all(py_marked[s] == ts_marked[s] for s in marked),
+          str({s[:8]: (py_marked[s], ts_marked[s]) for s in marked if py_marked[s] != ts_marked[s]}))
+    check("(Y) ...and TypeScript == SQL (the other direction, key for key)",
+          all(ts_marked[s] == py_marked[s] for s in marked)
+          and set(py_marked) == set(ts_marked), "")
+    check("(Y) every marker-bearing run RESOLVED on both sides — a number, "
+          "never null",
+          all(isinstance(py_marked[s], (int, float)) for s in marked)
+          and all(isinstance(ts_marked[s], (int, float)) for s in marked),
+          str([s[:8] for s in marked if py_marked[s] is None or ts_marked[s] is None]))
+    unmarked = [r["sizing_result_id"] for r in runs if r["sizing_result_id"] not in marked]
+    check("(Y) every PRE-MARKER run is NULL on the SQL side — never matched by "
+          "numbers in a second language",
+          all(py_side.get(s) is None for s in unmarked),
+          str([s[:8] for s in unmarked if py_side.get(s) is not None]))
+    print(f"        pre-marker runs, TS legacy fallback: "
+          f"{ {s[:8]: ts_side.get(s) for s in unmarked} }")
+    # The lean guarantee from prompt 7 still holds after the projection.
+    blob = json.dumps(page)
+    present = sorted(k for k in sizing_route.RUNS_FORBIDDEN_KEYS if f'"{k}"' in blob)
+    check("(Y) the history stays LEAN — none of the heavy keys appear",
+          present == [], str(present))
+    check("(Y) self_consumption_ratio is gone from the history",
+          "self_consumption_ratio" not in blob
+          and all("self_consumption_ratio" not in r for r in runs), "")
+
 def main() -> int:
     print("verify_results_contract.py — 3.13 prompts 1+2 (writes nothing)\n")
     start = _counts()
@@ -2481,6 +2582,7 @@ def main() -> int:
         t_x2_decline_counted(client, (x1 or {}).get("pin"))
         t_x3_flag_absent_unconstrained(client)
         t_x4_missing_battery_named(client, (x1 or {}).get("pin"))
+        t_y_two_languages_agree(client)
         t_q1_red()
         t_u_red()
         t_w1_red()

@@ -647,12 +647,19 @@ export function ResultsBar({
                   ? formatPct(shown.selfSufficiencyPct)
                   : "—"
               }
+              /* 3.14 prompt 9: against a historical baseline this tile
+                 COMPARES like the other three; only a baseline that recorded
+                 no marker gets the not-recorded sentence instead. */
               delta={
                 compare?.selfSufficiencyNote && comparing
                   ? compare.selfSufficiencyNote
                   : tileDelta("Self-sufficiency", "")
               }
-              deltaSign={comparing ? undefined : tileSign("Self-sufficiency", true)}
+              deltaSign={
+                comparing && compare?.selfSufficiencyNote
+                  ? undefined
+                  : tileSign("Self-sufficiency", true)
+              }
             />
             {/* 3.14 prompt 3 (F205), label decided by Mayur 2026-08-21. The
                 THREE cases are discriminated in lib/worksheet.ts, not here —

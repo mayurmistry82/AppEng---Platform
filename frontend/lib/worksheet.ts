@@ -5276,36 +5276,66 @@ export function elapsedLabel(ms: number): string {
  * system_cost) — an ambiguous match yields null, never a guess. ONE
  * derivation, two readers (resultsView and resultsBarView).
  */
-function storedSelfSufficiencyPct(
+/**
+ * 3.14 prompt 9 (2R.1, F195) — ONE RULE for which option a run chose, on
+ * BOTH run kinds: THE MARKER FIRST. A run that recorded chosen_index names
+ * its winner; the figure is read from that point and from nowhere else.
+ *
+ * THE LEGACY FALLBACK, named and fenced: runs stored before 3.14 prompt 2
+ * gave battery runs a marker carry none, and for those ONLY the old
+ * capacity-and-cost match still answers — exactly as it always did, null on
+ * a tie. A marker that is PRESENT but corrupt (outside the array, or naming
+ * a point with no figure) yields null and does NOT fall through to the
+ * match: falling through would hide the corruption behind a plausible
+ * number, and a silent substitution is the fault this row has been deleting.
+ *
+ * Exported so the two-sided gate (verify_results_contract) can run the SAME
+ * derivation over node against the endpoint's SQL projection (2Q.1).
+ */
+export function storedSelfSufficiencyPct(
   sizing: Record<string, unknown>,
   eo: Record<string, unknown>,
 ): number | null {
+  if (eo.chosen_index !== undefined && eo.chosen_index !== null) {
+    // A marker was recorded: it decides, corrupt or not.
+    const idx = eo.chosen_index;
+    if (typeof idx !== "number" || !Number.isInteger(idx) || idx < 0) return null;
+    const points = Array.isArray(eo.points) ? eo.points : null;
+    if (!points || idx >= points.length) return null;
+    return tariffNum(asRecord(points[idx]).self_sufficiency_pct);
+  }
   const runKind = typeof sizing.run_kind === "string" ? sizing.run_kind : null;
-  if (runKind === "solar_battery") {
-    const points = Array.isArray(eo.points) ? eo.points : [];
-    const rowKwh = tariffNum(sizing.battery_kwh);
-    const rowCost = tariffNum(sizing.system_cost);
-    const matches = points
-      .map((p) => asRecord(p))
-      .filter(
-        (p) =>
-          rowKwh !== null &&
-          rowCost !== null &&
-          tariffNum(p.usable_kwh) === rowKwh &&
-          tariffNum(p.system_cost) === rowCost,
-      );
-    return matches.length === 1
-      ? tariffNum(matches[0].self_sufficiency_pct)
-      : null;
-  }
-  if (
-    typeof eo.chosen_index === "number" &&
-    Number.isInteger(eo.chosen_index) &&
-    Array.isArray(eo.points)
-  ) {
-    return tariffNum(asRecord(eo.points[eo.chosen_index]).self_sufficiency_pct);
-  }
+  if (runKind === "solar_battery") return legacySelfSufficiencyByMatch(sizing, eo);
+  // A solar run without a marker recorded nothing to read.
   return null;
+}
+
+/**
+ * THE PRE-MARKER RULE for battery runs, unchanged from 3.13: the chosen
+ * candidate is the one whose usable_kwh AND system_cost equal the row's,
+ * and an ambiguous match (a tie on both) yields null, never a guess. Kept
+ * only for runs stored before the marker existed; exported so the suite can
+ * prove, on a corrupt-marker run, that it would have answered and did not.
+ */
+export function legacySelfSufficiencyByMatch(
+  sizing: Record<string, unknown>,
+  eo: Record<string, unknown>,
+): number | null {
+  const points = Array.isArray(eo.points) ? eo.points : [];
+  const rowKwh = tariffNum(sizing.battery_kwh);
+  const rowCost = tariffNum(sizing.system_cost);
+  const matches = points
+    .map((p) => asRecord(p))
+    .filter(
+      (p) =>
+        rowKwh !== null &&
+        rowCost !== null &&
+        tariffNum(p.usable_kwh) === rowKwh &&
+        tariffNum(p.system_cost) === rowCost,
+    );
+  return matches.length === 1
+    ? tariffNum(matches[0].self_sufficiency_pct)
+    : null;
 }
 
 export interface ResultsHeadline {
@@ -7479,9 +7509,10 @@ export interface RailHistoryRun {
   solarKw: number | null;
   batteryKwh: number | null;
   systemCost: number | null;
-  /** The share of GENERATION consumed on site. NOT self-sufficiency — that
-      figure is in the heavy half and is not in the history read. */
-  selfConsumptionRatio: number | null;
+  /** 3.14 prompt 9: the CHOSEN option's self-sufficiency, projected by the
+      endpoint from the run's marker — the same rule storedSelfSufficiencyPct
+      applies. null when the run recorded no marker (a recorded silence). */
+  selfSufficiencyPct: number | null;
   hasChosenMarker: boolean;
   hasSolarCurve: boolean;
   /** null = no financial row for this run; its figures are then absent. */
@@ -7520,7 +7551,7 @@ export function parseRunHistory(payload: unknown): RailHistory {
       solarKw: tariffNum(row.solar_kw),
       batteryKwh: tariffNum(row.battery_kwh),
       systemCost: tariffNum(row.system_cost),
-      selfConsumptionRatio: tariffNum(row.self_consumption_ratio),
+      selfSufficiencyPct: tariffNum(row.self_sufficiency_pct),
       hasChosenMarker: row.has_chosen_marker === true,
       hasSolarCurve: row.has_solar_curve === true,
       financialResultId:
@@ -7580,16 +7611,16 @@ export function railPickerState(
   return { kind: "ready", choices, notice: railHistoryNotice(history) };
 }
 
-/** A history run's headline figures as the rail's before-figures. The
-    self-sufficiency figure is NOT in the history read (what it carries is
-    self-consumption, a different measure), so it is honestly null. */
+/** A history run's headline figures as the rail's before-figures. 3.14
+    prompt 9: self-sufficiency comes from the run's marker, via the endpoint;
+    null for a pre-marker run, which the tile names as not recorded. */
 export function railHistoryFigures(run: RailHistoryRun): RailFigures {
   return {
     solarKw: run.solarKw,
     batteryKwh: run.batteryKwh,
     paybackYears: run.paybackYears,
     npv: run.npv,
-    selfSufficiencyPct: null,
+    selfSufficiencyPct: run.selfSufficiencyPct,
     basis: "whole-system",
   };
 }
@@ -7704,8 +7735,11 @@ export function railComparability(current: RailRunMeta, baseline: RailRunMeta): 
 
 export const RAIL_SPLIT_CURRENT_ONLY =
   "The split is only available for the current run — the history carries the headline figures, not the parts behind them.";
-export const RAIL_SELF_SUFFICIENCY_CURRENT_ONLY =
-  "Baseline self-sufficiency is not in the history read (it carries self-consumption, a different measure) — shown for the current run only.";
+/** 3.14 prompt 9: the baseline run recorded no chosen-option marker, so its
+    self-sufficiency cannot be stated — the same honest silence used
+    elsewhere, never a dash alone and never self-consumption in its place. */
+export const RAIL_SELF_SUFFICIENCY_NOT_RECORDED =
+  "Self-sufficiency was not recorded for the baseline run (it stored no chosen-option marker), so there is nothing to compare it against.";
 
 export interface RailCompareView {
   /** What the figures are read against. */
@@ -7774,7 +7808,9 @@ export function railCompareView(
     splitTile: { available: false, text: RAIL_SPLIT_CURRENT_ONLY },
     selfSufficiencyNote: solarOnly
       ? "A solar-only re-rank reads against the current run's own solar figures; the historical baseline applies to whole-system figures."
-      : RAIL_SELF_SUFFICIENCY_CURRENT_ONLY,
+      : selected.selfSufficiencyPct === null
+        ? RAIL_SELF_SUFFICIENCY_NOT_RECORDED
+        : null,
     currentLabel: comparability.currentLabel,
     baselineLabel: comparability.baselineLabel,
   };
