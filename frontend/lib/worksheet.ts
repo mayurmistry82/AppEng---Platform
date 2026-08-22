@@ -6777,11 +6777,20 @@ export interface RailFigures {
 
 export interface RailDelta {
   label: string;
+  /** The figure, or "not recorded" — NEVER a formatter's null rendering. */
   before: string;
   after: string;
-  /** "+$1,204" / "−0.3 yr" / "no change" — the change between them. */
+  /** "+$1,204" / "−0.3 yr" / "no change", or — when a figure is absent —
+      the sentence saying so. See RailDelta["direction"]. */
   change: string;
-  direction: "up" | "down" | "none";
+  /**
+   * F212 (b): THREE outcomes, not two. "unknown" means a figure was never
+   * recorded, which is NOT "no change": on job a57e13f1's oldest run, which
+   * predates financial_results, the Payback tile read "was no payback within
+   * the analysis period · no change" and the NPV tile "was — · no change".
+   * Nothing did not change; nothing was ever recorded.
+   */
+  direction: "up" | "down" | "none" | "unknown";
 }
 
 /** Where the new figures came from — the ONLY carrier, since nothing is saved. */
@@ -7027,6 +7036,29 @@ export const RAIL_STATE_KINDS = [
   "stored", "reranked", "rerank-unavailable", "recosting", "recosted", "failed",
 ] as const;
 
+/**
+ * F212 (b): what a tile says when a figure was never recorded. It follows
+ * RAIL_SELF_SUFFICIENCY_NOT_RECORDED's wording deliberately — the same idea
+ * in a second voice is the drift this project deletes (2R.1).
+ *
+ * railChange sees two numbers and cannot know WHY one is missing (a run with
+ * no financial row is a different silence from one with no chosen marker), so
+ * it says the figure was not recorded and stops rather than guessing at a
+ * reason. Where the reason IS known it is said by the caller that knows it —
+ * railCompareView's selfSufficiencyNote is exactly that case, and the
+ * component prefers it.
+ */
+export function railNotRecordedNote(label: string, which: string): string {
+  return `${label} was not recorded for ${which}, so there is nothing to compare it against.`;
+}
+
+/** The figure, or the words "not recorded" — never formatYears(null), whose
+    "no payback within the analysis period" is a MEANING and would substitute
+    an answer for an absence. */
+function railFigureText(value: number | null, fmt: (v: unknown) => string): string {
+  return value === null ? "not recorded" : fmt(value);
+}
+
 function railChange(
   label: string,
   before: number | null,
@@ -7035,10 +7067,23 @@ function railChange(
   unit: "aud" | "years" | "pct" | "kw" | "kwh",
 ): RailDelta {
   const none: RailDelta = {
-    label, before: fmt(before), after: fmt(after), change: "no change", direction: "none",
+    label,
+    before: railFigureText(before, fmt),
+    after: railFigureText(after, fmt),
+    change: "no change",
+    direction: "none",
   };
+  // ABSENCE IS NOT A ZERO, and it is not stability either. Note the order:
+  // this branch runs BEFORE any arithmetic, and `0` is a real value that
+  // never reaches it — a payback of 0 or a value of $0 compares normally.
   if (before === null || after === null) {
-    return { ...none, change: before === after ? "no change" : "—" };
+    const which =
+      before === null && after === null
+        ? "either run"
+        : before === null
+          ? "the baseline run"
+          : "the current figures";
+    return { ...none, change: railNotRecordedNote(label, which), direction: "unknown" };
   }
   const diff = Math.round((after - before) * 100) / 100;
   if (diff === 0) return none;
@@ -7054,6 +7099,12 @@ function railChange(
     label, before: fmt(before), after: fmt(after),
     change: `${sign}${body}`, direction: diff > 0 ? "up" : "down",
   };
+}
+
+/** An array size in words — "the array it recorded" when none was stored.
+    F212 sweep: never formatKw(null) inside a sentence. */
+function railKwWords(kw: number | null): string {
+  return kw === null ? "an array it did not record" : formatKw(kw);
 }
 
 export function railDeltas(before: RailFigures, after: RailFigures): RailDelta[] {
@@ -7225,8 +7276,15 @@ export function railRerank(
       arrayMoved: true,
       batteryStale: isBattery,
       note: isBattery
-        ? `Under this objective the top array is ${formatKw(topKw)} rather than ${formatKw(baseline.chosen.solarKw)}. Its solar figures are the run's own, exact; the battery figures still belong to the ${formatKw(baseline.chosen.solarKw)} array and need a full Size to resolve.`
-        : `Under this objective the top array is ${formatKw(topKw)} rather than ${formatKw(baseline.chosen.solarKw)} — the run's own stored figures for it.`,
+        // F212 sweep: the run's own array, or the words for its absence —
+        // formatKw(null) is "—", which would read as a size rather than a
+        // silence in the middle of a sentence.
+        ? `Under this objective the top array is ${formatKw(topKw)} rather than ${railKwWords(baseline.chosen.solarKw)}. Its solar figures are the run's own, exact; the battery figures still belong to ${
+            baseline.chosen.solarKw === null
+              ? "the array the run did not record"
+              : `the ${formatKw(baseline.chosen.solarKw)} array`
+          } and need a full Size to resolve.`
+        : `Under this objective the top array is ${formatKw(topKw)} rather than ${railKwWords(baseline.chosen.solarKw)} — the run's own stored figures for it.`,
       notSaved,
     };
   }
@@ -7701,11 +7759,20 @@ export function railComparability(current: RailRunMeta, baseline: RailRunMeta): 
   const cr = current.dispatchResolution;
   const br = baseline.dispatchResolution;
   if (cr === null || br === null) {
-    const which =
-      cr === null && br === null ? "Neither run" : cr === null ? "The current run" : "The baseline";
+    // F212 (a): THE NEGATIVE. Without it this sentence contradicted itself
+    // mid-clause — "recorded its dispatch resolution — a recorded silence" —
+    // and it is the one line whose whole purpose is to stop two runs being
+    // read as like-for-like. The verb varies with the subject so the
+    // both-null case does not become a double negative.
+    const clause =
+      cr === null && br === null
+        ? "Neither run recorded a dispatch resolution"
+        : cr === null
+          ? "The current run recorded no dispatch resolution"
+          : "The baseline recorded no dispatch resolution";
     reasons.push({
       kind: "resolution-not-recorded",
-      text: `${which} recorded its dispatch resolution — a recorded silence, not a full-year run. Whether the two dispatched alike cannot be stated.`,
+      text: `${clause} — a recorded silence, not a full-year run. Whether the two dispatched alike cannot be stated.`,
     });
   } else if (cr !== br) {
     reasons.push({

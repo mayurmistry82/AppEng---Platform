@@ -21,7 +21,12 @@ import {
   railCompareView,
   railComparability,
   railHistoryMeta,
+  railDeltas,
   railHistoryNotice,
+  railNotRecordedNote,
+  railRunLabel,
+  type RailFigures,
+  type RailDelta,
   railPickerState,
   railRerankedCurve,
   rankSolarPoints,
@@ -8471,7 +8476,12 @@ test("3.14-8: against a historical baseline the split tile says it is current-"
   const h2 = railCompareView(RAIL_BASELINE8, nofin, { kind: "stored" }, splitLabel);
   assert.equal(h2.before.npv, null);
   assert.equal(h2.before.paybackYears, null);
-  assert.equal(h2.deltas.find((d) => d.label === "NPV")?.change, "—");
+  // F212 (b): an absent baseline figure is NOT "—" and NOT "no change" — it
+  // says nothing was recorded to compare against.
+  const h2npv = h2.deltas.find((d) => d.label === "NPV");
+  assert.equal(h2npv?.direction, "unknown");
+  assert.equal(h2npv?.change,
+    railNotRecordedNote("NPV", "the baseline run"));
 });
 
 // 8-E. TRUNCATION IS ADMITTED.
@@ -8717,4 +8727,250 @@ test("3.14-9: self-sufficiency compares against a historical baseline that "
   // Two distinct outcomes.
   assert.notEqual(compared.selfSufficiencyNote, notRecorded.selfSufficiencyNote);
   assert.notEqual(ss?.change, ss2?.change);
+});
+
+
+// ── 3.14 F212 — an absence is not a zero, and the warning says the negative ──
+
+// F212-A. THE MISSING NEGATIVE: assert the MEANING, not that a string exists.
+test("3.14 F212: the incomparability warning says the run recorded NO dispatch "
+  + "resolution — the sentence asserts the negative", () => {
+  const base: RailRunMeta = {
+    sizingResultId: "b", createdAt: "2026-08-20T05:00:00Z", runKind: "solar_battery",
+    engineMode: "sequential", dispatchResolution: "full_year", objectiveUsed: "max_npv",
+  };
+  const cases: [string, RailRunMeta, RailRunMeta][] = [
+    ["baseline silent", base, { ...base, dispatchResolution: null }],
+    ["current silent", { ...base, dispatchResolution: null }, base],
+    ["both silent", { ...base, dispatchResolution: null }, { ...base, dispatchResolution: null }],
+  ];
+  const texts: string[] = [];
+  for (const [label, current, baseline] of cases) {
+    const v = railComparability(current, baseline);
+    const reason = v.reasons.find((r) => r.kind === "resolution-not-recorded");
+    assert.ok(reason, `${label}: the reason is raised`);
+    const text = reason.text;
+    texts.push(text);
+    console.log(`        ${label.padEnd(16)} ${text}`);
+    // THE MEANING: it must say a resolution was NOT recorded. A test that
+    // only checked the string was non-empty passed all week while the
+    // sentence said the opposite.
+    assert.match(text, /recorded (no dispatch resolution|a dispatch resolution)/);
+    assert.ok(
+      /recorded no dispatch resolution/.test(text)
+        || /Neither run recorded a dispatch resolution/.test(text),
+      `${label}: must assert the NEGATIVE, got: ${text}`,
+    );
+    // The exact phrase that was wrong must not reappear in any voice.
+    assert.ok(!/(The current run|The baseline) recorded its dispatch resolution/.test(text),
+      `${label}: the self-contradicting clause is back`);
+    assert.ok(!/Neither run recorded no dispatch/.test(text), `${label}: double negative`);
+    // The rest of the wording is right and is kept.
+    assert.match(text, /a recorded silence, not a full-year run/);
+    assert.match(text, /Whether the two dispatched alike cannot be stated/);
+    assert.equal(v.comparable, false, `${label}: never like-for-like`);
+  }
+  assert.equal(new Set(texts).size, 3, "each case names WHICH run was silent");
+});
+
+// F212-B. THE THREE DELTA OUTCOMES, distinct.
+test("3.14 F212: a delta has THREE outcomes — changed, no change, and not "
+  + "recorded — and they are three DISTINCT results", () => {
+  const figs = (npv: number | null): RailFigures => ({
+    solarKw: 9.24, batteryKwh: 9.83, paybackYears: 4.4, npv,
+    selfSufficiencyPct: 84.1, basis: "whole-system",
+  });
+  const npvOf = (before: number | null, after: number | null) =>
+    railDeltas(figs(before), figs(after)).find((d) => d.label === "NPV") as RailDelta;
+  const changed = npvOf(15000, 19935.55);
+  const equal = npvOf(19935.55, 19935.55);
+  const absent = npvOf(null, 19935.55);
+  for (const [label, d] of [["changed", changed], ["no change", equal], ["absent", absent]] as const) {
+    console.log(`        ${label.padEnd(10)} direction=${d.direction.padEnd(8)} before=${d.before.padEnd(14)} change=${d.change}`);
+  }
+  assert.deepEqual(
+    [changed.direction, equal.direction, absent.direction],
+    ["up", "none", "unknown"],
+    "three directions, one per outcome",
+  );
+  assert.equal(changed.change, "+$4,936");
+  assert.equal(equal.change, "no change");
+  assert.equal(absent.change, railNotRecordedNote("NPV", "the baseline run"));
+  // THREE DISTINCT RESULTS. Merge "absent" into "no change" and this fails.
+  const words = [changed.change, equal.change, absent.change];
+  assert.equal(new Set(words).size, 3, `three distinct words: ${words}`);
+  assert.notEqual(absent.change, equal.change, "an absence is NOT stability");
+  assert.notEqual(absent.direction, equal.direction);
+  // The absent case says WHY, and names the figure.
+  assert.match(absent.change, /was not recorded/);
+  assert.match(absent.change, /nothing to compare it against/);
+  assert.match(absent.change, /^NPV /);
+  // It follows the existing wording rather than inventing a fourth voice.
+  assert.ok(RAIL_SELF_SUFFICIENCY_NOT_RECORDED.includes("was not recorded for"));
+  assert.ok(absent.change.includes("was not recorded for"));
+  assert.ok(RAIL_SELF_SUFFICIENCY_NOT_RECORDED.includes("nothing to compare it against"));
+  assert.ok(absent.change.includes("nothing to compare it against"));
+  // The before TEXT is the words, never the formatter's null rendering —
+  // formatYears(null) is a MEANING ("no payback within the analysis period").
+  const pay = railDeltas(
+    { ...figs(1), paybackYears: null }, { ...figs(1), paybackYears: 4.4 },
+  ).find((d) => d.label === "Payback") as RailDelta;
+  console.log(`        payback absent before="${pay.before}" change=${pay.change}`);
+  assert.equal(pay.before, "not recorded");
+  assert.notEqual(pay.before, formatYears(null));
+  assert.ok(!pay.before.includes("no payback within the analysis period"),
+    "the exact substitution F212 (b) reported");
+});
+
+// F212-C. ZERO IS A REAL VALUE.
+test("3.14 F212: zero is not absent — 0 vs 0 is no change, 0 vs a number is "
+  + "the change", () => {
+  const figs = (npv: number | null, pay: number | null): RailFigures => ({
+    solarKw: 1, batteryKwh: 0, paybackYears: pay, npv,
+    selfSufficiencyPct: 0, basis: "whole-system",
+  });
+  const d = (b: RailFigures, a: RailFigures, label: string) =>
+    railDeltas(b, a).find((x) => x.label === label) as RailDelta;
+  const zeroZero = d(figs(0, 0), figs(0, 0), "NPV");
+  const zeroUp = d(figs(0, 0), figs(1200, 0), "NPV");
+  const downToZero = d(figs(1200, 0), figs(0, 0), "NPV");
+  const payZero = d(figs(0, 0), figs(0, 0), "Payback");
+  const battZero = d(figs(0, 0), figs(0, 0), "Battery");
+  const ssZero = d(figs(0, 0), figs(0, 0), "Self-sufficiency");
+  console.log(`        0 vs 0     -> ${zeroZero.direction} / ${zeroZero.change}`);
+  console.log(`        0 vs 1200  -> ${zeroUp.direction} / ${zeroUp.change}`);
+  console.log(`        1200 vs 0  -> ${downToZero.direction} / ${downToZero.change}`);
+  for (const z of [zeroZero, payZero, battZero, ssZero]) {
+    assert.equal(z.direction, "none", `${z.label}: zero vs zero is no change`);
+    assert.equal(z.change, "no change");
+    assert.notEqual(z.direction, "unknown", `${z.label}: 0 must NEVER read as absent`);
+  }
+  assert.equal(zeroUp.direction, "up");
+  assert.equal(zeroUp.change, "+$1,200");
+  assert.equal(downToZero.direction, "down");
+  assert.equal(downToZero.change, "−$1,200");
+  // A zero payback and a zero self-sufficiency render as figures, not words.
+  assert.equal(payZero.before, formatYears(0));
+  assert.equal(ssZero.before, formatPct(0));
+  assert.notEqual(payZero.before, "not recorded");
+});
+
+// F212-D. ABSENCE IN EITHER DIRECTION, AND IN BOTH.
+test("3.14 F212: absence is handled in BOTH directions and when both are "
+  + "absent — three different reasons, none of them 'no change'", () => {
+  const figs = (npv: number | null): RailFigures => ({
+    solarKw: 9.24, batteryKwh: null, paybackYears: null, npv,
+    selfSufficiencyPct: null, basis: "whole-system",
+  });
+  const npvOf = (b: number | null, a: number | null) =>
+    railDeltas(figs(b), figs(a)).find((d) => d.label === "NPV") as RailDelta;
+  const baselineGone = npvOf(null, 19935.55);
+  const currentGone = npvOf(19935.55, null);
+  const bothGone = npvOf(null, null);
+  for (const [label, d] of [
+    ["baseline absent", baselineGone], ["current absent", currentGone], ["both absent", bothGone],
+  ] as const) {
+    console.log(`        ${label.padEnd(16)} direction=${d.direction} before="${d.before}" after="${d.after}" change=${d.change}`);
+    assert.equal(d.direction, "unknown", label);
+    assert.notEqual(d.change, "no change", `${label}: both absent is NOT stability either`);
+    assert.match(d.change, /nothing to compare it against/);
+  }
+  assert.equal(baselineGone.change, railNotRecordedNote("NPV", "the baseline run"));
+  assert.equal(currentGone.change, railNotRecordedNote("NPV", "the current figures"));
+  assert.equal(bothGone.change, railNotRecordedNote("NPV", "either run"));
+  assert.equal(new Set([baselineGone.change, currentGone.change, bothGone.change]).size, 3,
+    "the reason that applies is the reason said");
+  assert.equal(baselineGone.before, "not recorded");
+  assert.equal(baselineGone.after, formatMoney(19935.55));
+  assert.equal(currentGone.after, "not recorded");
+  assert.equal(bothGone.before, "not recorded");
+  assert.equal(bothGone.after, "not recorded");
+});
+
+// F212-E. THE SWEEP: every before-and-after caption, against null figures.
+test("3.14 F212 sweep: every rail caption survives a null baseline and a null "
+  + "current figure without claiming stability or printing a formatter's null", () => {
+  const NOTHING: RailFigures = {
+    solarKw: null, batteryKwh: null, paybackYears: null, npv: null,
+    selfSufficiencyPct: null, basis: "whole-system",
+  };
+  const REAL: RailFigures = {
+    solarKw: 9.24, batteryKwh: 9.83, paybackYears: 4.4, npv: 19935.55,
+    selfSufficiencyPct: 84.1, basis: "whole-system",
+  };
+  // (1) all five railDeltas captions, both directions and both-absent.
+  for (const [b, a] of [[NOTHING, REAL], [REAL, NOTHING], [NOTHING, NOTHING]] as const) {
+    for (const d of railDeltas(b, a)) {
+      assert.equal(d.direction, "unknown", d.label);
+      assert.notEqual(d.change, "no change", d.label);
+      assert.notEqual(d.change, "—", `${d.label}: a bare dash says nothing`);
+      assert.ok(!d.before.includes("no payback within the analysis period"), d.label);
+      assert.ok(!d.after.includes("no payback within the analysis period"), d.label);
+    }
+  }
+  console.log(`        railDeltas x5, null baseline: ${railDeltas(NOTHING, REAL).map((d) => `${d.label}=${d.direction}`).join(" ")}`);
+  // (2) railStatusLine on every state — carries no figures, and never throws.
+  const physics = CHANGE({ kind: "physics", section: "energy-data" });
+  const states: RailState[] = [
+    { kind: "stored" },
+    railRerank(RAIL_BASELINE8, CHANGE({ objective: "max_npv" })),
+    railRerank(RAIL_BASELINE8, CHANGE({ objective: "custom" })),
+    { kind: "recosting", trigger: physics, startedAt: 1 },
+    railFailedState(physics, "the engine did not answer."),
+  ];
+  for (const s of states) {
+    assert.doesNotThrow(() => railStatusLine(s));
+    const line = railStatusLine(s) ?? "";
+    assert.ok(!line.includes("no payback within the analysis period"), s.kind);
+  }
+  console.log(`        railStatusLine x${states.length}: no figures carried, none threw`);
+  // (3) the re-rank note when the run recorded no chosen array.
+  const noArray = JSON.parse(JSON.stringify(STORED_BATTERY_RUN));
+  noArray.solar_kw = null;
+  noArray.objective_used = "max_npv";
+  const noArrayBase = railBaselineView({ ...RAIL_JOB, sizing_results: [noArray] });
+  const moved = railRerank(noArrayBase, CHANGE({ objective: "max_self_sufficiency" }));
+  if (moved.kind === "reranked") {
+    console.log(`        re-rank note, no stored array: ${moved.note}`);
+    assert.ok(!/rather than —/.test(moved.note), "never a bare dash mid-sentence");
+    assert.match(moved.note, /did not record/);
+    // The sweep's own find: a words-for-absence substitution must still read
+    // as English where the sentence appends a noun.
+    assert.ok(!/the an array/.test(moved.note), `ungrammatical: ${moved.note}`);
+    assert.ok(!/record array/.test(moved.note), `ungrammatical: ${moved.note}`);
+  }
+  // (4) the re-ranked chart's chosenNote — same guard.
+  const curveNote = railRerankedCurve(noArrayBase, CHANGE({ objective: "max_npv" }))?.chosenNote ?? "";
+  assert.ok(!/chose —/.test(curveNote), "the chart caption never prints a bare dash as a size");
+  console.log(`        re-ranked chart caption: ${curveNote.slice(0, 90)}…`);
+  // (5) railRunLabel on a wholly unrecorded run — words, never blanks.
+  const blank = railRunLabel({
+    sizingResultId: null, createdAt: null, runKind: null, engineMode: null,
+    dispatchResolution: null, objectiveUsed: null,
+  });
+  console.log(`        railRunLabel, nothing recorded: ${blank}`);
+  for (const part of ["date not recorded", "kind not recorded", "objective not recorded",
+                      "engine not recorded", "dispatch resolution not recorded"]) {
+    assert.ok(blank.includes(part), part);
+  }
+  // (6) the component's own captions are swept by the source test below.
+});
+
+test("3.14 F212 sweep: the component renders the third outcome as the sentence "
+  + "alone, withholds the sign, and the hero tile has words for an empty baseline", async () => {
+  const [fs, path] = await Promise.all([import("node:fs"), import("node:path")]);
+  const FRONTEND = path.resolve(import.meta.dirname, "..");
+  const bar = fs.readFileSync(
+    path.join(FRONTEND, "components/worksheet/results-bar.tsx"), "utf8");
+  assert.match(bar, /if \(d\.direction === "unknown"\) return d\.change;/,
+    "the sentence alone — never prefixed with a baseline that does not exist");
+  assert.match(bar, /d\.direction === "none" \|\| d\.direction === "unknown"\) return undefined/,
+    "an absence is neither good nor bad, so it is not coloured");
+  assert.match(bar, /the baseline run recorded no system to compare against/);
+  assert.match(bar, /the previous figures were not recorded/);
+  // ORDER MATTERS: the unknown branch must run BEFORE the two-way one, or
+  // an absent figure falls into "was <before> · <sentence>".
+  const fn = bar.slice(bar.indexOf("const tileDelta"), bar.indexOf("const tileSign"));
+  assert.ok(fn.indexOf('=== "unknown"') < fn.indexOf('=== "none"'),
+    "the unknown branch precedes the two-way one");
 });

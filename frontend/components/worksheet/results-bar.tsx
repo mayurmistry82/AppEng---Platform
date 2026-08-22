@@ -547,13 +547,20 @@ export function ResultsBar({
   const tileDelta = (label: string, fallback: string): React.ReactNode => {
     const d = deltaFor(label);
     if (!d) return fallback;
+    // F212 (b): an absent figure gets the sentence ALONE. "was <before> · …"
+    // would prefix it with a baseline that does not exist — and for payback
+    // `before` would have been formatYears(null), the sentence "no payback
+    // within the analysis period", which is a meaning and not an absence.
+    if (d.direction === "unknown") return d.change;
     return d.direction === "none"
       ? `was ${d.before} · no change`
       : `was ${d.before} · ${d.change}`;
   };
   const tileSign = (label: string, higherIsBetter: boolean) => {
     const d = deltaFor(label);
-    if (!d || d.direction === "none") return undefined;
+    // "unknown" is not a direction: an absence is neither good nor bad, and
+    // colouring it would assert a judgement about a figure that is missing.
+    if (!d || d.direction === "none" || d.direction === "unknown") return undefined;
     return (d.direction === "up") === higherIsBetter ? "positive" : "negative";
   };
   const statusLine = railStatusLine(rail);
@@ -614,10 +621,21 @@ export function ResultsBar({
                   : rail.kind === "reranked" && rail.batteryStale
                     ? `solar re-ranked · battery from the ${formatKw(storedFigures.solarKw)} array, not resolved`
                     : recomputed || comparing
-                      ? `was ${[
-                          compare?.before.solarKw != null ? formatKw(compare.before.solarKw) : null,
-                          compare?.before.batteryKwh != null ? formatKwh(compare.before.batteryKwh) : null,
-                        ].filter(Boolean).join(" + ") || "—"}${recomputed ? " · not saved" : " · the selected baseline"}`
+                      ? (() => {
+                          // F212 sweep: a baseline with NO recorded system said
+                          // "was — · the selected baseline", which reads as a
+                          // baseline that exists and is blank.
+                          const wasText = [
+                            compare?.before.solarKw != null ? formatKw(compare.before.solarKw) : null,
+                            compare?.before.batteryKwh != null ? formatKwh(compare.before.batteryKwh) : null,
+                          ].filter(Boolean).join(" + ");
+                          if (!wasText) {
+                            return recomputed
+                              ? "the previous figures were not recorded · not saved"
+                              : "the baseline run recorded no system to compare against";
+                          }
+                          return `was ${wasText}${recomputed ? " · not saved" : " · the selected baseline"}`;
+                        })()
                       : "latest sizing run"
               }
             />
