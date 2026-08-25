@@ -1091,6 +1091,27 @@ export interface AddressRoofView {
    * component (D25's rule generalised — wording and comparison live here).
    */
   panelMismatchNotice: RoofNoticeView | null;
+  /**
+   * 3.4c prompt 4 (D24): the confirmed state prompt 1 stored — read from the
+   * newest row's roof_confirmed_at / roof_confirmed_by / roof_confirmed_source.
+   * Raw values plus a composed notice, the solarExpiredNotice convention: the
+   * wording lives here, never in the component. All null when nobody has
+   * confirmed — and a roof re-looked-up after a confirmation is unconfirmed
+   * again BY CONSTRUCTION, because the backend's _persist never writes those
+   * columns to a new row (asserted by verify_roof_confirmation.py's
+   * inheritance proof, and again in this file's suite).
+   */
+  roofConfirmedAt: string | null;
+  roofConfirmedSource: string | null;
+  confirmedNotice: RoofNoticeView | null;
+  /**
+   * True only when there is a lookup roof (found / low_confidence) that nobody
+   * has confirmed yet. No roof row -> no control at all, never a disabled one.
+   * A manual roof is already the installer's own entry with its basis
+   * recorded, so it takes no second attestation. SIZING IS NEVER GATED on
+   * this (Mayur, 2026-08-14) — the control is an offer, not a lock.
+   */
+  showsConfirmControl: boolean;
 }
 
 function roofNum(v: unknown): number | null {
@@ -1292,11 +1313,13 @@ function roofStateNotice(
     // so captions. Agrees with D24 (the lookup is a prefill awaiting
     // confirmation) and 3.4c(a)'s planned rework of the tick.
     case "found":
+      // D24: the lookup is a PREFILL, not a result — the wording asks for the
+      // ten-second check instead of announcing success (3.4c prompt 4).
       return {
-        tone: "success",
+        tone: "info",
         level: "caption",
-        title: "Roof found",
-        body: "Google's aerial imagery found this roof automatically.",
+        title: "Roof prefilled from Google's aerial imagery",
+        body: "Check it against the property, then confirm it below — or correct it, which takes a few keystrokes.",
       };
     case "not_found":
       // Fires on roughly one address in five — it CAN not fire, so a finding.
@@ -1488,6 +1511,10 @@ export function addressRoofView(job: unknown): AddressRoofView {
     orientationNotice: null,
     totalKwpLabel: null,
     panelMismatchNotice: null,
+    roofConfirmedAt: null,
+    roofConfirmedSource: null,
+    confirmedNotice: null,
+    showsConfirmControl: false,
   };
 
   const row = latestRoofGeometry(job);
@@ -1623,6 +1650,48 @@ export function addressRoofView(job: unknown): AddressRoofView {
 
   view.confidenceNotices = confidenceNotices(row);
   view.notice = roofStateNotice(view.state, source);
+  // 3.4c prompt 4 (item e): with the Solar Data DELETED, the prefill caption
+  // must not still speak as if the lookup result were on screen — the section
+  // was asserting found and deleted in one breath. The expired notice carries
+  // the whole message; the caption yields.
+  if (view.solarDataExpired && view.state === "found") {
+    view.notice = null;
+  }
+
+  // ── The confirmed state (3.4c prompt 4, step 5 — D24, F107) ────────────
+  view.roofConfirmedAt =
+    typeof row.roof_confirmed_at === "string" ? row.roof_confirmed_at : null;
+  view.roofConfirmedSource =
+    typeof row.roof_confirmed_source === "string" ? row.roof_confirmed_source : null;
+  if (view.roofConfirmedAt !== null) {
+    const who =
+      view.roofConfirmedSource === "installer"
+        ? "the installer"
+        : view.roofConfirmedSource === "customer"
+          ? "the customer"
+          : view.roofConfirmedSource ?? "someone";
+    const when = new Date(view.roofConfirmedAt);
+    const whenLabel = Number.isFinite(when.getTime())
+      ? when.toLocaleDateString("en-AU", {
+          day: "numeric",
+          month: "long",
+          year: "numeric",
+        })
+      : null;
+    view.confirmedNotice = {
+      tone: "success",
+      // A finding about THIS job — it fires only once a human has confirmed
+      // this roof (D25).
+      level: "notice",
+      title: "Roof confirmed",
+      body: `Confirmed as the right building and roof by ${who}${
+        whenLabel !== null ? ` on ${whenLabel}` : ""
+      }. Looking the roof up again replaces it with a fresh, unconfirmed prefill.`,
+    };
+  }
+  view.showsConfirmControl =
+    (view.state === "found" || view.state === "low_confidence") &&
+    view.roofConfirmedAt === null;
   if (view.imageryStale && view.state !== "manual") {
     const years = view.imageryAgeYears;
     view.staleNotice = {

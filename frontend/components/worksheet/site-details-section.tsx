@@ -30,9 +30,13 @@ import type { SiteDetailsView, SizingInputSave } from "@/lib/worksheet";
  * untouched → absent — the backend treats those differently, and conflating
  * them wipes another visit's data), then router.refresh() re-reads.
  *
- * F99: the multi-dwelling caution renders here under the dwelling type, and the
- * same flag is passed to the Address & roof section — one derivation
- * (siteDetailsView.showsMultiDwellingCaution), two renderers.
+ * F99 / 3.4c prompt 4 (item d): the multi-dwelling caution renders in ONE
+ * place — Address & roof — because it doubts the ROOF LOOKUP and belongs
+ * beside the numbers it doubts, not beside the form field that drives it.
+ * This form only stores the dwelling type; the stored value flows to the
+ * caution through siteDetailsView.showsMultiDwellingCaution. One derivation,
+ * one renderer. (The old immediate pre-save render here said the same words
+ * with the same weight twice on one screen — the trade is deliberate.)
  */
 
 const DWELLING_OPTIONS = [
@@ -287,17 +291,8 @@ export function SiteDetailsSection({
         )}
       </div>
 
-      {/* F99 — the answer in this form drives the caution IMMEDIATELY, before a
-          save, because the warning is about what the installer just declared. */}
-      {form.dwellingType === "unit" || form.dwellingType === "townhouse" ? (
-        <Notice tone="caution" title="The roof lookup may not be this dwelling">
-          Google returns the one building nearest the address. On a
-          multi-dwelling site that may not be this one. Check the roof against
-          the plans, and note that a shared roof usually needs body corporate
-          approval.
-        </Notice>
-      ) : null}
-
+      {/* 3.4c prompt 4 (item d): the multi-dwelling caution no longer renders
+          here — Address & roof owns it (see the module docstring). */}
       {actionError ? (
         <Notice tone="problem" title={actionError.heading}>
           {actionError.body}

@@ -962,7 +962,8 @@ test("addressRoofView: junk-safe, serialisable, correct states", () => {
 
   const found = addressRoofView(emptyJob({ path: "A", roof_geometry: [roofRow()] }));
   assert.equal(found.state, "found");
-  assert.equal(found.notice?.tone, "success");
+  // 3.4c-4 (D24): the found state reads as a PREFILL now — info, not a success tick.
+  assert.equal(found.notice?.tone, "info");
   assert.equal(found.planes[0].azimuthLabel, "N");
   assert.equal(found.totals.panels, 17);
   assert.equal(found.solarMode, "optimise"); // 3.3b PATH_RULES, first consumer
@@ -10185,4 +10186,230 @@ test("3.4c-3 (step 5): the panel the table was scaled to vs the panel the run pr
     ).panelMismatchNotice,
     null,
   );
+});
+// ── 3.4c prompt 4: the section asks to be confirmed (D24) ───────────────────
+
+const CONFIRMED_ROW = roofRow({
+  roof_confirmed_at: "2026-08-25T07:41:51.519549+00:00",
+  roof_confirmed_by: "8e496f09-d1b8-47a3-9d53-3f09ed389b34",
+  roof_confirmed_source: "installer",
+});
+
+test("3.4c-4 (5): the confirmed state — raw values plus the composed notice", () => {
+  const view = viewFor(CONFIRMED_ROW);
+  assert.equal(view.roofConfirmedAt, "2026-08-25T07:41:51.519549+00:00");
+  assert.equal(view.roofConfirmedSource, "installer");
+  assert.ok(view.confirmedNotice);
+  assert.equal(view.confirmedNotice.tone, "success");
+  assert.equal(view.confirmedNotice.level, "notice"); // fires per job — a finding (D25)
+  assert.ok(view.confirmedNotice.body.includes("the installer"), view.confirmedNotice.body);
+  assert.ok(view.confirmedNotice.body.includes("25 August 2026"), view.confirmedNotice.body);
+  assert.equal(view.showsConfirmControl, false); // already confirmed — no control
+  const customer = viewFor({ ...CONFIRMED_ROW, roof_confirmed_source: "customer" });
+  assert.ok(customer.confirmedNotice?.body.includes("the customer"));
+  // An unknown stored label still renders — raw, never hidden (the D33 family).
+  const odd = viewFor({ ...CONFIRMED_ROW, roof_confirmed_source: "auditor" });
+  assert.ok(odd.confirmedNotice?.body.includes("auditor"));
+});
+
+test("3.4c-4 (5): the control exists exactly where an unconfirmed LOOKUP roof does", () => {
+  assert.equal(viewFor(roofRow()).showsConfirmControl, true); // found, unconfirmed
+  assert.equal(viewFor(roofRow({ low_confidence: true })).showsConfirmControl, true);
+  assert.equal(viewFor(roofRow({ source: "manual_plans" })).showsConfirmControl, false);
+  assert.equal(viewFor(roofRow({ found: false, planes: [] })).showsConfirmControl, false);
+  assert.equal(addressRoofView(null).showsConfirmControl, false); // no roof row: no control at all
+  assert.equal(addressRoofView(null).confirmedNotice, null);
+  // Junk in the columns is not a confirmation.
+  const junk = viewFor(roofRow({ roof_confirmed_at: 12345, roof_confirmed_source: 7 }));
+  assert.equal(junk.confirmedNotice, null);
+  assert.equal(junk.showsConfirmControl, true);
+});
+
+test("3.4c-4 (5): a re-looked-up roof is unconfirmed BY CONSTRUCTION — asserted, not assumed", async () => {
+  // The view half: the NEWEST row (a fresh lookup) wins, and it has no
+  // confirmation, so the confirmed state is gone and the control is back.
+  const older = { ...CONFIRMED_ROW, created_at: "2026-08-20T00:00:00Z" };
+  const fresh = roofRow({ created_at: "2026-08-25T09:00:00Z" });
+  const view = addressRoofView(emptyJob({ roof_geometry: [older, fresh] }));
+  assert.equal(view.confirmedNotice, null);
+  assert.equal(view.showsConfirmControl, true);
+  // The backend half, pinned at the source: _persist's inserted row dict
+  // carries none of the three columns (verify_roof_confirmation.py runs the
+  // full inheritance proof; this is the cross-repo tripwire).
+  const { readFileSync } = await import("node:fs");
+  const { fileURLToPath } = await import("node:url");
+  const path = await import("node:path");
+  const platform = path.dirname(path.dirname(path.dirname(fileURLToPath(import.meta.url))));
+  const roofPy = readFileSync(path.join(platform, "backend/routes/roof.py"), "utf8");
+  const rowDict = /def _persist[\s\S]*?row = \{[\s\S]*?\n    \}/.exec(roofPy)?.[0];
+  assert.ok(rowDict, "found _persist's row dict");
+  assert.ok(!rowDict.includes("roof_confirmed"), "an appended row cannot carry a confirmation");
+});
+
+test("3.4c-4 (b): the confirm control renders first for a found roof, and only while unconfirmed", () => {
+  const unconfirmed = renderRoofSection({
+    view: viewFor(roofRow()),
+    jobId: "j",
+    isOpen: false,
+  });
+  const text = roofTextOf(unconfirmed);
+  const iConfirm = text.indexOf("Confirm this roof");
+  const iCorrect = text.indexOf("Correct these values");
+  const iLookup = text.indexOf("Look up again");
+  assert.ok(iConfirm !== -1 && iCorrect !== -1 && iLookup !== -1, text.slice(-300));
+  assert.ok(iConfirm < iCorrect && iCorrect < iLookup, `${iConfirm} ${iCorrect} ${iLookup}`);
+  const confirmed = roofTextOf(
+    renderRoofSection({ view: viewFor(CONFIRMED_ROW), jobId: "j", isOpen: false }),
+  );
+  assert.ok(!confirmed.includes("Confirm this roof"), "no control once confirmed");
+  assert.ok(confirmed.includes("Roof confirmed"), confirmed.slice(0, 200));
+  const none = roofTextOf(
+    renderRoofSection({ view: addressRoofView(null), jobId: "j", isOpen: false }),
+  );
+  assert.ok(!none.includes("Confirm this roof"), "no roof row: no control at all");
+});
+
+test("3.4c-4 (item e): the EXPIRED state no longer asserts found and deleted at once", () => {
+  const expired = viewFor(roofRow({ solar_data_expired: true }));
+  assert.equal(expired.solarDataExpired, true);
+  assert.equal(expired.notice, null); // the prefill caption yields to the expiry notice
+  const text = roofTextOf(
+    renderRoofSection({ view: expired, jobId: "j", isOpen: false }),
+  );
+  console.log(`        [expired render] ${text.slice(0, 420)}`);
+  assert.ok(text.includes("has been deleted"), text.slice(0, 300));
+  assert.ok(!text.includes("Roof found"), "the old success tick is gone");
+  assert.ok(!text.includes("Roof prefilled"), "the prefill caption yields while expired");
+});
+
+test("3.4c-4 (F234): the caption leads with the question; specs follow; the two wattages connect", () => {
+  const diagram = {
+    show: true,
+    tileLat: -34.92,
+    tileLng: 138.62,
+    zoom: 20,
+    buildingBox: { x: 10, y: 10, width: 100, height: 80 },
+    rects: [
+      { cx: 60, cy: 60, widthPx: 20, heightPx: 12, rotationDeg: 0, segmentIndex: 0 },
+    ],
+    reason: null,
+    panelCount: 21,
+    panelWidthM: 1.05,
+    panelHeightM: 1.88,
+    panelCapacityW: 400,
+  };
+  const view = viewFor(
+    roofRow({
+      selected_panel: { id: "p1", brand: "Jinko", model: "Tiger Neo", watts: 440 },
+    }),
+  );
+  const text = roofTextOf(
+    renderRoofSection({ view, jobId: "j", isOpen: true, diagram }),
+  );
+  const iQuestion = text.indexOf("is this the right building");
+  const iRough = text.indexOf("different supplier");
+  const iSpecs = text.indexOf("Google drew 21 panels");
+  const iIdentity = text.indexOf("400 W assumption");
+  console.log(
+    `        [caption render] ${text.slice(text.indexOf("Check this picture"), text.indexOf("Imagery") === -1 ? undefined : text.indexOf("Imagery")).slice(0, 700)}`,
+  );
+  assert.ok(iQuestion !== -1 && iRough !== -1 && iSpecs !== -1 && iIdentity !== -1, text);
+  assert.ok(iQuestion < iSpecs, "the question LEADS the specs");
+  assert.ok(iRough < iSpecs, "the roughness is up front, not three lines below");
+  assert.ok(iSpecs < iIdentity, "identity follows the specs");
+  assert.ok(text.includes("scaled to Jinko Tiger Neo 440 W"), "the two wattages connect");
+  assert.ok(!text.includes("uses a different panel"), "the false sentence stays dead");
+});
+
+test("3.4c-4 (item d): the multi-dwelling caution has ONE home", async () => {
+  const { readFileSync } = await import("node:fs");
+  const { fileURLToPath } = await import("node:url");
+  const path = await import("node:path");
+  const root = path.dirname(path.dirname(fileURLToPath(import.meta.url)));
+  const phrase = /may not be this dwelling/g;
+  const site = readFileSync(path.join(root, "components/worksheet/site-details-section.tsx"), "utf8");
+  const roof = readFileSync(path.join(root, "components/worksheet/address-roof-section.tsx"), "utf8");
+  const lib = readFileSync(path.join(root, "lib/worksheet.ts"), "utf8");
+  const counts = [site, roof, lib].map((s) => (s.match(phrase) ?? []).length);
+  console.log(`        occurrences [site-details, address-roof, lib]: ${counts.join(", ")}`);
+  assert.deepEqual(counts, [0, 0, 1], "the wording lives ONCE, in the logic layer");
+  // And the one renderer really is Address & roof, from the one constant.
+  assert.ok(roof.includes("MULTI_DWELLING_CAPTION"));
+  assert.ok(!site.includes("MULTI_DWELLING_CAPTION"));
+});
+
+test("3.4c-4 (7): an unconfirmed roof still sizes — no gate, no lock, anywhere", () => {
+  const unconfirmedJob = emptyJob({ roof_geometry: [roofRow()] });
+  const confirmedJob = emptyJob({ roof_geometry: [CONFIRMED_ROW] });
+  const spec = SECTIONS.find((s) => s.id === "address-roof");
+  assert.ok(spec);
+  assert.equal(spec.complete(unconfirmedJob), true, "completion never waits for a confirmation");
+  // The whole ladder is IDENTICAL confirmed vs not — a gate would split them.
+  assert.deepEqual(
+    sectionStates(unconfirmedJob).map((s) => [s.id, s.state]),
+    sectionStates(confirmedJob).map((s) => [s.id, s.state]),
+  );
+});
+
+test("3.4c-4 (a): the route handler forwards the session Bearer and HARDCODES source installer", async () => {
+  const { registerHooks } = await import("node:module");
+  registerHooks({
+    resolve(specifier, context, nextResolve) {
+      if (specifier === "@/lib/supabase/server") {
+        return { url: "virtual:supabase-server-stub", shortCircuit: true };
+      }
+      if (specifier === "next/server") {
+        // Bare Node cannot resolve next's "./server" export; point it at the
+        // real file so the REAL NextResponse is what the test exercises.
+        return {
+          url: new URL("../node_modules/next/server.js", import.meta.url).href,
+          shortCircuit: true,
+        };
+      }
+      return nextResolve(specifier, context);
+    },
+    load(url, context, nextLoad) {
+      if (url === "virtual:supabase-server-stub") {
+        return {
+          format: "module",
+          source:
+            "export async function createClient() { return { auth: { getSession: async () => ({ data: { session: { access_token: 'suite-token' } } }) } }; }",
+          shortCircuit: true,
+        };
+      }
+      return nextLoad(url, context);
+    },
+  });
+  const { POST } = await import("../app/api/roof/confirm/route.ts");
+  const recorded: { url: string; init: RequestInit }[] = [];
+  const realFetch = globalThis.fetch;
+  globalThis.fetch = ((url: string, init: RequestInit) => {
+    recorded.push({ url: String(url), init });
+    return Promise.resolve(
+      new Response(JSON.stringify({ confirmed: true, roof_geometry_id: "r1" }), {
+        status: 200,
+        headers: { "Content-Type": "application/json" },
+      }),
+    );
+  }) as typeof fetch;
+  try {
+    // The client SENT a source — the handler must ignore it (D29: the label is
+    // the handler's fact, not the browser's claim).
+    const res = await POST(
+      new Request("http://localhost/api/roof/confirm", {
+        method: "POST",
+        body: JSON.stringify({ job_id: "job-9", source: "customer" }),
+      }),
+    );
+    assert.equal(recorded.length, 1);
+    assert.ok(recorded[0].url.endsWith("/api/roof/confirm"), recorded[0].url);
+    const headers = recorded[0].init.headers as Record<string, string>;
+    assert.equal(headers.Authorization, "Bearer suite-token");
+    const forwarded = JSON.parse(String(recorded[0].init.body));
+    assert.deepEqual(forwarded, { job_id: "job-9", source: "installer" });
+    assert.equal(res.status, 200);
+    assert.deepEqual(await res.json(), { confirmed: true, roof_geometry_id: "r1" });
+  } finally {
+    globalThis.fetch = realFetch;
+  }
 });

@@ -163,7 +163,7 @@ export function AddressRoofSection({
   diagram?: RoofDiagramView;
 }) {
   const router = useRouter();
-  const [busy, setBusy] = React.useState<"lookup" | "save" | null>(null);
+  const [busy, setBusy] = React.useState<"lookup" | "save" | "confirm" | null>(null);
   // The copy plus whether it was an auth failure — the expired-session case adds a
   // /login link, and the installer chooses when to follow it. We NEVER navigate
   // away mid-action: losing a half-filled roof form is worse than the bug fixed.
@@ -227,6 +227,41 @@ export function AddressRoofSection({
             geocodedState: String(c.geocoded_state ?? "—"),
           });
         }
+      }
+      router.refresh();
+    } finally {
+      setBusy(null);
+    }
+  }
+
+  /**
+   * 3.4c prompt 4 (D24): record that the INSTALLER confirmed this roof. The
+   * source is set by the route handler, never chosen here — a chooser would
+   * store a claim nothing can check (D29); "customer" is row 8.4's, answered
+   * on the homeowner's own phone. NEVER optimistic: the confirmed state
+   * renders only from the server re-read, so a false tick cannot appear
+   * before the write is stored.
+   */
+  async function confirmRoof() {
+    if (busy) return;
+    setBusy("confirm");
+    setActionError(null);
+    try {
+      const result = await postJson<Record<string, unknown>>("/api/roof/confirm", {
+        job_id: jobId,
+      });
+      if (!result.ok) {
+        failed(result.kind, result.status);
+        return;
+      }
+      if ((result.data ?? {}).confirmed !== true) {
+        // The backend reported a failure inside a 200 (its _persist rule).
+        setActionError({
+          heading: "The roof could not be confirmed",
+          body: "The confirmation was not stored — try again in a moment.",
+          isAuth: false,
+        });
+        return;
       }
       router.refresh();
     } finally {
@@ -552,31 +587,51 @@ export function AddressRoofSection({
             </div>
           )}
         </div>
-        {diagramActive ? (
+        {diagramActive && diagram.reason === null ? (
+          <>
+            {/* F234: LEAD WITH THE QUESTION the picture answers — never with
+                a layout claim. The roughness is stated up front because it is
+                EVIDENCE, not a defect (F107: never fit the overlay to the
+                roof — tidy is what would have hidden the pergola). */}
+            <p className="mt-1 text-caption text-foreground">
+              Check this picture for two things: is this the right building,
+              and is every shaded shape really a roof surface? The panels are
+              drawn where Google measured them, but the photo comes from a
+              different supplier, so they will sit roughly — judge the
+              building, not the layout.
+            </p>
+            {/* The specifications FOLLOW; they do not lead (F234). */}
+            <p className="mt-1 text-caption text-muted-foreground">
+              Google drew {diagram.panelCount} panels at{" "}
+              {fmtMetres(diagram.panelWidthM)} m × {fmtMetres(diagram.panelHeightM)} m
+              {diagram.panelCapacityW !== null
+                ? `, ${Math.round(diagram.panelCapacityW)} W each`
+                : null}
+              .
+              {diagram.buildingBox
+                ? " The dashed box is the extent of the area Google measured."
+                : null}
+            </p>
+            {/* The panel-identity gap (found on screen 2026-08-25): the TRUE
+                half of the deleted different-panel sentence — it describes
+                the panel DRAWN, stated separately from the count, which the
+                reconciliation below explains. */}
+            {diagram.panelCapacityW !== null && view.panelLabel ? (
+              <p className="mt-1 text-caption text-muted-foreground">
+                The drawn panels are Google&apos;s{" "}
+                {Math.round(diagram.panelCapacityW)} W assumption; the table
+                above is scaled to {view.panelLabel} — the same roof, two
+                panel models.
+              </p>
+            ) : null}
+          </>
+        ) : null}
+        {diagramActive && diagram.reason !== null ? (
           <p className="mt-1 text-caption text-muted-foreground">
-            {diagram.reason === null ? (
-              <>
-                {/* GOOGLE'S layout at GOOGLE'S panel size — never the table's
-                    panel count or kW, which describe a different panel. */}
-                Google&apos;s indicative panel layout: {diagram.panelCount}{" "}
-                panels at {fmtMetres(diagram.panelWidthM)} m ×{" "}
-                {fmtMetres(diagram.panelHeightM)} m
-                {diagram.panelCapacityW !== null
-                  ? `, ${Math.round(diagram.panelCapacityW)} W each`
-                  : null}
-                .
-                {diagram.buildingBox
-                  ? " The dashed box is the extent of the area Google measured."
-                  : null}
-              </>
-            ) : (
-              <>
-                {DIAGRAM_REASON_COPY[diagram.reason]}
-                {diagram.buildingBox
-                  ? " The dashed box is the extent of the area Google measured."
-                  : null}
-              </>
-            )}
+            {DIAGRAM_REASON_COPY[diagram.reason]}
+            {diagram.buildingBox
+              ? " The dashed box is the extent of the area Google measured."
+              : null}
           </p>
         ) : null}
         {/* F231: the TRUE account of any gap between Google's count and the
@@ -590,17 +645,6 @@ export function AddressRoofSection({
         view.countReconciliation?.explanation ? (
           <p className="mt-1 text-caption text-muted-foreground">
             {view.countReconciliation.explanation}
-          </p>
-        ) : null}
-        {diagramActive && diagram.reason === null ? (
-          // The honest caveat: two imagery sources, so edges won't line up
-          // exactly — and that is fine, because this picture answers WHICH
-          // building, not where panels go. Plain words, no jargon.
-          <p className="mt-1 text-caption text-muted-foreground">
-            The panels are drawn where Google measured them, but the photo
-            comes from a different supplier, so they can sit slightly off a
-            roof edge. Use this picture to check which building was measured —
-            not exactly where panels would go.
           </p>
         ) : null}
         <figcaption className="mt-1 text-caption text-muted-foreground">
@@ -853,6 +897,7 @@ export function AddressRoofSection({
           here; this block only partitions. Wording untouched (3.4c owns it). */}
       {(
         [
+          view.confirmedNotice,
           view.notice,
           ...view.confidenceNotices,
           view.solarExpiredNotice,
@@ -929,6 +974,22 @@ export function AddressRoofSection({
             ) : null}
             {view.state === "found" ? (
               <>
+                {/* D24 order: confirm-or-correct is the next step; the re-run
+                    comes last. Confirm yields primary to the refresh when the
+                    Solar Data has expired. The control exists only while
+                    unconfirmed (view.showsConfirmControl) — never disabled. */}
+                {view.showsConfirmControl ? (
+                  <Button
+                    variant={view.solarDataExpired ? "secondary" : "primary"}
+                    onClick={confirmRoof}
+                    disabled={busy !== null}
+                  >
+                    {busy === "confirm" ? "Confirming…" : "Confirm this roof"}
+                  </Button>
+                ) : null}
+                <Button variant="secondary" onClick={openForm} disabled={busy !== null}>
+                  {manualTriggerLabel}
+                </Button>
                 <Button
                   variant={view.solarDataExpired ? "primary" : "secondary"}
                   onClick={lookup}
@@ -940,9 +1001,6 @@ export function AddressRoofSection({
                       ? "Refresh roof data from Google"
                       : "Look up again"}
                 </Button>
-                <Button variant="secondary" onClick={openForm} disabled={busy !== null}>
-                  {manualTriggerLabel}
-                </Button>
               </>
             ) : null}
             {view.state === "low_confidence" ? (
@@ -950,6 +1008,18 @@ export function AddressRoofSection({
                 <Button onClick={openForm} disabled={busy !== null}>
                   {manualTriggerLabel}
                 </Button>
+                {/* An installer may know a flagged roof is fine (Mayur,
+                    2026-08-14) — confirming stays available, correcting stays
+                    first. */}
+                {view.showsConfirmControl ? (
+                  <Button
+                    variant="secondary"
+                    onClick={confirmRoof}
+                    disabled={busy !== null}
+                  >
+                    {busy === "confirm" ? "Confirming…" : "Confirm this roof"}
+                  </Button>
+                ) : null}
                 {/* Restored at 3.4-D: a low-confidence roof is exactly where you
                     might re-run after checking, and the retry had vanished.
                     3.5b: when the Solar Data has expired the same handler is the
