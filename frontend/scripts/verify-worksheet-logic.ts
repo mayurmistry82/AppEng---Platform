@@ -8230,6 +8230,9 @@ test("3.14-6: exactly the sections the engine reads announce a save; the bar is 
     ["components/worksheet/energy-data-section.tsx", "physics", 3],
     ["components/worksheet/tariff-network-section.tsx", "physics", 1],
     ["components/worksheet/objective-budget-section.tsx", "objective-budget", 1],
+    // 3.14b prompt 3: equipment joined the list the moment prompts 1 and 2 made
+    // jobs.equipment_* an engine input. It was silent before that, correctly.
+    ["components/worksheet/equipment-specs-section.tsx", "equipment", 1],
   ];
   for (const [file, kind, sites] of announcing) {
     const s = read(file);
@@ -8237,11 +8240,10 @@ test("3.14-6: exactly the sections the engine reads announce a save; the bar is 
     assert.ok(s.includes(`kind: "${kind}"`), `${file}: kind ${kind}`);
     assert.ok(/onSaved\?: \(change: SizingInputSave\) => void;/.test(s), `${file}: optional prop`);
   }
-  // SILENT by decision: equipment (the endpoints read roof.selected_panel and
-  // the company catalogue, never jobs.equipment_*), and the two Size sections
-  // (they create a NEW stored run, which resets the rail by id).
+  // STILL SILENT by decision: the two Size sections (they create a NEW stored
+  // run, which resets the rail by id) and the edit button. Equipment left this
+  // list at 3.14b prompt 3 — see above.
   for (const file of [
-    "components/worksheet/equipment-specs-section.tsx",
     "components/worksheet/solar-sizing-section.tsx",
     "components/worksheet/battery-sizing-section.tsx",
     "components/worksheet/job-edit-button.tsx",
@@ -8249,8 +8251,8 @@ test("3.14-6: exactly the sections the engine reads announce a save; the bar is 
     assert.ok(!read(file).includes("onSaved"), `${file} stays silent`);
   }
   const body = read("components/worksheet/worksheet-body.tsx");
-  assert.equal((body.match(/onSaved=\{announce\(section\.id\)\}/g) ?? []).length, 5,
-    "the body threads the callback to exactly five sections");
+  assert.equal((body.match(/onSaved=\{announce\(section\.id\)\}/g) ?? []).length, 6,
+    "the body threads the callback to exactly six sections");
   assert.match(body, /<ResultsBar[\s\S]*change=\{change\}/, "the body hosts the bar and hands it the change");
   const page = read("app/(app)/jobs/[id]/worksheet/page.tsx");
   assert.ok(!page.includes("<ResultsBar"), "page.tsx no longer renders the bar itself");
@@ -8973,4 +8975,365 @@ test("3.14 F212 sweep: the component renders the third outcome as the sentence "
   const fn = bar.slice(bar.indexOf("const tileDelta"), bar.indexOf("const tileSign"));
   assert.ok(fn.indexOf('=== "unknown"') < fn.indexOf('=== "none"'),
     "the unknown branch precedes the two-way one");
+});
+
+
+// ── 3.14b prompt 3 — Equipment & specs announces its save (D37, D30) ─────────
+//
+// A .tsx file cannot be imported into this runner (node --experimental-strip-types
+// erases types but does not transform JSX; the import fails with
+// ERR_UNKNOWN_FILE_EXTENSION), so the component's decision is asserted on the
+// shipped source — as every other component assertion in this suite is. Where a
+// case turns on WHAT `dirty` means, the test EVALUATES the component's own
+// `dirty` expression rather than restating it (2R.1).
+
+/** The component's shipped `dirty` expression, lifted out and made callable.
+    Nothing here is re-typed: if the expression changes, this changes with it. */
+async function equipmentDirty(): Promise<
+  (form: Record<string, string>, baseline: Record<string, string>) => boolean
+> {
+  const [fs, path] = await Promise.all([import("node:fs"), import("node:path")]);
+  const FRONTEND = path.resolve(import.meta.dirname, "..");
+  const src = fs.readFileSync(
+    path.join(FRONTEND, "components/worksheet/equipment-specs-section.tsx"), "utf8");
+  const start = src.indexOf("const dirty =");
+  assert.ok(start > 0, "the component still has a `dirty` flag");
+  const expr = src.slice(start + "const dirty =".length, src.indexOf(";", start));
+  assert.ok(/form\./.test(expr) && /baseline\./.test(expr), `unexpected dirty expression: ${expr}`);
+  const fn = new Function("form", "baseline", `return (${expr});`) as (
+    f: Record<string, string>, b: Record<string, string>,
+  ) => boolean;
+  return fn;
+}
+
+/** The save() body, from its opening to the `finally` — the region every
+    ordering assertion below is made against. */
+async function equipmentSaveBody(): Promise<string> {
+  const [fs, path] = await Promise.all([import("node:fs"), import("node:path")]);
+  const FRONTEND = path.resolve(import.meta.dirname, "..");
+  const src = fs.readFileSync(
+    path.join(FRONTEND, "components/worksheet/equipment-specs-section.tsx"), "utf8");
+  const start = src.indexOf("  async function save() {");
+  assert.ok(start > 0, "save() is still where the announce belongs");
+  const end = src.indexOf("  function setDraftField(", start);
+  assert.ok(end > start, "save() still ends before setDraftField");
+  return src.slice(start, end);
+}
+
+// (a) A SAVE THAT MOVED A PIN announces exactly once, kind "physics".
+test("3.14b-3: a save that changes an equipment id announces exactly once, with "
+  + "kind physics, and only after the row has actually been written", async () => {
+  const body = await equipmentSaveBody();
+  const sites = body.match(/onSaved\?\.\(/g) ?? [];
+  assert.equal(sites.length, 1, "exactly one announce site inside save()");
+  const [fs, path] = await Promise.all([import("node:fs"), import("node:path")]);
+  const FRONTEND = path.resolve(import.meta.dirname, "..");
+  const whole = fs.readFileSync(
+    path.join(FRONTEND, "components/worksheet/equipment-specs-section.tsx"), "utf8");
+  assert.equal((whole.match(/onSaved\?\.\(/g) ?? []).length, 1,
+    "and exactly one in the whole file — createUnit() does not announce");
+  assert.match(body, /onSaved\?\.\(\{ kind: "equipment" \}\)/,
+    'the one kind it emits is "equipment" — a re-cost whose answer may differ');
+  assert.ok(!/kind: "objective-budget"/.test(whole),
+    "equipment is never an objective-budget change");
+  assert.ok(!/kind: "physics"/.test(whole),
+    'and no longer "physics" — the substitution guards must stand down (3.14b-4)');
+  // The optional-call form: `onSaved` absent must not throw.
+  assert.ok(!/[^?]\.\(|onSaved\(/.test(body.replace(/onSaved\?\.\(/g, "")),
+    "the callback is invoked optionally, never as a bare call");
+  // It fires AFTER the tick that means the row is written.
+  assert.ok(body.indexOf("setSavedTick(true)") < body.indexOf("onSaved?.("),
+    "the announce follows the save, never precedes it");
+  // The change it announces is real: one moved id makes dirty true.
+  const dirty = await equipmentDirty();
+  assert.equal(
+    dirty({ panels: "p-2", inverters: "i-1", batteries: "b-1" },
+          { panels: "p-1", inverters: "i-1", batteries: "b-1" }),
+    true, "a changed panel id is a change");
+  assert.equal(
+    dirty({ panels: "p-1", inverters: "i-1", batteries: "b-2" },
+          { panels: "p-1", inverters: "i-1", batteries: "b-1" }),
+    true, "a changed battery id is a change");
+});
+
+// (b) THE CONFIRMATION-ONLY SAVE — RED PROOF. D30 keeps Save enabled with
+// nothing dirty; that save changes no engine input, so it must stay silent.
+test("3.14b-3 D30: a confirmation-only save announces NOTHING — the announce is "
+  + "guarded by the component's own dirty flag, and that flag is false when "
+  + "nothing moved", async () => {
+  const body = await equipmentSaveBody();
+  // THE GUARD. Removing it is what this test exists to catch.
+  assert.match(body, /if \(dirty\) onSaved\?\.\(/,
+    "the announce is guarded by `dirty` — a confirmation-only save fires nothing");
+  // ...and the guard is not decorative: it is false for a save that moved nothing.
+  const dirty = await equipmentDirty();
+  const same = { panels: "p-1", inverters: "i-1", batteries: "b-1" };
+  assert.equal(dirty({ ...same }, { ...same }), false,
+    "nothing moved -> dirty false -> no announce");
+  const autos = { panels: "", inverters: "", batteries: "" };
+  assert.equal(dirty({ ...autos }, { ...autos }), false,
+    "three Autos confirmed for the first time is still not an engine-input change");
+  // equipment_confirmed still travels on EVERY save — the silence is the rail's,
+  // not the write's. D30 is untouched.
+  assert.match(body, /payload\.equipment_confirmed = true;/,
+    "pressing Save is still the confirmation");
+  assert.ok(body.indexOf("payload.equipment_confirmed = true;") < body.indexOf("if (dirty) onSaved"),
+    "the row is written unconditionally; only the announcement is conditional");
+});
+
+// (c) A FAILED SAVE announces nothing — both failure shapes.
+test("3.14b-3: a failed save announces nothing, and neither does a 200 whose "
+  + "returned row disagrees with what was sent", async () => {
+  const body = await equipmentSaveBody();
+  // Located by the CALL, not by the guard — this test is about ordering, and
+  // must fail for its own reason rather than borrowing test (b)'s.
+  const announce = body.indexOf("onSaved?.(");
+  assert.ok(announce > 0, "there is an announce site to order against");
+  // Both early returns stand BEFORE the announce, so neither path reaches it.
+  const httpFail = body.indexOf("if (!result.ok) {");
+  const rowFail = body.indexOf("if (notices.length > 0) {");
+  assert.ok(httpFail > 0 && rowFail > 0, "both failure branches are still there");
+  assert.ok(httpFail < announce, "the transport failure returns before the announce");
+  assert.ok(rowFail < announce, "the disagreeing-row failure returns before the announce");
+  for (const [name, at] of [["http", httpFail], ["row", rowFail]] as const) {
+    const branch = body.slice(at, announce);
+    assert.match(branch, /return;/, `${name} branch returns rather than falling through`);
+  }
+  // Nothing announces outside save(): the drawer's createUnit writes a catalogue
+  // row, not a job pin, and the job's own ids are untouched by it.
+  const [fs, path] = await Promise.all([import("node:fs"), import("node:path")]);
+  const FRONTEND = path.resolve(import.meta.dirname, "..");
+  const whole = fs.readFileSync(
+    path.join(FRONTEND, "components/worksheet/equipment-specs-section.tsx"), "utf8");
+  const after = whole.slice(whole.indexOf("  function setDraftField("));
+  assert.ok(!after.includes("onSaved"), "createUnit and the render announce nothing");
+});
+
+// (d) CLEARING A PIN BACK TO AUTO is a change and DOES announce.
+test("3.14b-3: clearing a pin back to Auto is a change — dirty is true, the "
+  + "column is cleared with an explicit null, and the rail is told", async () => {
+  const dirty = await equipmentDirty();
+  assert.equal(
+    dirty({ panels: "", inverters: "i-1", batteries: "b-1" },
+          { panels: "p-1", inverters: "i-1", batteries: "b-1" }),
+    true, "Auto after a pin is a change, so the rail hears about it");
+  // Auto travels as an explicit null, which is what makes the engine fall back
+  // to the roof's own panel — the thing the re-cost will then measure.
+  const body = await equipmentSaveBody();
+  assert.match(body, /payload\[API_FIELD\[kind\]\] = form\[kind\] === "" \? null : form\[kind\];/,
+    "Auto is an explicit null, never an absent key");
+  assert.match(body, /if \(form\[kind\] === baseline\[kind\]\) continue;/,
+    "an untouched kind is absent — absent and null are different facts");
+});
+
+// (e) THE RAIL TREATS IT LIKE EVERY OTHER PHYSICS SAVE — no new kind, no new
+// branch, and the bar was not touched to make this work.
+test("3.14b-3: the bar re-costs an equipment save through the SAME branch every "
+  + "other physics save uses — no new kind, no new request field", async () => {
+  const [fs, path] = await Promise.all([import("node:fs"), import("node:path")]);
+  const FRONTEND = path.resolve(import.meta.dirname, "..");
+  const bar = fs.readFileSync(
+    path.join(FRONTEND, "components/worksheet/results-bar.tsx"), "utf8");
+  assert.match(bar, /if \(change\.kind === "objective-budget"\) \{[\s\S]*?\} else \{\s*void recost\(change\);/,
+    "anything that is not objective-budget re-costs — physics needs no branch of its own");
+  // The kind set, DERIVED from the union in lib rather than restated here.
+  const lib = fs.readFileSync(path.join(FRONTEND, "lib/worksheet.ts"), "utf8");
+  const union = lib.slice(
+    lib.indexOf("export type SizingInputChangeKind ="),
+    lib.indexOf(";", lib.indexOf("export type SizingInputChangeKind =")));
+  const kinds = [...union.matchAll(/^  \| "([a-z-]+)"/gm)].map((m) => m[1]);
+  console.log(`        change kinds : ${kinds.join(", ")}`);
+  assert.deepEqual(kinds, ["objective-budget", "physics", "equipment"],
+    "exactly three kinds — 3.14b prompt 4 added equipment, and nothing else");
+  // The re-cost pins the stored run's ARRAY SIZE and battery and sends no panel
+  // id at all — the job's own pin is what the engine will resolve (D37: the
+  // rail re-costs, it never re-searches).
+  const body = railRecostRequest(RAIL_BASELINE, "job-1");
+  assert.ok(body, "the fixture run can be pinned");
+  const sent = JSON.stringify(body);
+  for (const key of ["panel_id", "panel_ids", "equipment_panel_id", "inverter_id", "inverter_ids"]) {
+    assert.ok(!sent.includes(key), `the re-cost sends no ${key} — the job's pin wins`);
+  }
+  assert.equal(body.persist, false, "and stores nothing");
+});
+
+
+// ── 3.14b prompt 4 — the substitution guards stand down for kind "equipment",
+// and ONLY for it. A changed pin NECESSARILY answers with different kit (a
+// 455 W Aiko cannot rebuild a 440 W Maxeon array), so on that kind the rail
+// accepts the different system and NAMES what moved, in figures. On every
+// other kind both guards fire exactly as before — that is the safety property,
+// and (b)/(d) below were red-proven against a let-everything-through condition.
+// The response fields the sentence names were PRINTED from a live run in this
+// task: chosen_solar.panel_count/solar_kw, optimal.panel_count/solar_kw,
+// optimal_battery.model/usable_kwh. The changed-array figures (19 panels,
+// 8.645 kW against the stored 440 W array) are that live run's own.
+
+const EQUIPMENT = CHANGE({ kind: "equipment", section: "equipment-specs" });
+const EQ_OK = {
+  flags: [RAIL_DECLINE_FLAG, "not_persisted_by_request"],
+  engine_mode: "sequential", resolution: "full_year", constraint_deltas: null,
+  chosen_solar: { solar_kw: 9.24, panel_count: 21 },
+  optimal_battery: { battery_id: "b1", usable_kwh: 9.83, model: "GoodWe Lynx Home F",
+    system_cost: 12000, annual_savings_vs_solar_only: 300, incremental_npv: 2900,
+    self_sufficiency_pct: 85 },
+  solar_options: { chosen_index: 1, points: [{}, { annual_savings: 1800, npv_25yr: 17100 }] },
+};
+
+// (a) equipment + a changed ARRAY -> accepted, and the sentence carries the
+// count and kW on BOTH sides.
+test("3.14b-4: kind equipment + a changed array is ACCEPTED, and the sentence "
+  + "names the panel count and kW on both sides — never a bare 'changed'", () => {
+  const resp = { ...EQ_OK, chosen_solar: { solar_kw: 8.645, panel_count: 19 } };
+  const st = railRecostState(RAIL_BASELINE, EQUIPMENT, resp);
+  assert.equal(st.kind, "recosted", st.kind === "failed" ? st.reason : "");
+  if (st.kind !== "recosted") return;
+  console.log(`        moved: ${st.moved}`);
+  assert.ok(st.moved, "an equipment change that moved the array SAYS so");
+  assert.ok(st.moved.includes("21 panels (9.24 kW)"), `before side: ${st.moved}`);
+  assert.ok(st.moved.includes("19 panels (8.645 kW)"), `after side: ${st.moved}`);
+  assert.ok(!st.moved.includes("battery"), "the battery did not move, so it is not named");
+  assert.equal(st.after.solarKw, 8.645, "the after figures ARE the answer");
+  // The one line under the tiles carries the sentence AND the provenance AND
+  // the not-saved words — the bar renders railStatusLine, untouched.
+  const line = railStatusLine(st) ?? "";
+  console.log(`        line : ${line}`);
+  assert.ok(line.startsWith("The pinned equipment changed the system:"), line);
+  assert.match(line, /sequential engine/);
+  assert.match(line, /not saved/i);
+  // The SOLAR route's shape, through the same guard. A solar baseline's count
+  // comes from the chosen curve point (panels_per_plane [21] on the fixture),
+  // so both sides carry counts here.
+  const solarBase = railBaselineView({ ...RAIL_JOB, sizing_results: [STORED_SOLAR_RUN] });
+  const solarResp = {
+    flags: [RAIL_DECLINE_FLAG], engine_mode: "sequential",
+    optimal: { solar_kw: 8.645, panel_count: 19, simple_payback_years: 5.1,
+      npv_25yr: 17000, self_sufficiency_pct: 40.2 },
+  };
+  const sst = railRecostState(solarBase, EQUIPMENT, solarResp);
+  assert.equal(sst.kind, "recosted", sst.kind === "failed" ? sst.reason : "");
+  if (sst.kind !== "recosted") return;
+  console.log(`        solar: ${sst.moved}`);
+  assert.ok(sst.moved?.includes("was 21 panels (9.24 kW), now 19 panels (8.645 kW)"), `${sst.moved}`);
+  // ...and a run that recorded NO per-plane counts shows what IS carried on
+  // the before side — the kW — and invents nothing.
+  const noCount = JSON.parse(JSON.stringify(STORED_SOLAR_RUN));
+  delete noCount.evaluated_options.points[1].panels_per_plane;
+  const ncBase = railBaselineView({ ...RAIL_JOB, sizing_results: [noCount] });
+  assert.equal(ncBase.chosen.panelsPerPlane, null, "the count is genuinely absent");
+  const nst = railRecostState(ncBase, EQUIPMENT, solarResp);
+  assert.equal(nst.kind, "recosted");
+  if (nst.kind === "recosted") {
+    console.log(`        no-count: ${nst.moved}`);
+    assert.ok(nst.moved?.includes("was 9.24 kW, now 19 panels (8.645 kW)"), `${nst.moved}`);
+    assert.ok(!/undefined|null|NaN/.test(nst.moved ?? ""), "no formatter leak");
+  }
+  // And an equipment save that moved NOTHING carries no sentence: the line is
+  // the provenance alone, exactly as a physics re-cost reads.
+  const same = railRecostState(RAIL_BASELINE, EQUIPMENT, EQ_OK);
+  assert.equal(same.kind, "recosted");
+  if (same.kind === "recosted") {
+    assert.equal(same.moved, null, "nothing moved -> nothing claimed");
+    assert.equal(railStatusLine(same), same.provenance.label);
+  }
+});
+
+// (b) physics + a changed ARRAY -> STILL REFUSED, same wording as today.
+// RED-PROVEN: fails when the guard is written to let everything through.
+test("3.14b-4: kind physics + a changed array is STILL refused with today's "
+  + "wording — the guard stood down for equipment only", () => {
+  const physics = CHANGE({ kind: "physics", section: "tariff-network" });
+  const resp = { ...EQ_OK, chosen_solar: { solar_kw: 8.645, panel_count: 19 } };
+  const st = railRecostState(RAIL_BASELINE, physics, resp);
+  assert.equal(st.kind, "failed", "a physics save must not move the array");
+  if (st.kind !== "failed") return;
+  assert.equal(st.reason,
+    "The engine answered with a different array from the stored run's, so this is not a re-cost of the stored system.");
+});
+
+// (c) equipment + a changed BATTERY -> accepted and named on both sides.
+test("3.14b-4: kind equipment + a changed battery is ACCEPTED, and the sentence "
+  + "names the model on both sides", () => {
+  const resp = { ...EQ_OK, optimal_battery: { battery_id: "b2", usable_kwh: 13.5,
+    model: "Tesla Powerwall", system_cost: 16000, annual_savings_vs_solar_only: 400,
+    incremental_npv: 1200, self_sufficiency_pct: 90.2 } };
+  const st = railRecostState(RAIL_BASELINE, EQUIPMENT, resp);
+  assert.equal(st.kind, "recosted", st.kind === "failed" ? st.reason : "");
+  if (st.kind !== "recosted") return;
+  console.log(`        moved: ${st.moved}`);
+  assert.ok(st.moved?.includes("GoodWe Lynx Home F (9.83 kWh)"), `before: ${st.moved}`);
+  assert.ok(st.moved?.includes("Tesla Powerwall (13.5 kWh)"), `after: ${st.moved}`);
+  assert.ok(!st.moved?.includes("array"), "the array did not move, so it is not named");
+  assert.equal(st.after.batteryKwh, 13.5);
+  // A response whose battery carries NO model still answers with what it does
+  // carry — the kWh — and invents nothing.
+  const anon = { ...EQ_OK, optimal_battery: { battery_id: "b2", usable_kwh: 13.5,
+    system_cost: 16000, annual_savings_vs_solar_only: 400, incremental_npv: 1200,
+    self_sufficiency_pct: 90.2 } };
+  const ast = railRecostState(RAIL_BASELINE, EQUIPMENT, anon);
+  assert.equal(ast.kind, "recosted");
+  if (ast.kind === "recosted") {
+    console.log(`        anon : ${ast.moved}`);
+    assert.ok(ast.moved?.includes("now 13.5 kWh"), `${ast.moved}`);
+    assert.ok(!/undefined|null/.test(ast.moved ?? ""), "no formatter leak");
+  }
+});
+
+// (d) physics + a changed BATTERY -> STILL REFUSED, same wording as today.
+// RED-PROVEN alongside (b).
+test("3.14b-4: kind physics + a changed battery is STILL refused with today's "
+  + "wording", () => {
+  const physics = CHANGE({ kind: "physics", section: "energy-data" });
+  const resp = { ...EQ_OK, optimal_battery: { ...EQ_OK.optimal_battery,
+    battery_id: "b2", usable_kwh: 13.5, model: "Tesla Powerwall" } };
+  const st = railRecostState(RAIL_BASELINE, physics, resp);
+  assert.equal(st.kind, "failed", "a physics save must not swap the battery");
+  if (st.kind !== "failed") return;
+  assert.equal(st.reason,
+    "The engine answered with a different battery from the stored run's, so this is not a re-cost of the stored system.");
+});
+
+// Every UNTOUCHED guard still fires under kind "equipment" — they are about
+// the engine's honesty, not about which system it answered for.
+test("3.14b-4: all six untouched guards still fire on an equipment change — "
+  + "decline flag, contradiction, catalogue, engine_mode, resolution, no figures", () => {
+  const cases: [string, unknown, RegExp][] = [
+    ["decline flag missing", { ...EQ_OK, flags: ["not_persisted_by_request"] },
+      /did not confirm it skipped the comparison/],
+    ["declined AND deltas (contradiction)", { ...EQ_OK, constraint_deltas: { battery_kwh: 0 } },
+      /contradictory/],
+    ["battery gone from catalogue", { ...EQ_OK,
+      flags: [RAIL_DECLINE_FLAG, "battery_ids not in the active catalogue — not evaluated: ['b1']"] },
+      /no longer in the catalogue/],
+    ["engine_mode missing", { ...EQ_OK, engine_mode: undefined },
+      /did not say which engine/],
+    ["resolution missing", { ...EQ_OK, resolution: undefined },
+      /dispatch resolution/],
+    ["no figures", { ...EQ_OK, chosen_solar: {} },
+      /returned no figures/],
+  ];
+  for (const [label, resp, wording] of cases) {
+    const st = railRecostState(RAIL_BASELINE, EQUIPMENT, resp);
+    assert.equal(st.kind, "failed", label);
+    if (st.kind !== "failed") continue;
+    assert.match(st.reason, wording, label);
+    console.log(`        ${label.padEnd(38)} -> ${st.reason.slice(0, 62)}`);
+  }
+});
+
+// The permissive path is gated on the EXACT literal — a missing or
+// unrecognised kind takes the strict path. Asserted on the source: the
+// condition is equality with "equipment", never inequality with "physics".
+test("3.14b-4: permissiveness is opt-in by the exact literal — the source "
+  + "tests kind === \"equipment\", not kind !== \"physics\"", async () => {
+  const [fs, path] = await Promise.all([import("node:fs"), import("node:path")]);
+  const FRONTEND = path.resolve(import.meta.dirname, "..");
+  const lib = fs.readFileSync(path.join(FRONTEND, "lib/worksheet.ts"), "utf8");
+  const fn = lib.slice(lib.indexOf("export function railRecostState"),
+    lib.indexOf("function equipmentMovedNote"));
+  assert.match(fn, /const equipmentChange = change\.kind === "equipment";/,
+    "strict by default: only the literal stands the guards down");
+  assert.ok(!fn.includes('!== "physics"'), "never an inequality that a fourth kind would slip through");
+  assert.equal((fn.match(/equipmentChange/g) ?? []).length >= 3, true,
+    "both guards and the sentence read the ONE flag (2R.1)");
 });

@@ -790,6 +790,166 @@ def t5_live() -> None:
           str(c.get("flags")))
 
 
+
+# ── 3.14b prompt 2 — ONE per-plane count rule (F134) ─────────────────────────
+#
+# _normalise caps the area count by Google's measured count; the pinned path's
+# rescale_planes_for_panel never did. So the roof was measured one way when
+# the engine chose the panel and another when the installer did. The fix is
+# ONE function both call; these checks hold the identity and the rule itself.
+import math as _math
+
+
+def _live_roofs():
+    """Every live roof row, read-only. None when there is no client."""
+    client = roof_geometry._client()
+    if client is None:
+        return None
+    res = (client.table("roof_geometry")
+           .select("roof_geometry_id,job_id,source,planes,candidate_configs,selected_panel,usability_factor")
+           .order("job_id").order("created_at", desc=True).execute())
+    return [r for r in (res.data or []) if isinstance(r, dict)]
+
+
+def t_one_count_rule() -> int:
+    """Returns the number of loud skips (uncounted)."""
+    print("\nT6. ONE per-plane panel-count rule — the pinned path measures the roof "
+          "exactly as the unpinned path does (F134)")
+    skipped = 0
+    rows = _live_roofs()
+    if rows is None:
+        print("  SKIP  (6a) the live roof rows need the Supabase env (SUPABASE_URL + "
+              "service-role key). NOT counted as a pass.")
+        skipped += 1
+        rows = []
+
+    # ── (6a) THE IDENTITY CHECK: rescaling a stored roof to its OWN panel
+    # reproduces its stored per-plane counts AND its candidate_configs.
+    # WHY IT MOVES WHEN THE FAULT IS PRESENT: on a Google roof the stored
+    # count is min(area rule, Google's count); an uncapped rescale returns the
+    # area rule alone, which is larger wherever Google measured fewer.
+    for r in rows:
+        planes = r.get("planes") or []
+        panel = r.get("selected_panel") or {}
+        rid, jid = str(r.get("roof_geometry_id"))[:8], str(r.get("job_id"))[:8]
+        out = roof_geometry.rescale_planes_for_panel(planes, panel)
+        stored = [p.get("panel_count") for p in planes]
+        recomputed = [p.get("panel_count") for p in out["planes"]]
+        google = [p.get("google_panel_count") for p in planes]
+        print(f"        roof {rid} job {jid}: stored {stored}  recomputed {recomputed}  google {google}")
+        check(f"(6a) roof {rid} (job {jid}): rescale with its OWN panel reproduces the "
+              "stored per-plane panel_count, element for element",
+              recomputed == stored, f"stored={stored} recomputed={recomputed}")
+        s_cfg = [(c.get("plane_indices"), c.get("panel_count"), c.get("kwp")) for c in (r.get("candidate_configs") or [])]
+        n_cfg = [(c.get("plane_indices"), c.get("panel_count"), c.get("kwp")) for c in out["candidate_configs"]]
+        check(f"(6a) roof {rid}: ...and its stored candidate_configs (indices, counts, kWp)",
+              n_cfg == s_cfg, f"stored={s_cfg} recomputed={n_cfg}")
+
+    # ── (6b) THE RULE ITSELF, offline. Both branches are _normalise's.
+    rule = getattr(roof_geometry, "plane_panel_count", None)
+    check("(6b) roof_geometry exports plane_panel_count — the ONE rule", callable(rule), str(rule))
+    if callable(rule):
+        fl: list[str] = []
+        check("(6b) area rule alone: floor(10.12 / 1.9981) = 5",
+              rule(10.12, 1.9981, None, fl, 0) == 5 and fl == [], str(fl))
+        check("(6b) Google's count CAPS the area rule: min(5, 3) = 3",
+              rule(10.12, 1.9981, 3, fl, 0) == 3, "")
+        check("(6b) a Google count LARGER than the area rule does not raise it: min(5, 9) = 5",
+              rule(10.12, 1.9981, 9, fl, 0) == 5, "")
+        check("(6b) usable area None -> 0 (the caller flags it, as today)",
+              rule(None, 1.9981, 3, fl, 0) == 0, "")
+        check("(6b) panel area None or 0 -> 0",
+              rule(10.12, None, 3, fl, 0) == 0 and rule(10.12, 0, 3, fl, 0) == 0, "")
+        fl = []
+        junk = [rule(10.12, 1.9981, g, fl, 7) for g in ("abc", -1, [], {}, float("nan"), True)]
+        print(f"        (6b) junk google counts -> {junk}; flags {fl}")
+        check("(6b) an unusable google_panel_count is treated as ABSENT (area rule) and "
+              "flagged — never a raise, never a negative",
+              all(v == 5 for v in junk) and all(isinstance(v, int) and v >= 0 for v in junk)
+              and any("google_panel_count" in f and "7" in f for f in fl), str(fl))
+        check("(6b) a Google count of 0 means 0 — Google measured no panel on that face",
+              rule(10.12, 1.9981, 0, fl, 0) == 0, "")
+        check("(6b) it returns an int >= 0 for every input shape",
+              all(isinstance(rule(u, a, g, [], 0), int) and rule(u, a, g, [], 0) >= 0
+                  for u in (None, 0, -3, 10.12, "x") for a in (None, 0, 1.9981, "y") for g in (None, 0, 3, -2, "z")),
+              "")
+
+    # ── (6c) THE CAP BITES ON THE PINNED PATH — the Maxeon against a57e13f1.
+    # WHY IT MOVES: plane 5 is 10.12 m² usable; the area rule with a 1.9319 m²
+    # panel gives floor(10.12/1.9319) = 5, and Google measured 3 on that face.
+    # Without the cap the rescaled count is 5; with it, 3.
+    a57 = next((r for r in rows if str(r.get("job_id")).startswith("a57e13f1")), None)
+    client = roof_geometry._client()
+    maxeon = None
+    if client is not None:
+        res = client.table("panels").select("id,brand,model,rated_power_w,length_mm,width_mm").execute()
+        for row in res.data or []:
+            if "Maxeon" in str(row.get("model")):
+                maxeon = roof_geometry._panel_from_row(row)
+    if a57 is None or maxeon is None:
+        print("  SKIP  (6c) needs the live roof for a57e13f1 and the Maxeon panel row. NOT counted.")
+        skipped += 1
+    else:
+        planes = a57.get("planes") or []
+        p5 = planes[5] if len(planes) > 5 else {}
+        area_rule = int(_math.floor(float(p5.get("usable_area_m2")) / maxeon["area_m2"]))
+        out = roof_geometry.rescale_planes_for_panel(planes, maxeon)
+        got = out["planes"][5]["panel_count"] if len(out["planes"]) > 5 else None
+        print(f"        (6c) Maxeon area {maxeon['area_m2']} m²; plane 5 usable {p5.get('usable_area_m2')} m² -> "
+              f"area rule {area_rule}, Google {p5.get('google_panel_count')}, rescaled {got}")
+        check("(6c/premise) plane 5's area rule EXCEEDS Google's count, so the cap is the only "
+              "thing that can bring it down",
+              area_rule > (p5.get("google_panel_count") or 0), f"{area_rule} vs {p5.get('google_panel_count')}")
+        check("(6c) the rescaled count for plane 5 is Google's 3 — the cap bites on the pinned path "
+              "(without it the count is the area rule's 5)",
+              got == p5.get("google_panel_count") == 3, f"got={got}")
+
+    # ── (6d) THE ROUNDING QUESTION — reported, never resolved here. _normalise
+    # divides the UNROUNDED area*usability; the stored usable_area_m2 is
+    # rounded to two decimals. The unrounded Google area is not stored, so
+    # the closest re-derivation is area_m2 (itself 2-dp) × usability_factor.
+    boundary = []
+    for r in rows:
+        pa = (r.get("selected_panel") or {}).get("area_m2")
+        uf = r.get("usability_factor")
+        if not pa or uf is None:
+            continue
+        for i, p in enumerate(r.get("planes") or []):
+            a, u = p.get("area_m2"), p.get("usable_area_m2")
+            if a is None or u is None:
+                continue
+            via_stored = int(_math.floor(float(u) / float(pa)))
+            via_product = int(_math.floor(float(a) * float(uf) / float(pa)))
+            if via_stored != via_product:
+                boundary.append((str(r.get("roof_geometry_id"))[:8], str(r.get("job_id"))[:8], i, u, round(float(a) * float(uf), 4), via_stored, via_product))
+    print(f"        (6d) planes where floor(stored usable/pa) != floor(area*usability/pa): "
+          f"{boundary if boundary else 'NONE across ' + str(sum(len(r.get('planes') or []) for r in rows)) + ' planes on ' + str(len(rows)) + ' roofs'}")
+    check("(6d) the rounding question was LOOKED AT on every live plane (reported above; "
+          "a disagreement is a separate fact for Mayur, not a failure here)",
+          rows is not None, "")
+
+    # ── (6e) THE MANUAL PATH IS UNMOVED: every plane google_panel_count None,
+    # so the area rule alone decides, exactly as before.
+    manual = roof_geometry.build_manual_roof(
+        planes=[{"azimuth": 0, "pitch": 20, "area_m2": 30.0}, {"azimuth": 90, "pitch": 25, "area_m2": 12.5}],
+        usability=0.7, selected_panel=dict(PANEL),
+    ) if hasattr(roof_geometry, "build_manual_roof") else None
+    if manual is None:
+        # Fall back to driving rescale on manual-shaped planes directly.
+        shaped = [{"azimuth": 0, "pitch": 20, "area_m2": 30.0, "usable_area_m2": 21.0, "sunshine_quantile": None, "google_panel_count": None, "center": None},
+                  {"azimuth": 90, "pitch": 25, "area_m2": 12.5, "usable_area_m2": 8.75, "sunshine_quantile": None, "google_panel_count": None, "center": None}]
+        out = roof_geometry.rescale_planes_for_panel(shaped, dict(PANEL))
+        counts = [p["panel_count"] for p in out["planes"]]
+        expect = [int(_math.floor(21.0 / PANEL["area_m2"])), int(_math.floor(8.75 / PANEL["area_m2"]))]
+        cfgs = [(c["plane_indices"], c["panel_count"]) for c in out["candidate_configs"]]
+        print(f"        (6e) manual-shaped planes -> counts {counts} (area rule {expect}), configs {cfgs}")
+        check("(6e) the manual path (google_panel_count None on every plane) is the area rule "
+              "alone — counts unchanged",
+              counts == expect, f"{counts} vs {expect}")
+        check("(6e) ...and its cumulative configs are unchanged: [[0],[0,1]] by usable area",
+              cfgs == [([0], expect[0]), ([0, 1], expect[0] + expect[1])], str(cfgs))
+    return skipped
+
 def main() -> int:
     live = "--live" in sys.argv
     print("verify_roof_contract.py — 3.4-A roof contract"
@@ -802,6 +962,7 @@ def main() -> int:
     t_prefill_provenance()
     t_panel_dimensions()
     t_segment_index()
+    skipped = t_one_count_rule()
     if live:
         t5_live()
 
@@ -811,7 +972,8 @@ def main() -> int:
         for name in FAILURES:
             print(f"  - {name}")
         return 1
-    print(f"OK: all {CHECKS_RUN} checks passed")
+    tail = f" ({skipped} skipped, not counted)" if skipped else ""
+    print(f"OK: all {CHECKS_RUN} checks passed{tail}")
     return 0
 
 

@@ -336,6 +336,44 @@ def _age_years(d: _dt.date) -> int:
 
 
 # ── Normalisation ─────────────────────────────────────────────────────────────
+def plane_panel_count(
+    usable_area_m2: Any,
+    panel_area_m2: Any,
+    google_panel_count: Any,
+    flags: list,
+    plane_index: int,
+) -> int:
+    """THE ONE per-plane panel-count rule (3.14b prompt 2, F134).
+
+    Two branches, exactly _normalise's:
+        area_count  = floor(usable_area_m2 / panel_area_m2)
+        count       = max(0, min(area_count, google_panel_count))  when Google measured one
+        count       = max(0, area_count)                           when it did not
+
+    Both callers — _normalise (the Google path) and rescale_planes_for_panel
+    (every pinned run, and the manual path) — call THIS, so a pinned panel is
+    laid out on the same measured roof the unpinned run uses. Before this the
+    rescale implemented the second branch only, and the same roof counted 26
+    panels one way and 30 the other (F134). Do not copy the `min` anywhere.
+
+    A google_panel_count that is not a usable number is treated as absent and
+    flagged. Returns an int >= 0 and NEVER raises, matching the module.
+    """
+    area_count = 0
+    if usable_area_m2 is not None and panel_area_m2:
+        try:
+            area_count = int(math.floor(float(usable_area_m2) / float(panel_area_m2)))
+        except (TypeError, ValueError, ZeroDivisionError, OverflowError):
+            area_count = 0
+    if google_panel_count is not None:
+        g = None if isinstance(google_panel_count, bool) else _num(google_panel_count)
+        if g is None or not math.isfinite(g) or g < 0:
+            flags.append(f"plane_{plane_index}_google_panel_count_unusable")
+        else:
+            return max(0, min(area_count, int(g)))
+    return max(0, area_count)
+
+
 def _normalise(data: dict, panel: dict, usability: float) -> dict:
     """
     Turn one buildingInsights response into our normalised roof model. Geometry only.
@@ -428,17 +466,14 @@ def _normalise(data: dict, panel: dict, usability: float) -> dict:
 
         if area is None:
             usable = None
-            area_panel_count = 0
             flags.append(f"segment_{i}_area_missing")
         else:
             usable = area * usability
-            area_panel_count = int(math.floor(usable / panel_area)) if panel_area else 0
 
         google_seg = seg_counts.get(i) if have_layout else None
-        if google_seg is not None:
-            panel_count = max(0, min(area_panel_count, google_seg))
-        else:
-            panel_count = max(0, area_panel_count)
+        # THE ONE RULE — the unrounded usable, exactly as before (the rounding
+        # question between this and the stored 2-dp value is a separate fact).
+        panel_count = plane_panel_count(usable, panel_area, google_seg, flags, i)
 
         kwp = round(panel_count * panel_watts / 1000.0, 3)
         az = _num(seg.get("azimuthDegrees"))
@@ -557,10 +592,13 @@ def rescale_planes_for_panel(planes: list[dict], panel: dict) -> dict:
     Re-scale a STORED roof model to a different panel — purely locally, NO Google Solar call.
 
     From each plane's already-stored ``usable_area_m2`` (and the existing plane order),
-    recompute ``panel_count = floor(usable_area_m2 / panel["area_m2"])`` and
-    ``kwp = panel_count * panel["watts"] / 1000``, then rebuild the cumulative
-    best-plane-first ``candidate_configs`` exactly as ``_normalise`` does. A plane missing
-    ``usable_area_m2`` is skipped (count 0) and flagged. Never raises.
+    recompute the count through THE ONE RULE, plane_panel_count — the area rule
+    capped by the plane's stored ``google_panel_count`` where Google measured one
+    (3.14b prompt 2, F134) — and ``kwp = panel_count * panel["watts"] / 1000``, then
+    rebuild the cumulative best-plane-first ``candidate_configs`` exactly as
+    ``_normalise`` does. A plane missing ``usable_area_m2`` is skipped (count 0) and
+    flagged. Never raises. The manual path's planes carry google_panel_count None on
+    every plane, so its counts are the area rule alone, unchanged.
 
     Returns {"planes": [...], "candidate_configs": [...], "flags": [...]}.
     """
@@ -571,17 +609,9 @@ def rescale_planes_for_panel(planes: list[dict], panel: dict) -> dict:
     new_planes: list[dict] = []
     for i, p in enumerate(planes or []):
         usable = p.get("usable_area_m2")
-        if usable is None or not panel_area:
-            count = 0
-            if usable is None:
-                flags.append(f"plane_{i}_usable_area_missing")
-        else:
-            try:
-                count = int(math.floor(float(usable) / float(panel_area)))
-            except (TypeError, ValueError, ZeroDivisionError):
-                count = 0
-            if count < 0:
-                count = 0
+        if usable is None:
+            flags.append(f"plane_{i}_usable_area_missing")
+        count = plane_panel_count(usable, panel_area, p.get("google_panel_count"), flags, i)
         kwp = round(count * float(watts) / 1000.0, 3) if watts else 0.0
         scaled = dict(p)
         scaled["panel_count"] = count

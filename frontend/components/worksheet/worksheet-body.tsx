@@ -202,7 +202,7 @@ export function WorksheetBody({
       ) : section.id === "objective-budget" && objectiveBudget && jobId ? (
         <ObjectiveBudgetSection view={objectiveBudget} jobId={jobId} onSaved={announce(section.id)} />
       ) : section.id === "equipment-specs" && equipmentSpecs && jobId ? (
-        <EquipmentSpecsSection view={equipmentSpecs} jobId={jobId} />
+        <EquipmentSpecsSection view={equipmentSpecs} jobId={jobId} onSaved={announce(section.id)} />
       ) : section.id === "solar-sizing" && solarSizing && jobId ? (
         <SolarSizingSection view={solarSizing} jobId={jobId} />
       ) : section.id === "battery-sizing" && batterySizing && jobId ? (

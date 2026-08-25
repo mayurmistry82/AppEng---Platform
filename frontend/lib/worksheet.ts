@@ -6742,7 +6742,15 @@ export type SizingInputChangeKind =
   /** The engine's objective, blend weight or budget cap — INSTANT. */
   | "objective-budget"
   /** Anything the engine re-costs from scratch: roof, site, load, tariff. */
-  | "physics";
+  | "physics"
+  /** An equipment pin moved (3.14b prompt 4). A re-cost like "physics" — the
+      bar's else branch already handles it — but the answer is EXPECTED to be
+      a different system: a 455 W panel cannot rebuild a 440 W array, so the
+      two substitution guards stand down for this kind ONLY. Every honesty
+      guard (decline flag, contradiction, catalogue, provenance, no figures)
+      still fires. Any kind that is not this exact literal takes the strict
+      path — permissiveness is never the default. */
+  | "equipment";
 
 export interface SizingInputChange {
   kind: SizingInputChangeKind;
@@ -7027,6 +7035,10 @@ export type RailState =
       after: RailFigures;
       deltas: RailDelta[];
       provenance: RailProvenance;
+      /** kind "equipment" only: WHAT MOVED, in figures — the array's panel
+          count and kW on both sides, the battery model on both sides when it
+          moved. null on every other kind, and when nothing moved. */
+      moved: string | null;
       notSaved: string;
     }
   /** A re-cost did not complete — the stored figures stand, and it says so. */
@@ -7387,8 +7399,13 @@ export function railRecostState(
     return failed("The stored battery is no longer in the catalogue, so this system cannot be re-costed as it stands.");
   }
   const isBattery = baseline.runKind === "solar_battery";
+  // ONLY the exact literal is permissive: a missing or unrecognised kind is
+  // judged as strictly as "physics" (3.14b prompt 4 fallback rule).
+  const equipmentChange = change.kind === "equipment";
   let after: RailFigures;
   let answeredKw: number | null;
+  let afterPanelCount: number | null = null;
+  let battMoved: { model: string | null; kwh: number | null } | null = null;
   if (isBattery) {
     const opt = asRecord(body.optimal_battery);
     const cs = asRecord(body.chosen_solar);
@@ -7401,8 +7418,18 @@ export function railRecostState(
     const battId = typeof opt.battery_id === "string" ? opt.battery_id : null;
     if (answeredKw === null || kwh === null) return failed("The engine returned no figures.");
     if (battId !== baseline.chosen.batteryId || kwh !== baseline.chosen.batteryKwh) {
-      return failed("The engine answered with a different battery from the stored run's, so this is not a re-cost of the stored system.");
+      // A changed equipment pin NECESSARILY answers with different kit — that
+      // is the answer, not a substitution (3.14b prompt 4). Every other kind
+      // still refuses it.
+      if (!equipmentChange) {
+        return failed("The engine answered with a different battery from the stored run's, so this is not a re-cost of the stored system.");
+      }
+      battMoved = {
+        model: typeof opt.model === "string" ? opt.model : null,
+        kwh,
+      };
     }
+    afterPanelCount = tariffNum(cs.panel_count);
     const incSav = tariffNum(opt.annual_savings_vs_solar_only);
     const incNpv = tariffNum(opt.incremental_npv);
     const solSav = tariffNum(sp.annual_savings);
@@ -7424,6 +7451,7 @@ export function railRecostState(
     const opt = asRecord(body.optimal);
     answeredKw = tariffNum(opt.solar_kw);
     if (answeredKw === null) return failed("The engine returned no figures.");
+    afterPanelCount = tariffNum(opt.panel_count);
     after = {
       solarKw: answeredKw,
       batteryKwh: null,
@@ -7433,7 +7461,7 @@ export function railRecostState(
       basis: "whole-system",
     };
   }
-  if (answeredKw !== baseline.chosen.solarKw) {
+  if (!equipmentChange && answeredKw !== baseline.chosen.solarKw) {
     return failed("The engine answered with a different array from the stored run's, so this is not a re-cost of the stored system.");
   }
   const engineMode = typeof body.engine_mode === "string" ? body.engine_mode : null;
@@ -7451,8 +7479,54 @@ export function railRecostState(
     after,
     deltas: railDeltas(baseline.figures, after),
     provenance: railProvenance(engineMode, resolution, isBattery),
+    moved: equipmentChange
+      ? equipmentMovedNote(baseline, answeredKw, afterPanelCount, battMoved)
+      : null,
     notSaved: RAIL_NOT_SAVED,
   };
+}
+
+/**
+ * kind "equipment" only: what the newly pinned kit changed, IN FIGURES —
+ * never a bare "changed" (3.14b prompt 4). Every response field named here
+ * was PRINTED from a live run in that task: chosen_solar.panel_count and
+ * chosen_solar.solar_kw on the battery route, optimal.panel_count and
+ * optimal.solar_kw on the solar route, optimal_battery.model and
+ * optimal_battery.usable_kwh for the battery's own name. The before side is
+ * the stored run's own chosen_solar/points, already on the baseline. A side
+ * whose count or model was not recorded shows what IS carried — the kW, the
+ * kWh — and invents nothing.
+ */
+function equipmentMovedNote(
+  baseline: RailBaseline,
+  answeredKw: number,
+  afterPanelCount: number | null,
+  battMoved: { model: string | null; kwh: number | null } | null,
+): string | null {
+  const parts: string[] = [];
+  const beforeKw = baseline.chosen.solarKw;
+  const ppp = baseline.chosen.panelsPerPlane;
+  const beforeCount = ppp !== null ? ppp.reduce((a, b) => a + b, 0) : null;
+  const arrayMoved =
+    answeredKw !== beforeKw ||
+    (afterPanelCount !== null && beforeCount !== null && afterPanelCount !== beforeCount);
+  if (arrayMoved) {
+    const b = beforeCount !== null
+      ? `${beforeCount} panels (${formatKw(beforeKw)})` : formatKw(beforeKw);
+    const a = afterPanelCount !== null
+      ? `${afterPanelCount} panels (${formatKw(answeredKw)})` : formatKw(answeredKw);
+    parts.push(`the array was ${b}, now ${a}`);
+  }
+  if (battMoved !== null) {
+    const b = baseline.chosen.batteryModel !== null
+      ? `${baseline.chosen.batteryModel} (${formatKwh(baseline.chosen.batteryKwh)})`
+      : formatKwh(baseline.chosen.batteryKwh);
+    const a = battMoved.model !== null
+      ? `${battMoved.model} (${formatKwh(battMoved.kwh)})` : formatKwh(battMoved.kwh);
+    parts.push(`the battery was ${b}, now ${a}`);
+  }
+  if (parts.length === 0) return null;
+  return `The pinned equipment changed the system: ${parts.join("; ")}.`;
 }
 
 export function railProvenance(
@@ -7492,7 +7566,9 @@ export function railStatusLine(state: RailState): string | null {
     case "recosting":
       return "Re-costing the stored system under the new inputs — full-year dispatch, nothing is saved.";
     case "recosted":
-      return state.provenance.label;
+      return state.moved !== null
+        ? `${state.moved} ${state.provenance.label}`
+        : state.provenance.label;
     case "failed":
       return `The recompute did not complete — ${state.reason} The stored run's figures are shown.${state.canRetry ? " Try again." : ""}`;
   }

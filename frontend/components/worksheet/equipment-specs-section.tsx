@@ -28,6 +28,7 @@ import {
   type EquipmentOption,
   type EquipmentSpecsView,
   type RoofNoticeView,
+  type SizingInputSave,
 } from "@/lib/worksheet";
 
 /**
@@ -86,9 +87,21 @@ const KIND_LABEL: Record<keyof FormState, string> = {
 export function EquipmentSpecsSection({
   view,
   jobId,
+  onSaved,
 }: {
   view: EquipmentSpecsView;
   jobId: string;
+  /** 3.14b prompt 3 (D37): called after a PERSISTED save that actually MOVED
+      one of the three equipment ids, so the results rail re-costs the stored
+      system on the newly pinned kit. Optional — absent means silent.
+
+      A CONFIRMATION-ONLY SAVE STAYS SILENT. D30 keeps Save enabled with
+      nothing dirty because pressing Save IS the confirmation; that save
+      changes no engine input, so announcing it would fire a re-cost that can
+      only reproduce the same numbers and would tell the installer something
+      changed when nothing did. `dirty` — the flag the button already uses —
+      is the test, never a second one. */
+  onSaved?: (change: SizingInputSave) => void;
 }) {
   const router = useRouter();
   const [form, setForm] = React.useState<FormState>(() => fromView(view));
@@ -165,6 +178,10 @@ export function EquipmentSpecsSection({
         return;
       }
       setSavedTick(true);
+      // Only a save that MOVED a pin is an engine-input change (see the prop).
+      // "equipment", not "physics": the re-cost's answer is EXPECTED to be a
+      // different system, and the rail must judge it so (3.14b prompt 4).
+      if (dirty) onSaved?.({ kind: "equipment" });
       router.refresh();
     } finally {
       setSaving(false);

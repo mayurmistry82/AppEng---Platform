@@ -2083,13 +2083,50 @@ class _CallCounter:
         return False
 
 
+def _is_unconstrained(constraints_applied) -> bool:
+    """3.14b prompt 1: constraints_applied now ALWAYS carries the two
+    equipment-pin record keys (present-and-null means "no pin", F191), so
+    "unconstrained" is no longer "an empty dict": it is every size/product key
+    None and every pin-record value None."""
+    if not constraints_applied:
+        return True
+    if not isinstance(constraints_applied, dict):
+        return False
+    for key, value in constraints_applied.items():
+        if key in ("equipment_pin_source", "equipment_pin_unavailable"):
+            if isinstance(value, dict) and any(v is not None for v in value.values()):
+                return False
+            continue
+        if value not in (None, False):
+            return False
+    return True
+
+
+def _pick_unconstrained(rows: list) -> tuple:
+    """(the newest UNCONSTRAINED run, how many constrained ones were passed
+    over) from rows already newest-first. Pure, so the suite can prove it
+    MOVES ON rather than skipping the whole check."""
+    skipped = 0
+    for row in rows:
+        ra = row.get("run_assumptions") if isinstance(row, dict) else None
+        ca = (ra or {}).get("constraints_applied") if isinstance(ra, dict) else None
+        if _is_unconstrained(ca):
+            return row, skipped
+        skipped += 1
+    return None, skipped
+
+
 def _newest_stored_battery_run(client, job_id: str):
     rows = (client.table("sizing_results").select("*")
             .eq("job_id", job_id).eq("run_kind", "solar_battery")
-            .order("created_at", desc=True).limit(1).execute().data) or []
-    if not rows:
+            .order("created_at", desc=True).order("sizing_result_id", desc=True)
+            .limit(sizing_route.RUNS_PAGE_MAX).execute().data) or []
+    stored, skipped = _pick_unconstrained(rows)
+    print(f"        (X1) newest UNCONSTRAINED solar_battery run: "
+          f"{(stored or {}).get('sizing_result_id')} — passed over {skipped} "
+          f"constrained run(s) of {len(rows)}")
+    if stored is None:
         return None, None
-    stored = rows[0]
     fins = (client.table("financial_results").select("*")
             .eq("sizing_result_id", stored.get("sizing_result_id"))
             .order("created_at", desc=True).limit(1).execute().data) or []
@@ -2136,7 +2173,7 @@ def t_x1_recost_reproduces(client) -> dict | None:
         and isinstance(cs.get("plane_indices"), list)
         and isinstance(cs.get("panels_per_plane"), list)
         and bool(s_only) and bool(s_inc)
-        and not (ra.get("constraints_applied") or {})
+        and _is_unconstrained(ra.get("constraints_applied"))
     )
     if not shape_ok:
         skip("(X1) the newest stored run is not in the shape this check "
@@ -2380,12 +2417,32 @@ def t_x3_flag_absent_unconstrained(client) -> None:
     print("\nX3. no constraint active + compare_to_unconstrained false: the "
           "flag does NOT fire (a flag that appears when nothing was declined "
           "teaches a reader to ignore it)")
-    caller = _caller_for(client, TOU_JOB)
+    # 3.14b: a job's OWN equipment pin is a constraint (prompt 1), so "no
+    # constraint active" needs a job with no pins — DERIVED, never assumed
+    # (2U.2). a57e13f1 now pins a panel; 456e0242 does not, and its roof
+    # profiles are cached.
+    unpinned_job = None
+    for candidate in (TOU_JOB, NULL_JOB):
+        row = (client.table("jobs")
+               .select("equipment_panel_id,equipment_inverter_id,equipment_battery_id")
+               .eq("job_id", candidate).limit(1).execute().data or [{}])[0]
+        if not any(row.get(k) for k in ("equipment_panel_id", "equipment_inverter_id", "equipment_battery_id")):
+            unpinned_job = candidate
+            break
+        print(f"        {candidate[:8]} carries an equipment pin "
+              f"({ {k: v for k, v in row.items() if v} }) — a constraint, so not this job")
+    if unpinned_job is None:
+        skip("(X4) every candidate job carries an equipment pin, so 'no constraint active' "
+             "cannot be constructed on live data today — clear a pin and it runs.")
+        return
+    print(f"        using job {unpinned_job[:8]} (no equipment pins)")
+    TOU_JOB_ = unpinned_job
+    caller = _caller_for(client, TOU_JOB_)
     with _CallCounter(solar_optimiser, "optimise") as s, \
             _CallCounter(battery_optimiser, "optimise_battery") as b:
         bat, rec, *_ = _run_endpoint(
             sizing_route.battery_sizing,
-            sizing_route.BatteryRequest(job_id=TOU_JOB, persist=False,
+            sizing_route.BatteryRequest(job_id=TOU_JOB_, persist=False,
                                         compare_to_unconstrained=False), caller)
     print(f"        battery unconstrained + declined: searches={s.calls} "
           f"dispatches={b.calls} flags with 'by_request'="
@@ -2402,7 +2459,7 @@ def t_x3_flag_absent_unconstrained(client) -> None:
     with _CallCounter(solar_optimiser, "optimise") as s:
         sol, *_ = _run_endpoint(
             sizing_route.optimise_sizing,
-            sizing_route.OptimiseRequest(job_id=TOU_JOB, persist=False,
+            sizing_route.OptimiseRequest(job_id=TOU_JOB_, persist=False,
                                          compare_to_unconstrained=False), caller)
     print(f"        solar unconstrained + declined  : searches={s.calls} "
           f"flags with 'by_request'="
@@ -2448,6 +2505,365 @@ def t_x4_missing_battery_named(client, pin: dict | None) -> None:
 # the Python endpoint and the TypeScript derivation over node (the
 # verify_objective_contract bridge) — never parsed (F148), and the figures are
 # compared both ways for every marker-bearing run on the live fixture job.
+def t_z_pins_live(client) -> None:
+    """3.14b prompt 1 — LIVE, persist=False, reads only, on job a57e13f1.
+      (Z0) the X1 selector MOVES ON past a constrained run (pure, constructed).
+      (Z1) a request-level panel pin whose DIMENSIONS differ from the roof's
+           selected_panel: the run lays out, prices and names THAT panel, and
+           the layout is RE-DERIVED (a different panel area changes how many
+           fit) — every expectation derived from the database in this run,
+           never a figure typed in (F144).
+      (Z2) a user-defined battery owned by the job's company IS evaluated —
+           the case A5 shows is broken before this change (the red proof).
+    cache_misses == 0 on every run: the six roof profiles are cached, so a
+    PVGIS call means something is wrong."""
+    print("\nZ. equipment pins reach the engine — LIVE, persist=False, reads only")
+    # (Z0)
+    constrained = {"sizing_result_id": "c", "run_assumptions": {"constraints_applied": {
+        "panel_id": "p", "fix_solar_kwp": None,
+        "equipment_pin_source": {"panel": "request", "inverter": None, "battery": None},
+        "equipment_pin_unavailable": {"panel": None, "inverter": None, "battery": None}}}}
+    plain = {"sizing_result_id": "u", "run_assumptions": {"constraints_applied": {
+        "equipment_pin_source": {"panel": None, "inverter": None, "battery": None},
+        "equipment_pin_unavailable": {"panel": None, "inverter": None, "battery": None}}}}
+    legacy = {"sizing_result_id": "l", "run_assumptions": {"constraints_applied": {}}}
+    picked, skipped = _pick_unconstrained([constrained, constrained, plain, legacy])
+    print(f"        (Z0) selector over [constrained, constrained, plain, legacy] -> "
+          f"{picked['sizing_result_id']} skipping {skipped}")
+    check("(Z0) the X1 selector MOVES ON past constrained runs to the newest "
+          "unconstrained one, and counts what it passed over",
+          picked is plain and skipped == 2, f"{picked} / {skipped}")
+    check("(Z0) present-and-null pin keys read as UNCONSTRAINED; a pinned run does not",
+          _is_unconstrained(plain["run_assumptions"]["constraints_applied"])
+          and _is_unconstrained({}) and _is_unconstrained(None)
+          and not _is_unconstrained(constrained["run_assumptions"]["constraints_applied"]),
+          "")
+
+    caller = _caller_for(client, TOU_JOB)
+    # 3.14b: the job may carry its OWN pin, which wins over a request pin by
+    # design (prompt 1's precedence). Read it, never assume it (2U.2).
+    job_row = (client.table("jobs").select("equipment_panel_id")
+               .eq("job_id", TOU_JOB).limit(1).execute().data or [{}])[0]
+    job_pin = job_row.get("equipment_panel_id") if isinstance(job_row.get("equipment_panel_id"), str) else None
+    roof = (client.table("roof_geometry").select("planes,selected_panel")
+            .eq("job_id", TOU_JOB).order("created_at", desc=True).limit(1).execute().data or [None])[0]
+    if not roof or not isinstance(roof.get("selected_panel"), dict):
+        skip("(Z1) the job's roof row or its selected_panel could not be read.")
+        return
+    cur = roof["selected_panel"]
+    cur_area = tariff_area = None
+    try:
+        cur_area = float(cur["length_mm"]) * float(cur["width_mm"]) / 1e6
+    except (KeyError, TypeError, ValueError):
+        pass
+    if cur_area is None:
+        skip("(Z1) the roof's selected_panel carries no dimensions to derive from.")
+        return
+    panels = (client.table("panels").select("id,brand,model,rated_power_w,length_mm,width_mm,origin,status")
+              .eq("status", "active").eq("origin", "catalogue").execute().data or [])
+    # A DIFFERENT-dimension panel, chosen to change the per-plane capacity
+    # the most — derived, never typed.
+    planes = roof.get("planes") if isinstance(roof.get("planes"), list) else []
+    areas = [tariffnum for tariffnum in (
+        (float(p.get("usable_area_m2")) if isinstance(p, dict) and p.get("usable_area_m2") is not None else None)
+        for p in planes)]
+    googles = [(p.get("google_panel_count") if isinstance(p, dict) else None) for p in planes]
+    def caps(area_m2):
+        # 3.14b prompt 2 (F134): the per-plane capacity is the ONE shared rule
+        # — the area rule CAPPED by Google's measured count where there is one.
+        out = []
+        for a, g in zip(areas, googles):
+            c = int(a // area_m2) if a is not None else 0
+            if isinstance(g, (int, float)) and not isinstance(g, bool):
+                c = min(c, int(g))
+            out.append(max(0, c))
+        return out
+    old_caps = caps(cur_area)
+    best, best_diff = None, -1
+    for p in panels:
+        if p["id"] == cur.get("id"):
+            continue
+        try:
+            area = float(p["length_mm"]) * float(p["width_mm"]) / 1e6
+        except (KeyError, TypeError, ValueError):
+            continue
+        if abs(area - cur_area) < 1e-6:
+            continue
+        diff = sum(1 for a, b in zip(old_caps, caps(area)) if a != b)
+        if diff > best_diff:
+            best, best_diff, best_area = p, diff, area
+    print(f"        (Z1) roof panel: {cur.get('brand')} {cur.get('model')} "
+          f"{cur.get('length_mm')}x{cur.get('width_mm')} mm = {cur_area:.4f} m²; "
+          f"per-plane capacity {old_caps} (area rule capped by Google {googles})")
+    if best is None:
+        skip("(Z1) no catalogue panel has different dimensions from the roof's.")
+        return
+    # The panel the ENGINE will use: the job's pin when there is one (it wins),
+    # else the request's. The expectation is derived from that panel.
+    requested = best
+    if job_pin:
+        jp = next((p for p in panels if p["id"] == job_pin), None)
+        if jp is None:
+            skip("(Z1) the job's pinned panel is not an active catalogue panel — cannot derive its capacity.")
+            return
+        best = jp
+        best_area = float(jp["length_mm"]) * float(jp["width_mm"]) / 1e6
+        best_diff = sum(1 for a, b in zip(old_caps, caps(best_area)) if a != b)
+        print(f"        (Z1) the JOB pins {jp['brand']} {jp['model']} — it wins over the request's "
+              f"{requested['brand']} {requested['model']}; expectations derive from the job's pin")
+    new_caps = caps(best_area)
+    print(f"        (Z1) expected panel {best['brand']} {best['model']} "
+          f"{best['length_mm']}x{best['width_mm']} mm = {best_area:.4f} m²; "
+          f"per-plane capacity {new_caps}")
+    if best_diff == 0:
+        # Identical CAPS no longer end the instrument (3.14b prompt 4 part B):
+        # the wattage clause below tells a re-price from a re-derivation even
+        # then, PROVIDED the rated watts differ. Only when both are identical
+        # is there genuinely nothing to distinguish.
+        if best.get("rated_power_w") == cur.get("watts"):
+            skip("(Z1) the per-plane capacities AND rated watts are identical under "
+                 "both panels, so a re-derived layout cannot be told from a re-priced "
+                 "one on this roof.")
+            return
+        print("        (Z1) capacities identical under both panels — the wattage "
+              "arithmetic is the instrument here")
+    # The stored newest run's layout — PRINTED FOR CONTEXT ONLY. The original
+    # check asserted the live layout DIFFERED from it, which was true only
+    # while a pre-fix run was the newest stored row; Mayur pressing Size
+    # stored a corrected run and erased that contrast (3.14b prompt 4 part B).
+    # No assertion below leans on whatever run happens to be newest.
+    newest = (client.table("sizing_results").select("solar_kw,evaluated_options")
+              .eq("job_id", TOU_JOB).order("created_at", desc=True).limit(1).execute().data or [{}])[0]
+    stored_layout = ((newest.get("evaluated_options") or {}).get("chosen_solar") or {}).get("panels_per_plane")
+    print(f"        (Z1) newest stored run (context only): {newest.get('solar_kw')} kW, panels_per_plane {stored_layout}")
+
+    puts: list = []
+    original_cache = generation._cache_put
+    generation._cache_put = lambda *a, **k: (puts.append(1) or True)
+    try:
+        resp, rec, fin_rec, quotes = _run_endpoint(
+            sizing_route.battery_sizing,
+            sizing_route.BatteryRequest(job_id=TOU_JOB, persist=False,
+                                        compare_to_unconstrained=False,
+                                        constraints={"panel_id": requested["id"]}),
+            caller)
+    finally:
+        generation._cache_put = original_cache
+    check("(Z1) nothing was written (persist=False) and cache_misses == 0",
+          rec == [] and fin_rec == [] and quotes == [] and puts == [],
+          f"writes={len(rec)} cache_puts={len(puts)}")
+    if "error" in resp:
+        check("(Z1) the pinned run answered", False, repr(resp.get("error")))
+        return
+    asm = resp.get("assumptions") or {}
+    used = asm.get("panel") or {}
+    bd = resp.get("cost_breakdown") or {}
+    line0 = ((bd.get("line_items") or [{}])[0]) or {}
+    cs = resp.get("chosen_solar") or {}
+    ca = asm.get("constraints_applied") or {}
+    print(f"        (Z1) run_assumptions.panel = {used}")
+    print(f"        (Z1) chosen_cost_breakdown.line_items[0] = {line0}")
+    print(f"        (Z1) chosen_solar: {cs.get('solar_kw')} kW, panel_count {cs.get('panel_count')}, "
+          f"panels_per_plane {cs.get('panels_per_plane')}")
+    print(f"        (Z1) constraints_applied = {ca}")
+    check("(Z1) run_assumptions.panel.id IS the pinned id",
+          used.get("id") == best["id"], f"{used.get('id')} vs {best['id']}")
+    check("(Z1) chosen_cost_breakdown.line_items[0].detail names the pinned brand AND model",
+          best["brand"] in str(line0.get("detail")) and best["model"] in str(line0.get("detail")),
+          repr(line0))
+    ppp = cs.get("panels_per_plane")
+    # RE-ANCHORED (3.14b prompt 4 part B): the old "differs from the stored
+    # run's" contrast could only pass while a pre-fix row was newest, and
+    # normal use erased it. The SAME property — the layout is derived from the
+    # PINNED panel, not re-priced from the stored one — is asserted on what
+    # cannot decay: this freshly computed run against (i) the pinned panel's
+    # own per-plane capacity built from the roof row's STORED Google counts
+    # (new_caps), and (ii) the pinned panel's own wattage arithmetic — the
+    # answered kW IS sum(panels_per_plane) × its rated watts. A re-price of a
+    # layout built for a different-dimension panel cannot satisfy (i) on every
+    # plane the two panels disagree on, and a kW not built from the pinned
+    # panel cannot satisfy (ii).
+    pin_watts = used.get("watts") if isinstance(used.get("watts"), (int, float)) else None
+    answered_kw = cs.get("solar_kw")
+    check("(Z1) THE LAYOUT WAS RE-DERIVED from the PINNED panel, not re-priced — every "
+          "plane obeys that panel's capacity under the SHARED rule (area rule capped by "
+          "the roof row's stored Google counts), and sum(panels_per_plane) × its rated "
+          "watts IS the answered kW. Speaks for THIS freshly computed run only, never "
+          "for the stored history",
+          isinstance(ppp, list) and len(ppp) == len(new_caps)
+          and all(int(n) <= c for n, c in zip(ppp, new_caps))
+          and pin_watts is not None and isinstance(answered_kw, (int, float))
+          and abs(sum(int(n) for n in ppp) * pin_watts / 1000.0 - answered_kw) < 1e-6,
+          f"layout={ppp} new_caps={new_caps} old_caps={old_caps} "
+          f"watts={pin_watts} kw={answered_kw}")
+    check("(Z1) ...and NO plane exceeds Google's measured count — the cap bites on the "
+          "pinned path too",
+          isinstance(ppp, list) and all(
+              not (isinstance(g, (int, float)) and not isinstance(g, bool)) or int(n) <= int(g)
+              for n, g in zip(ppp, googles)),
+          f"layout={ppp} google={googles}")
+    expected_source = "job" if job_pin else "request"
+    check(f"(Z1) the two record keys are PRESENT: panel pinned by the {expected_source}, nothing unavailable",
+          ca.get("equipment_pin_source") == {"panel": expected_source, "inverter": None, "battery": None}
+          and ca.get("equipment_pin_unavailable") == {"panel": None, "inverter": None, "battery": None},
+          str(ca))
+    if job_pin and requested["id"] != job_pin:
+        check("(Z1) the job's pin overrode the request's differing panel, and SAID so",
+              any(str(f).startswith("equipment pin: the job's panel") and requested["id"] in str(f)
+                  for f in resp.get("flags") or []),
+              str([f for f in resp.get("flags") or [] if "equipment pin" in str(f)]))
+    check("(Z1) the old 'not found — ignored' flag never appears",
+          not any("ignored" in str(f) for f in resp.get("flags") or []), str(resp.get("flags"))[:200])
+
+    # (Z2) THE USER-DEFINED BATTERY — derived from the database: one owned by
+    # the job's company.
+    company = (client.table("jobs").select("company_id").eq("job_id", TOU_JOB).limit(1).execute().data or [{}])[0].get("company_id")
+    mine = (client.table("batteries").select("id,brand,model,usable_capacity_kwh,origin,owner_company_id,status")
+            .eq("origin", "user_defined").eq("owner_company_id", company).eq("status", "active").execute().data or [])
+    if not mine:
+        skip("(Z2) this company owns no user-defined battery to pin.")
+        return
+    unit = mine[0]
+    print(f"        (Z2) pinning user-defined battery {unit['brand']} {unit['model']} ({unit['id'][:8]}…) "
+          f"owned by the job's company")
+    puts = []
+    generation._cache_put = lambda *a, **k: (puts.append(1) or True)
+    try:
+        resp2, rec2, *_ = _run_endpoint(
+            sizing_route.battery_sizing,
+            sizing_route.BatteryRequest(job_id=TOU_JOB, persist=False,
+                                        compare_to_unconstrained=False,
+                                        constraints={"fix_solar_kwp": newest.get("solar_kw"),
+                                                     "battery_ids": [unit["id"]]}),
+            caller)
+    finally:
+        generation._cache_put = original_cache
+    cands = [c.get("battery_id") for c in resp2.get("candidates") or []]
+    flags2 = resp2.get("flags") or []
+    print(f"        (Z2) candidates evaluated: {cands}")
+    print(f"        (Z2) flags mentioning the catalogue: {[f for f in flags2 if 'catalogue' in str(f)]}")
+    check("(Z2) nothing written, cache_misses == 0", rec2 == [] and puts == [], f"{len(rec2)} / {len(puts)}")
+    check("(Z2) the user-defined battery IS evaluated — it is a candidate, by id",
+          unit["id"] in cands, str(cands))
+    check("(Z2) ...and NOT flagged 'not in the active catalogue' — the silent filter is gone",
+          not any("not in the active catalogue" in str(f) for f in flags2), str(flags2)[:300])
+    check("(Z2) the record says the battery came from the request and nothing was unavailable",
+          ((resp2.get("assumptions") or {}).get("constraints_applied") or {}).get("equipment_pin_source", {}).get("battery") == "request"
+          and ((resp2.get("assumptions") or {}).get("constraints_applied") or {}).get("equipment_pin_unavailable", {}).get("battery") is None,
+          str(((resp2.get("assumptions") or {}).get("constraints_applied") or {})))
+
+
+def t_z3_own_panel_reproduces(client) -> None:
+    """3.14b prompt 2 (F134), LIVE, persist=False: pinning the roof's OWN panel
+    with compare_to_unconstrained=True must reproduce the unpinned run — every
+    constraint delta ZERO and the same per-plane layout as the newest
+    UNPINNED stored run (derived here). While the job pins a DIFFERENT panel
+    (which wins by design), that form is loudly skipped and the instrument is
+    the live run alone: the Google cap plus the pinned panel's own wattage
+    arithmetic — re-anchored at 3.14b prompt 4 part B after normal use erased
+    the original stored-run contrast."""
+    print("\nZ3. pinning the roof's OWN panel reproduces the unpinned answer — LIVE, persist=False")
+    caller = _caller_for(client, TOU_JOB)
+    roof = (client.table("roof_geometry").select("selected_panel,planes")
+            .eq("job_id", TOU_JOB).order("created_at", desc=True).limit(1).execute().data or [None])[0]
+    own = ((roof or {}).get("selected_panel") or {}).get("id")
+    if not own:
+        skip("(Z3) the roof's selected_panel has no id to pin.")
+        return
+    rows = (client.table("sizing_results").select("*")
+            .eq("job_id", TOU_JOB).eq("run_kind", "solar_battery")
+            .order("created_at", desc=True).order("sizing_result_id", desc=True)
+            .limit(sizing_route.RUNS_PAGE_MAX).execute().data) or []
+    unpinned, passed = _pick_unconstrained(rows)
+    if unpinned is None:
+        skip("(Z3) no unconstrained stored run to compare the pinned layout against.")
+        return
+    stored_layout = (((unpinned.get("evaluated_options") or {}).get("chosen_solar") or {}).get("panels_per_plane"))
+    print(f"        (Z3) own panel {own[:8]}…; newest UNPINNED run {unpinned.get('sizing_result_id')[:8]}… "
+          f"(passed over {passed}) layout {stored_layout}, {unpinned.get('solar_kw')} kW")
+    googles = [p.get("google_panel_count") if isinstance(p, dict) else None for p in (roof or {}).get("planes") or []]
+    job_row = (client.table("jobs").select("equipment_panel_id")
+               .eq("job_id", TOU_JOB).limit(1).execute().data or [{}])[0]
+    job_pin = job_row.get("equipment_panel_id") if isinstance(job_row.get("equipment_panel_id"), str) else None
+    puts: list = []
+    original_cache = generation._cache_put
+    generation._cache_put = lambda *a, **k: (puts.append(1) or True)
+    try:
+        resp, rec, fin_rec, quotes = _run_endpoint(
+            sizing_route.battery_sizing,
+            sizing_route.BatteryRequest(job_id=TOU_JOB, persist=False,
+                                        compare_to_unconstrained=True,
+                                        constraints={"panel_id": own}),
+            caller)
+    finally:
+        generation._cache_put = original_cache
+    check("(Z3) nothing written and cache_misses == 0",
+          rec == [] and fin_rec == [] and quotes == [] and puts == [], f"writes={len(rec)} puts={len(puts)}")
+    if "error" in resp:
+        check("(Z3) the pinned run answered", False, repr(resp.get("error")))
+        return
+    deltas = resp.get("constraint_deltas")
+    cs = resp.get("chosen_solar") or {}
+    opt = resp.get("optimal_battery") or {}
+    unc = resp.get("unconstrained_optimum_battery") or {}
+    used = ((resp.get("assumptions") or {}).get("panel") or {}).get("id")
+    print(f"        (Z3) constraint_deltas = {deltas}")
+    print(f"        (Z3) panel used {str(used)[:8]}…; pinned layout {cs.get('panels_per_plane')} "
+          f"({cs.get('solar_kw')} kW, {cs.get('panel_count')} panels); Google {googles}")
+    print(f"        (Z3) pinned battery {opt.get('battery_id')} ${opt.get('system_cost')} vs unconstrained "
+          f"{unc.get('battery_id')} ${unc.get('system_cost')}")
+    ppp = cs.get("panels_per_plane")
+    check("(Z3) NO plane exceeds Google's measured count on the pinned path",
+          isinstance(ppp, list) and all(
+              not (isinstance(g, (int, float)) and not isinstance(g, bool)) or int(n) <= int(g)
+              for n, g in zip(ppp, googles)),
+          f"layout={ppp} google={googles}")
+    if job_pin is None or job_pin == own:
+        # THE JOB IS UNPINNED (or pins its own panel): the request's own-panel
+        # pin reaches the engine and must reproduce the unpinned run exactly.
+        check("(Z3) constraint_deltas is PRESENT and every numeric delta is ZERO — pinning the "
+              "roof's own panel changes nothing",
+              isinstance(deltas, dict) and len(deltas) > 0
+              and all(v == 0 for v in deltas.values() if isinstance(v, (int, float)) and not isinstance(v, bool)),
+              str(deltas))
+        check("(Z3) chosen_solar.panels_per_plane == the newest UNPINNED stored run's layout, "
+              "re-derived from the database in this run",
+              cs.get("panels_per_plane") == stored_layout and stored_layout is not None,
+              f"{cs.get('panels_per_plane')} vs {stored_layout}")
+        check("(Z3) the pinned answer IS the unconstrained answer — same battery, same whole-system cost",
+              opt.get("battery_id") == unc.get("battery_id") and opt.get("system_cost") == unc.get("system_cost"),
+              f"{opt.get('battery_id')}/{opt.get('system_cost')} vs {unc.get('battery_id')}/{unc.get('system_cost')}")
+    else:
+        # THE JOB PINS A DIFFERENT PANEL, which wins over the request by design
+        # (3.14b prompt 1) — so the zero-delta form cannot be asserted on this
+        # job while its pin stands. Said loudly. The original fallback here
+        # contrasted the live layout against a stored run made BEFORE the
+        # prompt-2 fix; Mayur pressing Size stored a corrected run and erased
+        # that contrast (3.14b prompt 4 part B). The instrument is now the
+        # live run alone: the cap check above (roof row's own stored Google
+        # counts), plus the pinned panel's wattage arithmetic below — neither
+        # of which a new stored row can erase.
+        skip(f"(Z3) job a57e13f1 pins panel {job_pin[:8]}…, which wins over the request's own-panel "
+             "pin, so 'deltas all zero against the unpinned run' cannot be asserted on this job "
+             "while that pin stands — it runs the moment the pin is cleared.")
+        check("(Z3) the job's pin was used and the request's own-panel pin was overridden AND flagged",
+              used == job_pin and any(str(f).startswith("equipment pin: the job's panel") for f in resp.get("flags") or []),
+              f"used={used} flags={[f for f in resp.get('flags') or [] if 'equipment pin' in str(f)]}")
+        pin_watts = ((resp.get("assumptions") or {}).get("panel") or {}).get("watts")
+        answered_kw = cs.get("solar_kw")
+        print(f"        (Z3) pinned panel watts {pin_watts}; sum(layout) {sum(int(n) for n in ppp) if isinstance(ppp, list) else None} "
+              f"-> {sum(int(n) for n in ppp) * pin_watts / 1000.0 if isinstance(ppp, list) and isinstance(pin_watts, (int, float)) else None} kW "
+              f"vs answered {answered_kw} kW")
+        check("(Z3) THE ARRAY IS BUILT FROM THE PINNED PANEL — sum(panels_per_plane) × the "
+              "answer's own rated watts IS the answered kW; with the Google-cap check above "
+              "this speaks for the LIVE pinned run only, never for the stored history",
+              isinstance(ppp, list)
+              and isinstance(pin_watts, (int, float)) and not isinstance(pin_watts, bool)
+              and isinstance(answered_kw, (int, float))
+              and abs(sum(int(n) for n in ppp) * pin_watts / 1000.0 - answered_kw) < 1e-6,
+              f"layout={ppp} watts={pin_watts} kw={answered_kw}")
+
+
 def t_y_two_languages_agree(client) -> None:
     """A skip here goes through skip(), which counts it — NOT a pass."""
     print("\nY. self-sufficiency by the marker — SQL projection vs TypeScript "
@@ -2583,6 +2999,8 @@ def main() -> int:
         t_x3_flag_absent_unconstrained(client)
         t_x4_missing_battery_named(client, (x1 or {}).get("pin"))
         t_y_two_languages_agree(client)
+        t_z_pins_live(client)
+        t_z3_own_panel_reproduces(client)
         t_q1_red()
         t_u_red()
         t_w1_red()

@@ -401,30 +401,54 @@ def t4_autopick_scoping() -> None:
         check(f"(4b) default query {i + 1} carries ('origin', 'catalogue')",
               ("origin", "catalogue") in q["filters"], str(q["filters"]))
 
-    # (4d) the explicit-id lookup is UNCHANGED: serving the id row makes
-    # _get_panel return before the default branch, so exactly one query runs,
-    # filtered by id and NOT by origin — the pinned path did not quietly break.
-    stub = StubClient({"panels": [{"id": "some-id", "brand": "B", "model": "M",
-                                   "rated_power_w": 440, "length_mm": 1762,
-                                   "width_mm": 1134}]})
-    saved = roof_geometry._client
-    roof_geometry._client = lambda: stub
-    try:
-        panel, flags = roof_geometry._get_panel("some-id")
-    finally:
-        roof_geometry._client = saved
-    check("(4d) explicit id resolves through the id filter",
-          len(stub.queries) == 1 and ("id", "some-id") in stub.queries[0]["filters"],
-          str(stub.queries))
-    check("(4d) ...with NO origin filter on the pinned path",
-          ("origin", "catalogue") not in stub.queries[0]["filters"],
-          str(stub.queries[0]["filters"]))
-    check("(4d) ...and the panel resolved", panel.get("id") == "some-id", str(panel))
+    # (4d) 3.14b prompt 1 — the PINNED path is now SCOPED: a pinned unit
+    # resolves through the id filter AND the visibility disjunction
+    # (origin = catalogue OR owner_company_id = the job's company), and a unit
+    # belonging to another company does NOT resolve. This narrows F164 on this
+    # path; every other explicit-id path stays homed at 9.3b.
+    dims = {"rated_power_w": 440, "length_mm": 1762, "width_mm": 1134, "status": "active"}
+    stub = StubClient({"panels": [
+        {"id": "cat-p", "brand": "B", "model": "M", "origin": "catalogue", "owner_company_id": None, **dims},
+        {"id": "mine-p", "brand": "B", "model": "M", "origin": "user_defined", "owner_company_id": "co-A", **dims},
+        {"id": "theirs-p", "brand": "B", "model": "M", "origin": "user_defined", "owner_company_id": "co-B", **dims},
+    ]})
+    fl: list[str] = []
+    eq = sizing_route._resolve_equipment(
+        {"company_id": "co-A", "equipment_panel_id": "cat-p"}, None, None, "co-A", stub, fl)
+    q = [x for x in stub.queries if x["table"] == "panels"]
+    check("(4d) the pinned panel resolves through the id filter",
+          len(q) == 1 and ("id", "cat-p") in q[0]["filters"], str(stub.queries))
+    check("(4d) ...AND the query carries the ownership disjunction — "
+          "origin = catalogue OR owner_company_id = the job's company",
+          len(q) == 1 and q[0]["ors"] == ["origin.eq.catalogue,owner_company_id.eq.co-A"],
+          str(q[0]["ors"] if q else None))
+    check("(4d) ...with NO status filter on the pinned path (a retired pin must still resolve)",
+          len(q) == 1 and ("status", "active") not in q[0]["filters"], str(q[0]["filters"] if q else None))
+    check("(4d) ...and the catalogue panel resolved and was APPLIED",
+          eq["panel"] is not None and eq["panel"]["id"] == "cat-p"
+          and eq["constraints"].get("panel_id") == "cat-p" and eq["pin_source"]["panel"] == "job",
+          str(eq))
+    stub = StubClient({"panels": stub.tables["panels"]})
+    fl = []
+    eq = sizing_route._resolve_equipment(
+        {"company_id": "co-A", "equipment_panel_id": "mine-p"}, None, None, "co-A", stub, fl)
+    check("(4d) the company's OWN user-defined panel resolves",
+          eq["panel"] is not None and eq["panel"]["id"] == "mine-p", str(eq["pin_unavailable"]))
+    stub = StubClient({"panels": stub.tables["panels"]})
+    fl = []
+    eq = sizing_route._resolve_equipment(
+        {"company_id": "co-A", "equipment_panel_id": "theirs-p"}, None, None, "co-A", stub, fl)
+    check("(4d) a panel belonging to ANOTHER company does NOT resolve — unavailable, "
+          "never substituted",
+          eq["panel"] is None and eq["pin_unavailable"]["panel"] == "theirs-p"
+          and "panel_id" not in eq["constraints"]
+          and any("nothing was substituted" in f for f in fl),
+          f"{eq['pin_unavailable']} flags={fl}")
 
 
 def t5_caller_counts() -> None:
     print("\nCHECK 5 — caller counts (a later unscoped reader fails a gate, not a conversation)")
-    hits_p, hits_b = [], []
+    hits_p, hits_b, hits_i = [], [], []
     for root, dirs, files in os.walk(BACKEND_DIR):
         dirs[:] = [d for d in dirs if d not in ("__pycache__", "scripts", "_legacy")]
         for fn in files:
@@ -437,10 +461,33 @@ def t5_caller_counts() -> None:
                     hits_p.append(f"{rel}:{i}")
                 if 'table("batteries")' in line:
                     hits_b.append(f"{rel}:{i}")
+                if 'table("inverters")' in line:
+                    hits_i.append(f"{rel}:{i}")
     print(f"        panels   : {hits_p}")
     print(f"        batteries: {hits_b}")
-    check("(5a) table(\"panels\") at exactly 4 sites", len(hits_p) == 4, str(hits_p))
-    check("(5a) table(\"batteries\") at exactly 1 site", len(hits_b) == 1, str(hits_b))
+    print(f"        inverters: {hits_i}")
+    # 3.14b prompt 1: the sites are DERIVED and named, file by file, with the
+    # reason each exists — an absolute count broke three times in two days
+    # (F156). The resolver's reads are literal on purpose, so a later
+    # unscoped reader shows up here rather than hiding behind table(kind).
+    by_file = lambda hits: {}  # noqa: E731
+    def _per_file(hits):
+        out: dict = {}
+        for h in hits:
+            out[h.rsplit(":", 1)[0]] = out.get(h.rsplit(":", 1)[0], 0) + 1
+        return out
+    pf, bf, inf = _per_file(hits_p), _per_file(hits_b), _per_file(hits_i)
+    print(f"        per file — panels {pf}, batteries {bf}, inverters {inf}")
+    check("(5a) table(\"panels\"): roof_geometry.py's three (_get_panel: the explicit "
+          "id, the Jinko preference, the highest-rated fallback) + routes/sizing.py's "
+          "ONE (the equipment resolver, scoped) — nothing else",
+          pf == {"roof_geometry.py": 3, "routes/sizing.py": 1}, str(pf))
+    check("(5a) table(\"batteries\"): routes/sizing.py's TWO — the catalogue pool "
+          "(scoped by origin+status) and the equipment resolver (scoped by "
+          "visibility) — nothing else",
+          bf == {"routes/sizing.py": 2}, str(bf))
+    check("(5a) table(\"inverters\"): routes/sizing.py's ONE — the equipment resolver",
+          inf == {"routes/sizing.py": 1}, str(inf))
 
     src = open(os.path.join(BACKEND_DIR, "roof_geometry.py")).read()
     src_all = src + open(os.path.join(BACKEND_DIR, "routes", "roof.py")).read() \
@@ -455,6 +502,16 @@ def t5_caller_counts() -> None:
           gp_defs == 1 and gp_calls == 2, f"defs={gp_defs} calls={gp_calls}")
     check("(5b) rescale_planes_for_panel: 1 definition + 3 call sites",
           rs_defs == 1 and rs_calls == 3, f"defs={rs_defs} calls={rs_calls}")
+    # 3.14b prompt 2 (F134): the per-plane count rule is ONE function with
+    # exactly two callers — _normalise (the Google path) and
+    # rescale_planes_for_panel (every pinned run and the manual path). A third
+    # caller, or a second definition, is the drift this check exists to catch.
+    pc_defs = len(re.findall(r"def plane_panel_count\(", src_all))
+    pc_calls = len(re.findall(r"(?<!def )plane_panel_count\(", src_all))
+    print(f"        plane_panel_count defs={pc_defs} calls={pc_calls}")
+    check("(5b) plane_panel_count: exactly 1 definition + exactly 2 callers "
+          "(_normalise and rescale_planes_for_panel) — derived from the files",
+          pc_defs == 1 and pc_calls == 2, f"defs={pc_defs} calls={pc_calls}")
 
 
 def t6_junk() -> None:
@@ -720,10 +777,24 @@ def t7_write_path() -> int:
                     hits_pfr.append(f"{rel}:{i}")
     print(f"        battery_specs   : {hits_bs}")
     print(f"        _panel_from_row : {hits_pfr}")
-    check("(7m) battery_specs: 1 definition + 2 callers (optimiser + this POST)",
-          len(hits_bs) == 3, str(hits_bs))
-    check("(7m) _panel_from_row: 1 definition + 3 callers (2 in roof_geometry + this POST)",
-          len(hits_pfr) == 4, str(hits_pfr))
+    # 3.14b prompt 1: the equipment resolver in routes/sizing.py is ONE more
+    # caller of each — it tests a pinned unit's usability with the engine's
+    # own readers rather than a second rule (2R.1). Derived per file.
+    def _per_file(hits):
+        out: dict = {}
+        for h in hits:
+            f = h.rsplit(":", 1)[0]
+            out[f] = out.get(f, 0) + 1
+        return out
+    print(f"        per file — battery_specs {_per_file(hits_bs)}, _panel_from_row {_per_file(hits_pfr)}")
+    check("(7m) battery_specs: 1 definition + 3 callers (the optimiser, this POST, "
+          "and the sizing equipment resolver)",
+          _per_file(hits_bs) == {"battery_optimiser.py": 2, "routes/equipment.py": 1, "routes/sizing.py": 1},
+          str(hits_bs))
+    check("(7m) _panel_from_row: 1 definition + 4 callers (2 in roof_geometry, this POST, "
+          "and the sizing equipment resolver) — ONE definition, never a copy",
+          _per_file(hits_pfr) == {"roof_geometry.py": 3, "routes/equipment.py": 1, "routes/sizing.py": 1},
+          str(hits_pfr))
     import inspect
     # `from __future__ import annotations` makes inspect render annotations as
     # quoted strings — strip the quotes before comparing.
@@ -1007,6 +1078,210 @@ def t9_form_gate() -> int:
     return 0
 
 
+def t10_pins_reach_the_engine() -> None:
+    """3.14b prompt 1 — the installer's equipment choice reaches the engine."""
+    print("\nCHECK 9 — equipment pins reach the engine: precedence, size constraints, "
+          "the three outcomes, the user-defined battery, the privacy boundary")
+    import json as _json
+    dims = {"rated_power_w": 440, "length_mm": 1762, "width_mm": 1134}
+    batt = {"usable_capacity_kwh": 10.0, "cost_aud": 6000}
+    tables = {
+        "panels": [
+            {"id": "p-job", "brand": "JobCo", "model": "PJ", "origin": "catalogue", "owner_company_id": None, "status": "active", **dims},
+            {"id": "p-req", "brand": "ReqCo", "model": "PR", "origin": "catalogue", "owner_company_id": None, "status": "active", **dims},
+            {"id": "p-retired", "brand": "Old", "model": "PO", "origin": "catalogue", "owner_company_id": None, "status": "retired", **dims},
+            {"id": "p-nospec", "brand": "Bare", "model": "PB", "origin": "catalogue", "owner_company_id": None, "status": "active", "rated_power_w": 440},
+        ],
+        "inverters": [
+            {"id": "i-job", "brand": "JobCo", "model": "IJ", "origin": "catalogue", "owner_company_id": None, "status": "active"},
+            {"id": "i-req", "brand": "ReqCo", "model": "IR", "origin": "catalogue", "owner_company_id": None, "status": "active"},
+        ],
+        "batteries": [
+            {"id": "b-job", "brand": "JobCo", "model": "BJ", "origin": "catalogue", "owner_company_id": None, "status": "active", **batt},
+            {"id": "b-req", "brand": "ReqCo", "model": "BR", "origin": "catalogue", "owner_company_id": None, "status": "active", **batt},
+            {"id": "b-mine", "brand": "Huawei", "model": "LUNA", "origin": "user_defined", "owner_company_id": "co-A", "status": "active", **batt},
+            {"id": "b-theirs", "brand": "Secret", "model": "S1", "origin": "user_defined", "owner_company_id": "co-B", "status": "active",
+             "usable_capacity_kwh": 13.13, "cost_aud": 7777},
+            {"id": "b-nospec", "brand": "Bare", "model": "BB", "origin": "catalogue", "owner_company_id": None, "status": "active", "usable_capacity_kwh": 10.0},
+        ],
+    }
+    job = {"job_id": "j1", "company_id": "co-A", "equipment_panel_id": "p-job",
+           "equipment_inverter_id": "i-job", "equipment_battery_id": "b-job", "equipment_confirmed": False}
+
+    # ── 9a PRECEDENCE: the job's pin beats a DIFFERING request constraint, in
+    # all three components, and the differ-flag fires exactly once per component.
+    fl: list[str] = []
+    eq = sizing_route._resolve_equipment(
+        job, {"panel_id": "p-req", "inverter_id": "i-req", "battery_ids": ["b-req"]}, None, "co-A",
+        StubClient(dict(tables)), fl)
+    print(f"        9a effective={eq['constraints']} source={eq['pin_source']}")
+    print(f"        9a flags={fl}")
+    check("(9a) the job's pin WINS for panel, inverter and battery",
+          eq["constraints"].get("panel_id") == "p-job"
+          and eq["constraints"].get("inverter_id") == "i-job"
+          and eq["constraints"].get("battery_ids") == ["b-job"]
+          and eq["pin_source"] == {"panel": "job", "inverter": "job", "battery": "job"},
+          str(eq["constraints"]))
+    differ = [f for f in fl if f.startswith("equipment pin: the job's")]
+    check("(9a) the differ-flag fires EXACTLY ONCE per differing component — three",
+          len(differ) == 3 and len({f.split(" ")[4] for f in differ}) == 3, str(differ))
+    check("(9a) ...naming the job's value AND the request's",
+          all(("p-job" in f and "p-req" in f) or ("i-job" in f and "i-req" in f)
+              or ("b-job" in f and "b-req" in f) for f in differ), str(differ))
+    fl = []
+    sizing_route._resolve_equipment(
+        job, {"panel_id": "p-job", "inverter_id": "i-job", "battery_ids": ["b-job"]}, None, "co-A",
+        StubClient(dict(tables)), fl)
+    check("(9a) IDENTICAL ids fire nothing — the rail's ordinary re-cost stays quiet",
+          not any(f.startswith("equipment pin:") for f in fl), str(fl))
+    fl = []
+    eq = sizing_route._resolve_equipment(
+        {"company_id": "co-A"}, {"panel_id": "p-req"}, None, "co-A", StubClient(dict(tables)), fl)
+    check("(9a) a job on Auto takes the REQUEST's constraint, source 'request'",
+          eq["constraints"].get("panel_id") == "p-req" and eq["pin_source"]["panel"] == "request"
+          and eq["pin_source"]["battery"] is None, str(eq["pin_source"]))
+    eq = sizing_route._resolve_equipment({"company_id": "co-A"}, None, None, "co-A", StubClient(dict(tables)), [])
+    check("(9a) no pin and no constraint: Auto — no product key, both record keys all-null",
+          eq["constraints"] == {} and eq["panel"] is None and eq["battery_rows"] is None
+          and eq["pin_source"] == {"panel": None, "inverter": None, "battery": None}
+          and eq["pin_unavailable"] == {"panel": None, "inverter": None, "battery": None}, str(eq))
+
+    # ── 9b SIZE CONSTRAINTS ARE UNTOUCHED: a request fix_solar_kwp on a job
+    # with a panel pin arrives at the optimiser with BOTH.
+    fl = []
+    eq = sizing_route._resolve_equipment(
+        job, {"fix_solar_kwp": 6.6, "fix_battery_kwh": 10, "force_no_battery": False}, None, "co-A",
+        StubClient(dict(tables)), fl)
+    print(f"        9b effective={eq['constraints']}")
+    check("(9b) fix_solar_kwp from the REQUEST and panel_id from the JOB travel together",
+          eq["constraints"].get("fix_solar_kwp") == 6.6 and eq["constraints"].get("panel_id") == "p-job"
+          and eq["constraints"].get("fix_battery_kwh") == 10
+          and eq["constraints"].get("force_no_battery") is False, str(eq["constraints"]))
+
+    # ── 9c THE THREE OUTCOMES.
+    fl = []
+    eq = sizing_route._resolve_equipment(
+        {"company_id": "co-A", "equipment_panel_id": "p-job"}, None, None, "co-A", StubClient(dict(tables)), fl)
+    check("(9c/applied) resolved, visible, active: used, unflagged",
+          eq["panel"]["id"] == "p-job" and eq["pin_unavailable"]["panel"] is None and fl == [], str(fl))
+    fl = []
+    eq = sizing_route._resolve_equipment(
+        {"company_id": "co-A", "equipment_panel_id": "p-retired"}, None, None, "co-A", StubClient(dict(tables)), fl)
+    print(f"        9c retired flags={fl}")
+    check("(9c/retired) status != active: STILL USED, and flagged with the exact sentence",
+          eq["panel"] is not None and eq["panel"]["id"] == "p-retired"
+          and eq["constraints"].get("panel_id") == "p-retired"
+          and fl == ["pinned panel p-retired is no longer in the active catalogue — "
+                     "the system was costed on it and nothing was substituted"], str(fl))
+    fl = []
+    eq = sizing_route._resolve_equipment(
+        {"company_id": "co-A", "equipment_panel_id": "p-nospec"}, None, None, "co-A", StubClient(dict(tables)), fl)
+    check("(9c/unavailable) a panel missing length/width is UNAVAILABLE — not used, not substituted",
+          eq["panel"] is None and eq["pin_unavailable"]["panel"] == "p-nospec"
+          and "panel_id" not in eq["constraints"], str(eq["pin_unavailable"]))
+    fl = []
+    eq = sizing_route._resolve_equipment(
+        {"company_id": "co-A", "equipment_panel_id": "p-ghost"}, None, None, "co-A", StubClient(dict(tables)), fl)
+    check("(9c/unavailable) a panel that does not exist is UNAVAILABLE",
+          eq["panel"] is None and eq["pin_unavailable"]["panel"] == "p-ghost", str(fl))
+    fl = []
+    eq = sizing_route._resolve_equipment(
+        {"company_id": "co-A", "equipment_battery_id": "b-nospec"}, None, None, "co-A", StubClient(dict(tables)), fl)
+    check("(9c/unavailable) a battery battery_specs returns None for is UNAVAILABLE, with the "
+          "VERBATIM flag (X4b matches on it)",
+          eq["battery_rows"] == [] and eq["pin_unavailable"]["battery"] == "b-nospec"
+          and "battery_ids not in the active catalogue — not evaluated: ['b-nospec']" in fl, str(fl))
+    # The ENDPOINT, for the pinned-panel-unavailable case: the RESPONSE the
+    # caller receives is the error shape, and the roof's selected_panel is
+    # NOT substituted (asserted on the serialised response, 2N.1).
+    stub = StubClient({**tables,
+                       "jobs": [{**job, "equipment_panel_id": "p-ghost", "objective": "max_npv"}],
+                       "roof_geometry": [{"roof_geometry_id": "r1", "found": True, "planes": [{"azimuth": 0, "pitch": 20, "usable_area_m2": 30}],
+                                          "candidate_configs": [{"plane_indices": [0]}], "lat": -34.93, "lng": 138.6,
+                                          "selected_panel": {"id": "roof-p", "brand": "RoofCo", "model": "RP", "watts": 440}}]})
+    original = sizing_route._sb
+    sizing_route._sb = lambda: stub
+    try:
+        resp_s = asyncio.run(sizing_route.optimise_sizing(
+            sizing_route.OptimiseRequest(job_id="j1", persist=False), CALLER_A))
+        resp_b = asyncio.run(sizing_route.battery_sizing(
+            sizing_route.BatteryRequest(job_id="j1", persist=False), CALLER_A))
+    finally:
+        sizing_route._sb = original
+    for label, resp in (("solar", resp_s), ("battery", resp_b)):
+        ser = _json.dumps(resp, default=str)
+        print(f"        9c {label} endpoint, pinned panel unavailable -> {ser[:160]}")
+        check(f"(9c/unavailable) {label} endpoint answers the ERROR SHAPE — error + flags, the "
+              "existing 'panel_id required' shape — naming the pinned id and 'nothing was substituted'",
+              set(resp) == {"error", "flags"} and "p-ghost" in resp["error"]
+              and "Nothing was substituted" in resp["error"]
+              and "pinned_panel_unavailable" in resp["flags"], ser[:200])
+        check(f"(9c/unavailable) {label}: no numbers, and the roof's selected_panel was NOT used",
+              "optimal" not in resp and "optimal_battery" not in resp
+              and "roof-p" not in ser and "RoofCo" not in ser, ser[:200])
+        check(f"(9c/unavailable) {label}: the old 'not found — ignored' flag is GONE",
+              "ignored" not in ser, ser[:200])
+
+    # ── 9d THE USER-DEFINED BATTERY, owned by the job's company, IS handed to
+    # the engine — the case A5 shows is broken today (the red proof is the LIVE
+    # run in verify_results_contract against the pre-change file).
+    fl = []
+    eq = sizing_route._resolve_equipment(
+        {"company_id": "co-A", "equipment_battery_id": "b-mine"}, None, None, "co-A", StubClient(dict(tables)), fl)
+    print(f"        9d pool={[r.get('id') for r in eq['battery_rows'] or []]} flags={fl}")
+    check("(9d) a pinned USER-DEFINED battery owned by the job's company resolves BY ID and "
+          "is the pool the LP is given — not filtered out by the catalogue pool's origin rule",
+          eq["battery_rows"] is not None and [r.get("id") for r in eq["battery_rows"]] == ["b-mine"]
+          and eq["constraints"].get("battery_ids") == ["b-mine"] and fl == [], str(fl))
+    fl = []
+    eq = sizing_route._resolve_equipment(
+        {"company_id": "co-A"}, {"battery_ids": ["b-mine"]}, None, "co-A", StubClient(dict(tables)), fl)
+    check("(9d) ...and the same through a REQUEST constraint (the worksheet's path)",
+          [r.get("id") for r in eq["battery_rows"] or []] == ["b-mine"] and fl == [], str(fl))
+
+    # ── 9e THE PRIVACY BOUNDARY (the 7h pattern): another company's battery
+    # is NOT evaluated and its specs appear NOWHERE in the serialised result.
+    fl = []
+    eq = sizing_route._resolve_equipment(
+        {"company_id": "co-A", "equipment_battery_id": "b-theirs"}, None, None, "co-A", StubClient(dict(tables)), fl)
+    ser = _json.dumps({"eq": eq, "flags": fl}, default=str)
+    print(f"        9e pool={eq['battery_rows']} unavailable={eq['pin_unavailable']['battery']}")
+    check("(9e) a battery owned by ANOTHER company is NOT evaluated — unavailable, empty pool",
+          eq["battery_rows"] == [] and eq["pin_unavailable"]["battery"] == "b-theirs", str(eq["pin_unavailable"]))
+    check("(9e) ...and its specs appear NOWHERE in the serialised result — not the brand, "
+          "the model, the capacity or the price",
+          all(s not in ser for s in ("Secret", "S1", "13.13", "7777", "co-B")), ser[:300])
+    check("(9e) ...and the flag is the verbatim 'not in the active catalogue' sentence",
+          "battery_ids not in the active catalogue — not evaluated: ['b-theirs']" in fl, str(fl))
+
+    # client None (local dev): nothing resolved, nothing flagged, size keys pass.
+    fl = []
+    eq = sizing_route._resolve_equipment(job, {"fix_solar_kwp": 5.0}, None, "co-A", None, fl)
+    check("(9) client None: no pins, no flags, behaviour identical to today",
+          eq["constraints"] == {"fix_solar_kwp": 5.0} and eq["panel"] is None
+          and eq["battery_rows"] is None and fl == [], str(eq))
+    # A read FAILURE is a different fact from absence: flagged, sized with Auto.
+    fl = []
+    eq = sizing_route._resolve_equipment(
+        {"company_id": "co-A", "equipment_panel_id": "p-job"}, None, None, "co-A",
+        StubClient(dict(tables), raise_on=["panels"]), fl)
+    check("(9) a transport failure reading the pinned unit: flagged 'could not be read', sized "
+          "with Auto — NOT reported as unavailable",
+          eq["panel"] is None and eq["pin_unavailable"]["panel"] is None
+          and any("could not be read" in f and "is_fallback" in f for f in fl), str(fl))
+    # equipment_confirmed plays NO part (D30): False on the job row above, and
+    # every pin still applied.
+    fl = []
+    eq = sizing_route._resolve_equipment({**job, "equipment_confirmed": False}, None, None, "co-A",
+                                         StubClient(dict(tables)), fl)
+    check("(9) equipment_confirmed is NOT read — pins apply with it False",
+          eq["constraints"].get("panel_id") == "p-job", str(eq["constraints"]))
+    src_sizing = open(os.path.join(BACKEND_DIR, "routes", "sizing.py")).read()
+    check("(9) ...and the name appears in routes/sizing.py only inside comments",
+          all(line.lstrip().startswith("#") for line in src_sizing.splitlines()
+              if "equipment_confirmed" in line), "")
+
+
 def main_() -> int:
     print("verify_equipment_contract.py — 3.10 prompt 1 (offline, writes nothing)\n")
     t1_write_path()
@@ -1018,6 +1293,7 @@ def main_() -> int:
     skipped = t7_write_path()
     t8_wiring()
     skipped += t9_form_gate()
+    t10_pins_reach_the_engine()
     print(f"\n{'-' * 60}")
     if FAILURES:
         print(f"FAIL: {len(FAILURES)} of {CHECKS_RUN} checks failed:")

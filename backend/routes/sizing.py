@@ -425,25 +425,219 @@ def _roof_confidence(roof: Optional[dict], flags: list[str]) -> dict:
     }
 
 
-def _fetch_panel(client: Any, panel_id: str) -> Optional[dict]:
-    """Fetch a catalogue panel as {id, watts, area_m2} for a panel-model constraint."""
-    if client is None or not panel_id:
-        return None
+# ── 3.14b prompt 1 — THE INSTALLER'S EQUIPMENT CHOICE REACHES THE ENGINE ───
+#
+# A pinned product is an INSTRUCTION, not a note (Mayur, 2026-08-22). NULL on
+# the job means Auto and the engine chooses. equipment_confirmed plays NO part:
+# D30 makes it true on every save whether or not anything is pinned, so it
+# records that a human looked and gates nothing — it is not read here.
+#
+# D33 §13: the pin is expressed as an INPUT the optimiser is given (constraints
+# and a re-scaled panel), never as a step in the sequential flow, so it
+# survives whichever engine 4.0 selects.
+#
+# THE VISIBILITY PREDICATE — written once here rather than reused from
+# routes/equipment.py's _visible_rows, because that helper hard-codes
+# status='active' and this resolver must still RESOLVE a retired unit (the
+# installer asked for it; it is used and flagged, never substituted). The
+# disjunction is the same one the catalogue read uses.
+EQUIPMENT_VISIBILITY_OR = "origin.eq.catalogue,owner_company_id.eq.{company_id}"
+# Size constraints are NOT products: they always come from the request. The
+# live rail depends on them (railRecostRequest).
+_SIZE_CONSTRAINT_KEYS = ("fix_solar_kwp", "fix_panel_count", "fix_battery_kwh", "force_no_battery")
+# kind, jobs column, request constraint key
+_EQUIPMENT_KINDS = (
+    ("panel", "equipment_panel_id", "panel_id"),
+    ("inverter", "equipment_inverter_id", "inverter_id"),
+    ("battery", "equipment_battery_id", "battery_ids"),
+)
+
+
+def _fetch_visible_unit(
+    client: Any, kind: str, unit_id: str, company_id: Optional[str],
+) -> tuple[Optional[dict], Optional[str]]:
+    """(row, error). row is the unit IFF it exists and is visible to this
+    company — catalogue, or owned by it — at ANY status. error 'read-failed'
+    on a transport fault, which is a different fact from absence."""
+    or_expr = EQUIPMENT_VISIBILITY_OR.format(company_id=company_id or "")
     try:
-        res = client.table("panels").select(
-            "id,rated_power_w,length_mm,width_mm"
-        ).eq("id", panel_id).limit(1).execute()
-        if not res.data:
-            return None
-        r = res.data[0]
-        length = float(r["length_mm"]) if r.get("length_mm") else None
-        width = float(r["width_mm"]) if r.get("width_mm") else None
-        watts = float(r["rated_power_w"]) if r.get("rated_power_w") else None
-        if not length or not width or not watts:
-            return None
-        return {"id": r["id"], "watts": int(watts), "area_m2": round(length * width / 1_000_000.0, 4)}
-    except Exception:
+        if kind == "panel":
+            q = client.table("panels").select(
+                "id,brand,model,rated_power_w,length_mm,width_mm,status,origin,owner_company_id"
+            )
+        elif kind == "inverter":
+            q = client.table("inverters").select("id,brand,model,status,origin,owner_company_id")
+        else:
+            q = client.table("batteries").select("*")
+        res = q.eq("id", unit_id).or_(or_expr).limit(1).execute()
+        rows = getattr(res, "data", None) or []
+        row = rows[0] if rows and isinstance(rows[0], dict) else None
+        return row, None
+    except Exception as exc:  # noqa: BLE001 — a read failure is flagged, never raised
+        sentry_sdk.capture_exception(exc)
+        return None, "read-failed"
+
+
+def _resolve_equipment(
+    job_row: Optional[dict],
+    request_constraints: Optional[dict],
+    request_battery_ids: Optional[list],
+    company_id: Optional[str],
+    client: Any,
+    flags: list[str],
+) -> dict:
+    """ONE resolver for the equipment pins, used by BOTH sizing endpoints — the
+    _resolve_objective pattern: never raises, never blocks sizing (D24).
+
+    Precedence per component, most specific first:
+      1. the JOB'S PIN (column non-null, resolves, visible) — WINS over a
+         request constraint naming the same component, so no caller may
+         quietly override the installer;
+      2. the REQUEST's constraint for that component, when the job is on Auto;
+      3. Auto — the key is absent and the engine chooses, exactly as today.
+
+    THREE OUTCOMES PER COMPONENT, never two (F208, 2W.3):
+      applied      resolved, visible, usable — used;
+      retired      resolved and visible but status != 'active' — STILL USED,
+                   and flagged;
+      unavailable  cannot resolve, not visible, or missing the specs the
+                   engine needs — NEVER substituted, NEVER silently dropped.
+
+    Returns:
+      constraints       the EFFECTIVE constraints the endpoint uses: the size
+                        keys from the request, plus panel_id / inverter_id /
+                        battery_ids as resolved;
+      panel             {id, watts, area_m2} to lay out, or None;
+      battery_rows      the pool handed to the LP when a battery is pinned or
+                        named (None = Auto: the catalogue pool);
+      pin_source        {"panel"|"inverter"|"battery": "job"|"request"|None};
+      pin_unavailable   {"panel"|"inverter"|"battery": id|None}.
+    """
+    req = dict(request_constraints or {})
+    effective: dict = {k: req[k] for k in _SIZE_CONSTRAINT_KEYS if k in req}
+    pin_source: dict = {"panel": None, "inverter": None, "battery": None}
+    pin_unavailable: dict = {"panel": None, "inverter": None, "battery": None}
+    out: dict = {
+        "constraints": effective, "panel": None, "battery_rows": None,
+        "pin_source": pin_source, "pin_unavailable": pin_unavailable,
+    }
+    job = job_row if isinstance(job_row, dict) else {}
+
+    for kind, column, req_key in _EQUIPMENT_KINDS:
+        job_pin = job.get(column)
+        job_pin = job_pin if isinstance(job_pin, str) and job_pin else None
+        if kind == "battery":
+            raw = req.get("battery_ids") or request_battery_ids
+            req_val = [i for i in raw if isinstance(i, str) and i] if isinstance(raw, list) else None
+            req_val = req_val or None
+        else:
+            raw = req.get(req_key)
+            req_val = raw if isinstance(raw, str) and raw else None
+
+        if job_pin:
+            source, ids = "job", [job_pin]
+            # The job's pin overrides a DIFFERING request value, and says so —
+            # the rail re-costing a job whose pin has just changed.
+            req_ids = req_val if isinstance(req_val, list) else ([req_val] if req_val else None)
+            if req_ids and req_ids != ids:
+                flags.append(
+                    f"equipment pin: the job's {kind} {job_pin} was used; the request "
+                    f"asked for {req_val!r}, which was not applied"
+                )
+        elif req_val:
+            source, ids = "request", (req_val if isinstance(req_val, list) else [req_val])
+        else:
+            continue  # Auto — the engine chooses
+
+        if client is None:
+            # Local dev with no Supabase: nothing to resolve against, no flags,
+            # behaviour identical to today.
+            continue
+
+        pin_source[kind] = source
+        usable_rows: list[dict] = []
+        unavailable_ids: list[str] = []
+        for unit_id in ids:
+            row, err = _fetch_visible_unit(client, kind, unit_id, company_id)
+            if err == "read-failed":
+                # A failure to READ is a different fact from absence: flag it
+                # and size with Auto for this component.
+                flags.append(f"pinned {kind} {unit_id} could not be read — sized with Auto — is_fallback")
+                continue
+            usable = None
+            if row is not None:
+                if kind == "panel":
+                    # roof_geometry's own row→panel shape (id, brand, model,
+                    # watts, dimensions, area_m2) — REUSED, not copied (2R.1);
+                    # None when the specs the layout needs are missing.
+                    usable = roof_geometry._panel_from_row(row)
+                elif kind == "battery":
+                    usable = row if battery_optimiser.battery_specs(row, []) is not None else None
+                else:
+                    usable = {"id": row.get("id")}
+            if usable is None:
+                unavailable_ids.append(unit_id)
+                continue
+            if row.get("status") != "active":
+                flags.append(
+                    f"pinned {kind} {unit_id} is no longer in the active catalogue — "
+                    "the system was costed on it and nothing was substituted"
+                )
+            usable_rows.append(usable)
+
+        if unavailable_ids:
+            pin_unavailable[kind] = unavailable_ids[0] if len(unavailable_ids) == 1 else unavailable_ids
+            if kind == "battery":
+                # VERBATIM — verify_results_contract (X4b) matches on it.
+                flags.append(
+                    f"battery_ids not in the active catalogue — not evaluated: {unavailable_ids}"
+                )
+            else:
+                flags.append(
+                    f"pinned {kind} {unavailable_ids[0]} is unavailable — not found, not visible "
+                    "to this company, or missing the specs the engine needs; nothing was substituted"
+                )
+
+        if kind == "panel" and usable_rows:
+            out["panel"] = usable_rows[0]
+            effective["panel_id"] = usable_rows[0]["id"]
+        elif kind == "inverter" and usable_rows:
+            effective["inverter_id"] = usable_rows[0]["id"]
+        elif kind == "battery":
+            # Resolved BY ID, not by filtering the catalogue — an installer's
+            # own user-defined unit, which the automatic pool deliberately
+            # excludes, can be pinned. [] = pinned but none usable.
+            out["battery_rows"] = usable_rows
+            if usable_rows and (source == "job" or req.get("battery_ids")):
+                effective["battery_ids"] = [r.get("id") for r in usable_rows]
+    return out
+
+
+def _pin_record(eq: dict) -> dict:
+    """The two keys constraints_applied gains — PRESENT on every run, so a
+    reader can tell "no pin" (all-null) from "not recorded" (absent) (F191)."""
+    return {
+        "equipment_pin_source": dict(eq["pin_source"]),
+        "equipment_pin_unavailable": dict(eq["pin_unavailable"]),
+    }
+
+
+def _pinned_panel_error(eq: dict, flags: list[str]) -> Optional[dict]:
+    """The ONE case that answers the error shape rather than numbers: a pinned
+    panel that cannot be used. There is no honest system to describe, so this
+    mirrors the existing "panel_id (or job roof selected_panel) required"
+    branch — the same keys — and NEVER falls back to the roof's selected_panel."""
+    pinned = eq["pin_unavailable"].get("panel")
+    if not pinned:
         return None
+    return {
+        "error": (
+            f"pinned panel {pinned} could not be used — it was not found, is not visible "
+            "to this company, or is missing the specs the engine needs (rated_power_w, "
+            "length_mm, width_mm). Nothing was substituted."
+        ),
+        "flags": ["pinned_panel_unavailable", *flags],
+    }
 
 
 # ── 3.7 shared helpers: time base + the one load resolver ─────────────────────
@@ -1078,8 +1272,11 @@ async def optimise_sizing(
         # always wins over invalid-objective. client None = local dev with no
         # Supabase: nothing to own and nothing to leak — do not "harden" this
         # skip into a 500 that breaks local development.
+        # 3.14b prompt 1: the job row is BOUND — it carries the three
+        # equipment pins the engine is now given (A2: it used to be discarded).
+        job_row: Optional[dict] = None
         if body.job_id and client is not None:
-            _get_company_job(client, body.job_id, caller.company_id)
+            job_row = _get_company_job(client, body.job_id, caller.company_id)
         # 3.11b — the installer identity comes from the LOGIN, never the body
         # (the routes/job.py:610 precedent). An attempted assertion is visible,
         # not silently ignored (F161).
@@ -1099,6 +1296,16 @@ async def optimise_sizing(
         budget = resolved["budget"]
         if objective not in solar_optimiser.VALID_OBJECTIVES:
             return {"error": f"invalid objective '{objective}'", "valid": sorted(solar_optimiser.VALID_OBJECTIVES)}
+        # 3.14b prompt 1 — THE EQUIPMENT RESOLVER, before the roof block: a
+        # pinned panel that cannot be used answers here, with nothing
+        # substituted, rather than sizing a plausible quote on the roof's panel.
+        eq = _resolve_equipment(
+            job_row, body.constraints, None,
+            (job_row or {}).get("company_id") or caller.company_id, client, flags,
+        )
+        pinned_panel_error = _pinned_panel_error(eq, flags)
+        if pinned_panel_error is not None:
+            return pinned_panel_error
 
         planes = body.planes
         candidate_configs = body.candidate_configs
@@ -1192,19 +1399,17 @@ async def optimise_sizing(
             )
 
         # ── Resolve solar constraints (panel-model re-scale is LOCAL — no Google call) ──
-        constraints = body.constraints or {}
+        # 3.14b prompt 1: the EFFECTIVE constraints — the job's pins over the
+        # request's, size constraints from the request untouched.
+        constraints = eq["constraints"]
         con_planes, con_configs, con_panel = planes, candidate_configs, panel
         panel_constraint_active = False
-        if constraints.get("panel_id"):
-            prow = _fetch_panel(client, constraints["panel_id"])
-            if prow:
-                con_panel = prow
-                rescaled = roof_geometry.rescale_planes_for_panel(planes, con_panel)
-                con_planes, con_configs = rescaled["planes"], rescaled["candidate_configs"]
-                flags.extend(rescaled.get("flags", []))
-                panel_constraint_active = True
-            else:
-                flags.append(f"constraint panel_id {constraints['panel_id']} not found — ignored.")
+        if eq["panel"] is not None:
+            con_panel = eq["panel"]
+            rescaled = roof_geometry.rescale_planes_for_panel(planes, con_panel)
+            con_planes, con_configs = rescaled["planes"], rescaled["candidate_configs"]
+            flags.extend(rescaled.get("flags", []))
+            panel_constraint_active = True
         if constraints.get("inverter_id"):
             flags.append(f"inverter_id {constraints['inverter_id']} applied at cost-model level only (Phase 1).")
 
@@ -1221,7 +1426,8 @@ async def optimise_sizing(
             unconstrained_optimum = None
             constraint_deltas = None
             score_curve = result["score_curve"]
-            constraints_applied = {}
+            # 3.14b prompt 1: the two pin keys are PRESENT on every run (F191).
+            constraints_applied = _pin_record(eq)
         else:
             con_constraints = {
                 "fix_panel_count": constraints.get("fix_panel_count"),
@@ -1260,6 +1466,7 @@ async def optimise_sizing(
                 "inverter_id": constraints.get("inverter_id"),
                 "fix_solar_kwp": constraints.get("fix_solar_kwp"),
                 "fix_panel_count": constraints.get("fix_panel_count"),
+                **_pin_record(eq),
             }
 
         # 3.11 — the roof's confidence state, built ONCE and used by BOTH the
@@ -1672,8 +1879,10 @@ async def battery_sizing(
         # always wins over invalid-objective. client None = local dev with no
         # Supabase: nothing to own and nothing to leak — do not "harden" this
         # skip into a 500 that breaks local development.
+        # 3.14b prompt 1: the job row is BOUND for its equipment pins (A2).
+        job_row: Optional[dict] = None
         if body.job_id and client is not None:
-            _get_company_job(client, body.job_id, caller.company_id)
+            job_row = _get_company_job(client, body.job_id, caller.company_id)
         # 3.11b — the installer identity comes from the LOGIN, never the body
         # (the routes/job.py:610 precedent). An attempted assertion is visible,
         # not silently ignored (F161).
@@ -1690,6 +1899,16 @@ async def battery_sizing(
         budget = resolved["budget"]
         if objective not in solar_optimiser.VALID_OBJECTIVES:
             return {"error": f"invalid objective '{objective}'", "valid": sorted(solar_optimiser.VALID_OBJECTIVES)}
+        # 3.14b prompt 1 — THE EQUIPMENT RESOLVER (the same one the solar
+        # endpoint calls). body.battery_ids resolves through it too, so a named
+        # battery passes the same visibility rule as a pinned one.
+        eq = _resolve_equipment(
+            job_row, body.constraints, body.battery_ids,
+            (job_row or {}).get("company_id") or caller.company_id, client, flags,
+        )
+        pinned_panel_error = _pinned_panel_error(eq, flags)
+        if pinned_panel_error is not None:
+            return pinned_panel_error
 
         planes = body.planes
         candidate_configs = body.candidate_configs
@@ -1842,23 +2061,32 @@ async def battery_sizing(
         if not full_catalogue:
             flags.append("battery catalogue unavailable — only the no-battery baseline evaluated.")
 
-        def _filter_rows(ids):
-            return [r for r in full_catalogue if r.get("id") in ids] if ids else full_catalogue
+        # 3.14b prompt 1: a pinned or named battery is resolved BY ID through
+        # the visibility rule (the resolver above) — the catalogue filter that
+        # could empty a pool rather than flag it is DELETED, not gated (2R.1).
+        # battery_rows None = Auto, the catalogue pool.
+        pinned_rows = eq["battery_rows"]
+        if pinned_rows is not None and not pinned_rows:
+            flags.append(
+                f"pinned battery {eq['pin_unavailable'].get('battery')} was not evaluated — "
+                "a no-battery result here is not a verdict on it"
+            )
+
+        def _battery_pool():
+            return full_catalogue if pinned_rows is None else pinned_rows
 
         # ── Resolve constraints ──
-        constraints = body.constraints or {}
+        # 3.14b prompt 1: the EFFECTIVE constraints — the job's pins over the
+        # request's, size constraints from the request untouched.
+        constraints = eq["constraints"]
         con_planes, con_configs, con_panel = planes, candidate_configs, panel
         panel_constraint_active = False
-        if constraints.get("panel_id"):
-            prow = _fetch_panel(client, constraints["panel_id"])
-            if prow:
-                con_panel = prow
-                rescaled = roof_geometry.rescale_planes_for_panel(planes, con_panel)
-                con_planes, con_configs = rescaled["planes"], rescaled["candidate_configs"]
-                flags.extend(rescaled.get("flags", []))
-                panel_constraint_active = True
-            else:
-                flags.append(f"constraint panel_id {constraints['panel_id']} not found — ignored.")
+        if eq["panel"] is not None:
+            con_panel = eq["panel"]
+            rescaled = roof_geometry.rescale_planes_for_panel(planes, con_panel)
+            con_planes, con_configs = rescaled["planes"], rescaled["candidate_configs"]
+            flags.extend(rescaled.get("flags", []))
+            panel_constraint_active = True
         if constraints.get("inverter_id"):
             flags.append(f"inverter_id {constraints['inverter_id']} applied at cost-model level only (Phase 1).")
 
@@ -1866,20 +2094,6 @@ async def battery_sizing(
             panel_constraint_active or constraints.get("fix_panel_count") is not None
             or constraints.get("fix_solar_kwp") is not None or constraints.get("inverter_id")
         )
-        con_batt_ids = constraints.get("battery_ids") or body.battery_ids
-        # 3.14 prompt 5: a pinned battery that is no longer in the active
-        # catalogue is NAMED here. Without this the filter below quietly
-        # yields an empty pool, the engine answers "no battery" with an
-        # economics reason, and a re-cost of a specific system has been
-        # replaced by a different answer with nothing on screen saying so —
-        # the exact silent substitution D37 exists to prevent.
-        if con_batt_ids:
-            _known_ids = {r.get("id") for r in full_catalogue}
-            _missing_ids = [i for i in con_batt_ids if i not in _known_ids]
-            if _missing_ids:
-                flags.append(
-                    f"battery_ids not in the active catalogue — not evaluated: {_missing_ids}"
-                )
         fix_kwh = constraints.get("fix_battery_kwh")
         force_nb = bool(constraints.get("force_no_battery"))
         batt_con_active = bool(constraints.get("battery_ids") or fix_kwh is not None or force_nb)
@@ -1897,12 +2111,13 @@ async def battery_sizing(
             # silent about why.
             chosen, solar_8760, solar_run_flags, solar_curve, solar_curve_index = _solar_chosen(planes, candidate_configs, panel, None)
             flags.extend(solar_run_flags)
-            result = _battery_run(solar_8760, chosen, panel, _filter_rows(body.battery_ids), None, False, flags)
+            result = _battery_run(solar_8760, chosen, panel, _battery_pool(), None, False, flags)
             opt = result["optimal_battery"]
             unconstrained_optimum_battery = None
             constraint_deltas = None
             chosen_solar, used_panel = chosen, panel
-            constraints_applied = {}
+            # 3.14b prompt 1: the two pin keys are PRESENT on every run (F191).
+            constraints_applied = _pin_record(eq)
         else:
             # 3.12 (2N.1): the SHADOW run exists only for the deltas — its
             # flags stay discarded, or every solar flag would appear twice.
@@ -1923,7 +2138,7 @@ async def battery_sizing(
             # The RESULT-BEARING run: its solar flags reach the response.
             chosen, solar_8760, solar_run_flags, solar_curve, solar_curve_index = _solar_chosen(con_planes, con_configs, con_panel, con_solar_constraints)
             flags.extend(solar_run_flags)
-            result = _battery_run(solar_8760, chosen, con_panel, _filter_rows(con_batt_ids), fix_kwh, force_nb, flags)
+            result = _battery_run(solar_8760, chosen, con_panel, _battery_pool(), fix_kwh, force_nb, flags)
             opt = result["optimal_battery"]
             if unc_result is not None:
                 unconstrained_optimum_battery = unc_result["optimal_battery"]
@@ -1950,6 +2165,7 @@ async def battery_sizing(
                 "battery_ids": constraints.get("battery_ids"),
                 "fix_battery_kwh": constraints.get("fix_battery_kwh"),
                 "force_no_battery": force_nb,
+                **_pin_record(eq),
             }
 
         # 3.14 prompt 2 (F202): the value-versus-size curve the solar search
