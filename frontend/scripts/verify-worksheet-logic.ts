@@ -105,6 +105,12 @@ import {
   typedUsageError,
   usagePlausibilityNotice,
   azimuthLabel,
+  ROOF_CONFIRM_FAILED_NOTICE,
+  ROOF_NOT_SAVED_NOTICE,
+  roofActionErrorNotice,
+  roofDiagramCaptionLines,
+  roofOmittedPlanesNotice,
+  roofStateMismatchNotice,
   CUSTOM_EQUIPMENT_FIELDS,
   EQUIPMENT_AUTO_CAPTION,
   EQUIPMENT_CATALOGUE_PROBLEM,
@@ -10282,43 +10288,38 @@ test("3.4c-4 (item e): the EXPIRED state no longer asserts found and deleted at 
   assert.ok(!text.includes("Roof prefilled"), "the prefill caption yields while expired");
 });
 
-test("3.4c-4 (F234): the caption leads with the question; specs follow; the two wattages connect", () => {
-  const diagram = {
-    show: true,
-    tileLat: -34.92,
-    tileLng: 138.62,
-    zoom: 20,
-    buildingBox: { x: 10, y: 10, width: 100, height: 80 },
-    rects: [
-      { cx: 60, cy: 60, widthPx: 20, heightPx: 12, rotationDeg: 0, segmentIndex: 0 },
-    ],
-    reason: null,
-    panelCount: 21,
-    panelWidthM: 1.05,
-    panelHeightM: 1.88,
-    panelCapacityW: 400,
-  };
-  const view = viewFor(
-    roofRow({
+test("3.4c-5 (F234): the caption STATES the drawing and its assumptions — the instruction-shaped opening is gone", () => {
+  // REPLACES prompt 4's "the caption leads with the question" test: that one
+  // asserted the opening instruction ("Check this picture for two things…"),
+  // which is exactly what this prompt removes. Same fixture, new shape.
+  const view = viewFor({
+    ...roofRow({
       selected_panel: { id: "p1", brand: "Jinko", model: "Tiger Neo", watts: 440 },
     }),
-  );
+    imagery_date: "2018-11-17",
+    imagery_quality: "MEDIUM",
+  });
   const text = roofTextOf(
-    renderRoofSection({ view, jobId: "j", isOpen: true, diagram }),
+    renderRoofSection({ view, jobId: "j", isOpen: true, diagram: CAPTION_DIAGRAM }),
   );
-  const iQuestion = text.indexOf("is this the right building");
-  const iRough = text.indexOf("different supplier");
-  const iSpecs = text.indexOf("Google drew 21 panels");
-  const iIdentity = text.indexOf("400 W assumption");
-  console.log(
-    `        [caption render] ${text.slice(text.indexOf("Check this picture"), text.indexOf("Imagery") === -1 ? undefined : text.indexOf("Imagery")).slice(0, 700)}`,
-  );
-  assert.ok(iQuestion !== -1 && iRough !== -1 && iSpecs !== -1 && iIdentity !== -1, text);
-  assert.ok(iQuestion < iSpecs, "the question LEADS the specs");
-  assert.ok(iRough < iSpecs, "the roughness is up front, not three lines below");
-  assert.ok(iSpecs < iIdentity, "identity follows the specs");
+  // The deleted shapes, gone from what SHIPS.
+  for (const dead of [
+    "Check this picture",
+    "is this the right building",
+    "judge the building, not the layout",
+    "they will sit roughly",
+    "uses a different panel",
+  ]) {
+    assert.ok(!text.includes(dead), `still on screen: ${dead}`);
+  }
+  // The facts, present and in order.
+  const iFitted = text.indexOf("Google's model fitted 21 panels");
+  const iAssumption = text.indexOf("400 W assumption");
+  const iSources = text.indexOf("different supplier");
+  assert.ok(iFitted !== -1 && iAssumption !== -1 && iSources !== -1, text);
+  assert.ok(iFitted < iAssumption, "what was drawn precedes whose panel it assumes");
   assert.ok(text.includes("scaled to Jinko Tiger Neo 440 W"), "the two wattages connect");
-  assert.ok(!text.includes("uses a different panel"), "the false sentence stays dead");
+  assert.ok(text.includes("rather than a placement plan"), "the unfinished sentence is replaced");
 });
 
 test("3.4c-4 (item d): the multi-dwelling caution has ONE home", async () => {
@@ -10412,4 +10413,264 @@ test("3.4c-4 (a): the route handler forwards the session Bearer and HARDCODES so
   } finally {
     globalThis.fetch = realFetch;
   }
+});
+// ── 3.4c prompt 5: the caption is objective, and F128's notices are data ────
+
+/** A drawable diagram, Google's own figures — the a57e13f1 shape. */
+const CAPTION_DIAGRAM = {
+  show: true,
+  tileLat: -34.92,
+  tileLng: 138.62,
+  zoom: 20,
+  buildingBox: { x: 10, y: 10, width: 100, height: 80 },
+  rects: [{ cx: 60, cy: 60, widthPx: 20, heightPx: 12, rotationDeg: 0, segmentIndex: 0 }],
+  reason: null,
+  panelCount: 21,
+  panelWidthM: 1.05,
+  panelHeightM: 1.88,
+  panelCapacityW: 400,
+};
+
+const withImagery = (row: Record<string, unknown>) => ({
+  ...row,
+  imagery_date: "2018-11-17",
+  imagery_quality: "MEDIUM",
+  selected_panel: { id: "p1", brand: "Jinko", model: "Tiger Neo", watts: 440 },
+  usability_factor: 0.7,
+});
+
+/**
+ * Second-person address, or an imperative aimed at the reader. The caption may
+ * contain none of these: the drawing is under keep-or-kill review at 8.4
+ * (F234) and must not be built up into a task the reader is set.
+ */
+const READER_INSTRUCTION = [
+  /\byou\b/i, /\byour\b/i, /\byours\b/i,
+  /\bshould\b/i, /\bmust\b/i, /\bneed to\b/i, /\bworth\b/i,
+];
+const IMPERATIVE_OPENERS = [
+  "check", "judge", "look", "use", "confirm", "treat", "note", "make",
+  "consider", "see", "read", "verify", "compare", "ignore", "remember",
+  "ensure", "watch", "review", "refer", "take", "keep", "do", "avoid",
+  "assume", "trust", "rely", "bear", "count", "expect",
+];
+
+/** Every reader-instruction found in these lines, with why it tripped. */
+function readerInstructionsIn(lines: readonly string[]): string[] {
+  const bad: string[] = [];
+  for (const line of lines) {
+    for (const raw of line.split(/(?<=\.)\s+/)) {
+      const sentence = raw.trim();
+      if (!sentence) continue;
+      for (const pattern of READER_INSTRUCTION) {
+        if (pattern.test(sentence)) bad.push(`${pattern} in: ${sentence}`);
+      }
+      const opener = (sentence.match(/^[A-Za-z']+/)?.[0] ?? "").toLowerCase();
+      if (IMPERATIVE_OPENERS.includes(opener)) {
+        bad.push(`imperative opener "${opener}" in: ${sentence}`);
+      }
+    }
+  }
+  return bad;
+}
+
+test("3.4c-5 (3): the caption instructs the reader NOWHERE, on any roof", () => {
+  const fixtures: [string, unknown, unknown][] = [
+    ["a57e13f1", withImagery(A57_ROW), CAPTION_DIAGRAM],
+    ["670c80db", withImagery(BISHOPS_ROW), { ...CAPTION_DIAGRAM, panelCount: 28 }],
+    ["456e0242", withImagery(FROME_ROW), { ...CAPTION_DIAGRAM, reason: "no_panel_positions", panelCount: 0 }],
+    ["no diagram", withImagery(roofRow()), undefined],
+    ["no building box", withImagery(roofRow()), { ...CAPTION_DIAGRAM, buildingBox: null }],
+  ];
+  for (const [name, row, diagram] of fixtures) {
+    const lines = roofDiagramCaptionLines(viewFor(row), diagram as never);
+    const bad = readerInstructionsIn(lines);
+    assert.deepEqual(bad, [], `${name}: ${bad.join(" | ")}`);
+  }
+  // The check is only worth something if the WHOLE caption is being read.
+  assert.ok(
+    readerInstructionsIn(["Check this picture for two things."]).length > 0,
+    "the detector itself must catch a planted instruction",
+  );
+  assert.ok(readerInstructionsIn(["Your roof is fine."]).length > 0);
+});
+
+test("3.4c-5 (4): the three real roofs — every caption figure traces to the view", () => {
+  const cases: [string, Record<string, unknown>, unknown][] = [
+    ["a57e13f1 (26 vs 21)", withImagery(A57_ROW), CAPTION_DIAGRAM],
+    ["670c80db (27 vs 28)", withImagery(BISHOPS_ROW), { ...CAPTION_DIAGRAM, panelCount: 28 }],
+    ["456e0242 (no layout)", withImagery(FROME_ROW), { ...CAPTION_DIAGRAM, reason: "no_panel_positions", panelCount: 0 }],
+  ];
+  for (const [name, row, diagram] of cases) {
+    const view = viewFor(row);
+    const lines = roofDiagramCaptionLines(view, diagram as never);
+    console.log(`        [${name}]`);
+    for (const line of lines) console.log(`          ${line}`);
+    const text = lines.join(" ");
+    const rec = view.countReconciliation;
+    assert.ok(rec);
+    // Face provenance: BOTH counts are the view's own, never restated numbers.
+    if (rec.facesGoogleAssessed > 0 && rec.facesFromAreaAlone > 0) {
+      assert.ok(text.includes(`Of the ${view.planes.length} faces`), text);
+      assert.ok(text.includes(`${rec.facesGoogleAssessed} take their panel counts`), text);
+      assert.ok(text.includes(`${rec.facesFromAreaAlone} are estimated from roof area`), text);
+    } else if (rec.facesFromAreaAlone === 0) {
+      assert.ok(
+        text.includes(`supplied the panel counts on all ${view.planes.length} faces`),
+        text,
+      );
+    } else {
+      // The no-layout roof: it still says where its counts came from, which is
+      // the roof where that matters most and the one whose drawing cannot be drawn.
+      assert.ok(
+        text.includes(`Google placed no panels, so the panel counts on all ${view.planes.length} faces are estimated from roof area alone.`),
+        text,
+      );
+    }
+    // The usable-area factor, the imagery, and the dashed box — all view facts.
+    assert.ok(text.includes("70% of each face"), text);
+    assert.ok(text.includes("The photo is dated 2018-11-17, medium-quality imagery."), text);
+    assert.ok(text.includes("The dashed box is the extent"), text);
+    // And it is rendered, not merely computed.
+    const rendered = roofTextOf(
+      renderRoofSection({ view, jobId: "j", isOpen: true, diagram: diagram as never }),
+    );
+    for (const line of lines) assert.ok(rendered.includes(line), `${name} renders: ${line}`);
+  }
+});
+
+test("3.4c-5 (4): the drawable roof states what was drawn, whose panel, and why it sits roughly", () => {
+  const lines = roofDiagramCaptionLines(viewFor(withImagery(A57_ROW)), CAPTION_DIAGRAM as never);
+  const text = lines.join(" ");
+  assert.ok(text.includes("Google's model fitted 21 panels of 1.05 m × 1.88 m at 400 W each"), text);
+  assert.ok(text.includes("Google's own 400 W assumption"), text);
+  assert.ok(text.includes("scaled to Jinko Tiger Neo 440 W"), text);
+  assert.ok(text.includes("come from Google's model and the photo comes from a different supplier"), text);
+  assert.ok(text.includes("rather than a placement plan"), text);
+  // A roof with NO drawing still states the TABLE's facts and the imagery, and
+  // says nothing about a drawing that does not exist.
+  const noDiagram = roofDiagramCaptionLines(viewFor(withImagery(roofRow())), undefined);
+  assert.deepEqual(noDiagram, [
+    // roofRow()'s one plane carries no google_panel_count, so it is an
+    // area-estimated face — the caption says exactly that.
+    "Google placed no panels, so the panel counts on the single face are estimated from roof area alone.",
+    "70% of each face is treated as usable after setbacks, vents and walkways.",
+    "The photo is dated 2018-11-17, medium-quality imagery.",
+  ]);
+});
+
+test("3.4c-5 (6): totality — junk view and missing figures invent nothing", () => {
+  assert.deepEqual(roofDiagramCaptionLines(addressRoofView(null), undefined), []);
+  // A junk view with a drawable diagram cannot occur on screen (roofDiagramView
+  // hides the diagram when there is no roof row), but the function is total:
+  // it describes the DRAWING it was handed and states nothing about the roof.
+  const junk = roofDiagramCaptionLines(addressRoofView("garbage"), CAPTION_DIAGRAM as never);
+  assert.deepEqual(readerInstructionsIn(junk), []);
+  for (const forbidden of ["faces", "% of each face", "The photo is dated", "scaled to"]) {
+    assert.ok(!junk.join(" ").includes(forbidden), `${forbidden} invented from a junk view`);
+  }
+  // No dimensions, no wattage, no panel, no usability, no imagery: the lines
+  // that HAVE figures appear, the rest are omitted rather than guessed.
+  const bare = viewFor(roofRow({ planes: [{ panel_count: 3 }], usability_factor: null }));
+  const lines = roofDiagramCaptionLines(bare, {
+    ...CAPTION_DIAGRAM,
+    panelWidthM: null,
+    panelHeightM: null,
+    panelCapacityW: null,
+    buildingBox: null,
+  } as never);
+  const text = lines.join(" ");
+  assert.ok(text.includes("Google's model fitted 21 panels onto this building."), text);
+  assert.ok(!text.includes("null"), text);
+  assert.ok(!text.includes("undefined"), text);
+  assert.ok(!text.includes("NaN"), text);
+  assert.ok(!text.includes("m ×"), "no dimensions were invented");
+  assert.ok(!text.includes("% of each face"), "no usability factor was invented");
+  // One face, none assessed: the singular reads properly, never "all 1 face".
+  assert.ok(
+    text.includes("the panel counts on the single face are estimated from roof area alone"),
+    text,
+  );
+  assert.ok(!text.includes("dashed box"), "no box was invented");
+  assert.ok(!text.includes("The photo is dated"), "no imagery date was invented");
+  assert.deepEqual(readerInstructionsIn(lines), []);
+  assert.doesNotThrow(() =>
+    renderRoofSection({ view: bare, jobId: "j", isOpen: true, diagram: CAPTION_DIAGRAM }),
+  );
+});
+
+test("3.4c-5 (F128): all FIVE notices are data in the logic layer, none composed inline", async () => {
+  // The prompt named three; the manual form's omitted-faces caution and prompt
+  // 4's confirm-failure copy are the other two. Derived from the file, not counted.
+  const { readFileSync } = await import("node:fs");
+  const { fileURLToPath } = await import("node:url");
+  const path = await import("node:path");
+  const root = path.dirname(path.dirname(fileURLToPath(import.meta.url)));
+  const component = readFileSync(
+    path.join(root, "components/worksheet/address-roof-section.tsx"),
+    "utf8",
+  );
+  const literalProps = component.match(/(?:tone|title)="/g) ?? [];
+  console.log(`        literal tone=/title= props left in the component: ${literalProps.length}`);
+  assert.equal(literalProps.length, 0, `still inline: ${literalProps.join(", ")}`);
+
+  // Each one, as data, with its wording moved VERBATIM.
+  assert.equal(ROOF_NOT_SAVED_NOTICE.tone, "caution");
+  assert.equal(ROOF_NOT_SAVED_NOTICE.level, "notice");
+  assert.equal(ROOF_NOT_SAVED_NOTICE.title, "This roof could not be saved");
+  assert.equal(ROOF_CONFIRM_FAILED_NOTICE.tone, "problem");
+  assert.equal(ROOF_CONFIRM_FAILED_NOTICE.title, "The roof could not be confirmed");
+
+  const mismatch = roofStateMismatchNotice(
+    { jobState: "SA", jobPostcode: "5000", geocodedState: "VIC", geocodedPostcode: "3000", mismatch: true },
+    null,
+  );
+  assert.ok(mismatch);
+  assert.equal(mismatch.tone, "caution");
+  assert.ok(mismatch.body.includes("set up as SA"), mismatch.body);
+  assert.ok(mismatch.body.includes("geocodes to VIC"), mismatch.body);
+  // The LIVE mismatch a just-finished lookup returned, with no stored one.
+  const live = roofStateMismatchNotice(null, { jobState: "SA", geocodedState: "NSW" });
+  assert.ok(live?.body.includes("geocodes to NSW"), String(live?.body));
+  // Agreement, or nothing known: silent.
+  assert.equal(
+    roofStateMismatchNotice(
+      { jobState: "SA", jobPostcode: "5000", geocodedState: "SA", geocodedPostcode: "5000", mismatch: false },
+      null,
+    ),
+    null,
+  );
+  assert.equal(roofStateMismatchNotice(null, null), null);
+
+  assert.equal(roofOmittedPlanesNotice(0, 12), null);
+  assert.equal(roofOmittedPlanesNotice(-1, 12), null);
+  const omitted = roofOmittedPlanesNotice(3, 12);
+  assert.ok(omitted);
+  assert.equal(omitted.title, "Only the first 12 faces are shown");
+  assert.ok(omitted.body.includes("This roof has 15 faces"), omitted.body);
+  assert.ok(omitted.body.includes("so 3 were left out"), omitted.body);
+  assert.ok(roofOmittedPlanesNotice(1, 12)?.body.includes("so 1 was left out"));
+
+  const err = roofActionErrorNotice({ heading: "Your session has expired", body: "Sign in again." });
+  assert.equal(err.tone, "problem");
+  assert.equal(err.level, "notice");
+  assert.equal(err.title, "Your session has expired");
+});
+
+test("3.4c-5 (F128): the moved notices still RENDER, wording unchanged", () => {
+  const view = viewFor(
+    roofRow({
+      site_cross_check: {
+        job_state: "SA",
+        job_postcode: "5000",
+        geocoded_state: "VIC",
+        geocoded_postcode: "3000",
+        mismatch: true,
+      },
+    }),
+  );
+  const text = roofTextOf(renderRoofSection({ view, jobId: "j", isOpen: false }));
+  assert.ok(text.includes("The address geocodes to a different state"), text.slice(0, 300));
+  assert.ok(text.includes("The job was set up as SA, but the address geocodes to VIC"), text);
+  assert.ok(text.includes("worth checking before quoting"), "wording moved verbatim");
 });

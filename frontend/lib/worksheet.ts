@@ -2319,6 +2319,217 @@ export function roofDiagramView(job: unknown): RoofDiagramView {
   };
 }
 
+// ── The picture's caption, and the notices F128 left inline (3.4c prompt 5) ──
+
+/** Metres to at most 2 dp, for the caption. Mirrors the component's old fmtMetres. */
+function roofMetres(value: number): string {
+  return String(Math.round(value * 100) / 100);
+}
+
+/**
+ * THE CAPTION UNDER THE ROOF PICTURE, as plain statements (3.4c prompt 5,
+ * decided by Mayur on 2026-08-25 at the screen).
+ *
+ * Prompt 4 had this caption OPEN WITH AN INSTRUCTION — "Check this picture for
+ * two things…". That is the wrong shape. The drawing is under a keep-or-kill
+ * review at row 8.4 (F234, F235) and may be replaced or removed, so the
+ * caption must not build it up into a task the reader is set. Each line STATES
+ * what the drawing is, what it was built from, and the assumptions behind it,
+ * and lets the reader draw their own conclusion.
+ *
+ * THE RULE, enforced by the suite: no second person, no imperative aimed at
+ * the reader, and no claim that the drawing is useful or reliable. Every
+ * sentence is either true or false about THIS job. Every figure comes from the
+ * view or the diagram — nothing hardcoded, nothing invented: a line whose
+ * figures are missing is OMITTED rather than guessed.
+ *
+ * Order: what was drawn, whose panel that assumes, where the counts came from,
+ * the usable-area factor, why the shapes sit where they do, the dashed box,
+ * the imagery. The imagery line depends on the view alone, so it is emitted
+ * even when there is no drawing to describe — it is the fact the <figcaption>
+ * used to own, and it now has ONE composer instead of two.
+ */
+export function roofDiagramCaptionLines(
+  view: AddressRoofView,
+  diagram: RoofDiagramView | null | undefined,
+): string[] {
+  const lines: string[] = [];
+  const shown = diagram !== null && diagram !== undefined && diagram.show;
+  const drawn = shown && diagram.reason === null;
+
+  if (drawn && diagram.panelCount > 0) {
+    const size =
+      diagram.panelWidthM !== null && diagram.panelHeightM !== null
+        ? ` of ${roofMetres(diagram.panelWidthM)} m × ${roofMetres(diagram.panelHeightM)} m`
+        : "";
+    const watts =
+      diagram.panelCapacityW !== null
+        ? ` at ${Math.round(diagram.panelCapacityW)} W each`
+        : "";
+    lines.push(
+      `Google's model fitted ${diagram.panelCount} panel${
+        diagram.panelCount === 1 ? "" : "s"
+      }${size}${watts} onto this building.`,
+    );
+    // The panel DRAWN is Google's assumption; the panel the TABLE is scaled to
+    // is ours. Both are named in one sentence because the two wattages appear
+    // metres apart on screen and nothing else joined them (seen 2026-08-25).
+    const drawnPanel =
+      diagram.panelCapacityW !== null
+        ? `Google's own ${Math.round(diagram.panelCapacityW)} W assumption`
+        : "Google's own panel assumption";
+    lines.push(
+      view.panelLabel !== null
+        ? `The drawn panels are ${drawnPanel}; the counts and kW in the table above are scaled to ${view.panelLabel}.`
+        : `The drawn panels are ${drawnPanel}.`,
+    );
+  }
+
+  // WHERE THE TABLE'S COUNTS CAME FROM is a fact about the FACES, not about
+  // the drawing, so it is stated whenever there are faces to describe — a roof
+  // Google returned no layout for is exactly the roof where that matters most,
+  // and it is also the roof whose drawing cannot be drawn. LOOKUP roofs only:
+  // on a manual roof Google never looked, so "Google placed no panels" would
+  // be an insinuation rather than a fact (prompt 3 draws the same line).
+  const rec = view.countReconciliation;
+  const total = view.planes.length;
+  const fromLookup = view.state === "found" || view.state === "low_confidence";
+  if (fromLookup && rec !== null && total > 0) {
+    const faces = (n: number) => `${n} ${n === 1 ? "face" : "faces"}`;
+    const allFaces = total === 1 ? "the single face" : `all ${total} faces`;
+    if (rec.facesFromAreaAlone === 0) {
+      lines.push(`Google's own layout supplied the panel counts on ${allFaces}.`);
+    } else if (rec.facesGoogleAssessed === 0) {
+      lines.push(
+        `Google placed no panels, so the panel counts on ${allFaces} are estimated from roof area alone.`,
+      );
+    } else {
+      // Mixed implies at least two faces, so the plural is always right here.
+      lines.push(
+        `Of the ${faces(total)}, ${rec.facesGoogleAssessed} take their panel counts from Google's own layout and ${rec.facesFromAreaAlone} are estimated from roof area alone, where Google placed no panels.`,
+      );
+    }
+  }
+  if (view.usabilityFactor !== null) {
+    lines.push(
+      `${Math.round(
+        view.usabilityFactor * 100,
+      )}% of each face is treated as usable after setbacks, vents and walkways.`,
+    );
+  }
+
+  if (drawn) {
+    // The replacement for prompt 4's unfinished "they will sit roughly —
+    // judge the building, not the layout": it now says roughly WHERE, and
+    // asks nothing of the reader. The roughness is inherent (F234/F235: two
+    // georeferencings), and F107 forbids tidying it away.
+    lines.push(
+      "The panel positions come from Google's model and the photo comes from a different supplier, so the shapes indicate roughly where Google measured panels rather than a placement plan.",
+    );
+  }
+
+  if (shown && diagram.buildingBox !== null) {
+    lines.push("The dashed box is the extent of the area Google measured.");
+  }
+
+  if (view.imageryDate !== null || view.imageryQualityLabel !== null) {
+    const quality =
+      view.imageryQualityLabel !== null
+        ? view.imageryQualityLabel.charAt(0).toLowerCase() +
+          view.imageryQualityLabel.slice(1)
+        : null;
+    lines.push(
+      view.imageryDate !== null && quality !== null
+        ? `The photo is dated ${view.imageryDate}, ${quality}.`
+        : view.imageryDate !== null
+          ? `The photo is dated ${view.imageryDate}.`
+          : `${view.imageryQualityLabel}.`,
+    );
+  }
+  return lines;
+}
+
+/**
+ * F128 (raised 2026-08-18, closed here): FIVE notices were still composed
+ * INLINE in address-roof-section.tsx — the prompt named three; the manual
+ * form's omitted-faces caution and prompt 4's confirm-failure copy are the
+ * other two. Their BEHAVIOUR was already right (all bordered notices by
+ * construction), but wording composed in a component is not assertable as
+ * data, which is the D25 gap. Wording is moved VERBATIM: this task relocates
+ * the notices, it does not rewrite them.
+ */
+export const ROOF_NOT_SAVED_NOTICE: RoofNoticeView = {
+  tone: "caution",
+  level: "notice",
+  title: "This roof could not be saved",
+  body: "The lookup worked but the result could not be stored — try again in a moment.",
+};
+
+/** The confirm write returned a reported failure inside a 200 (3.4c prompt 4). */
+export const ROOF_CONFIRM_FAILED_NOTICE: RoofNoticeView = {
+  tone: "problem",
+  level: "notice",
+  title: "The roof could not be confirmed",
+  body: "The confirmation was not stored — try again in a moment.",
+};
+
+/**
+ * The geocoded state disagrees with the job's (F22). Takes the STORED
+ * cross-check and the live one a just-completed lookup returned; the stored
+ * value wins per field, exactly as the component's inline version did.
+ */
+export function roofStateMismatchNotice(
+  crossCheck: AddressRoofView["crossCheck"],
+  live: { jobState: string; geocodedState: string } | null,
+): RoofNoticeView | null {
+  if (!(crossCheck?.mismatch === true || live !== null)) return null;
+  const jobState = crossCheck?.jobState ?? live?.jobState ?? "—";
+  const geocodedState = crossCheck?.geocodedState ?? live?.geocodedState ?? "—";
+  return {
+    tone: "caution",
+    level: "notice",
+    title: "The address geocodes to a different state",
+    body: `The job was set up as ${jobState}, but the address geocodes to ${geocodedState}. Tariff and rebate figures were set from the address — worth checking before quoting.`,
+  };
+}
+
+/** The manual form shows at most `max` faces; this says how many were left out. */
+export function roofOmittedPlanesNotice(
+  omitted: number,
+  max: number,
+): RoofNoticeView | null {
+  if (!Number.isFinite(omitted) || omitted <= 0) return null;
+  return {
+    tone: "caution",
+    level: "notice",
+    title: `Only the first ${max} faces are shown`,
+    body: `This roof has ${omitted + max} faces and a manual entry accepts ${max}, so ${omitted} ${
+      omitted === 1 ? "was" : "were"
+    } left out. Saving replaces the roof with what you see here.`,
+  };
+}
+
+/**
+ * A failed action, as a notice. The COPY already lives in lib/jobs
+ * (clientActionErrorCopy); what was inline was the CLASSIFICATION — tone and
+ * level — which D25 puts here. The copy is passed in rather than looked up
+ * because lib/worksheet.ts imports lib/jobs FOR TYPES ONLY: a value import is
+ * erased at strip time today, and adding one would break the suite, whose
+ * static import of this module is evaluated before its "@/" resolver hooks
+ * are registered.
+ */
+export function roofActionErrorNotice(copy: {
+  heading: string;
+  body: string;
+}): RoofNoticeView {
+  return {
+    tone: "problem",
+    level: "notice",
+    title: copy.heading,
+    body: copy.body,
+  };
+}
+
 // ── Results-bar geometry + preference (3.3a) ─────────────────────────────────
 //
 // The risky arithmetic lives here, unit-tested, rather than inline in the

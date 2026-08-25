@@ -30,6 +30,12 @@ import {
   EMPTY_PLANE_FORM_ROW,
   MULTI_DWELLING_CAPTION,
   PREFILL_FROM_LOOKUP_CAPTION,
+  ROOF_CONFIRM_FAILED_NOTICE,
+  ROOF_NOT_SAVED_NOTICE,
+  roofActionErrorNotice,
+  roofDiagramCaptionLines,
+  roofOmittedPlanesNotice,
+  roofStateMismatchNotice,
   TILE_H,
   TILE_IMG_SCALE,
   TILE_W,
@@ -136,10 +142,6 @@ const FACE_STYLES: readonly { fillOpacity: number }[] = [
   { fillOpacity: 0.15 },
 ];
 
-function fmtMetres(value: number | null): string {
-  return value !== null ? String(Math.round(value * 100) / 100) : "—";
-}
-
 export function AddressRoofSection({
   view,
   jobId,
@@ -168,7 +170,7 @@ export function AddressRoofSection({
   // /login link, and the installer chooses when to follow it. We NEVER navigate
   // away mid-action: losing a half-filled roof form is worse than the bug fixed.
   const [actionError, setActionError] = React.useState<
-    { heading: string; body: string; isAuth: boolean } | null
+    { notice: RoofNoticeView; isAuth: boolean } | null
   >(null);
   const [unsaved, setUnsaved] = React.useState(false);
   const [liveMismatch, setLiveMismatch] = React.useState<
@@ -197,7 +199,11 @@ export function AddressRoofSection({
   const [basisError, setBasisError] = React.useState<string | null>(null);
 
   function failed(kind: ApiErrorKind, status: number) {
-    setActionError({ ...clientActionErrorCopy(kind, status), isAuth: kind === "auth" });
+    // The COPY is lib/jobs'; the notice CLASSIFICATION is lib/worksheet's (F128).
+    setActionError({
+      notice: roofActionErrorNotice(clientActionErrorCopy(kind, status)),
+      isAuth: kind === "auth",
+    });
   }
 
   async function lookup() {
@@ -256,11 +262,7 @@ export function AddressRoofSection({
       }
       if ((result.data ?? {}).confirmed !== true) {
         // The backend reported a failure inside a 200 (its _persist rule).
-        setActionError({
-          heading: "The roof could not be confirmed",
-          body: "The confirmation was not stored — try again in a moment.",
-          isAuth: false,
-        });
+        setActionError({ notice: ROOF_CONFIRM_FAILED_NOTICE, isAuth: false });
         return;
       }
       router.refresh();
@@ -491,6 +493,8 @@ export function AddressRoofSection({
       </div>
     ) : null;
 
+  const captionLines = roofDiagramCaptionLines(view, diagram);
+
   const thumbnail = (() => {
     const diagramActive = diagram !== undefined && diagram.show;
     // 1b (3.5 prompt 2): the tile is REQUESTED centred on the exact point the
@@ -587,53 +591,20 @@ export function AddressRoofSection({
             </div>
           )}
         </div>
-        {diagramActive && diagram.reason === null ? (
-          <>
-            {/* F234: LEAD WITH THE QUESTION the picture answers — never with
-                a layout claim. The roughness is stated up front because it is
-                EVIDENCE, not a defect (F107: never fit the overlay to the
-                roof — tidy is what would have hidden the pergola). */}
-            <p className="mt-1 text-caption text-foreground">
-              Check this picture for two things: is this the right building,
-              and is every shaded shape really a roof surface? The panels are
-              drawn where Google measured them, but the photo comes from a
-              different supplier, so they will sit roughly — judge the
-              building, not the layout.
-            </p>
-            {/* The specifications FOLLOW; they do not lead (F234). */}
-            <p className="mt-1 text-caption text-muted-foreground">
-              Google drew {diagram.panelCount} panels at{" "}
-              {fmtMetres(diagram.panelWidthM)} m × {fmtMetres(diagram.panelHeightM)} m
-              {diagram.panelCapacityW !== null
-                ? `, ${Math.round(diagram.panelCapacityW)} W each`
-                : null}
-              .
-              {diagram.buildingBox
-                ? " The dashed box is the extent of the area Google measured."
-                : null}
-            </p>
-            {/* The panel-identity gap (found on screen 2026-08-25): the TRUE
-                half of the deleted different-panel sentence — it describes
-                the panel DRAWN, stated separately from the count, which the
-                reconciliation below explains. */}
-            {diagram.panelCapacityW !== null && view.panelLabel ? (
-              <p className="mt-1 text-caption text-muted-foreground">
-                The drawn panels are Google&apos;s{" "}
-                {Math.round(diagram.panelCapacityW)} W assumption; the table
-                above is scaled to {view.panelLabel} — the same roof, two
-                panel models.
-              </p>
-            ) : null}
-          </>
-        ) : null}
         {diagramActive && diagram.reason !== null ? (
           <p className="mt-1 text-caption text-muted-foreground">
             {DIAGRAM_REASON_COPY[diagram.reason]}
-            {diagram.buildingBox
-              ? " The dashed box is the extent of the area Google measured."
-              : null}
           </p>
         ) : null}
+        {/* 3.4c prompt 5: the caption STATES what the drawing is and every
+            assumption behind it, and asks nothing of the reader — the drawing
+            is under a keep-or-kill review at 8.4 (F234) and must not be built
+            up into a task. Composed in lib/worksheet.ts; this renders it. */}
+        {captionLines.map((line, i) => (
+          <p key={`caption-line-${i}`} className="mt-1 text-caption text-muted-foreground">
+            {line}
+          </p>
+        ))}
         {/* F231: the TRUE account of any gap between Google's count and the
             table's, assembled face-by-face in lib/worksheet.ts. It replaces
             the deleted different-panel sentence, which was FALSE on
@@ -647,23 +618,19 @@ export function AddressRoofSection({
             {view.countReconciliation.explanation}
           </p>
         ) : null}
-        <figcaption className="mt-1 text-caption text-muted-foreground">
-          {[
-            view.imageryDate ? `Imagery ${view.imageryDate}` : null,
-            view.imageryQualityLabel,
-          ]
-            .filter(Boolean)
-            .join(" · ")}
-          {showsGoogleSolarAttribution(view) ? (
-            <>
-              {view.imageryDate || view.imageryQualityLabel ? " · " : null}
-              Includes solar data from Google
-            </>
-          ) : null}
-        </figcaption>
+        {/* The imagery date and quality moved INTO the caption above (3.4c
+            prompt 5) so one composer owns them. This keeps the attribution,
+            which is a licence requirement, not a caption line. */}
+        {showsGoogleSolarAttribution(view) ? (
+          <figcaption className="mt-1 text-caption text-muted-foreground">
+            Includes solar data from Google
+          </figcaption>
+        ) : null}
       </figure>
     );
   })();
+
+  const omittedNotice = roofOmittedPlanesNotice(omittedPlanes, MAX_FORM_PLANES);
 
   const manualForm = formOpen ? (
     <div className="mt-3 flex flex-col gap-3 rounded-lg border border-border bg-card p-3">
@@ -676,12 +643,9 @@ export function AddressRoofSection({
           {PREFILL_FROM_LOOKUP_CAPTION.title}. {PREFILL_FROM_LOOKUP_CAPTION.body}
         </NoticeCaption>
       ) : null}
-      {omittedPlanes > 0 ? (
-        <Notice tone="caution" title={`Only the first ${MAX_FORM_PLANES} faces are shown`}>
-          This roof has {omittedPlanes + MAX_FORM_PLANES} faces and a manual entry
-          accepts {MAX_FORM_PLANES}, so {omittedPlanes}{" "}
-          {omittedPlanes === 1 ? "was" : "were"} left out. Saving replaces the roof
-          with what you see here.
+      {omittedNotice ? (
+        <Notice tone={omittedNotice.tone} title={omittedNotice.title}>
+          {omittedNotice.body}
         </Notice>
       ) : null}
 
@@ -888,6 +852,8 @@ export function AddressRoofSection({
     </div>
   ) : null;
 
+  const mismatchNotice = roofStateMismatchNotice(view.crossCheck, liveMismatch);
+
   return (
     <div className="flex flex-col gap-3">
       <p className="text-body text-foreground">{view.address}</p>
@@ -909,22 +875,19 @@ export function AddressRoofSection({
           {notice.body}
         </Notice>
       ))}
-      {view.crossCheck?.mismatch || liveMismatch ? (
-        <Notice tone="caution" title="The address geocodes to a different state">
-          The job was set up as {view.crossCheck?.jobState ?? liveMismatch?.jobState}, but
-          the address geocodes to{" "}
-          {view.crossCheck?.geocodedState ?? liveMismatch?.geocodedState}. Tariff and
-          rebate figures were set from the address — worth checking before quoting.
+      {mismatchNotice ? (
+        <Notice tone={mismatchNotice.tone} title={mismatchNotice.title}>
+          {mismatchNotice.body}
         </Notice>
       ) : null}
       {unsaved ? (
-        <Notice tone="caution" title="This roof could not be saved">
-          The lookup worked but the result could not be stored — try again in a moment.
+        <Notice tone={ROOF_NOT_SAVED_NOTICE.tone} title={ROOF_NOT_SAVED_NOTICE.title}>
+          {ROOF_NOT_SAVED_NOTICE.body}
         </Notice>
       ) : null}
       {actionError ? (
-        <Notice tone="problem" title={actionError.heading}>
-          {actionError.body}
+        <Notice tone={actionError.notice.tone} title={actionError.notice.title}>
+          {actionError.notice.body}
           {actionError.isAuth ? (
             <>
               {" "}
