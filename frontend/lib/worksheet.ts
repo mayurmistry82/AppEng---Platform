@@ -1081,6 +1081,16 @@ export interface AddressRoofView {
   orientationNotice: RoofNoticeView | null;
   /** F94: totals.kwp to one decimal, the same one-rule rounding as the planes. */
   totalKwpLabel: string | null;
+  /**
+   * 3.4c prompt 3 (step 5): fires when the roof row's selected_panel and the
+   * CURRENT run's run_assumptions panel are BOTH known and are different
+   * products — the table is then describing a layout for a panel the quote is
+   * not built on, and the reader is told so. Null when they match or when
+   * either side is unknown: absence of evidence is never asserted as
+   * agreement. Compared by product id in the logic layer, never in the
+   * component (D25's rule generalised — wording and comparison live here).
+   */
+  panelMismatchNotice: RoofNoticeView | null;
 }
 
 function roofNum(v: unknown): number | null {
@@ -1219,6 +1229,44 @@ function roofOrientationNotice(planes: RoofPlaneView[]): RoofNoticeView | null {
     level: "notice",
     title: `Most of these panels face ${leadWords}`,
     body: `${poorPanels} of the ${total} panels (${share}%) sit on faces pointing into the southern half of the compass, mostly ${leadWords}. In the southern hemisphere that is the low-sun side. Each face's direction and pitch are spelled out in the table.`,
+  };
+}
+
+/**
+ * 3.4c prompt 3 (step 5): the roof table is scaled to the roof row's
+ * selected_panel; the CURRENT run stores the panel the engine actually priced
+ * in run_assumptions.panel (3.13 prompt 4). When both product ids are known
+ * and differ, the table describes a layout the quote is not built on — said
+ * plainly, with both sides named. Null when they match or either is unknown.
+ */
+function roofPanelMismatchNotice(
+  job: unknown,
+  row: Record<string, unknown>,
+  panelLabel: string | null,
+): RoofNoticeView | null {
+  const roofPanel = row.selected_panel;
+  if (typeof roofPanel !== "object" || roofPanel === null) return null;
+  const roofId = (roofPanel as Record<string, unknown>).id;
+  if (typeof roofId !== "string" || !roofId) return null;
+
+  const sizing = currentSizingResult(job);
+  const ra = sizing?.run_assumptions;
+  if (typeof ra !== "object" || ra === null || Array.isArray(ra)) return null;
+  const runPanel = (ra as Record<string, unknown>).panel;
+  if (typeof runPanel !== "object" || runPanel === null) return null;
+  const rp = runPanel as Record<string, unknown>;
+  const runId = rp.id;
+  if (typeof runId !== "string" || !runId) return null;
+
+  if (runId === roofId) return null;
+  const runWatts = roofNum(rp.watts);
+  const tableName = panelLabel ?? "one panel";
+  const runName = runWatts !== null ? `a ${runWatts} W panel` : "a different panel";
+  return {
+    tone: "caution",
+    level: "notice",
+    title: "This table is scaled to a different panel than the quote",
+    body: `The layout above was worked out for ${tableName}, but the current run is priced on ${runName}. The counts and kW in the table describe the ${tableName} layout, not the quoted system — re-run the lookup or the sizing to bring them back together.`,
   };
 }
 
@@ -1439,6 +1487,7 @@ export function addressRoofView(job: unknown): AddressRoofView {
     countReconciliation: null,
     orientationNotice: null,
     totalKwpLabel: null,
+    panelMismatchNotice: null,
   };
 
   const row = latestRoofGeometry(job);
@@ -1521,6 +1570,8 @@ export function addressRoofView(job: unknown): AddressRoofView {
         ? `${bits.join(" ")}${watts !== null ? ` ${watts} W` : ""}`.trim()
         : null;
   }
+
+  view.panelMismatchNotice = roofPanelMismatchNotice(job, row, view.panelLabel);
 
   const reason = typeof row.reason === "string" ? row.reason : null;
   view.note = reason?.startsWith("Manual entry: ")

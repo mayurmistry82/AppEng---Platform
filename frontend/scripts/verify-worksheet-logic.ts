@@ -9968,3 +9968,221 @@ test("F5: the exact final text of both rows for the run 523b9c93 fixture", () =>
     "9.83 usable kilowatt-hours at 6.8 certificates each, $37 per certificate.",
   );
 });
+// ── 3.4c prompt 3: the section RENDERS the truth (F231/F168/F94 on screen) ──
+//
+// These checks render the REAL component with react-dom/server (the 3.6b
+// harness's module hooks are already registered above) and assert the markup
+// that ships — never the style table, never intent (the F47 lesson). The one
+// extra hook: next/navigation is served as a stub module, because useRouter
+// throws outside a Next app-router context and this component calls it.
+
+const ROOF_SECTION_SOURCE = await (async () => {
+  const { readFileSync } = await import("node:fs");
+  const { fileURLToPath } = await import("node:url");
+  const path = await import("node:path");
+  const root = path.dirname(path.dirname(fileURLToPath(import.meta.url)));
+  return readFileSync(
+    path.join(root, "components/worksheet/address-roof-section.tsx"),
+    "utf8",
+  );
+})();
+
+const renderRoofSection = await (async () => {
+  const { registerHooks } = await import("node:module");
+  registerHooks({
+    resolve(specifier, context, nextResolve) {
+      if (specifier === "next/navigation") {
+        return { url: "virtual:next-navigation-stub", shortCircuit: true };
+      }
+      if (specifier === "next/link") {
+        // Bare Node cannot resolve next's "./link" export the way Next's own
+        // bundler does; the stub renders exactly what a static <Link> would.
+        return { url: "virtual:next-link-stub", shortCircuit: true };
+      }
+      return nextResolve(specifier, context);
+    },
+    load(url, context, nextLoad) {
+      if (url === "virtual:next-navigation-stub") {
+        return {
+          format: "module",
+          source:
+            "export function useRouter() { return { refresh() {}, push() {} }; }",
+          shortCircuit: true,
+        };
+      }
+      if (url === "virtual:next-link-stub") {
+        return {
+          format: "module",
+          source:
+            "export default function Link(props) { return props.children ?? null; }",
+          shortCircuit: true,
+        };
+      }
+      return nextLoad(url, context);
+    },
+  });
+  const React = (await import("react")).default;
+  const { renderToStaticMarkup } = await import("react-dom/server");
+  const { AddressRoofSection } = await import(
+    "../components/worksheet/address-roof-section.tsx"
+  );
+  return (props: Record<string, unknown>) =>
+    renderToStaticMarkup(React.createElement(AddressRoofSection, props as never));
+})();
+
+/** The rendered markup as readable text — tags out, entities decoded. */
+function roofTextOf(markup: string): string {
+  return decodedMarkup(markup.replace(/<[^>]+>/g, " ")).replace(/\s+/g, " ").trim();
+}
+
+function roofSectionMarkup(row: unknown): string {
+  const job = emptyJob({ roof_geometry: [row] });
+  const view = addressRoofView(job);
+  return renderRoofSection({
+    view,
+    jobId: "job-render",
+    isOpen: true,
+    diagram: roofDiagramView(job),
+  });
+}
+
+test("3.4c-3 (3): the FALSE sentence is gone from the component source", () => {
+  const hits = ROOF_SECTION_SOURCE.match(/uses a different panel/g) ?? [];
+  assert.equal(hits.length, 0, `${hits.length} hits of the deleted sentence`);
+});
+
+test("3.4c-3 (4): the three real roofs each render their OWN true explanation", () => {
+  for (const [name, row] of [
+    ["a57e13f1 (26 vs 21)", A57_ROW],
+    ["670c80db (27 vs 28)", BISHOPS_ROW],
+    ["456e0242 (no layout)", FROME_ROW],
+  ] as const) {
+    const view = viewFor(row);
+    const explanation = view.countReconciliation?.explanation;
+    assert.ok(explanation, `${name} has an explanation`);
+    const text = roofTextOf(roofSectionMarkup(row));
+    console.log(`        [${name}] rendered: ${explanation}`);
+    assert.ok(text.includes(explanation), `${name} renders its explanation`);
+    assert.ok(!text.includes("uses a different panel"), name);
+    assert.ok(!/panel size/i.test(explanation), name);
+  }
+});
+
+test("3.4c-3 (5): the SHIPPED panel rectangles carry no stroke-dasharray; adjacent faces still differ", () => {
+  const diagram = {
+    show: true,
+    tileLat: -34.92,
+    tileLng: 138.62,
+    zoom: 20,
+    buildingBox: { x: 10, y: 10, width: 100, height: 80 },
+    rects: [0, 1, 2, 3].map((i) => ({
+      cx: 60 + i * 40,
+      cy: 60,
+      widthPx: 20,
+      heightPx: 12,
+      rotationDeg: 0,
+      segmentIndex: i,
+    })),
+    reason: null,
+    panelCount: 4,
+    panelWidthM: 1.13,
+    panelHeightM: 1.76,
+    panelCapacityW: 440,
+  };
+  const markup = renderRoofSection({
+    view: viewFor(A57_ROW),
+    jobId: "job-render",
+    isOpen: true,
+    diagram,
+  });
+  // The PANEL rects are the ones inside a <g transform=...> wrapper.
+  const panelRects = [...markup.matchAll(/<g transform="[^"]*"><rect ([^>]*?)\/?>/g)].map(
+    (m) => m[1],
+  );
+  assert.equal(panelRects.length, 4, markup.slice(0, 400));
+  for (const attrs of panelRects) {
+    assert.ok(!attrs.includes("stroke-dasharray"), attrs);
+  }
+  const opacities = panelRects.map((a) => /fill-opacity="([^"]+)"/.exec(a)?.[1]);
+  console.log(`        fill-opacity by segment: ${opacities.join(", ")}`);
+  assert.equal(new Set(opacities).size, 4, "all four face styles distinct");
+  for (let i = 0; i < 4; i++) {
+    assert.notEqual(opacities[i], opacities[(i + 1) % 4], `faces ${i}/${(i + 1) % 4}`);
+  }
+  // The building box KEEPS its dashes — it means extent, and the caption says so.
+  assert.ok(/stroke-dasharray="6 4"/.test(markup), "building box dashes stay");
+  // The honest two-imagery caveat survives the deletion.
+  assert.ok(roofTextOf(markup).includes("different supplier"), "the true caveat stays");
+});
+
+test("3.4c-3 (1): provenance, orientation words and rounded labels are ON SCREEN", () => {
+  const text = roofTextOf(
+    renderRoofSection({ view: viewFor(A57_ROW), jobId: "job-render", isOpen: false }),
+  );
+  assert.ok(text.includes("from Google's panel layout"), text.slice(0, 200));
+  assert.ok(text.includes("estimated from roof area — Google placed none here"));
+  assert.ok(text.includes("faces west-north-west, 23 degree pitch"));
+  assert.ok(text.includes("about 8 m²")); // area-counted face: approximate, whole metres
+  assert.ok(text.includes("19 m²")); // Google-laid-out face: whole metres, no "about"
+  assert.ok(text.includes("3.5 kW")); // one decimal
+  assert.ok(text.includes("11.4 kW")); // the total, one decimal
+  assert.ok(!text.includes("11.44"), "the raw two-decimal total no longer prints");
+});
+
+test("3.4c-3 (6): totality — junk view, no azimuth, no reconciliation: renders, never throws", () => {
+  assert.doesNotThrow(() =>
+    renderRoofSection({ view: addressRoofView(null), jobId: "j", isOpen: true }),
+  );
+  assert.doesNotThrow(() =>
+    renderRoofSection({ view: addressRoofView("garbage"), jobId: "j", isOpen: true }),
+  );
+  const noAzimuth = viewFor(roofRow({ planes: [{ pitch: 20, panel_count: 3 }] }));
+  const markup = renderRoofSection({ view: noAzimuth, jobId: "j", isOpen: false });
+  assert.ok(roofTextOf(markup).includes("20 degree pitch")); // pitch alone, never a blank-as-zero
+});
+
+test("3.4c-3 (step 5): the panel the table was scaled to vs the panel the run priced", () => {
+  const SELECTED = { id: "panel-a", brand: "Jinko", model: "Tiger Neo", watts: 440 };
+  const run = (panel: unknown) => ({
+    sizing_result_id: "s1",
+    created_at: "2026-08-25T00:00:00Z",
+    run_assumptions: { panel },
+  });
+  const jobFor = (panel: unknown) =>
+    emptyJob({
+      roof_geometry: [roofRow({ selected_panel: SELECTED })],
+      sizing_results: [run(panel)],
+    });
+
+  const mismatch = addressRoofView(jobFor({ id: "panel-b", watts: 475 }));
+  assert.ok(mismatch.panelMismatchNotice);
+  assert.equal(mismatch.panelMismatchNotice.level, "notice");
+  assert.ok(
+    mismatch.panelMismatchNotice.body.includes("Jinko Tiger Neo 440 W"),
+    mismatch.panelMismatchNotice.body,
+  );
+  assert.ok(
+    mismatch.panelMismatchNotice.body.includes("475 W"),
+    mismatch.panelMismatchNotice.body,
+  );
+  // And it renders, from the view, wording untouched by the component.
+  const markup = renderRoofSection({ view: mismatch, jobId: "j", isOpen: false });
+  assert.ok(roofTextOf(markup).includes("scaled to a different panel than the quote"));
+
+  // Same product -> silent. Unknown either side -> silent, never asserted equal.
+  assert.equal(addressRoofView(jobFor({ id: "panel-a", watts: 440 })).panelMismatchNotice, null);
+  assert.equal(addressRoofView(jobFor({ watts: 475 })).panelMismatchNotice, null);
+  assert.equal(addressRoofView(jobFor(null)).panelMismatchNotice, null);
+  assert.equal(
+    addressRoofView(
+      emptyJob({ roof_geometry: [roofRow({ selected_panel: SELECTED })] }),
+    ).panelMismatchNotice,
+    null,
+  );
+  assert.equal(
+    addressRoofView(
+      emptyJob({ roof_geometry: [roofRow()], sizing_results: [run({ id: "x" })] }),
+    ).panelMismatchNotice,
+    null,
+  );
+});

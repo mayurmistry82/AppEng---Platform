@@ -120,18 +120,20 @@ const DIAGRAM_REASON_COPY: Record<RoofDiagramReason, string> = {
 };
 
 /**
- * Per-face styling, cycled by Google's segment index — fill-opacity steps far
- * apart plus a dash-pattern change, so adjacent faces read as different at a
- * glance. Style only, zero new colour tokens — the count stays 83.
+ * Per-face styling, cycled by Google's segment index — FILL-OPACITY ONLY
+ * (3.4c prompt 3). The old cycle crossed two fills with dash patterns, and
+ * DASHED CONVENTIONALLY MEANS PROVISIONAL — on a tool whose claim is accuracy
+ * it implied we were less sure about those panels when all it encoded was a
+ * different face. Four opacity steps, consecutive steps far apart, so
+ * adjacent faces still read as different at a glance while the distinction
+ * carries no confidence meaning. The dashed BUILDING BOX below is untouched:
+ * it means extent, and the caption says so. Zero new colour tokens.
  */
-const FACE_STYLES: readonly {
-  fillOpacity: number;
-  strokeDasharray?: string;
-}[] = [
-  { fillOpacity: 0.6 },
-  { fillOpacity: 0.25 },
-  { fillOpacity: 0.6, strokeDasharray: "4 2" },
-  { fillOpacity: 0.25, strokeDasharray: "4 2" },
+const FACE_STYLES: readonly { fillOpacity: number }[] = [
+  { fillOpacity: 0.65 },
+  { fillOpacity: 0.3 },
+  { fillOpacity: 0.5 },
+  { fillOpacity: 0.15 },
 ];
 
 function fmtMetres(value: number | null): string {
@@ -373,9 +375,21 @@ export function AddressRoofSection({
             {view.planes.map((plane) => (
               <TableRow key={plane.index}>
                 <TableCell className="text-body text-foreground">
-                  {plane.azimuthLabel !== null && plane.azimuth !== null
-                    ? `${plane.azimuthLabel} (${fmt(plane.azimuth, 0, "°")})`
-                    : "—"}
+                  {/* F168: the direction spelled out, verbatim from the view —
+                      never composed here. The degrees stay for the installer
+                      who thinks in numbers. */}
+                  {plane.orientationLabel !== null ? (
+                    <>
+                      {plane.orientationLabel}
+                      {plane.azimuth !== null ? (
+                        <span className="ml-1 text-caption text-muted-foreground">
+                          ({fmt(plane.azimuth, 0, "°")})
+                        </span>
+                      ) : null}
+                    </>
+                  ) : (
+                    "—"
+                  )}
                   {plane.label ? (
                     <span className="ml-1 text-caption text-muted-foreground">
                       {plane.label}
@@ -383,12 +397,28 @@ export function AddressRoofSection({
                   ) : null}
                 </TableCell>
                 <TableCell className="metric-sm">{fmt(plane.pitch, 0, "°")}</TableCell>
-                <TableCell className="metric-sm">{fmt(plane.areaM2, 1, " m²")}</TableCell>
+                {/* F94: the view's rounded labels, never raw numbers — the raw
+                    values stay on the view for 4.13 and any future tooltip. */}
+                <TableCell className="metric-sm">{plane.areaM2Label ?? "—"}</TableCell>
                 <TableCell className="metric-sm">
-                  {fmt(plane.usableAreaM2, 1, " m²")}
+                  {plane.usableAreaM2Label ?? "—"}
                 </TableCell>
-                <TableCell className="metric-sm">{fmt(plane.panelCount, 0)}</TableCell>
-                <TableCell className="metric-sm">{fmt(plane.kwp, 2)}</TableCell>
+                <TableCell
+                  className={
+                    plane.countSource === "roof_area"
+                      ? "metric-sm text-muted-foreground"
+                      : "metric-sm"
+                  }
+                >
+                  {fmt(plane.panelCount, 0)}
+                  {/* F231: where this face's number came from, in the view's
+                      own words — an area-counted face is a different KIND of
+                      number and must look like one. */}
+                  <span className="block text-caption text-muted-foreground">
+                    {plane.countSourceLabel}
+                  </span>
+                </TableCell>
+                <TableCell className="metric-sm">{plane.kwpLabel ?? "—"}</TableCell>
               </TableRow>
             ))}
             <TableRow className="hover:bg-transparent">
@@ -396,7 +426,9 @@ export function AddressRoofSection({
                 Total
               </TableCell>
               <TableCell className="metric-sm">{view.totals.panels}</TableCell>
-              <TableCell className="metric-sm">{fmt(view.totals.kwp, 2)}</TableCell>
+              <TableCell className="metric-sm">
+                {view.totalKwpLabel ?? fmt(view.totals.kwp, 2)}
+              </TableCell>
             </TableRow>
           </TableBody>
         </Table>
@@ -408,6 +440,18 @@ export function AddressRoofSection({
               ? `${Math.round(view.usabilityFactor * 100)}% of each face treated as usable`
               : null}
           </p>
+        ) : null}
+        {/* Step 5 (3.4c prompt 3): the comparison and its wording live in
+            lib/worksheet.ts; this component only renders the result. */}
+        {view.panelMismatchNotice ? (
+          <div className="mt-2">
+            <Notice
+              tone={view.panelMismatchNotice.tone}
+              title={view.panelMismatchNotice.title}
+            >
+              {view.panelMismatchNotice.body}
+            </Notice>
+          </div>
         ) : null}
       </div>
     ) : null;
@@ -474,7 +518,6 @@ export function AddressRoofSection({
                   height={r.heightPx - 2 * inset}
                   className="fill-primary stroke-primary"
                   fillOpacity={style.fillOpacity}
-                  strokeDasharray={style.strokeDasharray}
                   strokeOpacity={1}
                   strokeWidth={1}
                 />
@@ -524,9 +567,7 @@ export function AddressRoofSection({
                 .
                 {diagram.buildingBox
                   ? " The dashed box is the extent of the area Google measured."
-                  : null}{" "}
-                The recommended system in the table above uses a different
-                panel.
+                  : null}
               </>
             ) : (
               <>
@@ -536,6 +577,19 @@ export function AddressRoofSection({
                   : null}
               </>
             )}
+          </p>
+        ) : null}
+        {/* F231: the TRUE account of any gap between Google's count and the
+            table's, assembled face-by-face in lib/worksheet.ts. It replaces
+            the deleted different-panel sentence, which was FALSE on
+            a57e13f1 — the two agree on every face Google assessed there, and
+            a plausible wrong cause stops the reader looking. Rendered for
+            LOOKUP roofs only: on a manual roof there is no Google side to
+            reconcile against. */}
+        {(view.state === "found" || view.state === "low_confidence") &&
+        view.countReconciliation?.explanation ? (
+          <p className="mt-1 text-caption text-muted-foreground">
+            {view.countReconciliation.explanation}
           </p>
         ) : null}
         {diagramActive && diagram.reason === null ? (
