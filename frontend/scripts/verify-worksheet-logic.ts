@@ -1013,6 +1013,247 @@ const FROME_ROW = {
 const viewFor = (row: unknown) =>
   addressRoofView(emptyJob({ roof_geometry: [row] }));
 
+// ── Per-face provenance + reconciliation (3.4c prompt 2, F231/F168/F94) ─────
+// Fixtures shaped from the LIVE rows, read 2026-08-25.
+
+/** a57e13f1's newest roof (e34f61dc): ours [3,8,2,8,2,3] vs Google [null,8,null,8,2,3]. */
+const A57_ROW = {
+  created_at: "2026-08-20T01:00:00Z",
+  found: true,
+  source: "google_solar",
+  google_max_array_panels_count: 21,
+  planes: [
+    { azimuth: 300.4, pitch: 23.1, area_m2: 11.1, usable_area_m2: 7.8, panel_count: 3, kwp: 1.32, google_panel_count: null },
+    { azimuth: 113.5, pitch: 5.6, area_m2: 27.1, usable_area_m2: 19.0, panel_count: 8, kwp: 3.52, google_panel_count: 8 },
+    { azimuth: 131.3, pitch: 27.5, area_m2: 7.2, usable_area_m2: 5.04, panel_count: 2, kwp: 0.88, google_panel_count: null },
+    { azimuth: 302.2, pitch: 29.2, area_m2: 24.7, usable_area_m2: 17.28, panel_count: 8, kwp: 3.52, google_panel_count: 8 },
+    { azimuth: 120.2, pitch: 29.3, area_m2: 10.7, usable_area_m2: 7.5, panel_count: 2, kwp: 0.88, google_panel_count: 2 },
+    { azimuth: 51.0, pitch: 8.2, area_m2: 14.5, usable_area_m2: 10.12, panel_count: 3, kwp: 1.32, google_panel_count: 3 },
+  ],
+};
+
+/** 670c80db's newest roof (74f3d9e2): ours 27 vs Google 28, all four faces assessed. */
+const BISHOPS_ROW = {
+  created_at: "2026-08-17T01:00:00Z",
+  found: true,
+  source: "google_solar",
+  google_max_array_panels_count: 28,
+  planes: [
+    { azimuth: 211.5, pitch: 39.3, area_m2: 38.41, usable_area_m2: 26.89, panel_count: 13, kwp: 5.72, google_panel_count: 14 },
+    { azimuth: 134.8, pitch: 25.9, area_m2: 12.64, usable_area_m2: 8.85, panel_count: 3, kwp: 1.32, google_panel_count: 3 },
+    { azimuth: 31.7, pitch: 21.9, area_m2: 30.3, usable_area_m2: 21.21, panel_count: 9, kwp: 3.96, google_panel_count: 9 },
+    { azimuth: 27.8, pitch: 34.9, area_m2: 11.92, usable_area_m2: 8.34, panel_count: 2, kwp: 0.88, google_panel_count: 2 },
+  ],
+};
+
+test("F231 (a) a57e13f1: assessed faces agree; the five extra panels come from the two unassessed faces", () => {
+  const view = viewFor(A57_ROW);
+  assert.deepEqual(
+    view.planes.map((p) => p.countSource),
+    ["roof_area", "google_layout", "roof_area", "google_layout", "google_layout", "google_layout"],
+  );
+  assert.deepEqual(
+    view.planes.map((p) => p.googlePanelCount),
+    [null, 8, null, 8, 2, 3],
+  );
+  const rec = view.countReconciliation;
+  assert.ok(rec);
+  assert.equal(rec.tableTotal, 26);
+  assert.equal(rec.googleTotal, 21);
+  assert.equal(rec.googleTotalStored, 21); // stored and summed agree on this roof
+  assert.equal(rec.facesGoogleAssessed, 4);
+  assert.equal(rec.facesFromAreaAlone, 2);
+  assert.equal(rec.panelsFromAreaAlone, 5);
+  assert.equal(rec.agreeOnAssessedFaces, true);
+  assert.ok(rec.explanation);
+  // Names the two unassessed faces, by number and direction.
+  assert.ok(rec.explanation.includes("face 1 (west-north-west)"), rec.explanation);
+  assert.ok(rec.explanation.includes("face 3 (south-east)"), rec.explanation);
+  assert.ok(rec.explanation.includes("5 of the 26 panels"), rec.explanation);
+  // NEVER the false cause. Panel size explains none of the count gap here.
+  assert.ok(!/different panel|panel size/i.test(rec.explanation), rec.explanation);
+  // 12 of 26 southerly panels is no majority — the orientation caution stays quiet.
+  assert.equal(view.orientationNotice, null);
+});
+
+test("F231 (b) 670c80db: the two disagree where both looked — said plainly, no invented cause", () => {
+  const view = viewFor(BISHOPS_ROW);
+  const rec = view.countReconciliation;
+  assert.ok(rec);
+  assert.equal(rec.tableTotal, 27);
+  assert.equal(rec.googleTotal, 28);
+  assert.equal(rec.googleTotalStored, 28);
+  assert.equal(rec.facesFromAreaAlone, 0);
+  assert.equal(rec.agreeOnAssessedFaces, false);
+  assert.ok(rec.explanation);
+  assert.ok(/disagree/.test(rec.explanation), rec.explanation);
+  assert.ok(rec.explanation.includes("27"), rec.explanation);
+  assert.ok(rec.explanation.includes("28"), rec.explanation);
+  assert.ok(!/different panel|panel size/i.test(rec.explanation), rec.explanation);
+});
+
+test("F231 (c) 456e0242 (the Frome row): no layout at all — every face reads roof_area", () => {
+  const view = viewFor(FROME_ROW);
+  assert.deepEqual(view.planes.map((p) => p.countSource), ["roof_area", "roof_area"]);
+  for (const p of view.planes) {
+    assert.equal(p.countSourceLabel, "estimated from roof area — Google placed none here");
+  }
+  const rec = view.countReconciliation;
+  assert.ok(rec);
+  assert.equal(rec.facesGoogleAssessed, 0);
+  assert.equal(rec.googleTotalStored, null);
+  assert.ok(rec.explanation);
+  assert.ok(rec.explanation.includes("no panel layout"), rec.explanation);
+  assert.ok(!/different panel|panel size/i.test(rec.explanation), rec.explanation);
+});
+
+test("F231: the MEASURED zero — google_panel_count 0 is google_layout, never roof_area", () => {
+  // A falsy check instead of a null check flips exactly this case, and it is
+  // the difference between "Google looked and nothing fits" and "nobody looked".
+  const view = viewFor(
+    roofRow({
+      planes: [
+        { azimuth: 10, pitch: 20, area_m2: 10, usable_area_m2: 7, panel_count: 0, kwp: 0, google_panel_count: 0 },
+        { azimuth: 200, pitch: 20, area_m2: 30, usable_area_m2: 21, panel_count: 9, kwp: 3.96, google_panel_count: null },
+      ],
+    }),
+  );
+  assert.equal(view.planes[0].countSource, "google_layout");
+  assert.equal(view.planes[0].countSourceLabel, "from Google's panel layout");
+  assert.equal(view.planes[1].countSource, "roof_area");
+  // An unusable google_panel_count is not a number Google gave us — roof_area.
+  const junk = viewFor(
+    roofRow({ planes: [{ azimuth: 10, pitch: 20, panel_count: 3, google_panel_count: unsafe<number>("3") }] }),
+  );
+  assert.equal(junk.planes[0].countSource, "roof_area");
+});
+
+test("F231: agreement across the board says so", () => {
+  const view = viewFor(
+    roofRow({
+      google_max_array_panels_count: 17,
+      planes: [{ azimuth: 0, pitch: 22, area_m2: 50, usable_area_m2: 35, panel_count: 17, kwp: 7.48, google_panel_count: 17 }],
+    }),
+  );
+  const rec = view.countReconciliation;
+  assert.ok(rec);
+  assert.equal(rec.agreeOnAssessedFaces, true);
+  assert.equal(rec.panelsFromAreaAlone, 0);
+  assert.ok(rec.explanation);
+  assert.ok(rec.explanation.includes("agree on every face"), rec.explanation);
+});
+
+test("F231: stored Google total disagreeing with the per-face sum is reported, not chosen from", () => {
+  const view = viewFor(
+    roofRow({
+      google_max_array_panels_count: 19,
+      planes: [{ azimuth: 0, pitch: 22, panel_count: 17, kwp: 7.48, google_panel_count: 17 }],
+    }),
+  );
+  const rec = view.countReconciliation;
+  assert.ok(rec);
+  assert.equal(rec.googleTotal, 17);
+  assert.equal(rec.googleTotalStored, 19);
+  assert.ok(rec.explanation);
+  assert.ok(rec.explanation.includes("19"), rec.explanation);
+  assert.ok(rec.explanation.includes("17"), rec.explanation);
+});
+
+test("F168: orientationLabel — direction and pitch in plain words, degrading to each alone", () => {
+  const view = viewFor(
+    roofRow({
+      planes: [
+        { azimuth: 158, pitch: 23.4, panel_count: 5, kwp: 2.2 },
+        { azimuth: null, pitch: 20, panel_count: 2, kwp: 0.88 },
+        { azimuth: 0, panel_count: 2, kwp: 0.88 },
+        { panel_count: 1, kwp: 0.44 },
+      ],
+    }),
+  );
+  assert.equal(view.planes[0].orientationLabel, "faces south-south-east, 23 degree pitch");
+  assert.equal(view.planes[1].orientationLabel, "20 degree pitch");
+  assert.equal(view.planes[2].orientationLabel, "faces north");
+  assert.equal(view.planes[3].orientationLabel, null);
+});
+
+test("F168: the orientation caution fires on the 173-degree roof and names direction and share", () => {
+  const view = viewFor(FROME_ROW); // all 23 panels at azimuth 173.1
+  assert.ok(view.orientationNotice);
+  assert.equal(view.orientationNotice.tone, "caution");
+  assert.equal(view.orientationNotice.level, "notice"); // D25: job-specific, a finding
+  assert.ok(view.orientationNotice.title.includes("south"), view.orientationNotice.title);
+  assert.ok(view.orientationNotice.body.includes("23 of the 23"), view.orientationNotice.body);
+  assert.ok(view.orientationNotice.body.includes("100%"), view.orientationNotice.body);
+  // And on the real Bishops Pl roof: 16 of 27 southerly, mostly the 13-panel SSW face.
+  const bishops = viewFor(BISHOPS_ROW);
+  assert.ok(bishops.orientationNotice);
+  assert.equal(bishops.orientationNotice.title, "Most of these panels face south-south-west");
+  assert.ok(bishops.orientationNotice.body.includes("16 of the 27"), bishops.orientationNotice.body);
+  assert.ok(bishops.orientationNotice.body.includes("59%"), bishops.orientationNotice.body);
+});
+
+test("F168: the caution does NOT fire north-facing, at exactly half, or with no panels", () => {
+  assert.equal(viewFor(roofRow()).orientationNotice, null); // 17 panels at azimuth 0
+  const half = viewFor(
+    roofRow({
+      planes: [
+        { azimuth: 180, pitch: 20, panel_count: 5, kwp: 2.2 },
+        { azimuth: 0, pitch: 20, panel_count: 5, kwp: 2.2 },
+      ],
+    }),
+  );
+  assert.equal(half.orientationNotice, null); // strict majority, never half
+  // Due east and west sit on the boundary — no southerly component, no caution.
+  const eastWest = viewFor(
+    roofRow({
+      planes: [
+        { azimuth: 90, pitch: 20, panel_count: 5, kwp: 2.2 },
+        { azimuth: 270, pitch: 20, panel_count: 5, kwp: 2.2 },
+      ],
+    }),
+  );
+  assert.equal(eastWest.orientationNotice, null);
+  assert.equal(viewFor(roofRow({ planes: [] })).orientationNotice, null);
+});
+
+test("F94: rounded strings emitted beside the raw numbers, which stay unrounded", () => {
+  const frome = viewFor(FROME_ROW);
+  // roof_area face: area coarser still — said as approximate, whole metres.
+  assert.equal(frome.planes[1].usableAreaM2Label, "about 48 m²");
+  assert.equal(frome.planes[1].areaM2Label, "about 68 m²");
+  assert.equal(frome.planes[1].usableAreaM2, 47.82); // raw, untouched
+  assert.equal(frome.planes[1].kwpLabel, "10.1 kW"); // one decimal, never two
+  assert.equal(frome.planes[1].kwp, 10.12); // raw, untouched
+  assert.equal(frome.totalKwpLabel, "10.1 kW");
+  assert.equal(frome.totals.kwp, 10.12); // raw total, untouched
+  const a57 = viewFor(A57_ROW);
+  // google_layout face: whole metres, no "about".
+  assert.equal(a57.planes[1].usableAreaM2Label, "19 m²");
+  assert.equal(a57.planes[1].kwpLabel, "3.5 kW");
+  assert.equal(a57.totalKwpLabel, "11.4 kW"); // 11.44 raw
+  assert.equal(a57.totals.kwp, 11.44);
+});
+
+test("3.4c prompt 2: totality — junk in, fields out, nothing invented, nothing thrown", () => {
+  assert.equal(addressRoofView(null).countReconciliation, null);
+  assert.equal(addressRoofView(null).orientationNotice, null);
+  assert.equal(addressRoofView(null).totalKwpLabel, null);
+  assert.equal(addressRoofView(unsafe<object>("garbage")).countReconciliation, null);
+  // A row with planes as a string: a reconciliation object exists (there IS a
+  // roof row) but explains nothing and invents nothing.
+  const junkPlanes = viewFor(roofRow({ planes: "not-a-list" }));
+  assert.ok(junkPlanes.countReconciliation);
+  assert.equal(junkPlanes.countReconciliation.tableTotal, 0);
+  assert.equal(junkPlanes.countReconciliation.explanation, null);
+  assert.equal(junkPlanes.orientationNotice, null);
+  const bare = viewFor(roofRow({ planes: [{}] }));
+  assert.equal(bare.planes[0].countSource, "roof_area");
+  assert.equal(bare.planes[0].orientationLabel, null);
+  assert.equal(bare.planes[0].areaM2Label, null);
+  assert.equal(bare.planes[0].kwpLabel, null);
+  assert.doesNotThrow(() => JSON.stringify(viewFor(A57_ROW)));
+});
+
 test("confidenceNotices: both causes render, in the stated order", () => {
   const view = viewFor(FROME_ROW);
   assert.equal(view.confidenceNotices.length, 2);

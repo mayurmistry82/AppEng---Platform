@@ -930,6 +930,18 @@ export function azimuthLabel(deg: unknown): string | null {
   return COMPASS_16[Math.round(normalised / 22.5) % 16];
 }
 
+/**
+ * azimuthLabel's 16 codes spelled out (3.4c prompt 2, F168). Keyed BY the code
+ * so the degrees-to-sector mapping stays azimuthLabel's alone — this is words
+ * for the existing compass's output, never a second compass.
+ */
+const COMPASS_WORDS: Record<string, string> = {
+  N: "north", NNE: "north-north-east", NE: "north-east", ENE: "east-north-east",
+  E: "east", ESE: "east-south-east", SE: "south-east", SSE: "south-south-east",
+  S: "south", SSW: "south-south-west", SW: "south-west", WSW: "west-south-west",
+  W: "west", WNW: "west-north-west", NW: "north-west", NNW: "north-north-west",
+};
+
 export interface RoofPlaneView {
   index: number;
   label: string | null;
@@ -940,6 +952,61 @@ export interface RoofPlaneView {
   usableAreaM2: number | null;
   panelCount: number | null;
   kwp: number | null;
+  /**
+   * 3.4c prompt 2 (F231): Google's OWN per-face count from the stored plane —
+   * a number where Google placed panels (0 is a MEASURED zero: it looked and
+   * nothing fits), null where it returned nothing for the face.
+   */
+  googlePanelCount: number | null;
+  /** Where panelCount came from — decided by googlePanelCount null-vs-number, nothing else. */
+  countSource: "google_layout" | "roof_area";
+  /** The same fact in plain words, for rendering as-is. */
+  countSourceLabel: string;
+  /**
+   * F168: the direction and pitch in plain words, e.g.
+   * "faces south-south-east, 23 degree pitch". Pitch alone when only pitch is
+   * known; null when neither is.
+   */
+  orientationLabel: string | null;
+  /**
+   * F94 rounding, applied in the VIEW so one rule serves every renderer:
+   * areas to whole square metres ("about" when the face's count came from
+   * roof area — coarser input, coarser words), kW to one decimal. The raw
+   * numbers stay in the fields above, unrounded — tooltips and 4.13 need them.
+   */
+  areaM2Label: string | null;
+  usableAreaM2Label: string | null;
+  kwpLabel: string | null;
+}
+
+/**
+ * 3.4c prompt 2 (F231): the roof-level reconciliation of OUR per-face counts
+ * against Google's, built by COMPARING the two — never a fixed sentence. The
+ * caption that blamed "a different panel" was FALSE on a57e13f1 (the two agree
+ * exactly on all four faces Google assessed; every extra panel sits on the two
+ * faces it returned nothing for), so `explanation` is assembled from the
+ * numbers and can only say what they establish.
+ */
+export interface RoofCountReconciliation {
+  /** Sum of the table's per-face panel counts. */
+  tableTotal: number;
+  /** Sum of the non-null per-face google_panel_count values. */
+  googleTotal: number;
+  /**
+   * The row's stored google_max_array_panels_count — may differ from the sum;
+   * both are reported rather than one chosen, and the explanation says when
+   * they disagree.
+   */
+  googleTotalStored: number | null;
+  facesGoogleAssessed: number;
+  facesFromAreaAlone: number;
+  /** How many of tableTotal sit on faces Google returned no layout for. */
+  panelsFromAreaAlone: number;
+  /** Face-by-face agreement where BOTH sides have a number. */
+  agreeOnAssessedFaces: boolean;
+  /** The TRUE reason for any gap, assembled from the fields above. Null only
+   *  when there are no faces to reconcile. */
+  explanation: string | null;
 }
 
 export interface RoofNoticeView {
@@ -1002,10 +1069,157 @@ export interface AddressRoofView {
   /** From PATH_RULES via pathRule() — 3.3b's fields, first consumer. */
   solarMode: PathRule["solarMode"] | null;
   showsExistingArray: boolean;
+  /** 3.4c prompt 2 (F231). Null when there is no roof row. */
+  countReconciliation: RoofCountReconciliation | null;
+  /**
+   * F168: fires when a strict MAJORITY of panels sit on faces pointing into
+   * the southern half of the compass (a bearing strictly between 90° and 270°
+   * — any southerly component; due east/west sit on the boundary and do not
+   * count). It states a FACT about orientation and names the direction and
+   * the share. It does NOT judge the yield — that is row 4.13, deliberately.
+   */
+  orientationNotice: RoofNoticeView | null;
+  /** F94: totals.kwp to one decimal, the same one-rule rounding as the planes. */
+  totalKwpLabel: string | null;
 }
 
 function roofNum(v: unknown): number | null {
   return typeof v === "number" && Number.isFinite(v) ? v : null;
+}
+
+/** F168: compass words + pitch; pitch alone when only pitch is known. */
+function orientationLabelFor(azimuth: number | null, pitch: number | null): string | null {
+  const code = azimuthLabel(azimuth);
+  const words = code !== null ? COMPASS_WORDS[code] ?? null : null;
+  const degrees = pitch !== null ? Math.round(pitch) : null;
+  if (words !== null && degrees !== null) return `faces ${words}, ${degrees} degree pitch`;
+  if (words !== null) return `faces ${words}`;
+  if (degrees !== null) return `${degrees} degree pitch`;
+  return null;
+}
+
+/** F94: whole square metres; "about" when the face's count came from area alone. */
+function roofAreaLabel(
+  area: number | null,
+  source: RoofPlaneView["countSource"],
+): string | null {
+  if (area === null) return null;
+  const whole = Math.round(area);
+  return source === "roof_area" ? `about ${whole} m²` : `${whole} m²`;
+}
+
+/** F94: kW to one decimal — never two. */
+function roofKwLabel(kw: number | null): string | null {
+  return kw === null ? null : `${kw.toFixed(1)} kW`;
+}
+
+/** "a", "a and b", "a, b and c" — for naming faces in the explanation. */
+function joinAnd(items: string[]): string {
+  if (items.length <= 1) return items.join("");
+  return `${items.slice(0, -1).join(", ")} and ${items[items.length - 1]}`;
+}
+
+/**
+ * 3.4c prompt 2 (F231): the reconciliation, computed by comparing the two
+ * counts per face. The explanation is chosen by the DATA and never says
+ * "uses a different panel" — panel size may explain a kW difference, but on
+ * the live evidence it explains none of the count difference, and a plausible
+ * wrong cause is worse than none.
+ */
+function roofCountReconciliation(
+  planes: RoofPlaneView[],
+  row: Record<string, unknown>,
+): RoofCountReconciliation {
+  const tableTotal = planes.reduce((s, p) => s + (p.panelCount ?? 0), 0);
+  const assessed = planes.filter((p) => p.googlePanelCount !== null);
+  const areaFaces = planes.filter((p) => p.googlePanelCount === null);
+  const googleTotal = assessed.reduce((s, p) => s + (p.googlePanelCount ?? 0), 0);
+  const googleTotalStored = roofNum(row.google_max_array_panels_count);
+  const tableOnAssessed = assessed.reduce((s, p) => s + (p.panelCount ?? 0), 0);
+  const panelsFromAreaAlone = tableTotal - tableOnAssessed;
+  const agreeOnAssessedFaces = assessed.every(
+    (p) => (p.panelCount ?? 0) === p.googlePanelCount,
+  );
+
+  const sentences: string[] = [];
+  if (planes.length > 0) {
+    if (assessed.length === 0) {
+      sentences.push(
+        "Google returned no panel layout for this roof, so every panel count is estimated from roof area alone.",
+      );
+    } else {
+      if (!agreeOnAssessedFaces) {
+        sentences.push(
+          `Google's layout and the table disagree on faces both assessed — the table has ${tableOnAssessed} panels on those faces, Google's layout ${googleTotal}.`,
+        );
+      } else if (areaFaces.length > 0) {
+        sentences.push("The faces Google assessed match the table exactly.");
+      }
+      if (areaFaces.length > 0) {
+        const names = areaFaces.map((p) => {
+          const code = azimuthLabel(p.azimuth);
+          const words = code !== null ? COMPASS_WORDS[code] ?? null : null;
+          return words !== null ? `face ${p.index + 1} (${words})` : `face ${p.index + 1}`;
+        });
+        const faces =
+          areaFaces.length === 1 ? "a face" : `${areaFaces.length} faces`;
+        sentences.push(
+          `${panelsFromAreaAlone} of the ${tableTotal} panels sit on ${faces} Google returned no layout for — ${joinAnd(names)} — where the count is estimated from roof area alone.`,
+        );
+      } else if (agreeOnAssessedFaces) {
+        sentences.push("Google's panel layout and the table agree on every face.");
+      }
+    }
+    if (googleTotalStored !== null && googleTotalStored !== googleTotal) {
+      sentences.push(
+        `Google's stored building total is ${googleTotalStored} panels while its per-face layout sums to ${googleTotal} — both are reported rather than one chosen.`,
+      );
+    }
+  }
+  return {
+    tableTotal,
+    googleTotal,
+    googleTotalStored,
+    facesGoogleAssessed: assessed.length,
+    facesFromAreaAlone: areaFaces.length,
+    panelsFromAreaAlone,
+    agreeOnAssessedFaces,
+    explanation: sentences.length > 0 ? sentences.join(" ") : null,
+  };
+}
+
+/**
+ * F168: the orientation caution — a strict majority of panels on southerly
+ * faces (bearing strictly between 90° and 270°). Names the direction and the
+ * share; never judges the yield (row 4.13). D25: it CAN not fire on a job
+ * like this one, so it is a notice, not a caption.
+ */
+function roofOrientationNotice(planes: RoofPlaneView[]): RoofNoticeView | null {
+  const total = planes.reduce((s, p) => s + (p.panelCount ?? 0), 0);
+  if (total <= 0) return null;
+  const poor = planes.filter(
+    (p) => p.azimuth !== null && p.azimuth > 90 && p.azimuth < 270,
+  );
+  const poorPanels = poor.reduce((s, p) => s + (p.panelCount ?? 0), 0);
+  if (poorPanels * 2 <= total) return null; // strict majority, never half
+  let leadWords = "south";
+  let leadCount = -1;
+  for (const p of poor) {
+    const count = p.panelCount ?? 0;
+    const code = azimuthLabel(p.azimuth);
+    const words = code !== null ? COMPASS_WORDS[code] ?? null : null;
+    if (count > leadCount && words !== null) {
+      leadCount = count;
+      leadWords = words;
+    }
+  }
+  const share = Math.round((poorPanels / total) * 100);
+  return {
+    tone: "caution",
+    level: "notice",
+    title: `Most of these panels face ${leadWords}`,
+    body: `${poorPanels} of the ${total} panels (${share}%) sit on faces pointing into the southern half of the compass, mostly ${leadWords}. In the southern hemisphere that is the low-sun side. Each face's direction and pitch are spelled out in the table.`,
+  };
 }
 
 const SOURCE_LABELS: Record<string, string> = {
@@ -1222,6 +1436,9 @@ export function addressRoofView(job: unknown): AddressRoofView {
     confidenceNotices: [],
     solarMode: rule ? rule.solarMode : null,
     showsExistingArray: rule ? rule.showsExistingArray : false,
+    countReconciliation: null,
+    orientationNotice: null,
+    totalKwpLabel: null,
   };
 
   const row = latestRoofGeometry(job);
@@ -1239,22 +1456,45 @@ export function addressRoofView(job: unknown): AddressRoofView {
   let kwp = 0;
   for (const [index, plane] of arr(row.planes).entries()) {
     const azimuth = roofNum(plane.azimuth);
+    const pitch = roofNum(plane.pitch);
+    const areaM2 = roofNum(plane.area_m2);
+    const usableAreaM2 = roofNum(plane.usable_area_m2);
+    // 3.4c prompt 2 (F231): null-vs-number, NEVER falsy — 0 here is Google's
+    // MEASURED zero ("looked, and nothing fits"), which must read
+    // google_layout; only a missing or unusable value means "nobody looked".
+    const googlePanelCount = roofNum(plane.google_panel_count);
+    const countSource: RoofPlaneView["countSource"] =
+      googlePanelCount !== null ? "google_layout" : "roof_area";
+    const kwpValue = roofNum(plane.kwp);
     const planeView: RoofPlaneView = {
       index,
       label: typeof plane.label === "string" && plane.label ? plane.label : null,
       azimuth,
       azimuthLabel: azimuthLabel(azimuth),
-      pitch: roofNum(plane.pitch),
-      areaM2: roofNum(plane.area_m2),
-      usableAreaM2: roofNum(plane.usable_area_m2),
+      pitch,
+      areaM2,
+      usableAreaM2,
       panelCount: roofNum(plane.panel_count),
-      kwp: roofNum(plane.kwp),
+      kwp: kwpValue,
+      googlePanelCount,
+      countSource,
+      countSourceLabel:
+        countSource === "google_layout"
+          ? "from Google's panel layout"
+          : "estimated from roof area — Google placed none here",
+      orientationLabel: orientationLabelFor(azimuth, pitch),
+      areaM2Label: roofAreaLabel(areaM2, countSource),
+      usableAreaM2Label: roofAreaLabel(usableAreaM2, countSource),
+      kwpLabel: roofKwLabel(kwpValue),
     };
     panels += planeView.panelCount ?? 0;
     kwp += planeView.kwp ?? 0;
     view.planes.push(planeView);
   }
   view.totals = { panels, kwp: Math.round(kwp * 1000) / 1000 };
+  view.totalKwpLabel = roofKwLabel(view.totals.kwp);
+  view.countReconciliation = roofCountReconciliation(view.planes, row);
+  view.orientationNotice = roofOrientationNotice(view.planes);
 
   const imageryDate = typeof row.imagery_date === "string" ? row.imagery_date : null;
   view.imageryDate = imageryDate;
