@@ -23,6 +23,7 @@ intentionally treated as unmappable (→ safe default) for sizing purposes.
 
 from __future__ import annotations
 
+from datetime import date, datetime
 from typing import Optional
 
 # ── Defaults ──────────────────────────────────────────────────────────────────
@@ -356,6 +357,116 @@ def battery_rebate_effective_kwh(usable_kwh: Optional[float]) -> float:
         if band > 0:
             eff += band * pct
     return round(eff, 4)
+
+
+
+# ── Dated federal incentive schedules (3.13b prompt 1 — F224) ─────────────────
+# The battery certificate factor and the solar deeming period are LEGISLATED,
+# DATED schedules. The schedule here is the FACT; the copy in cost_assumptions
+# is only a copy (D26 applied to policy — cost_model compares the two and
+# flags a disagreement, but the arithmetic reads THIS table; 2R.1 deletes the
+# second copy rather than gating both). Entries are (valid_from, valid_to,
+# value, source, verified_on) with ISO dates, inclusive at BOTH ends, and
+# cover ONLY the periods actually verified against the Clean Energy
+# Regulator. Anything outside them resolves to UNKNOWN — never the nearest
+# period, never an extrapolation. A guessed rate moves the error, not fixes
+# it: an unknown rate is NOT quoted, it is reported as unknown.
+
+CER_SOLAR_BATTERIES_URL: str = (
+    "https://cer.gov.au/schemes/renewable-energy-target/"
+    "small-scale-renewable-energy-scheme/small-scale-renewable-energy-systems/"
+    "solar-batteries"
+)
+CER_STC_CALCULATOR_URL: str = (
+    "https://cer.gov.au/schemes/renewable-energy-target/"
+    "small-scale-renewable-energy-scheme/small-scale-technology-certificates/"
+    "calculate-small-scale-technology-certificate-entitlements"
+)
+
+# Battery STC factor (certificates per usable kWh) — steps every SIX months
+# in 2026: 8.4 for Jan–Apr, 6.8 for May–Dec. Verified 2026-08-25 against the
+# CER solar-batteries page. 2027 is NOT listed: it has not been verified, so
+# it must resolve to UNKNOWN, not to a guess.
+BATTERY_STC_FACTOR_PERIODS: list[tuple[str, str, float, str, str]] = [
+    ("2026-01-01", "2026-04-30", 8.4, CER_SOLAR_BATTERIES_URL, "2026-08-25"),
+    ("2026-05-01", "2026-12-31", 6.8, CER_SOLAR_BATTERIES_URL, "2026-08-25"),
+]
+
+# Solar STC deeming period (years) by INSTALL YEAR: 5 years for a 2026
+# install. 2027 falls to 4 years but is NOT listed for the same reason.
+SOLAR_DEEMING_YEARS_PERIODS: list[tuple[str, str, int, str, str]] = [
+    ("2026-01-01", "2026-12-31", 5, CER_STC_CALCULATOR_URL, "2026-08-25"),
+]
+
+
+def _resolve_schedule(periods: list[tuple], as_at: object, what: str) -> dict:
+    """Resolve a dated schedule at `as_at`. Fixed shape, NEVER raises.
+
+    A datetime is accepted and truncated to its date. Anything else that is
+    not a date — None, a string, a number — resolves to UNKNOWN with a
+    plain-English reason naming the last known period, as does any date
+    outside every listed period. The nearest period is NEVER used and nothing
+    is extrapolated.
+
+    Returns: {"value": float|int|None, "is_known": bool, "valid_from":
+    str|None, "valid_to": str|None, "source": str|None, "verified_on":
+    str|None, "reason": str|None}.
+    """
+    if isinstance(as_at, datetime):
+        as_at = as_at.date()
+    unknown: dict = {
+        "value": None, "is_known": False, "valid_from": None,
+        "valid_to": None, "source": None, "verified_on": None, "reason": None,
+    }
+    if not periods:
+        unknown["reason"] = f"No {what} periods are on record at all."
+        return unknown
+    last = periods[-1]
+    if not isinstance(as_at, date):
+        unknown["reason"] = (
+            f"as_at is not a date ({type(as_at).__name__}), so the {what} "
+            f"cannot be resolved; the last known period is {last[0]} to "
+            f"{last[1]} at {last[2]}."
+        )
+        return unknown
+    for valid_from, valid_to, value, source, verified_on in periods:
+        try:
+            if date.fromisoformat(valid_from) <= as_at <= date.fromisoformat(valid_to):
+                return {
+                    "value": value, "is_known": True, "valid_from": valid_from,
+                    "valid_to": valid_to, "source": source,
+                    "verified_on": verified_on, "reason": None,
+                }
+        except (TypeError, ValueError):  # a malformed period entry — skip it
+            continue
+    unknown["reason"] = (
+        f"No {what} is on record for {as_at.isoformat()}; the last known "
+        f"period is {last[0]} to {last[1]} at {last[2]}. The rate is not "
+        f"extrapolated, and an unknown rate is not quoted."
+    )
+    return unknown
+
+
+def get_battery_stc_factor(as_at: date) -> dict:
+    """Battery STC factor (certificates per usable kWh) legislated at `as_at`.
+
+    Resolved against BATTERY_STC_FACTOR_PERIODS only — is_known False with a
+    plain-English reason outside every verified period. Never raises.
+    """
+    return _resolve_schedule(
+        BATTERY_STC_FACTOR_PERIODS, as_at,
+        "battery STC factor (certificates per kWh)")
+
+
+def get_solar_deeming_years(as_at: date) -> dict:
+    """Solar STC deeming period (years) for an install at `as_at`.
+
+    Resolved against SOLAR_DEEMING_YEARS_PERIODS only — is_known False with a
+    plain-English reason outside every verified period. Never raises.
+    """
+    return _resolve_schedule(
+        SOLAR_DEEMING_YEARS_PERIODS, as_at,
+        "solar STC deeming period (years)")
 
 
 # ── Time base (3.7 Part A) ────────────────────────────────────────────────────

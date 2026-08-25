@@ -10,11 +10,24 @@ compute_system_cost(...) returns an itemised line-item breakdown:
   − battery_rebate  (computed Cheaper Home Batteries STCs)
   = net_cost
 
-Value authority: docs/2026-06-11-cost-model-pricing.md. Soft-cost + policy params come from
+Value authority: docs/2026-06-11-cost-model-pricing.md. Soft-cost params come from
 the `cost_assumptions` config table; `installer_profiles` overrides win. All prices are
 INDICATIVE and installer-overridable — `assumptions_used` + `flags` are returned so the
 breakdown is transparent. Standalone for now (NOT wired into sizing_engine/financial_model;
 they consume this later).
+
+3.13b (F224): the two POLICY params — the solar deeming period and the battery
+STC factor — are resolved from the DATED schedules in nem_data against the
+quote date (`as_at`), NOT from cost_assumptions. The legislated schedule is
+the fact; the config row is a copy, still read solely so a disagreement can
+be flagged (D26 applied to policy; 2R.1 — delete the second copy from the
+arithmetic rather than gate two of them). When a schedule does not know the
+rate for `as_at`, that deduction is NOT taken: its line item keeps its name,
+carries a plain-English reason and amount_aud None (the existing null-amount
+convention — the results panel renders it "installer to confirm" and reports
+that the lines do not sum), and net_cost excludes it. Never a stale rate,
+never a silent zero. stc_price_net is a MARKET price, not a legislated one —
+it stays in cost_assumptions.
 
 Best-effort reads — never raises. If Supabase or a row is unavailable, documented defaults
 are used and a flag is added. A NULL catalogue price falls back to the §1 tier $/W band for
@@ -26,7 +39,9 @@ from __future__ import annotations
 
 import math
 import os
+from datetime import date, datetime
 from typing import Any, Optional
+from zoneinfo import ZoneInfo
 
 import nem_data
 
@@ -37,6 +52,8 @@ except Exception:  # pragma: no cover
 
 
 # Documented safe defaults — used only when cost_assumptions is unreachable.
+# deeming_years / battery_stc_per_kwh remain here ONLY as the config-copy
+# stand-ins for the schedule comparison; the arithmetic reads nem_data.
 _DEFAULTS: dict[str, Any] = {
     "solar_install_per_kw": 450.0,
     "battery_install_base": 1500.0,
@@ -48,6 +65,13 @@ _DEFAULTS: dict[str, Any] = {
 # §1 tier $/W fallback bands (supply, GST inc.) for a panel with NULL cost_aud.
 _PANEL_TIER_PER_W: dict[str, float] = {"value": 0.35, "mid": 0.45, "premium": 0.70}
 _PANEL_FALLBACK_PER_W: float = _PANEL_TIER_PER_W["mid"]  # mid-band default
+
+# The quote is written in Adelaide and certificates are assigned on the local
+# calendar — `as_at` defaults to today THERE, not UTC.
+_QUOTE_TZ = "Australia/Adelaide"
+
+# Config staleness threshold (days) beyond which the market-price flag fires.
+_CONFIG_AGE_FLAG_DAYS = 90
 
 _client_cache: Any = None
 _client_ready = False
@@ -80,6 +104,50 @@ def reset_client_cache() -> None:
 
 def _round2(x: Any) -> float:
     return round(float(x), 2)
+
+
+def _as_float(x: Any) -> Optional[float]:
+    try:
+        return float(x)
+    except (TypeError, ValueError):
+        return None
+
+
+def _resolve_as_at(as_at: Any) -> date:
+    """Coerce `as_at` to a date; None / unparseable → today in Australia/Adelaide.
+
+    A datetime is truncated to its date; an ISO string is parsed. Never raises.
+    """
+    if isinstance(as_at, datetime):
+        return as_at.date()
+    if isinstance(as_at, date):
+        return as_at
+    if isinstance(as_at, str):
+        try:
+            return date.fromisoformat(as_at.strip())
+        except ValueError:
+            pass
+    try:
+        return datetime.now(ZoneInfo(_QUOTE_TZ)).date()
+    except Exception:  # tz database unavailable — degrade to system date, never raise
+        return date.today()
+
+
+def _config_age_days(as_at: date, last_verified: Any) -> Optional[int]:
+    """Whole days from the config row's last_verified to `as_at`, or None."""
+    lv: Optional[date] = None
+    if isinstance(last_verified, datetime):
+        lv = last_verified.date()
+    elif isinstance(last_verified, date):
+        lv = last_verified
+    elif isinstance(last_verified, str):
+        try:
+            lv = date.fromisoformat(last_verified.strip()[:10])
+        except ValueError:
+            lv = None
+    if lv is None:
+        return None
+    return (as_at - lv).days
 
 
 def _fetch_one(table: str, id_value: Optional[str], columns: str) -> Optional[dict]:
@@ -171,8 +239,13 @@ def compute_system_cost(
     postcode: Optional[str] = None,
     state: Optional[str] = None,
     installer_id: Optional[str] = None,
+    as_at: Optional[date] = None,
 ) -> dict:
-    """Bottom-up itemised system cost. Never raises; returns a dict (see module docstring)."""
+    """Bottom-up itemised system cost. Never raises; returns a dict (see module docstring).
+
+    `as_at` is the quote date the policy schedules are resolved against;
+    None / unparseable defaults to today in Australia/Adelaide.
+    """
     flags: list[str] = []
     try:
         solar_kw = float(solar_kw or 0)
@@ -183,9 +256,49 @@ def compute_system_cost(
     override = _fetch_installer_override(installer_id) if installer_id else None
     solar_install_per_kw = _pick(override, assumptions, "solar_install_per_kw", flags)
     battery_install_base = _pick(override, assumptions, "battery_install_base", flags)
-    stc_price_net = float(assumptions["stc_price_net"])
-    deeming_years = int(assumptions["deeming_years"])
-    battery_stc_per_kwh = float(assumptions["battery_stc_per_kwh"])
+    stc_price_net = float(assumptions["stc_price_net"])  # MARKET price — stays in config
+
+    # ── 3.13b (F224): resolve the DATED policy schedules for the quote date ──
+    as_at_date = _resolve_as_at(as_at)
+    bat_sched = nem_data.get_battery_stc_factor(as_at_date)
+    deem_sched = nem_data.get_solar_deeming_years(as_at_date)
+    deeming_years: Optional[int] = (
+        int(deem_sched["value"]) if deem_sched["is_known"] else None
+    )
+    battery_stc_per_kwh: Optional[float] = (
+        float(bat_sched["value"]) if bat_sched["is_known"] else None
+    )
+
+    # The config row is still READ, solely so a disagreement can be flagged —
+    # when the schedule knows the value, the schedule wins.
+    cfg_deeming = _as_float(assumptions.get("deeming_years"))
+    cfg_bat_factor = _as_float(assumptions.get("battery_stc_per_kwh"))
+    if (deem_sched["is_known"] and cfg_deeming is not None
+            and abs(cfg_deeming - float(deem_sched["value"])) > 1e-9):
+        flags.append(
+            f"Solar deeming period: the legislated schedule says "
+            f"{deem_sched['value']} years for {as_at_date.isoformat()} but "
+            f"cost_assumptions carries {cfg_deeming:g} — the schedule wins; "
+            f"the config copy is stale."
+        )
+    if (bat_sched["is_known"] and cfg_bat_factor is not None
+            and abs(cfg_bat_factor - float(bat_sched["value"])) > 1e-9):
+        flags.append(
+            f"Battery STC factor: the legislated schedule says "
+            f"{bat_sched['value']} certificates/kWh for "
+            f"{as_at_date.isoformat()} but cost_assumptions carries "
+            f"{cfg_bat_factor:g} — the schedule wins; the config copy is stale."
+        )
+
+    config_age_days = _config_age_days(as_at_date, assumptions.get("last_verified"))
+    if config_age_days is not None and config_age_days > _CONFIG_AGE_FLAG_DAYS:
+        flags.append(
+            f"cost_assumptions was last verified {config_age_days} days "
+            f"before this quote's date ({as_at_date.isoformat()}). "
+            f"stc_price_net ${stc_price_net:g}/certificate is a MARKET "
+            f"price, not a legislated one — confirm it is current before "
+            f"quoting."
+        )
 
     # ── Panels ──
     panels_qty = panel_count
@@ -243,6 +356,7 @@ def compute_system_cost(
     battery_priced = False
     battery_install = 0.0
     battery_rebate = 0.0
+    battery_rebate_known = False
     battery_detail = ""
     usable_kwh: Optional[float] = None
     eff_kwh = 0.0
@@ -271,7 +385,21 @@ def compute_system_cost(
 
         battery_install = _round2(battery_install_base)
         eff_kwh = nem_data.battery_rebate_effective_kwh(usable_kwh)
-        battery_rebate = _round2(eff_kwh * battery_stc_per_kwh * stc_price_net)
+        if battery_stc_per_kwh is not None:
+            battery_rebate = _round2(eff_kwh * battery_stc_per_kwh * stc_price_net)
+            battery_rebate_known = True
+        # else: rate unknown for as_at — NOT deducted; the line item carries
+        # amount_aud None plus the schedule's reason (never zero, never stale).
+
+        # F225 (D29 — a FACT on screen, not a control): CEC approval is not
+        # checked anywhere yet. Raised on every battery run, because every
+        # battery run carries a Battery rebate line item.
+        flags.append(
+            f"A battery must be on the Clean Energy Council approved battery "
+            f"list for any Cheaper Home Batteries certificates to be claimed. "
+            f"CEC approval has NOT been checked for this unit "
+            f"({battery_detail}) — row 4.10 is where approval is enforced."
+        )
 
     # ── Solar install ──
     solar_install = _round2(solar_kw * solar_install_per_kw)
@@ -280,12 +408,23 @@ def compute_system_cost(
     zone = nem_data.get_stc_zone_rating(state=state, postcode=postcode)
     if zone["is_default"]:
         flags.append("STC zone defaulted to Zone 3 (state/postcode not recognised).")
-    stc_count = math.floor(solar_kw * zone["zone_rating"] * deeming_years)
-    stc_value = _round2(stc_count * stc_price_net)
+    stc_count: Optional[int] = None
+    stc_value = 0.0
+    stc_known = False
+    if deeming_years is not None:
+        stc_count = math.floor(solar_kw * zone["zone_rating"] * deeming_years)
+        stc_value = _round2(stc_count * stc_price_net)
+        stc_known = True
+    # else: deeming unknown for as_at — NOT deducted (see the line item).
 
     # ── Net ──
+    # An unknown deduction is EXCLUDED — never zeroed, never a stale rate.
     gross = panels_total + inverter_total + battery_total + solar_install + battery_install
-    net = _round2(gross - stc_value - battery_rebate)
+    net = _round2(
+        gross
+        - (stc_value if stc_known else 0.0)
+        - (battery_rebate if battery_rebate_known else 0.0)
+    )
     net_per_watt = _round2(net / (solar_kw * 1000)) if solar_kw > 0 else None
 
     # ── Itemised line items (canonical order) ──
@@ -321,23 +460,37 @@ def compute_system_cost(
             "detail": f"flat ${battery_install_base:g} (install / wiring / gateway)",
             "amount_aud": battery_install,
         })
-    line_items.append({
-        "item": "STCs (solar)",
-        "detail": (
-            f"floor({solar_kw:g} × {zone['zone_rating']} × {deeming_years}) = {stc_count} STCs "
-            f"× ${stc_price_net:g}"
-        ),
-        "amount_aud": _round2(-stc_value),
-    })
-    if has_battery:
+    if stc_known:
         line_items.append({
-            "item": "Battery rebate",
+            "item": "STCs (solar)",
             "detail": (
-                f"Cheaper Home Batteries — {eff_kwh:g} eff. kWh × {battery_stc_per_kwh:g}/kWh "
+                f"floor({solar_kw:g} × {zone['zone_rating']} × {deeming_years}) = {stc_count} STCs "
                 f"× ${stc_price_net:g}"
             ),
-            "amount_aud": _round2(-battery_rebate),
+            "amount_aud": _round2(-stc_value),
         })
+    else:
+        line_items.append({
+            "item": "STCs (solar)",
+            "detail": f"{deem_sched['reason']} Not deducted — installer to confirm.",
+            "amount_aud": None,
+        })
+    if has_battery:
+        if battery_rebate_known:
+            line_items.append({
+                "item": "Battery rebate",
+                "detail": (
+                    f"Cheaper Home Batteries — {eff_kwh:g} eff. kWh × {battery_stc_per_kwh:g}/kWh "
+                    f"× ${stc_price_net:g}"
+                ),
+                "amount_aud": _round2(-battery_rebate),
+            })
+        else:
+            line_items.append({
+                "item": "Battery rebate",
+                "detail": f"{bat_sched['reason']} Not deducted — installer to confirm.",
+                "amount_aud": None,
+            })
 
     return {
         "hardware": {
@@ -347,8 +500,8 @@ def compute_system_cost(
         },
         "solar_install": solar_install,
         "battery_install": battery_install if has_battery else None,
-        "stc_value": _round2(-stc_value),
-        "battery_rebate": _round2(-battery_rebate) if has_battery else None,
+        "stc_value": _round2(-stc_value) if stc_known else None,
+        "battery_rebate": (_round2(-battery_rebate) if battery_rebate_known else None) if has_battery else None,
         "net_cost": net,
         "net_cost_per_watt": net_per_watt,
         "line_items": line_items,
@@ -356,6 +509,7 @@ def compute_system_cost(
             "solar_install_per_kw": solar_install_per_kw,
             "battery_install_base": battery_install_base if has_battery else None,
             "stc_price_net": stc_price_net,
+            # Schedule-resolved (None when the schedule does not know as_at):
             "deeming_years": deeming_years,
             "battery_stc_per_kwh": battery_stc_per_kwh,
             "stc_zone": zone["zone"],
@@ -367,6 +521,28 @@ def compute_system_cost(
             "config_last_verified": str(assumptions.get("last_verified")) if assumptions.get("last_verified") else None,
             "prices_indicative": True,
             "note": "Indicative AU prices (±20–30%), installer-overridable — not fixed quotes.",
+            # ── 3.13b (F224/F225): the time-honesty keys ──
+            "as_at": as_at_date.isoformat(),
+            "battery_stc_factor_window": (
+                f"{bat_sched['valid_from']}..{bat_sched['valid_to']}"
+                if bat_sched["is_known"] else None
+            ),
+            "battery_stc_factor_is_known": bool(bat_sched["is_known"]),
+            "deeming_years_window": (
+                f"{deem_sched['valid_from']}..{deem_sched['valid_to']}"
+                if deem_sched["is_known"] else None
+            ),
+            "deeming_years_is_known": bool(deem_sched["is_known"]),
+            # Both schedules are CER pages, verified together on the same day.
+            "policy_source": {
+                "battery_stc_factor": nem_data.BATTERY_STC_FACTOR_PERIODS[-1][3],
+                "solar_deeming_years": nem_data.SOLAR_DEEMING_YEARS_PERIODS[-1][3],
+            },
+            "policy_verified_on": nem_data.BATTERY_STC_FACTOR_PERIODS[-1][4],
+            "config_age_days": config_age_days,
+            # F225: literally False in this task — approval is checked nowhere
+            # yet; row 4.10 is where it is enforced.
+            "cec_approval_checked": False,
         },
         "flags": flags,
     }
