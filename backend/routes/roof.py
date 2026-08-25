@@ -26,6 +26,12 @@ them back onto the job is checklist 3.3c, the only job-update endpoint, delibera
 Best-effort persistence: a Storage/DB failure still returns the model in-response with
 persisted=false — never blocks the workflow. persist=false skips the write entirely
 (exists so verification can exercise the real code paths without writing — F77).
+
+3.4c prompt 1 adds POST /api/roof/confirm — the D24 confirmation: the lookup is a
+PREFILL THAT MUST BE CONFIRMED, and confirming UPDATES the newest row in place (the
+geometry is unchanged; only the human's acknowledgement is new). WHO confirmed rides
+with it (CONFIRMED_SOURCES) because an installer's office tick and the occupant's
+"yes, that is my roof" are worth very different amounts (F107).
 """
 
 from __future__ import annotations
@@ -84,6 +90,29 @@ class ManualRoofRequest(BaseModel):
     persist: bool = True
 
 
+# ── Confirmation vocabulary (3.4c prompt 1 — D24, D33, F107) ─────────────────
+# THE ONLY definition of the confirmation-source vocabulary anywhere: the
+# database column deliberately carries NO CHECK constraint (D33 — a label must
+# be able to gain a value without a migration each time). The confirm endpoint
+# refuses an unknown label at write time, and
+# scripts/verify_roof_confirmation.py compares this constant against what is
+# actually stored, in both directions. The RUN_KINDS / ENGINE_MODES /
+# PRICING_BASES pattern in capture.py — one convention, not two.
+# Expected to grow: row 8.4's tokenised homeowner link is a "customer"
+# confirmation made remotely; today "customer" means the occupant was shown
+# the roof at the site visit (F107 — the person who lives there is the
+# strongest verifier the product has, so 3.15 rates it highest).
+CONFIRMED_SOURCES: frozenset[str] = frozenset({"installer", "customer"})
+
+
+class RoofConfirmRequest(BaseModel):
+    job_id: str = Field(min_length=1)
+    # str, NOT a Literal: the vocabulary lives in CONFIRMED_SOURCES (D33) and
+    # the endpoint refuses unknown labels itself, so the refusal names the
+    # accepted values and the constant stays the single source of truth.
+    source: str = Field(min_length=1)
+
+
 def _client() -> Any:
     """Supabase client preferring the service-role key (bypasses RLS). None if unconfigured."""
     url = os.getenv("SUPABASE_URL")
@@ -140,6 +169,32 @@ def _latest_roof_row(client: Any, job_id: str) -> Optional[dict]:
         return rows[0] if rows else None
     except Exception:  # noqa: BLE001 — inherited coordinates are a bonus, never a blocker
         return None
+
+
+def _newest_roof_row_id(client: Any, job_id: str) -> tuple[Optional[dict], Optional[str]]:
+    """
+    The NEWEST roof_geometry row for a job — the same created_at-desc rule as
+    _latest_roof_row — selecting only what the confirm endpoint needs
+    (roof_geometry_id, job_id, created_at). A separate helper deliberately:
+    _latest_roof_row answers None for BOTH "no row" and "lookup failed", which
+    is right for bonus coordinates and wrong here — "nothing to confirm" and
+    "roof lookup failed" are different answers. Returns (row | None,
+    error | None). Never raises.
+    """
+    try:
+        res = (
+            client.table("roof_geometry")
+            .select("roof_geometry_id, job_id, created_at")
+            .eq("job_id", job_id)
+            .order("created_at", desc=True)
+            .limit(1)
+            .execute()
+        )
+        rows = getattr(res, "data", None) or []
+        return (rows[0] if rows else None), None
+    except Exception as exc:  # noqa: BLE001 — reported, never raised
+        sentry_sdk.capture_exception(exc)
+        return None, "roof lookup failed"
 
 
 def _apply_site_cross_check(model: dict, job: Optional[dict]) -> None:
@@ -343,6 +398,102 @@ async def roof_manual_endpoint(
             "persisted": False,
             "flags": ["internal_error"],
         }
+
+
+@router.post("/api/roof/confirm")
+async def roof_confirm_endpoint(
+    body: RoofConfirmRequest, caller: Caller = Depends(require_company)
+):
+    """
+    3.4c prompt 1 (D24): record that a HUMAN confirmed the prefilled roof —
+    when, who, and from which side of the transaction (CONFIRMED_SOURCES).
+    UPDATES the newest roof_geometry row IN PLACE — the geometry is unchanged
+    and only the acknowledgement is new, so appending here would fork the
+    append-only history for a non-geometry fact. Its inverse is structural:
+    _persist never writes these three columns, so a fresh lookup appends a
+    row whose confirmation is NULL by construction — re-running the lookup
+    produces a roof nobody has confirmed yet.
+
+    Identity comes from the auth dependency, NEVER the body (auth.py's rule).
+    Never raises (auth/ownership HTTPExceptions pass through, as everywhere
+    in this file); every other failure is a REPORTED error, like _persist:
+      unknown source     -> 422, the accepted values named, NOTHING written
+                            (validated BEFORE any write path is reachable —
+                            an endpoint that validates after writing leaves
+                            a timestamp behind)
+      no roof row        -> 404 "nothing to confirm", no row invented
+      roof lookup failed -> 503 reported, never a silent 500
+      update failed      -> 200 {"confirmed": false, "error": ...}
+    """
+    try:
+        client = _client()
+        _require_company_job(client, body.job_id, caller.company_id)
+        if body.source not in CONFIRMED_SOURCES:
+            return JSONResponse(
+                status_code=422,
+                content={
+                    "confirmed": False,
+                    "error": (
+                        f"unknown source {body.source!r} — accepted values: "
+                        f"{', '.join(sorted(CONFIRMED_SOURCES))}"
+                    ),
+                },
+            )
+        row, err = _newest_roof_row_id(client, body.job_id)
+        if err:
+            return JSONResponse(
+                status_code=503, content={"confirmed": False, "error": err}
+            )
+        if row is None:
+            return JSONResponse(
+                status_code=404,
+                content={
+                    "confirmed": False,
+                    "error": "nothing to confirm — this job has no roof_geometry row",
+                },
+            )
+        rid = row.get("roof_geometry_id")
+        patch = {
+            "roof_confirmed_at": datetime.now(timezone.utc).isoformat(),
+            "roof_confirmed_by": caller.user_id,
+            "roof_confirmed_source": body.source,
+        }
+        try:
+            res = (
+                client.table("roof_geometry")
+                .update(patch)
+                .eq("roof_geometry_id", rid)
+                .execute()
+            )
+            rows = getattr(res, "data", None) or []
+        except Exception as exc:  # noqa: BLE001 — reported, never raised (_persist's rule)
+            sentry_sdk.capture_exception(exc)
+            return {
+                "confirmed": False,
+                "roof_geometry_id": rid,
+                "error": f"roof confirmation write failed: {exc}",
+            }
+        if not rows:
+            return {
+                "confirmed": False,
+                "roof_geometry_id": rid,
+                "error": "confirmation write matched no row",
+            }
+        stored = rows[0]
+        # The STORED values, read back from the update's returned row — the
+        # caller learns WHICH roof was confirmed and what the database now says.
+        return {
+            "confirmed": True,
+            "roof_geometry_id": stored.get("roof_geometry_id", rid),
+            "roof_confirmed_at": stored.get("roof_confirmed_at"),
+            "roof_confirmed_by": stored.get("roof_confirmed_by"),
+            "roof_confirmed_source": stored.get("roof_confirmed_source"),
+        }
+    except HTTPException:
+        raise  # 401/404/503 pass through untouched — never swallowed into a 200
+    except Exception as exc:  # noqa: BLE001 — never surface a traceback
+        sentry_sdk.capture_exception(exc)
+        return {"confirmed": False, "error": "internal error"}
 
 
 # ── Static satellite tile (3.4-B) ────────────────────────────────────────────
