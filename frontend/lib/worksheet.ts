@@ -1092,6 +1092,14 @@ export interface AddressRoofView {
    */
   panelMismatchNotice: RoofNoticeView | null;
   /**
+   * 3.4c fix 3 (F217, D39): the "Scaled to …" line under the table, composed
+   * HERE so it always agrees with the numbers above it. It names the panel
+   * the table is showing and says whether that is the panel PINNED for the
+   * current run (the table then shows the engine's stored capacity layout for
+   * it) or the panel the LOOKUP was scaled to (the roof row's own numbers).
+   */
+  scaledToLine: string | null;
+  /**
    * 3.4c prompt 4 (D24): the confirmed state prompt 1 stored — read from the
    * newest row's roof_confirmed_at / roof_confirmed_by / roof_confirmed_source.
    * Raw values plus a composed notice, the solarExpiredNotice convention: the
@@ -1260,11 +1268,108 @@ function roofOrientationNotice(planes: RoofPlaneView[]): RoofNoticeView | null {
  * and differ, the table describes a layout the quote is not built on — said
  * plainly, with both sides named. Null when they match or either is unknown.
  */
+/** "Brand Model 440 W" from a stored panel object — ONE convention, two callers. */
+function panelDisplayLabel(panel: unknown): string | null {
+  if (typeof panel !== "object" || panel === null) return null;
+  const p = panel as Record<string, unknown>;
+  const bits = [p.brand, p.model].filter((b) => typeof b === "string" && b);
+  const watts = roofNum(p.watts);
+  return bits.length || watts !== null
+    ? `${bits.join(" ")}${watts !== null ? ` ${watts} W` : ""}`.trim()
+    : null;
+}
+
+/**
+ * 3.4c fix 3 (F217, D39): the PINNED panel's stored roof layout, or null.
+ *
+ * A pinned product is an INSTRUCTION to the engine (D39), so the roof table —
+ * which states CAPACITY, what fits at all — must show capacity re-derived for
+ * that panel. The engine already re-derived and STORED it: the largest
+ * evaluated_options.solar_options point carries panels_per_plane (one entry
+ * per roof face, verified live on run 0df98317), panel_count and solar_kw.
+ * This READS that layout; re-deriving it in TypeScript would be a second copy
+ * of the engine's packing rule (2R.1: delete the second copy, never gate two).
+ *
+ * THE CONFUSION GUARD: capacity is the LARGEST point, NEVER chosen_solar —
+ * chosen_solar is the recommended system (20 panels on the live run, against
+ * a capacity of 27), and showing it as capacity would be a worse error than
+ * the one this fixes.
+ *
+ * Null unless EVERYTHING holds: the current run pinned its panel
+ * (constraints_applied.equipment_pin_source.panel), the panel has finite
+ * watts, and the largest point's panels_per_plane is one finite count per
+ * roof face summing to its own panel_count. Anything less falls back to the
+ * roof row's numbers — the table is never blanked and never guessed at.
+ */
+function pinnedRoofLayout(
+  job: unknown,
+  planeCount: number,
+): {
+  panelsPerPlane: number[];
+  totalPanels: number;
+  totalKw: number;
+  watts: number;
+  label: string | null;
+} | null {
+  if (planeCount === 0) return null;
+  const sizing = currentSizingResult(job);
+  if (!sizing) return null;
+  const ra = sizing.run_assumptions;
+  if (typeof ra !== "object" || ra === null || Array.isArray(ra)) return null;
+  const r = ra as Record<string, unknown>;
+  const ca = r.constraints_applied;
+  if (typeof ca !== "object" || ca === null) return null;
+  const pinSource = (ca as Record<string, unknown>).equipment_pin_source;
+  if (typeof pinSource !== "object" || pinSource === null) return null;
+  const pin = (pinSource as Record<string, unknown>).panel;
+  if (typeof pin !== "string" || !pin) return null; // not pinned -> the roof row's own numbers
+
+  const watts = roofNum((r.panel as Record<string, unknown> | undefined)?.watts ?? null);
+  if (watts === null || watts <= 0) return null;
+
+  const eo = sizing.evaluated_options;
+  if (typeof eo !== "object" || eo === null) return null;
+  const so = (eo as Record<string, unknown>).solar_options;
+  if (typeof so !== "object" || so === null) return null;
+  const points = (so as Record<string, unknown>).points;
+  if (!Array.isArray(points)) return null;
+
+  let best: { panelsPerPlane: number[]; totalPanels: number; totalKw: number } | null = null;
+  for (const raw of points) {
+    if (typeof raw !== "object" || raw === null) continue;
+    const point = raw as Record<string, unknown>;
+    const totalPanels = roofNum(point.panel_count);
+    const totalKw = roofNum(point.solar_kw);
+    const ppp = point.panels_per_plane;
+    if (totalPanels === null || totalKw === null || !Array.isArray(ppp)) continue;
+    if (ppp.length !== planeCount) continue; // a layout for a different roof shape
+    const counts = ppp.map((v) => roofNum(v));
+    if (counts.some((v) => v === null || v < 0)) continue;
+    const perPlane = counts as number[];
+    // The stored figures must agree with themselves — incoherent rows fall back.
+    if (perPlane.reduce((s, v) => s + v, 0) !== totalPanels) continue;
+    if (best === null || totalPanels > best.totalPanels) {
+      best = { panelsPerPlane: perPlane, totalPanels, totalKw };
+    }
+  }
+  if (best === null) return null;
+  return { ...best, watts, label: panelDisplayLabel(r.panel) };
+}
+
 function roofPanelMismatchNotice(
   job: unknown,
   row: Record<string, unknown>,
   panelLabel: string | null,
+  tableFollowsRun: boolean,
 ): RoofNoticeView | null {
+  // 3.4c fix 3 (c): NARROWED, deliberately, rather than retired. Once the
+  // table follows the pinned panel's stored layout, the table and the engine
+  // AGREE, and a notice saying they disagree would be false. But the
+  // disagreement it describes still exists exactly when the table COULD NOT
+  // follow the run's panel — a run with no pin marker or no usable stored
+  // layout (legacy runs, battery-only runs, junk points) whose panel differs
+  // from the lookup's. That case keeps the notice.
+  if (tableFollowsRun) return null;
   const roofPanel = row.selected_panel;
   if (typeof roofPanel !== "object" || roofPanel === null) return null;
   const roofId = (roofPanel as Record<string, unknown>).id;
@@ -1511,6 +1616,7 @@ export function addressRoofView(job: unknown): AddressRoofView {
     orientationNotice: null,
     totalKwpLabel: null,
     panelMismatchNotice: null,
+    scaledToLine: null,
     roofConfirmedAt: null,
     roofConfirmedSource: null,
     confirmedNotice: null,
@@ -1567,6 +1673,23 @@ export function addressRoofView(job: unknown): AddressRoofView {
     kwp += planeView.kwp ?? 0;
     view.planes.push(planeView);
   }
+  // ── 3.4c fix 3 (F217, D39): the table follows the PINNED panel ─────────
+  // The engine's stored capacity layout for the pinned panel replaces the
+  // per-face counts and kW; faces, areas, orientation and provenance labels
+  // are facts about the ROOF and stay. With no pin, or nothing usable stored,
+  // everything below is exactly the roof row's own numbers.
+  const pinned = pinnedRoofLayout(job, view.planes.length);
+  if (pinned !== null) {
+    for (const [i, planeView] of view.planes.entries()) {
+      const count = pinned.panelsPerPlane[i];
+      planeView.panelCount = count;
+      const faceKw = Math.round(count * pinned.watts) / 1000;
+      planeView.kwp = faceKw;
+      planeView.kwpLabel = roofKwLabel(faceKw);
+    }
+    panels = pinned.totalPanels;
+    kwp = pinned.totalKw; // the STORED total — read, never recomputed
+  }
   view.totals = { panels, kwp: Math.round(kwp * 1000) / 1000 };
   view.totalKwpLabel = roofKwLabel(view.totals.kwp);
   view.countReconciliation = roofCountReconciliation(view.planes, row);
@@ -1587,18 +1710,18 @@ export function addressRoofView(job: unknown): AddressRoofView {
   const quality = typeof row.imagery_quality === "string" ? row.imagery_quality : null;
   view.imageryQualityLabel = quality ? QUALITY_LABELS[quality] ?? quality : null;
 
-  const panel = row.selected_panel;
-  if (typeof panel === "object" && panel !== null) {
-    const p = panel as Record<string, unknown>;
-    const bits = [p.brand, p.model].filter((b) => typeof b === "string" && b);
-    const watts = roofNum(p.watts);
-    view.panelLabel =
-      bits.length || watts !== null
-        ? `${bits.join(" ")}${watts !== null ? ` ${watts} W` : ""}`.trim()
+  // The panel the TABLE is showing (3.4c fix 3): the pinned panel when its
+  // stored layout drives the numbers above, else the lookup's own panel.
+  const lookupLabel = panelDisplayLabel(row.selected_panel);
+  view.panelLabel = pinned !== null ? pinned.label ?? lookupLabel : lookupLabel;
+  view.scaledToLine =
+    pinned !== null
+      ? `Scaled to ${pinned.label ?? "the pinned panel"} — the panel pinned for the current run`
+      : lookupLabel !== null
+        ? `Scaled to ${lookupLabel} — the panel the lookup was scaled to`
         : null;
-  }
 
-  view.panelMismatchNotice = roofPanelMismatchNotice(job, row, view.panelLabel);
+  view.panelMismatchNotice = roofPanelMismatchNotice(job, row, view.panelLabel, pinned !== null);
 
   const reason = typeof row.reason === "string" ? row.reason : null;
   view.note = reason?.startsWith("Manual entry: ")
@@ -2421,10 +2544,28 @@ export function roofDiagramCaptionLines(
   if (drawn) {
     // The replacement for prompt 4's unfinished "they will sit roughly —
     // judge the building, not the layout": it now says roughly WHERE, and
-    // asks nothing of the reader. The roughness is inherent (F234/F235: two
-    // georeferencings), and F107 forbids tidying it away.
+    // asks nothing of the reader. F107 forbids tidying the overlay away.
+    //
+    // THE OLD VENDOR WORDING WAS WRONG AND IS FIXED HERE (3.4c fix 2). BOTH
+    // sources are Google: the panel positions come from the Google Solar API
+    // (solar.googleapis.com buildingInsights:findClosest, roof_geometry.py)
+    // and the photo from the Google Static Maps API at maptype=satellite
+    // (routes/roof.py). Its Australian base layer is licensed from other
+    // operators — which is what the figcaption attribution names, once — but
+    // it is still a Google API. The old wording put the photo with a second
+    // VENDOR, which implied we mix two companies' APIs and would send anyone
+    // trying to fix the alignment to the wrong place. What is actually true
+    // is that these are two different
+    // Google products serving two different CAPTURES, with nothing in either
+    // contract co-registering them.
+    //
+    // THE CAUSE IS DELIBERATELY NOT NAMED. Building lean / relief displacement
+    // is the leading hypothesis and it is UNTESTED — the measurement that
+    // would settle it is homed at row 4.2 (F235). This states the fact that
+    // the captures differ; it must not state a mechanism we have not
+    // established.
     lines.push(
-      "The panel positions come from Google's model and the photo comes from a different supplier, so the shapes indicate roughly where Google measured panels rather than a placement plan.",
+      "The panel positions come from Google's solar model while the photo is Google's satellite layer — a different capture, and nothing guarantees the two line up — so the shapes indicate roughly where Google measured panels rather than a placement plan.",
     );
   }
 

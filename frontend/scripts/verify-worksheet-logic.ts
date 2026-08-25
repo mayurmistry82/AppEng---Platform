@@ -10119,7 +10119,7 @@ test("3.4c-3 (5): the SHIPPED panel rectangles carry no stroke-dasharray; adjace
   // The building box KEEPS its dashes — it means extent, and the caption says so.
   assert.ok(/stroke-dasharray="6 4"/.test(markup), "building box dashes stay");
   // The honest two-imagery caveat survives the deletion.
-  assert.ok(roofTextOf(markup).includes("different supplier"), "the true caveat stays");
+  assert.ok(roofTextOf(markup).includes("a different capture"), "the true caveat stays");
 });
 
 test("3.4c-3 (1): provenance, orientation words and rounded labels are ON SCREEN", () => {
@@ -10315,7 +10315,9 @@ test("3.4c-5 (F234): the caption STATES the drawing and its assumptions — the 
   // The facts, present and in order.
   const iFitted = text.indexOf("Google's model fitted 21 panels");
   const iAssumption = text.indexOf("400 W assumption");
-  const iSources = text.indexOf("different supplier");
+  // Anchored on the satellite-layer clause: same sentence, and unique in the
+  // caption now that the old vendor wording is gone (3.4c fix 2).
+  const iSources = text.indexOf("Google's satellite layer");
   assert.ok(iFitted !== -1 && iAssumption !== -1 && iSources !== -1, text);
   assert.ok(iFitted < iAssumption, "what was drawn precedes whose panel it assumes");
   assert.ok(text.includes("scaled to Jinko Tiger Neo 440 W"), "the two wattages connect");
@@ -10545,7 +10547,12 @@ test("3.4c-5 (4): the drawable roof states what was drawn, whose panel, and why 
   assert.ok(text.includes("Google's model fitted 21 panels of 1.05 m × 1.88 m at 400 W each"), text);
   assert.ok(text.includes("Google's own 400 W assumption"), text);
   assert.ok(text.includes("scaled to Jinko Tiger Neo 440 W"), text);
-  assert.ok(text.includes("come from Google's model and the photo comes from a different supplier"), text);
+  assert.ok(
+    text.includes(
+      "come from Google's solar model while the photo is Google's satellite layer",
+    ),
+    text,
+  );
   assert.ok(text.includes("rather than a placement plan"), text);
   // A roof with NO drawing still states the TABLE's facts and the imagery, and
   // says nothing about a drawing that does not exist.
@@ -10673,4 +10680,220 @@ test("3.4c-5 (F128): the moved notices still RENDER, wording unchanged", () => {
   assert.ok(text.includes("The address geocodes to a different state"), text.slice(0, 300));
   assert.ok(text.includes("The job was set up as SA, but the address geocodes to VIC"), text);
   assert.ok(text.includes("worth checking before quoting"), "wording moved verbatim");
+});
+test("3.4c fix 2: the caption names BOTH sources as Google's, and names no mechanism", () => {
+  const lines = roofDiagramCaptionLines(viewFor(withImagery(A57_ROW)), CAPTION_DIAGRAM as never);
+  const sentence = lines.find((l) => l.includes("placement plan"));
+  assert.ok(sentence, lines.join(" | "));
+  // BOTH are Google APIs — the Solar API's model and the Static Maps
+  // satellite layer. The old wording implied two separate vendors, which
+  // would send anyone fixing the alignment to the wrong place.
+  assert.ok(sentence.includes("Google's solar model"), sentence);
+  assert.ok(sentence.includes("Google's satellite layer"), sentence);
+  assert.ok(sentence.includes("a different capture"), sentence);
+  assert.ok(sentence.includes("nothing guarantees the two line up"), sentence);
+  // The ending is prompt 5's, unchanged — only the cause was replaced.
+  assert.ok(
+    sentence.endsWith(
+      "so the shapes indicate roughly where Google measured panels rather than a placement plan.",
+    ),
+    sentence,
+  );
+  // What it must never say: a second vendor, the attribution the figcaption
+  // already carries once, or a mechanism nobody has measured (the test that
+  // would settle it is row 4.2, F235).
+  for (const forbidden of [
+    "supplier", "vendor", "third party", "third-party",
+    "Airbus", "Maxar", "Vexcel",
+    "lean", "relief displacement", "parallax", "perspective", "ortho",
+  ]) {
+    assert.ok(
+      !new RegExp(forbidden, "i").test(sentence),
+      `the caption must not say "${forbidden}": ${sentence}`,
+    );
+  }
+  // And the whole caption still instructs nobody.
+  assert.deepEqual(readerInstructionsIn(lines), []);
+
+  // RENDERED, server-side, and printed whole so the new sentence can be read
+  // in context rather than as a string in a test.
+  const view = viewFor(withImagery(A57_ROW));
+  const rendered = roofTextOf(
+    renderRoofSection({ view, jobId: "j", isOpen: true, diagram: CAPTION_DIAGRAM }),
+  );
+  console.log("        [a57e13f1 caption, rendered server-side]");
+  for (const line of roofDiagramCaptionLines(view, CAPTION_DIAGRAM as never)) {
+    assert.ok(rendered.includes(line), `not rendered: ${line}`);
+    console.log(`          ${line}`);
+  }
+});
+// ── 3.4c fix 3: the roof table follows the pinned panel (F217, D39) ─────────
+// Fixtures shaped on the two LIVE runs, both verified against the database on
+// 2026-08-26: 0df98317 (Maxeon 6 pinned) and 523b9c93 (Auto, Tiger Neo).
+
+const MAXEON_PANEL = {
+  id: "d9e94b28-5cd2-4986-bdf7-a67d82eb9b6d",
+  brand: "SunPower / Maxeon",
+  model: "Maxeon 6",
+  watts: 440,
+  area_m2: 1.9319,
+  width_mm: 1032.0,
+  length_mm: 1872.0,
+};
+
+/** Run 0df98317: panel pinned; capacity point 27 panels, chosen system 20. */
+const PINNED_RUN = {
+  sizing_result_id: "0df98317",
+  created_at: "2026-08-23T03:43:36Z",
+  run_assumptions: {
+    panel: MAXEON_PANEL,
+    constraints_applied: {
+      equipment_pin_source: { panel: "job", battery: null, inverter: null },
+    },
+  },
+  evaluated_options: {
+    chosen_solar: {
+      solar_kw: 8.8, panel_count: 20,
+      plane_indices: [0, 1, 3], panels_per_plane: [4, 8, 0, 8, 0, 0],
+    },
+    solar_options: {
+      chosen_index: 3,
+      points: [
+        { solar_kw: 8.8, panel_count: 20, plane_indices: [0, 1, 3],
+          panels_per_plane: [4, 8, 0, 8, 0, 0] },
+        { solar_kw: 11.88, panel_count: 27, plane_indices: [0, 1, 3, 4, 2, 5],
+          panels_per_plane: [4, 8, 2, 8, 2, 3] },
+      ],
+    },
+  },
+};
+
+/** Run 523b9c93: Auto — no pin, whatever the stored options say. */
+const AUTO_RUN = {
+  sizing_result_id: "523b9c93",
+  created_at: "2026-08-25T03:13:51Z",
+  run_assumptions: {
+    panel: { id: "p1", watts: 440 },
+    constraints_applied: {
+      equipment_pin_source: { panel: null, battery: null, inverter: null },
+    },
+  },
+  evaluated_options: {
+    chosen_solar: { solar_kw: 9.24, panel_count: 21, panels_per_plane: [3, 8, 0, 8, 2, 0] },
+    solar_options: {
+      chosen_index: 4,
+      points: [
+        { solar_kw: 11.44, panel_count: 26, plane_indices: [0, 1, 3, 4, 2, 5],
+          panels_per_plane: [3, 8, 2, 8, 2, 3] },
+      ],
+    },
+  },
+};
+
+const jobWithRun = (run: unknown) =>
+  emptyJob({
+    roof_geometry: [withImagery(A57_ROW)],
+    sizing_results: [run],
+  });
+
+test("3.4c fix 3 (3): PINNED — the table shows the engine's capacity for the Maxeon", () => {
+  const view = addressRoofView(jobWithRun(PINNED_RUN));
+  // Today this read 26 and [3,8,2,8,2,3] — the Tiger Neo's capacity, a wrong
+  // per-face capacity for the panel the engine was instructed to use (F217).
+  assert.deepEqual(view.planes.map((p) => p.panelCount), [4, 8, 2, 8, 2, 3]);
+  assert.deepEqual(view.planes.map((p) => p.kwp), [1.76, 3.52, 0.88, 3.52, 0.88, 1.32]);
+  assert.deepEqual(view.planes.map((p) => p.kwpLabel),
+    ["1.8 kW", "3.5 kW", "0.9 kW", "3.5 kW", "0.9 kW", "1.3 kW"]);
+  assert.deepEqual(view.totals, { panels: 27, kwp: 11.88 });
+  assert.equal(view.totalKwpLabel, "11.9 kW");
+  assert.ok(view.panelLabel?.includes("Maxeon 6"), String(view.panelLabel));
+  assert.equal(
+    view.scaledToLine,
+    "Scaled to SunPower / Maxeon Maxeon 6 440 W — the panel pinned for the current run",
+  );
+  // (c) the table now FOLLOWS the pin, so the disagreement notice would be
+  // false — it stays silent here.
+  assert.equal(view.panelMismatchNotice, null);
+  // Roof facts are untouched by the pin: provenance and orientation stay.
+  assert.deepEqual(
+    view.planes.map((p) => p.countSource),
+    ["roof_area", "google_layout", "roof_area", "google_layout", "google_layout", "google_layout"],
+  );
+  // And it RENDERS.
+  const text = roofTextOf(
+    renderRoofSection({ view, jobId: "j", isOpen: false }),
+  );
+  console.log(`        [pinned table] ${text.slice(text.indexOf("Direction"), text.indexOf("Direction") + 620)}`);
+  assert.ok(text.includes("the panel pinned for the current run"), text);
+});
+
+test("3.4c fix 3 (4): UNPINNED — the roof row's own numbers, exactly as today", () => {
+  const view = addressRoofView(jobWithRun(AUTO_RUN));
+  assert.deepEqual(view.planes.map((p) => p.panelCount), [3, 8, 2, 8, 2, 3]);
+  assert.deepEqual(view.totals, { panels: 26, kwp: 11.44 });
+  assert.equal(view.totalKwpLabel, "11.4 kW");
+  assert.equal(view.panelLabel, "Jinko Tiger Neo 440 W");
+  assert.equal(
+    view.scaledToLine,
+    "Scaled to Jinko Tiger Neo 440 W — the panel the lookup was scaled to",
+  );
+  const text = roofTextOf(renderRoofSection({ view, jobId: "j", isOpen: false }));
+  console.log(`        [auto table]   ${text.slice(text.indexOf("Direction"), text.indexOf("Direction") + 620)}`);
+  assert.ok(text.includes("the panel the lookup was scaled to"), text);
+});
+
+test("3.4c fix 3 (5): the CONFUSION GUARD — capacity is the largest point, never chosen_solar", () => {
+  const view = addressRoofView(jobWithRun(PINNED_RUN));
+  // chosen_solar is 20 panels on this run; capacity is 27. Showing 20 as
+  // capacity would be a new and worse error.
+  assert.equal(view.totals.panels, 27);
+  assert.notEqual(view.totals.panels, 20, "the table must never show chosen_solar as capacity");
+  assert.notEqual(view.planes[2].panelCount, 0, "chosen_solar zeroes face 3; capacity does not");
+});
+
+test("3.4c fix 3 (6): totality — no run, no layout, junk points: falls back, never throws, never blanks", () => {
+  const lookupCounts = [3, 8, 2, 8, 2, 3];
+  const cases: [string, unknown][] = [
+    ["no sizing run at all", undefined],
+    ["run with no evaluated_options", { ...PINNED_RUN, evaluated_options: undefined }],
+    ["run with no solar_options", { ...PINNED_RUN, evaluated_options: { chosen_solar: {} } }],
+    ["solar_options is junk", { ...PINNED_RUN, evaluated_options: { solar_options: "junk" } }],
+    ["points is empty", { ...PINNED_RUN, evaluated_options: { solar_options: { points: [] } } }],
+    ["points are junk", { ...PINNED_RUN, evaluated_options: { solar_options: { points: ["x", null, 7] } } }],
+    ["panels_per_plane wrong length", { ...PINNED_RUN, evaluated_options: { solar_options: { points: [
+      { solar_kw: 11.88, panel_count: 27, panels_per_plane: [27] }] } } }],
+    ["panels_per_plane junk entries", { ...PINNED_RUN, evaluated_options: { solar_options: { points: [
+      { solar_kw: 11.88, panel_count: 27, panels_per_plane: [4, 8, "2", 8, 2, 3] }] } } }],
+    ["stored figures disagree with themselves", { ...PINNED_RUN, evaluated_options: { solar_options: { points: [
+      { solar_kw: 11.88, panel_count: 27, panels_per_plane: [3, 8, 2, 8, 2, 3] }] } } }],
+    ["panel has no watts", { ...PINNED_RUN, run_assumptions: {
+      panel: { id: "x" },
+      constraints_applied: { equipment_pin_source: { panel: "job" } } } }],
+    ["pin marker null with a layout present", AUTO_RUN],
+  ];
+  for (const [name, run] of cases) {
+    const job = run === undefined
+      ? emptyJob({ roof_geometry: [withImagery(A57_ROW)] })
+      : jobWithRun(run);
+    const view = addressRoofView(job);
+    assert.deepEqual(view.planes.map((p) => p.panelCount), lookupCounts, name);
+    assert.deepEqual(view.totals, { panels: 26, kwp: 11.44 }, name);
+    assert.ok(view.scaledToLine?.includes("the panel the lookup was scaled to"), name);
+    assert.doesNotThrow(() => renderRoofSection({ view, jobId: "j", isOpen: false }), name);
+  }
+});
+
+test("3.4c fix 3 (c): the narrowed mismatch notice — silent when the table follows, live when it cannot", () => {
+  // A pinned run whose layout is UNUSABLE and whose panel differs from the
+  // lookup's: the table falls back to the lookup, so the disagreement is real
+  // and the notice must still fire.
+  const brokenPinned = {
+    ...PINNED_RUN,
+    evaluated_options: { solar_options: { points: [] } },
+  };
+  const view = addressRoofView(jobWithRun(brokenPinned));
+  assert.ok(view.panelMismatchNotice, "the table could not follow the run — the notice stays");
+  assert.ok(view.panelMismatchNotice.body.includes("Jinko Tiger Neo 440 W"),
+    view.panelMismatchNotice.body);
+  // And when the table DOES follow (test 3 above), it is silent — asserted there.
 });

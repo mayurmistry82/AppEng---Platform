@@ -469,10 +469,13 @@ export function AddressRoofSection({
             </TableRow>
           </TableBody>
         </Table>
-        {view.panelLabel || view.usabilityFactor !== null ? (
+        {view.scaledToLine || view.usabilityFactor !== null ? (
           <p className="mt-1 text-caption text-muted-foreground">
-            {view.panelLabel ? `Scaled to ${view.panelLabel}` : null}
-            {view.panelLabel && view.usabilityFactor !== null ? " · " : null}
+            {/* 3.4c fix 3: composed in lib/worksheet.ts so the line can never
+                disagree with the numbers above it — it says whether the table
+                shows the pinned panel or the panel the lookup was scaled to. */}
+            {view.scaledToLine}
+            {view.scaledToLine && view.usabilityFactor !== null ? " · " : null}
             {view.usabilityFactor !== null
               ? `${Math.round(view.usabilityFactor * 100)}% of each face treated as usable`
               : null}
