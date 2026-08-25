@@ -8,6 +8,7 @@ import {
   batterySizingView,
   energyDataView,
   equipmentSpecsView,
+  incentivesView,
   objectiveBudgetView,
   phaseStates,
   railBaselineView,
@@ -144,6 +145,7 @@ export default async function Page({
         solarSizing={solarSizingView(job)}
         batterySizing={batterySizingView(job)}
         results={resultsView(job)}
+        incentives={incentivesView(job)}
         jobId={id}
       />
     </div>

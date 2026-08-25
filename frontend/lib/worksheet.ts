@@ -359,8 +359,17 @@ export const SECTIONS: readonly WorksheetSectionSpec[] = [
     title: "Incentives",
     phase: "resolve",
     builtAt: "3.13b",
-    // ALWAYS FALSE — no incentives column exists yet; lands at 3.13b.
-    complete: () => false,
+    // 3.13b: complete when the CURRENT run's stored breakdown carries an
+    // incentive line. The predicate and the body (incentivesView) BOTH read
+    // storedIncentives — one question about one object, agreeing by
+    // construction (F178/F179), exactly as storedLoadProfile does for
+    // Energy data.
+    complete: (job) => storedIncentives(job) !== null,
+    // Decided by Mayur 2026-08-25: nothing in this section is the installer's
+    // to fill in, so it must not block Summary & finish — Results already
+    // gates on the real prerequisite. It reports honestly on ITSELF and locks
+    // nothing beneath it (D5/D24's shape).
+    gates: false,
   },
   {
     id: "summary-finish",
@@ -7956,5 +7965,321 @@ export function railCompareView(
         : null,
     currentLabel: comparability.currentLabel,
     baselineLabel: comparability.baselineLabel,
+  };
+}
+
+
+// ── Incentives (checklist 3.13b) ─────────────────────────────────────────────
+
+/**
+ * The two incentive line items the engine writes, keyed by their stored
+ * `item` strings. Presence on the quote is decided by the LINE ITEMS the
+ * engine stored — NEVER by the job's path (2T.4 in reverse: a path rule here
+ * would be a second rule that has to agree with the engine forever). A
+ * solar-only job simply has no "Battery rebate" line; path E has no
+ * "STCs (solar)" line.
+ */
+const INCENTIVE_ITEMS = {
+  "STCs (solar)": "Small-scale technology certificates (solar)",
+  "Battery rebate": "Cheaper Home Batteries rebate",
+} as const;
+
+/**
+ * THE JOB'S STORED INCENTIVE RECORD (3.13b) — the CURRENT run's stored cost
+ * breakdown when it carries at least one incentive line, else null. Null when
+ * there is no current sizing result, when the breakdown is absent, or when
+ * its line_items carries neither incentive entry.
+ *
+ * ONE DEFINITION, TWO READERS, deliberately (F178/F179): the Incentives
+ * section's completeness predicate in SECTIONS and its body (incentivesView)
+ * BOTH call this — the tick and the body are one question about one object,
+ * agreeing by construction rather than by two rules kept in step, exactly as
+ * storedLoadProfile does for Energy data.
+ *
+ * Total: never throws for any input.
+ */
+export function storedIncentives(job: unknown): Record<string, unknown> | null {
+  const sizing = currentSizingResult(job);
+  if (!sizing) return null;
+  const bd = asRecord(asRecord(sizing.evaluated_options).chosen_cost_breakdown);
+  if (!Array.isArray(bd.line_items)) return null;
+  const has = bd.line_items.some((raw) => {
+    const item = asRecord(raw).item;
+    return typeof item === "string" && item in INCENTIVE_ITEMS;
+  });
+  return has ? bd : null;
+}
+
+export interface IncentiveRowView {
+  name: string;
+  /** formatMoneyCents, or the literal "installer to confirm" for a null
+      amount — NEVER $0 and never omitted (the results tab's own convention;
+      after 31 December 2026 this is the state every rate falls into). */
+  amount: string;
+  confirmed: boolean;
+  /** The stored reason, shown when unconfirmed — the engine's own words. */
+  reason: string | null;
+  /** The stored working, restated in plain English; falls back to the stored
+      detail verbatim when the assumption keys are missing. Never recomputed —
+      every number in it is a STORED field (2R.1/D26). */
+  working: string | null;
+  /** "This rate applies to installations up to 31 December 2026", from the
+      STORED window. Null in the legacy state: a run that never recorded a
+      window claims none — inventing one is the exact wrongness this row
+      exists to remove. */
+  validity: string | null;
+}
+
+export interface IncentivesView {
+  /**
+   * "unsized"    — no current run; nothing to show.
+   * "unrecorded" — a run exists but carries no incentive record.
+   * "legacy"     — a record whose assumptions_used has NO as_at: every run
+   *                stored before 3.13b prompt 1, so the COMMON case on first
+   *                sight, not an edge.
+   * "ready"      — a record with the time-honesty keys.
+   * ready|legacy ⇔ storedIncentives(job) !== null BY CONSTRUCTION, so the
+   * section's tick and its body can never disagree (F178/F179).
+   */
+  state: "unsized" | "unrecorded" | "legacy" | "ready";
+  /** What the engine took off, in one plain sentence. */
+  headline: string | null;
+  rows: IncentiveRowView[];
+  /** THE SUM OF THE STORED INCENTIVE LINE AMOUNTS — null whenever any line
+      is unconfirmed: a total that silently excluded an unknown line is the
+      F212 fault (an absence is not a zero). */
+  total: string | null;
+  /** The honest line shown instead of a hidden total. */
+  totalNote: string | null;
+  /** CEC statement, certificate-price age and the legacy note — classified
+      per D25 in this logic layer, rendered by NoticeStack. */
+  notices: RoofNoticeView[];
+}
+
+/** The end of a stored "YYYY-MM-DD..YYYY-MM-DD" window as "31 December 2026".
+    Pure string work — no Date object, no timezone, no arithmetic. */
+function windowEndLabel(window: unknown): string | null {
+  if (typeof window !== "string") return null;
+  const end = window.split("..")[1];
+  if (!end) return null;
+  const [y, m, d] = end.split("-");
+  const months = [
+    "January", "February", "March", "April", "May", "June", "July",
+    "August", "September", "October", "November", "December",
+  ];
+  const month = months[Number(m) - 1];
+  const day = Number(d);
+  if (!y || !month || !Number.isFinite(day) || day < 1) return null;
+  return `${day} ${month} ${y}`;
+}
+
+/** The STC working restated from STORED fields only — null when any is
+    missing (the caller falls back to the stored detail verbatim). */
+function stcWorking(
+  au: Record<string, unknown>,
+  sizing: Record<string, unknown> | null,
+): string | null {
+  const count = tariffNum(au.stc_count);
+  const price = tariffNum(au.stc_price_net);
+  const zone = tariffNum(au.stc_zone);
+  const rating = tariffNum(au.stc_zone_rating);
+  const years = tariffNum(au.deeming_years);
+  if (count === null || price === null || zone === null || rating === null || years === null) {
+    return null;
+  }
+  const kw = sizing ? tariffNum(sizing.solar_kw) : null;
+  const kwPart = kw === null ? "" : `${kw} kW, `;
+  return (
+    `${count} certificates at ${formatMoney(price)} each — ${kwPart}` +
+    `zone ${zone} rating ${rating}, deemed over ${years} years.`
+  );
+}
+
+/**
+ * THE QUANTITY THE REBATE WAS CALCULATED ON, taken from the stored line
+ * item's own words — the ONLY place the run recorded it. NEVER recomputed
+ * from the tier bands (that would be a second implementation of the taper,
+ * 2R.1), and NEVER read from sizing_results.battery_kwh, which is the CHOSEN
+ * capacity and not necessarily the figure the rebate was worked out on.
+ *
+ * The matched TEXT is returned, not a parsed float, so the row echoes the
+ * engine's own digits. Null when the line does not carry it — the caller then
+ * falls back to the stored detail verbatim, which always names all three
+ * numbers, so the row can never lose its quantity.
+ */
+function storedEffectiveKwh(detail: unknown): string | null {
+  if (typeof detail !== "string") return null;
+  const match = detail.match(/(\d+(?:\.\d+)?)\s*eff\. kWh/);
+  return match ? match[1] : null;
+}
+
+/**
+ * The battery's usable capacity as THIS run stored it, from the Battery line
+ * item. Only used to say whether a taper applied: effective ≠ usable IS the
+ * taper, an arithmetic identity rather than a copy of the band thresholds,
+ * so the wording cannot go stale when the bands change. Null when the run
+ * did not record it, and an unknown taper is then not claimed either way.
+ */
+function storedUsableKwh(lines: readonly unknown[]): string | null {
+  for (const raw of lines) {
+    const li = asRecord(raw);
+    if (li.item !== "Battery") continue;
+    if (typeof li.detail !== "string") return null;
+    const match = li.detail.match(/\(\s*(\d+(?:\.\d+)?)\s*kWh usable/);
+    return match ? match[1] : null;
+  }
+  return null;
+}
+
+/**
+ * The battery-rebate working restated from STORED fields only.
+ *
+ * THE RULE (fix 1, found on screen 2026-08-25): every incentive row states
+ * the QUANTITY it was calculated on, the RATE and the PRICE, so a person can
+ * arrive at the amount from the words alone. The old wording gave the rate
+ * and the price but never the quantity, so -$2,473.23 could not be reached
+ * from the sentence. The taper is named ONLY when one actually applied to
+ * this battery: a parenthetical about a taper that is not in play invites the
+ * reader to wonder whether it was.
+ */
+function batteryWorking(
+  au: Record<string, unknown>,
+  effectiveKwh: string | null,
+  usableKwh: string | null,
+): string | null {
+  const rate = tariffNum(au.battery_stc_per_kwh);
+  const price = tariffNum(au.stc_price_net);
+  // No quantity, no sentence — the caller falls back to the engine's own
+  // stored detail rather than shipping a row that cannot be reproduced.
+  if (rate === null || price === null || effectiveKwh === null) return null;
+  const effective = tariffNum(effectiveKwh);
+  const usable = tariffNum(usableKwh);
+  const tapered =
+    effective !== null && usable !== null && Math.abs(usable - effective) > 0.005;
+  const quantity = tapered
+    ? `${effectiveKwh} effective kilowatt-hours after the large-battery ` +
+      `taper (${usableKwh} kWh usable)`
+    : `${effectiveKwh} usable kilowatt-hours`;
+  return `${quantity} at ${rate} certificates each, ${formatMoney(price)} per certificate.`;
+}
+
+/**
+ * incentivesView (3.13b) — the Incentives section's one source. READS the
+ * current run's stored breakdown and computes nothing: every figure is a
+ * stored field, the rows come from the stored line items, and the only
+ * arithmetic is the presentation sum of the stored line amounts (step 1e).
+ * Total: never throws; junk yields a state and a note, never an invented
+ * figure. The section must never block the page.
+ */
+export function incentivesView(job: unknown): IncentivesView {
+  const sizing = currentSizingResult(job);
+  const record = storedIncentives(job);
+  if (record === null) {
+    return {
+      state: sizing === null ? "unsized" : "unrecorded",
+      headline: null,
+      rows: [],
+      total: null,
+      totalNote: null,
+      notices: [],
+    };
+  }
+
+  const au = asRecord(record.assumptions_used);
+  const legacy = typeof au.as_at !== "string";
+  const lines = Array.isArray(record.line_items) ? record.line_items : [];
+
+  const rows: IncentiveRowView[] = [];
+  let sum = 0;
+  let allConfirmed = true;
+  let hasBattery = false;
+  for (const raw of lines) {
+    const li = asRecord(raw);
+    const item = typeof li.item === "string" ? li.item : "";
+    if (!(item in INCENTIVE_ITEMS)) continue;
+    const isBattery = item === "Battery rebate";
+    if (isBattery) hasBattery = true;
+    const amount = tariffNum(li.amount_aud);
+    const detail = typeof li.detail === "string" && li.detail ? li.detail : null;
+    if (amount === null) allConfirmed = false;
+    else sum += amount;
+    const window = isBattery
+      ? au.battery_stc_factor_window
+      : au.deeming_years_window;
+    const end = legacy ? null : windowEndLabel(window);
+    const working = isBattery
+      ? batteryWorking(au, storedEffectiveKwh(li.detail), storedUsableKwh(lines))
+      : stcWorking(au, sizing);
+    rows.push({
+      name: INCENTIVE_ITEMS[item as keyof typeof INCENTIVE_ITEMS],
+      amount: amount === null ? "installer to confirm" : formatMoneyCents(amount),
+      confirmed: amount !== null,
+      reason: amount === null ? detail : null,
+      working: amount === null ? null : (working ?? detail),
+      validity: end ? `This rate applies to installations up to ${end}.` : null,
+    });
+  }
+
+  const total = allConfirmed && rows.length > 0 ? formatMoneyCents(sum) : null;
+
+  const notices: RoofNoticeView[] = [];
+  if (legacy) {
+    // A finding about THIS job (newer runs carry the record) → notice, D25.
+    notices.push({
+      tone: "info",
+      level: "notice",
+      title: "This run predates the incentive validity record",
+      body:
+        "The window each rate is valid in was not recorded when this job was " +
+        "sized, so none is claimed here. The figures above are the run's own " +
+        "stored deductions; re-run the sizing to capture the validity record.",
+    });
+  }
+  if (hasBattery) {
+    // D29: a STATEMENT OF FACT, not a control. Fires on every battery run
+    // until 4.10 enforces approval → a caption, per D25's one question.
+    notices.push({
+      tone: "info",
+      level: "caption",
+      icon: "info",
+      title: "",
+      body:
+        "A battery must be on the Clean Energy Council approved battery list " +
+        "before any of this rebate can be claimed, and approval has not been " +
+        "checked for this unit.",
+    });
+  }
+  const price = tariffNum(au.stc_price_net);
+  const lastChecked =
+    typeof au.config_last_verified === "string" && au.config_last_verified
+      ? au.config_last_verified
+      : null;
+  const age = tariffNum(au.config_age_days);
+  if (price !== null && lastChecked) {
+    notices.push({
+      tone: "info",
+      level: "caption",
+      icon: "clock",
+      title: "",
+      body:
+        `Certificate price ${formatMoney(price)} net, last checked ` +
+        `${lastChecked}` +
+        (age !== null ? ` (${age} days before this run's quote date)` : "") +
+        ".",
+    });
+  }
+
+  return {
+    state: legacy ? "legacy" : "ready",
+    headline: "What the engine took off the system price for this run.",
+    rows,
+    total,
+    totalNote:
+      total === null
+        ? "No total is shown — at least one incentive is awaiting " +
+          "confirmation, and a total that skipped it would read as if " +
+          "nothing were missing."
+        : null,
+    notices,
   };
 }

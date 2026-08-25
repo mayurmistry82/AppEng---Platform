@@ -167,6 +167,8 @@ import {
   latestRoofGeometry,
   resultsBarView,
   resultsView,
+  storedIncentives,
+  incentivesView,
   roofEntryState,
   sectionStates,
   sectionsForPath,
@@ -271,12 +273,15 @@ test("fresh job: section 1 active, rest locked, S current", () => {
   for (let i = 1; i < states.length; i++) {
     // D5 (2026-08-18): a NON-GATING section is "unlocked" rather than "locked"
     // even here, with the gating section above it still active — an optional
-    // section must always be openable. site-details (D5) and, from 3.10,
+    // section must always be openable. site-details (D5); from 3.10,
     // equipment-specs (D24: Auto is a real answer, so it confirms rather than
-    // requires, and it must not block a quote). Every OTHER section locks
-    // exactly as before.
+    // requires, and it must not block a quote); and from 3.13b, incentives
+    // (nothing in it is the installer's to fill in, so it must not block
+    // Summary & finish). Every OTHER section locks exactly as before.
     const expected =
-      states[i].id === "site-details" || states[i].id === "equipment-specs"
+      states[i].id === "site-details" ||
+      states[i].id === "equipment-specs" ||
+      states[i].id === "incentives"
         ? "unlocked"
         : "locked";
     assert.equal(states[i].state, expected, states[i].id);
@@ -340,23 +345,27 @@ test("all predicates true: 11 complete, phases all done", () => {
     sizing_results: [{ sizing_result_id: "s1", solar_kw: 6.6, battery_kwh: 12.8 }],
     financial_results: [{ sizing_result_id: "s1", payback_years: 4.2 }],
   });
-  // equipment-specs / incentives are () => false by design (no columns exist
-  // until 3.10 / 3.13b), so "all true" means: force those two true to test the
-  // aggregate rule, not the schema. objective-budget left this list at 3.9 —
-  // its predicate is real now, so the fixture satisfies it with a stored
-  // objective instead of a patch.
-  const patched = SECTIONS.map((s) =>
-    ["equipment-specs", "incentives"].includes(s.id)
-      ? { ...s, complete: () => true }
-      : s,
-  );
-  const done = patched.map((s) => s.complete({ ...job, objective: "max_npv" }));
+  // 3.13b: NO predicate is hardcoded any more — equipment-specs has been real
+  // since 3.10 (equipment_confirmed) and incentives is real now (the current
+  // run's stored breakdown carries an incentive line), so "all true" is a job
+  // that genuinely satisfies all eleven, with nothing patched. The
+  // patch-and-force mechanism died with the last hardcoded predicate.
+  const satisfied = {
+    ...job,
+    objective: "max_npv",
+    equipment_confirmed: true,
+    sizing_results: [{
+      sizing_result_id: "s1", solar_kw: 6.6, battery_kwh: 12.8,
+      evaluated_options: {
+        chosen_cost_breakdown: {
+          net_cost: 10000,
+          line_items: [{ item: "STCs (solar)", detail: "", amount_aud: -2331 }],
+        },
+      },
+    }],
+  };
+  const done = SECTIONS.map((s) => s.complete(satisfied));
   assert.ok(done.every(Boolean), `not all predicates true: ${JSON.stringify(done)}`);
-  // The two still-hardcoded ones really are always false against ANY job:
-  for (const id of ["equipment-specs", "incentives"]) {
-    const spec = SECTIONS.find((s) => s.id === id);
-    assert.equal(spec?.complete(job), false, `${id} must be false until its row lands`);
-  }
 });
 
 // h. jobBarView placeholders
@@ -2363,19 +2372,21 @@ test("D5 check 4: every GATING section keeps today's behaviour exactly", () => {
       { id: "solar-sizing", state: "locked" },
       { id: "battery-sizing", state: "locked" },
       { id: "results", state: "locked" },
-      { id: "incentives", state: "locked" },
+      // 3.13b: non-gating (decided by Mayur 2026-08-25), so unlocked rather
+      // than locked — openable early, and it locks nothing beneath it.
+      { id: "incentives", state: "unlocked" },
       { id: "summary-finish", state: "locked" },
     ],
   );
-  // ...and EXACTLY THREE sections differ from the old rule, all of them
+  // ...and EXACTLY FOUR sections differ from the old rule, all of them
   // accounted for: the optional section itself (active -> unlocked), the one
-  // that should have been active all along (locked -> active), and 3.10's
-  // second non-gating section (locked -> unlocked). Everything else was
-  // already locked under both rules and stays locked, so the change is
-  // narrower than it looks: the sections beneath are unlocked by DOING the
-  // work, not by these flags. The reference rule above has no concept of
-  // `gates`, which is exactly why it diverges on precisely the non-gating
-  // sections and nowhere else.
+  // that should have been active all along (locked -> active), and the two
+  // later non-gating sections (locked -> unlocked): 3.10's equipment-specs
+  // and 3.13b's incentives. Everything else was already locked under both
+  // rules and stays locked, so the change is narrower than it looks: the
+  // sections beneath are unlocked by DOING the work, not by these flags. The
+  // reference rule above has no concept of `gates`, which is exactly why it
+  // diverges on precisely the non-gating sections and nowhere else.
   const before = referenceStates(empty);
   const after = sectionStates(empty).map((s) => ({ id: s.id, state: s.state }));
   const moved = after
@@ -2385,6 +2396,7 @@ test("D5 check 4: every GATING section keeps today's behaviour exactly", () => {
     "site-details: active -> unlocked",
     "energy-data: locked -> active",
     "equipment-specs: locked -> unlocked",
+    "incentives: locked -> unlocked",
   ]);
 });
 
@@ -2423,13 +2435,13 @@ test("D5 check 6: `gates` absent means GATING — the default is the safe one", 
   // is first-incomplete -> active, and c locks behind it.
   const gates = specs.map((s) => s.gates !== false);
   assert.deepEqual(gates, [true, true, true]);
-  // And the catalogue itself: exactly TWO sections are non-gating — D5's
-  // site-details and, from 3.10, equipment-specs. Every other section must
-  // still gate, which is what makes the permissive default safe.
+  // And the catalogue itself: exactly THREE sections are non-gating — D5's
+  // site-details, 3.10's equipment-specs and 3.13b's incentives. Every other
+  // section must still gate, which is what makes the permissive default safe.
   const nonGating = SECTIONS.filter((s) => s.gates === false).map((s) => s.id);
-  assert.deepEqual(nonGating, ["site-details", "equipment-specs"]);
+  assert.deepEqual(nonGating, ["site-details", "equipment-specs", "incentives"]);
   for (const s of SECTIONS) {
-    if (s.id !== "site-details" && s.id !== "equipment-specs") {
+    if (!["site-details", "equipment-specs", "incentives"].includes(s.id)) {
       assert.notEqual(s.gates, false, `${s.id} must keep gating`);
     }
   }
@@ -4439,14 +4451,17 @@ test("3.10 (4b): complete() is true for boolean true ONLY — a truthy check wou
   assert.equal(EQUIP_SPEC?.complete(emptyJob({})), false, "absent must not complete it");
 });
 
-test("3.10 (4c): gates is false on equipment-specs and site-details, and unchanged on every other section", () => {
+test("3.10 (4c): gates is false on equipment-specs, site-details and (3.13b) incentives, and unchanged on every other section", () => {
   // The full map, both directions — an accidental change to ANY section fails here.
   const nonGating = new Set(
     SECTIONS.filter((s) => s.gates === false).map((s) => s.id),
   );
-  assert.deepEqual([...nonGating].sort(), ["equipment-specs", "site-details"]);
+  assert.deepEqual([...nonGating].sort(), ["equipment-specs", "incentives", "site-details"]);
   for (const section of SECTIONS) {
-    const expected = section.id === "equipment-specs" || section.id === "site-details";
+    const expected =
+      section.id === "equipment-specs" ||
+      section.id === "site-details" ||
+      section.id === "incentives";
     assert.equal(section.gates === false, expected,
       `${section.id}: gates === false should be ${expected}`);
   }
@@ -9336,4 +9351,379 @@ test("3.14b-4: permissiveness is opt-in by the exact literal — the source "
   assert.ok(!fn.includes('!== "physics"'), "never an inequality that a fourth kind would slip through");
   assert.equal((fn.match(/equipmentChange/g) ?? []).length >= 3, true,
     "both guards and the sentence read the ONE flag (2R.1)");
+});
+
+
+// ── Incentives (checklist 3.13b) ─────────────────────────────────────────────
+
+// Shaped like the stored run 523b9c93… — the full breakdown of every run
+// stored before prompt 1, whose assumptions_used has NO `as_at`.
+const LEGACY_BREAKDOWN = {
+  net_cost: 11868.77,
+  stc_value: -2331.0,
+  battery_rebate: -2473.23,
+  line_items: [
+    { item: "Panels", detail: "21 × Jinko Tiger Neo (440 W)", amount_aud: 4515.0 },
+    { item: "Battery", detail: "GoodWe Lynx Home F (9.83 kWh usable, pre-rebate)", amount_aud: 6500.0 },
+    { item: "Solar install", detail: "9.24 kW × $450/kW", amount_aud: 4158.0 },
+    { item: "Battery install", detail: "flat $1500", amount_aud: 1500.0 },
+    { item: "STCs (solar)", detail: "floor(9.24 × 1.382 × 5) = 63 STCs × $37", amount_aud: -2331.0 },
+    { item: "Battery rebate", detail: "Cheaper Home Batteries — 9.83 eff. kWh × 6.8/kWh × $37", amount_aud: -2473.23 },
+  ],
+  assumptions_used: {
+    solar_install_per_kw: 450, battery_install_base: 1500, stc_price_net: 37,
+    deeming_years: 5, battery_stc_per_kwh: 6.8, stc_zone: 3,
+    stc_zone_rating: 1.382, stc_zone_is_default: false, stc_count: 63,
+    panel_count: 21, config_source: "docs/2026-06-11-cost-model-pricing.md",
+    config_last_verified: "2026-06-11", prices_indicative: true, note: "…",
+  },
+  flags: [],
+};
+
+// The same breakdown as prompt 1 now stores it — the nine time-honesty keys.
+const READY_BREAKDOWN = {
+  ...LEGACY_BREAKDOWN,
+  assumptions_used: {
+    ...LEGACY_BREAKDOWN.assumptions_used,
+    as_at: "2026-08-25",
+    battery_stc_factor_window: "2026-05-01..2026-12-31",
+    battery_stc_factor_is_known: true,
+    deeming_years_window: "2026-01-01..2026-12-31",
+    deeming_years_is_known: true,
+    policy_source: { battery_stc_factor: "https://cer.gov.au/x", solar_deeming_years: "https://cer.gov.au/y" },
+    policy_verified_on: "2026-08-25",
+    config_age_days: 75,
+    cec_approval_checked: false,
+  },
+};
+
+// A 2027 quote: both rates outside every verified period — amounts null with
+// the engine's reasons, net equal to gross (prompt 1's whole point).
+const EXPIRED_BREAKDOWN = {
+  ...READY_BREAKDOWN,
+  net_cost: 16673.0,
+  stc_value: null,
+  battery_rebate: null,
+  line_items: [
+    ...LEGACY_BREAKDOWN.line_items.slice(0, 4),
+    { item: "STCs (solar)", detail: "No solar STC deeming period (years) is on record for 2027-01-15; the last known period is 2026-01-01 to 2026-12-31 at 5. Not deducted — installer to confirm.", amount_aud: null },
+    { item: "Battery rebate", detail: "No battery STC factor (certificates per kWh) is on record for 2027-01-15; the last known period is 2026-05-01 to 2026-12-31 at 6.8. Not deducted — installer to confirm.", amount_aud: null },
+  ],
+  assumptions_used: {
+    ...READY_BREAKDOWN.assumptions_used,
+    as_at: "2027-01-15", deeming_years: null, battery_stc_per_kwh: null,
+    stc_count: null, battery_stc_factor_window: null,
+    battery_stc_factor_is_known: false, deeming_years_window: null,
+    deeming_years_is_known: false, config_age_days: 218,
+  },
+};
+
+function incentivesJob(bd: unknown, over: Partial<JobDetailLike> = {}): JobDetailLike {
+  return emptyJob({
+    sizing_results: [{
+      sizing_result_id: "s1", solar_kw: 9.24, battery_kwh: 9.83,
+      evaluated_options: { chosen_cost_breakdown: bd },
+    }],
+    ...over,
+  });
+}
+
+// I1 — THE PAIR CHECK (modelled on R2): the SECTIONS predicate and the view
+// state are ONE question. Give the predicate a second rule of its own and
+// this fails immediately — which is what F178/F179 lacked.
+test("I1: the Incentives predicate and incentivesView agree on EVERY fixture — run both, compare", () => {
+  const spec = SECTIONS.find((s) => s.id === "incentives");
+  assert.ok(spec);
+  const fixtures: [string, unknown][] = [
+    ["no run at all", emptyJob()],
+    ["a run with no breakdown", incentivesJob(undefined)],
+    ["a breakdown with no incentive line", incentivesJob({ net_cost: 1, line_items: [{ item: "Panels", amount_aud: 1 }] })],
+    ["line_items not an array", incentivesJob({ net_cost: 1, line_items: "junk" })],
+    ["the legacy run 523b9c93", incentivesJob(LEGACY_BREAKDOWN)],
+    ["a prompt-1 run", incentivesJob(READY_BREAKDOWN)],
+    ["a 2027 expired run", incentivesJob(EXPIRED_BREAKDOWN)],
+    ["junk job", "garbage"],
+    ["null job", null],
+  ];
+  for (const [label, job] of fixtures) {
+    const tick = spec!.complete(job as never);
+    const view = incentivesView(job);
+    assert.equal(
+      tick,
+      view.state === "ready" || view.state === "legacy",
+      `${label}: tick says ${tick} but the body renders ${view.state} — a section whose tick and body disagree is the F178/F179 fault`,
+    );
+    assert.equal(tick, storedIncentives(job) !== null, `${label}: the predicate IS storedIncentives`);
+  }
+});
+
+// I2 — NON-GATING, PROVED, on the fixture where the flag ALONE decides:
+// every gating section before Incentives is complete, Incentives is not, and
+// Summary & finish is not. Remove `gates: false` from the incentives entry
+// and BOTH assertions fail — incentives becomes "active" and Summary & finish
+// sits "locked" behind it. (A fixture with summary-finish already complete
+// takes the jumped-pass path and cannot break — rule 4, found on first run.)
+test("I2: incomplete Incentives never locks — and never blocks Summary & finish", () => {
+  const job = emptyJob({
+    status: "draft", // summary-finish INCOMPLETE — the section the flag protects
+    objective: "max_npv",
+    roof_geometry: [{ created_at: "2026-08-01T00:00:00Z", found: true, planes: [{ panel_count: 12 }] }],
+    load_profiles: [{ annual_kwh: 5500, created_at: "2026-08-01T00:00:00Z" }],
+    tariffs: [{ tariff_id: "t1" }],
+    // Sized and costed, but the stored breakdown carries NO incentive line —
+    // so every gating section above is complete and Incentives alone is not.
+    sizing_results: [{
+      sizing_result_id: "s1", solar_kw: 6.6, battery_kwh: 12.8,
+      evaluated_options: { chosen_cost_breakdown: {
+        net_cost: 10000, line_items: [{ item: "Panels", amount_aud: 10000 }],
+      } },
+    }],
+    financial_results: [{ sizing_result_id: "s1", payback_years: 4.2 }],
+  });
+  const states = sectionStates(job);
+  assert.equal(stateOf(states, "incentives"), "unlocked",
+    "an incomplete non-gating section is unlocked — never active, never locked");
+  assert.notEqual(stateOf(states, "summary-finish"), "locked",
+    "Summary & finish must not sit locked behind a section with nothing to fill in");
+  assert.equal(stateOf(states, "summary-finish"), "active",
+    "Summary & finish is what the installer should be on — Incentives took no part in choosing it");
+});
+
+// I3 — THE LEGACY STATE IS THE LIVE STATE (every one of the 20 stored runs).
+test("I3: a run shaped like 523b9c93 is 'legacy' — amounts render, NO validity window is claimed", () => {
+  const view = incentivesView(incentivesJob(LEGACY_BREAKDOWN));
+  assert.equal(view.state, "legacy");
+  assert.equal(view.rows.length, 2);
+  assert.equal(view.rows[0].amount, "-$2,331.00");
+  assert.equal(view.rows[1].amount, "-$2,473.23");
+  assert.equal(view.total, "-$4,804.23");
+  for (const row of view.rows) {
+    assert.equal(row.validity, null, `${row.name}: a run that never recorded a window must claim none`);
+  }
+  assert.ok(
+    !JSON.stringify(view).includes("applies to installations"),
+    "no validity wording anywhere in the view — a window invented for a run that never recorded one is the exact wrongness this row removes",
+  );
+  assert.ok(view.notices.some((n) => n.level === "notice" && n.title.includes("predates")),
+    "the legacy note replaces the validity line");
+  // The ready state DOES claim the stored window — same wording, real source:
+  const ready = incentivesView(incentivesJob(READY_BREAKDOWN));
+  assert.equal(ready.state, "ready");
+  assert.equal(ready.rows[0].validity, "This rate applies to installations up to 31 December 2026.");
+  assert.equal(ready.rows[1].validity, "This rate applies to installations up to 31 December 2026.");
+});
+
+// I4 — THE EXPIRED STATE: null amounts render as "installer to confirm" with
+// their stored reasons, and NO total is shown (F212 — an absence is not a zero).
+test("I4: null amounts render 'installer to confirm' with reasons, and the total is withheld", () => {
+  const view = incentivesView(incentivesJob(EXPIRED_BREAKDOWN));
+  assert.equal(view.state, "ready");
+  assert.equal(view.rows.length, 2);
+  for (const row of view.rows) {
+    assert.equal(row.amount, "installer to confirm", row.name);
+    assert.ok(row.reason && row.reason.includes("last known period"), `${row.name} carries the engine's reason`);
+    assert.equal(row.validity, null);
+  }
+  assert.equal(view.total, null, "a total that silently excluded an unknown line is the F212 fault");
+  assert.ok(view.totalNote, "the withheld total says so");
+});
+
+// I5 — PATHS: presence comes from the STORED LINE ITEMS, never from the path.
+test("I5: solar-only and battery-only breakdowns each yield one row, whatever the path says", () => {
+  const solarOnly = {
+    net_cost: 6342, stc_value: -2331,
+    line_items: [
+      { item: "Panels", amount_aud: 4515 },
+      { item: "STCs (solar)", detail: "floor(9.24 × 1.382 × 5) = 63 STCs × $37", amount_aud: -2331 },
+    ],
+    assumptions_used: LEGACY_BREAKDOWN.assumptions_used,
+  };
+  const batteryOnly = {
+    net_cost: 5527, battery_rebate: -2473.23,
+    line_items: [
+      { item: "Battery", amount_aud: 6500 },
+      { item: "Battery rebate", detail: "Cheaper Home Batteries — 9.83 eff. kWh × 6.8/kWh × $37", amount_aud: -2473.23 },
+    ],
+    assumptions_used: LEGACY_BREAKDOWN.assumptions_used,
+  };
+  for (const path of ["A", "E", "B", null, "junk"]) {
+    const s = incentivesView(incentivesJob(solarOnly, { path: path as never }));
+    assert.deepEqual(s.rows.map((r) => r.name), ["Small-scale technology certificates (solar)"],
+      `solar-only rows must not vary with path ${path}`);
+    const b = incentivesView(incentivesJob(batteryOnly, { path: path as never }));
+    assert.deepEqual(b.rows.map((r) => r.name), ["Cheaper Home Batteries rebate"],
+      `battery-only rows must not vary with path ${path}`);
+    assert.ok(b.notices.some((n) => n.body.includes("Clean Energy Council")),
+      "the CEC statement rides with the battery rebate row");
+    assert.ok(!s.notices.some((n) => n.body.includes("Clean Energy Council")),
+      "…and never appears on a solar-only breakdown");
+  }
+});
+
+// I6 — TOTALITY: junk in, a state and honest notes out. Never a throw, never
+// an invented figure.
+test("I6: storedIncentives and incentivesView are total on junk", () => {
+  const junks: [string, unknown][] = [
+    ["null", null],
+    ["a string", "garbage"],
+    ["junk evaluated_options", incentivesJob("junk" as never)],
+    ["line_items as a string", incentivesJob({ line_items: "nope" })],
+    ["a line with no amount", incentivesJob({ line_items: [{ item: "STCs (solar)", detail: "d" }] })],
+  ];
+  for (const [label, job] of junks) {
+    assert.doesNotThrow(() => storedIncentives(job), label);
+    assert.doesNotThrow(() => incentivesView(job), label);
+  }
+  assert.equal(incentivesView(null).state, "unsized");
+  assert.equal(incentivesView("garbage").state, "unsized");
+  assert.equal(incentivesView(incentivesJob("junk" as never)).state, "unrecorded");
+  assert.equal(incentivesView(incentivesJob({ line_items: "nope" })).state, "unrecorded");
+  const noAmount = incentivesView(incentivesJob({ line_items: [{ item: "STCs (solar)", detail: "d" }] }));
+  assert.equal(noAmount.rows[0].amount, "installer to confirm");
+  assert.equal(noAmount.total, null);
+});
+
+
+// ── Incentives fix 1 (2026-08-25): every row is REPRODUCIBLE from its words ──
+// Found on screen by Mayur: the battery row named the rate and the price but
+// never the QUANTITY, so its amount could not be arrived at from the sentence.
+// The test below is not "is the sentence readable" but "can a person get the
+// amount from the words alone" — asserted mechanically, for EVERY row, so the
+// rule holds for any incentive row added later.
+
+/** Every number in a row's working, in order — the reader's raw material. */
+function numbersIn(text: string): number[] {
+  return (text.match(/\d+(?:\.\d+)?/g) ?? []).map(Number);
+}
+
+/** Can SOME subset of those numbers be multiplied to the row's amount? That
+    is exactly "a person can get the amount from the words alone". */
+function reproducible(text: string, amountAud: number): boolean {
+  const nums = numbersIn(text);
+  const target = Math.abs(amountAud);
+  for (let mask = 1; mask < 1 << nums.length; mask++) {
+    let product = 1;
+    let used = 0;
+    for (let i = 0; i < nums.length; i++) {
+      if (mask & (1 << i)) {
+        product *= nums[i];
+        used += 1;
+      }
+    }
+    if (used >= 2 && Math.abs(product - target) <= 0.01) return true;
+  }
+  return false;
+}
+
+/** A breakdown whose battery rebate was calculated on `eff` effective kWh,
+    against a battery of `usable` kWh, at 6.8/kWh and $37. */
+function batteryRebateBreakdown(eff: number, usable: number, amount: number) {
+  return {
+    net_cost: 10000,
+    battery_rebate: -amount,
+    line_items: [
+      { item: "Battery", detail: `GoodWe Lynx Home F (${usable} kWh usable, pre-rebate)`, amount_aud: 6500 },
+      { item: "Battery rebate", detail: `Cheaper Home Batteries — ${eff} eff. kWh × 6.8/kWh × $37`, amount_aud: -amount },
+    ],
+    assumptions_used: LEGACY_BREAKDOWN.assumptions_used,
+  };
+}
+
+// F1 — THE QUANTITY IS STATED, AND IT IS READ, NOT HARDCODED. The fixture's
+// figure is 11.5, not the fixture-famous 9.83, so a hardcoded number fails.
+test("F1: the battery row states the quantity the rebate was calculated on, READ from the stored line item", () => {
+  const view = incentivesView(incentivesJob(batteryRebateBreakdown(11.5, 11.5, 2893.4)));
+  const row = view.rows.find((r) => r.name === "Cheaper Home Batteries rebate");
+  assert.ok(row?.working, "the battery row must carry a working");
+  assert.match(row!.working!, /11\.5/,
+    "the quantity must come from the stored line item — a hardcoded 9.83 fails here");
+  assert.doesNotMatch(row!.working!, /9\.83/, "9.83 would mean the number was hardcoded");
+  assert.match(row!.working!, /6\.8/, "the rate");
+  assert.match(row!.working!, /\$37/, "the price");
+  assert.equal(row!.amount, "-$2,893.40");
+  assert.ok(reproducible(row!.working!, 2893.4),
+    `the amount must be reachable from the words alone: ${row!.working}`);
+});
+
+// F2 — THE TAPER IS NAMED ONLY WHEN ONE APPLIES, both directions.
+test("F2: no taper wording on a battery inside the first band; taper named on one above it", () => {
+  // 9.83 kWh usable — the taper does not touch it, so it is not mentioned.
+  const small = incentivesView(incentivesJob(batteryRebateBreakdown(9.83, 9.83, 2473.23)));
+  const smallRow = small.rows.find((r) => r.name === "Cheaper Home Batteries rebate");
+  assert.ok(smallRow?.working);
+  assert.doesNotMatch(smallRow!.working!, /taper/i,
+    "a parenthetical about a taper that is not in play invites the reader to wonder whether it was");
+  assert.match(smallRow!.working!, /9\.83 usable kilowatt-hours/);
+
+  // 24 kWh usable -> 14 + 0.6 x 10 = 20 effective. The taper IS in play, and
+  // the row says so AND names both figures, so the gap is explained.
+  const large = incentivesView(incentivesJob(batteryRebateBreakdown(20, 24, 5032)));
+  const largeRow = large.rows.find((r) => r.name === "Cheaper Home Batteries rebate");
+  assert.ok(largeRow?.working);
+  assert.match(largeRow!.working!, /taper/i, "a battery above the first band must say so");
+  assert.match(largeRow!.working!, /20 effective kilowatt-hours/);
+  assert.match(largeRow!.working!, /24 kWh usable/);
+  assert.ok(reproducible(largeRow!.working!, 5032),
+    `the tapered amount must still be reachable from the words: ${largeRow!.working}`);
+});
+
+// F3 — THE RULE ITSELF, over every fixture and every row: quantity, rate and
+// price, such that the amount falls out of them. A future incentive row that
+// states a rate without its quantity fails here.
+test("F3: EVERY confirmed incentive row can be reproduced from its own words", () => {
+  const fixtures: [string, unknown][] = [
+    ["the legacy run 523b9c93", LEGACY_BREAKDOWN],
+    ["a prompt-1 run", READY_BREAKDOWN],
+    ["an 11.5 kWh battery", batteryRebateBreakdown(11.5, 11.5, 2893.4)],
+    ["a tapered 24 kWh battery", batteryRebateBreakdown(20, 24, 5032)],
+  ];
+  for (const [label, bd] of fixtures) {
+    const view = incentivesView(incentivesJob(bd));
+    assert.ok(view.rows.length > 0, label);
+    for (const row of view.rows) {
+      if (!row.confirmed) continue;
+      assert.ok(row.working, `${label} / ${row.name}: a confirmed row must show its working`);
+      const amount = Number(row.amount.replace(/[^0-9.]/g, ""));
+      assert.ok(
+        reproducible(row.working!, amount),
+        `${label} / ${row.name}: ${row.amount} cannot be arrived at from "${row.working}"`,
+      );
+    }
+  }
+});
+
+// F4 — WHEN THE QUANTITY IS NOT IN THE STORED LINE, the row falls back to the
+// engine's own detail verbatim rather than shipping a sentence that cannot be
+// reproduced. The rule survives a line the parser cannot read.
+test("F4: a rebate line with no stored quantity falls back to the engine's detail verbatim", () => {
+  const noQuantity = {
+    net_cost: 10000,
+    line_items: [
+      { item: "Battery rebate", detail: "Cheaper Home Batteries — 9.83 x 6.8 x $37", amount_aud: -2473.23 },
+    ],
+    assumptions_used: LEGACY_BREAKDOWN.assumptions_used,
+  };
+  const row = incentivesView(incentivesJob(noQuantity)).rows[0];
+  assert.equal(row.working, "Cheaper Home Batteries — 9.83 x 6.8 x $37",
+    "the engine's own words, which name all three numbers, beat a sentence missing one");
+  assert.ok(reproducible(row.working!, 2473.23));
+});
+
+// F5 — THE TEXT THAT SHIPS, printed for the run Mayur is looking at.
+test("F5: the exact final text of both rows for the run 523b9c93 fixture", () => {
+  const view = incentivesView(incentivesJob(LEGACY_BREAKDOWN));
+  for (const row of view.rows) {
+    console.log(`        ${row.name}`);
+    console.log(`          amount : ${row.amount}`);
+    console.log(`          working: ${row.working}`);
+  }
+  const [solar, battery] = view.rows;
+  assert.equal(
+    solar.working,
+    "63 certificates at $37 each — 9.24 kW, zone 3 rating 1.382, deemed over 5 years.",
+  );
+  assert.equal(
+    battery.working,
+    "9.83 usable kilowatt-hours at 6.8 certificates each, $37 per certificate.",
+  );
 });

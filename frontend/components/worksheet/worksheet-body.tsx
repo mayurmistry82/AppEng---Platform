@@ -12,6 +12,7 @@ import { AddressRoofSection } from "@/components/worksheet/address-roof-section"
 import { BatterySizingSection } from "@/components/worksheet/battery-sizing-section";
 import { EnergyDataSection } from "@/components/worksheet/energy-data-section";
 import { EquipmentSpecsSection } from "@/components/worksheet/equipment-specs-section";
+import { IncentivesSection } from "@/components/worksheet/incentives-section";
 import { ObjectiveBudgetSection } from "@/components/worksheet/objective-budget-section";
 import { ResultsBar } from "@/components/worksheet/results-bar";
 import { ResultsSection } from "@/components/worksheet/results-section";
@@ -24,6 +25,7 @@ import {
   type BatterySizingView,
   type EnergyDataView,
   type EquipmentSpecsView,
+  type IncentivesView,
   type ObjectiveBudgetView,
   type RailBaseline,
   type ResultsBarView,
@@ -102,6 +104,7 @@ export function WorksheetBody({
   solarSizing,
   batterySizing,
   results,
+  incentives,
   jobId,
   resultsBar,
 }: {
@@ -133,6 +136,10 @@ export function WorksheetBody({
       the roof's doubt and the panels' direction. NOTE: this section GATES —
       once it completes, Incentives and Summary & finish unlock behind it. */
   results?: ResultsView;
+  /** 3.13b: the Incentives view — the stored deductions, their validity
+      windows and the CEC fact. Read-only: the section computes nothing,
+      stores nothing and takes no jobId, so this prop is the whole wiring. */
+  incentives?: IncentivesView;
   jobId?: string;
   /** 3.14 prompt 6: the results bar's stored view, curve and rail baseline.
       Optional — without it the body renders no bar, exactly as before. */
@@ -209,6 +216,8 @@ export function WorksheetBody({
         <BatterySizingSection view={batterySizing} jobId={jobId} />
       ) : section.id === "results" && results && jobId ? (
         <ResultsSection view={results} jobId={jobId} />
+      ) : section.id === "incentives" && incentives ? (
+        <IncentivesSection view={incentives} />
       ) : (
         <p className="text-caption text-muted-foreground">
           Built at {section.builtAt}
