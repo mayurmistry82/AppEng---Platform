@@ -1079,11 +1079,16 @@ test("F231 (a) a57e13f1: assessed faces agree; the five extra panels come from t
   assert.ok(rec.explanation.includes("5 of the 26 panels"), rec.explanation);
   // NEVER the false cause. Panel size explains none of the count gap here.
   assert.ok(!/different panel|panel size/i.test(rec.explanation), rec.explanation);
-  // 12 of 26 southerly panels is no majority — the orientation caution stays quiet.
-  assert.equal(view.orientationNotice, null);
+  // D40 (was: "12 of 26 is no majority, so the caution stays quiet"). At a
+  // THIRD the same roof warns — 12 of 26 is 46%, and the old strict majority
+  // is exactly the line F241 says nobody would recognise as meaningful.
+  assert.ok(view.orientationNotice, "46% must now fire");
+  assert.equal(view.orientationNotice.title, "12 of the 26 panels face the southern half");
+  // ...and the split caption stays silent, because the caution carries the numbers.
+  assert.equal(view.orientationSplitCaption, null);
 });
 
-test("F231 (b) 670c80db: the two disagree where both looked — said plainly, no invented cause", () => {
+test("F231 (b) / D43 670c80db: the two disagree where both looked — panel size named as a CANDIDATE", () => {
   const view = viewFor(BISHOPS_ROW);
   const rec = view.countReconciliation;
   assert.ok(rec);
@@ -1096,7 +1101,11 @@ test("F231 (b) 670c80db: the two disagree where both looked — said plainly, no
   assert.ok(/disagree/.test(rec.explanation), rec.explanation);
   assert.ok(rec.explanation.includes("27"), rec.explanation);
   assert.ok(rec.explanation.includes("28"), rec.explanation);
-  assert.ok(!/different panel|panel size/i.test(rec.explanation), rec.explanation);
+  // D43 (was: panel size must NEVER appear). On a face BOTH sides assessed it
+  // is a plausible cause, and refusing to say so is truth-on-all-instances —
+  // F244. Named as a candidate, never as the cause.
+  assert.ok(/panel size is one possible explanation/i.test(rec.explanation), rec.explanation);
+  assert.ok(rec.explanation.includes("nothing here establishes the cause"), rec.explanation);
 });
 
 test("F231 (c) 456e0242 (the Frome row): no layout at all — every face reads roof_area", () => {
@@ -1194,12 +1203,14 @@ test("F168: the orientation caution fires on the 173-degree roof and names direc
   // And on the real Bishops Pl roof: 16 of 27 southerly, mostly the 13-panel SSW face.
   const bishops = viewFor(BISHOPS_ROW);
   assert.ok(bishops.orientationNotice);
-  assert.equal(bishops.orientationNotice.title, "Most of these panels face south-south-west");
+  // D40: the title is a COUNT now — "Most …" was false the moment the line
+  // moved to a third, and a count cannot go false at any firing share.
+  assert.equal(bishops.orientationNotice.title, "16 of the 27 panels face the southern half");
   assert.ok(bishops.orientationNotice.body.includes("16 of the 27"), bishops.orientationNotice.body);
   assert.ok(bishops.orientationNotice.body.includes("59%"), bishops.orientationNotice.body);
 });
 
-test("F168: the caution does NOT fire north-facing, at exactly half, or with no panels", () => {
+test("F168/D40: the caution does NOT fire north-facing, on the boundary, or with no panels", () => {
   assert.equal(viewFor(roofRow()).orientationNotice, null); // 17 panels at azimuth 0
   const half = viewFor(
     roofRow({
@@ -1209,7 +1220,10 @@ test("F168: the caution does NOT fire north-facing, at exactly half, or with no 
       ],
     }),
   );
-  assert.equal(half.orientationNotice, null); // strict majority, never half
+  // D40 (was: "strict majority, never half" -> null). Half is above a third,
+  // so this roof now warns; the split caption is silent in its place.
+  assert.ok(half.orientationNotice, "50% is above a third");
+  assert.equal(half.orientationSplitCaption, null);
   // Due east and west sit on the boundary — no southerly component, no caution.
   const eastWest = viewFor(
     roofRow({
@@ -10071,7 +10085,14 @@ test("3.4c-3 (4): the three real roofs each render their OWN true explanation", 
     console.log(`        [${name}] rendered: ${explanation}`);
     assert.ok(text.includes(explanation), `${name} renders its explanation`);
     assert.ok(!text.includes("uses a different panel"), name);
-    assert.ok(!/panel size/i.test(explanation), name);
+    // D43: panel size is allowed — and required — ONLY where both sides
+    // assessed the disagreeing face (670c80db). On the other two it must
+    // still be absent, which is F231's finding.
+    if (name.startsWith("670c80db")) {
+      assert.ok(/panel size is one possible explanation/i.test(explanation), name);
+    } else {
+      assert.ok(!/panel size/i.test(explanation), name);
+    }
   }
 });
 
@@ -10531,7 +10552,13 @@ test("3.4c-5 (4): the three real roofs — every caption figure traces to the vi
     }
     // The usable-area factor, the imagery, and the dashed box — all view facts.
     assert.ok(text.includes("70% of each face"), text);
-    assert.ok(text.includes("The photo is dated 2018-11-17, medium-quality imagery."), text);
+    // D46: the date belongs to the SOLAR MODEL; the photograph's is unknown.
+    assert.ok(
+      text.includes(
+        "Google's solar model is dated 2018-11-17, medium-quality imagery. The photograph's own date is not known to us.",
+      ),
+      text,
+    );
     assert.ok(text.includes("The dashed box is the extent"), text);
     // And it is rendered, not merely computed.
     const rendered = roofTextOf(
@@ -10562,7 +10589,7 @@ test("3.4c-5 (4): the drawable roof states what was drawn, whose panel, and why 
     // area-estimated face — the caption says exactly that.
     "Google placed no panels, so the panel counts on the single face are estimated from roof area alone.",
     "70% of each face is treated as usable after setbacks, vents and walkways.",
-    "The photo is dated 2018-11-17, medium-quality imagery.",
+    "Google's solar model is dated 2018-11-17, medium-quality imagery. The photograph's own date is not known to us.",
   ]);
 });
 
@@ -10573,7 +10600,7 @@ test("3.4c-5 (6): totality — junk view and missing figures invent nothing", ()
   // it describes the DRAWING it was handed and states nothing about the roof.
   const junk = roofDiagramCaptionLines(addressRoofView("garbage"), CAPTION_DIAGRAM as never);
   assert.deepEqual(readerInstructionsIn(junk), []);
-  for (const forbidden of ["faces", "% of each face", "The photo is dated", "scaled to"]) {
+  for (const forbidden of ["faces", "% of each face", "is dated", "scaled to"]) {
     assert.ok(!junk.join(" ").includes(forbidden), `${forbidden} invented from a junk view`);
   }
   // No dimensions, no wattage, no panel, no usability, no imagery: the lines
@@ -10599,7 +10626,7 @@ test("3.4c-5 (6): totality — junk view and missing figures invent nothing", ()
     text,
   );
   assert.ok(!text.includes("dashed box"), "no box was invented");
-  assert.ok(!text.includes("The photo is dated"), "no imagery date was invented");
+  assert.ok(!text.includes("is dated"), "no imagery date was invented");
   assert.deepEqual(readerInstructionsIn(lines), []);
   assert.doesNotThrow(() =>
     renderRoofSection({ view: bare, jobId: "j", isOpen: true, diagram: CAPTION_DIAGRAM }),
@@ -10896,4 +10923,167 @@ test("3.4c fix 3 (c): the narrowed mismatch notice — silent when the table fol
   assert.ok(view.panelMismatchNotice.body.includes("Jinko Tiger Neo 440 W"),
     view.panelMismatchNotice.body);
   // And when the table DOES follow (test 3 above), it is silent — asserted there.
+});
+// ── D40 / D43 / D46 — the three copy changes of 2026-08-26 ─────────────────
+
+/** A roof of `south` southerly panels and `north` northerly ones, one face each. */
+const splitRoof = (south: number, north: number) =>
+  viewFor(
+    roofRow({
+      planes: [
+        { azimuth: 180, pitch: 20, panel_count: south, kwp: 0.44 * south },
+        { azimuth: 0, pitch: 20, panel_count: north, kwp: 0.44 * north },
+      ],
+    }),
+  );
+
+test("D40 (1): the threshold is a THIRD — exactly a third fires, one panel below is silent", () => {
+  // Exactly one third: 5 of 15. Fires.
+  const atThird = splitRoof(5, 10);
+  assert.ok(atThird.orientationNotice, "exactly a third must fire");
+  assert.equal(atThird.orientationNotice.title, "5 of the 15 panels face the southern half");
+  // One panel below the third: 4 of 15 (26.7%). Silent — and the SPLIT speaks instead.
+  const belowThird = splitRoof(4, 11);
+  assert.equal(belowThird.orientationNotice, null, "below a third must stay silent");
+  assert.ok(belowThird.orientationSplitCaption, "a mixed roof still states its split");
+  // The old line, for contrast: a strict majority would have silenced BOTH of these.
+  assert.ok(splitRoof(5, 10).orientationNotice, "a majority rule would have been silent here");
+});
+
+test("D40 (2): the title is true at the LOWEST share that can fire — a count, not 'most'", () => {
+  // At exactly a third, "Most of these panels face south" would be FALSE. This
+  // assertion is the one that fails against the old title, which is the point.
+  const atThird = splitRoof(1, 2);
+  assert.ok(atThird.orientationNotice);
+  assert.equal(atThird.orientationNotice.title, "1 of the 3 panels faces the southern half");
+  assert.ok(!/^most/i.test(atThird.orientationNotice.title), atThird.orientationNotice.title);
+  // The claim in the title is arithmetically true at every share it can fire on.
+  for (const [south, north] of [[1, 2], [5, 10], [12, 14], [16, 11], [23, 0]]) {
+    const view = splitRoof(south, north);
+    assert.ok(view.orientationNotice, `${south}/${south + north}`);
+    assert.equal(
+      view.orientationNotice.title,
+      `${south} of the ${south + north} panels ${south === 1 ? "faces" : "face"} the southern half`,
+    );
+  }
+});
+
+test("D40 (3): the caution and the split caption are MUTUALLY EXCLUSIVE, always", () => {
+  for (let south = 0; south <= 12; south++) {
+    const view = splitRoof(south, 12 - south);
+    const both = view.orientationNotice !== null && view.orientationSplitCaption !== null;
+    assert.ok(!both, `${south} of 12 emitted both`);
+  }
+  // And the caption, when it speaks, states the split as a fact.
+  const quiet = splitRoof(2, 10); // 16.7% — below a third
+  assert.equal(quiet.orientationNotice, null);
+  assert.ok(quiet.orientationSplitCaption);
+  assert.equal(quiet.orientationSplitCaption.level, "caption"); // D25: a fact, not a finding
+  assert.equal(
+    quiet.orientationSplitCaption.body,
+    "Of the 12 panels, 10 face the northern half of the compass and 2 the southern.",
+  );
+});
+
+test("D40: fallbacks — one-sided roofs, the boundary, and an unknown azimuth", () => {
+  // Nothing southern: neither the caution nor the split.
+  const allNorth = splitRoof(0, 9);
+  assert.equal(allNorth.orientationNotice, null);
+  assert.equal(allNorth.orientationSplitCaption, null);
+  // Everything southern: the caution, and no caption.
+  const allSouth = splitRoof(9, 0);
+  assert.ok(allSouth.orientationNotice);
+  assert.equal(allSouth.orientationSplitCaption, null);
+  // A face with NO azimuth counts toward the TOTAL and toward NEITHER half, so
+  // the two halves need not sum to the total — the sentence is phrased for that.
+  const unknown = viewFor(
+    roofRow({
+      planes: [
+        { azimuth: 180, pitch: 20, panel_count: 2, kwp: 0.88 },
+        { azimuth: 0, pitch: 20, panel_count: 4, kwp: 1.76 },
+        { pitch: 20, panel_count: 6, kwp: 2.64 }, // azimuth unknown
+      ],
+    }),
+  );
+  assert.equal(unknown.orientationNotice, null); // 2 of 12 is below a third
+  assert.equal(
+    unknown.orientationSplitCaption?.body,
+    "Of the 12 panels, 4 face the northern half of the compass and 2 the southern.",
+  );
+  // Due east and due west are the boundary itself — neither half, same rule.
+  const boundary = viewFor(
+    roofRow({
+      planes: [
+        { azimuth: 90, pitch: 20, panel_count: 5, kwp: 2.2 },
+        { azimuth: 270, pitch: 20, panel_count: 5, kwp: 2.2 },
+      ],
+    }),
+  );
+  assert.equal(boundary.orientationNotice, null);
+  assert.equal(boundary.orientationSplitCaption, null, "no panel is on either half");
+});
+
+test("D43 (4): panel size is named ONLY where both sides assessed the face", () => {
+  // 670c80db: 27 against 28, the one disagreeing face assessed by both.
+  const bishops = viewFor(BISHOPS_ROW).countReconciliation;
+  assert.ok(bishops?.explanation);
+  assert.equal(bishops.agreeOnAssessedFaces, false);
+  assert.ok(/panel size is one possible explanation/i.test(bishops.explanation), bishops.explanation);
+  // A CANDIDATE, never the cause — the distinction F231 was about.
+  assert.ok(bishops.explanation.includes("nothing here establishes the cause"), bishops.explanation);
+  // a57e13f1 AGREES on every assessed face: panel size explains none of its
+  // gap, and the screen must still say nothing about it (F231's deleted line).
+  const a57 = viewFor(A57_ROW).countReconciliation;
+  assert.ok(a57?.explanation);
+  assert.equal(a57.agreeOnAssessedFaces, true);
+  assert.ok(!/panel size|different panel/i.test(a57.explanation), a57.explanation);
+  // The no-layout roof: every count from area alone, still no panel-size talk.
+  const frome = viewFor(FROME_ROW).countReconciliation;
+  assert.ok(!/panel size|different panel/i.test(String(frome?.explanation)), String(frome?.explanation));
+});
+
+test("D46 (5): NO caption line ever asserts a date for the PHOTOGRAPH itself", () => {
+  const fixtures = [
+    ["a57e13f1", withImagery(A57_ROW), CAPTION_DIAGRAM],
+    ["670c80db", withImagery(BISHOPS_ROW), CAPTION_DIAGRAM],
+    ["456e0242", withImagery(FROME_ROW), { ...CAPTION_DIAGRAM, reason: "no_panel_positions" }],
+    ["no diagram", withImagery(roofRow()), undefined],
+  ] as const;
+  for (const [name, row, diagram] of fixtures) {
+    const lines = roofDiagramCaptionLines(viewFor(row), diagram as never);
+    for (const line of lines) {
+      for (const raw of line.split(/(?<=\.)\s+/)) {
+        const sentence = raw.trim();
+        // THE DETECTOR: a sentence carrying a date must not be about the photo.
+        // Reinstating "The photo is dated 2018-11-17, medium-quality." trips this.
+        if (/\d{4}-\d{2}-\d{2}/.test(sentence)) {
+          assert.ok(
+            !/\bphoto(graph)?\b/i.test(sentence),
+            `${name}: a date is asserted for the photograph: ${sentence}`,
+          );
+        }
+      }
+    }
+    const text = lines.join(" ");
+    if (text.includes("2018-11-17")) {
+      // The date is attributed to the MODEL, and the photo's is stated unknown.
+      assert.ok(text.includes("Google's solar model is dated 2018-11-17"), text);
+      assert.ok(text.includes("The photograph's own date is not known to us."), text);
+    }
+  }
+  // Quality alone, with no date: still the model's, never the photo's.
+  const qualityOnly = roofDiagramCaptionLines(
+    viewFor({ ...roofRow(), imagery_quality: "HIGH" }),
+    undefined,
+  );
+  // roofRow() carries no usability_factor, so no usability line — the caption
+  // omits what it does not have rather than inventing it.
+  assert.deepEqual(qualityOnly, [
+    "Google placed no panels, so the panel counts on the single face are estimated from roof area alone.",
+    "Google's solar model is high-quality imagery. The photograph's own date is not known to us.",
+  ]);
+  // A roof with NO imagery values emits no line at all rather than a guess.
+  const none = roofDiagramCaptionLines(viewFor(roofRow()), undefined);
+  assert.ok(!none.join(" ").includes("is dated"), none.join(" "));
+  assert.ok(!none.join(" ").includes("not known to us"), none.join(" "));
 });

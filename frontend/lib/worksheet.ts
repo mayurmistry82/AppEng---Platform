@@ -1079,6 +1079,12 @@ export interface AddressRoofView {
    * the share. It does NOT judge the yield — that is row 4.13, deliberately.
    */
   orientationNotice: RoofNoticeView | null;
+  /**
+   * D40: the north/south split as a plain fact, on every roof with panels on
+   * both halves. Null when the caution above fires (its body already carries
+   * the numbers — F248), and null when every panel is on one half.
+   */
+  orientationSplitCaption: RoofNoticeView | null;
   /** F94: totals.kwp to one decimal, the same one-rule rounding as the planes. */
   totalKwpLabel: string | null;
   /**
@@ -1188,8 +1194,15 @@ function roofCountReconciliation(
       );
     } else {
       if (!agreeOnAssessedFaces) {
+        // D43 / F244: on a face BOTH sides assessed, panel size is genuinely
+        // plausible — 670c80db's one disagreeing face is 13 against 14 — and
+        // refusing to say so is truth-on-all-instances, which can be a way of
+        // saying nothing. Named as a CANDIDATE, never as the cause: the
+        // sentence deleted at 3.4c stated it as THE cause, and F231 proved
+        // that false on a57e13f1. Nothing is added to the area-alone branch
+        // below, where panel size explains none of the gap.
         sentences.push(
-          `Google's layout and the table disagree on faces both assessed — the table has ${tableOnAssessed} panels on those faces, Google's layout ${googleTotal}.`,
+          `Google's layout and the table disagree on faces both assessed — the table has ${tableOnAssessed} panels on those faces, Google's layout ${googleTotal}. A different panel size is one possible explanation for a difference of that kind, though nothing here establishes the cause.`,
         );
       } else if (areaFaces.length > 0) {
         sentences.push("The faces Google assessed match the table exactly.");
@@ -1228,19 +1241,63 @@ function roofCountReconciliation(
 }
 
 /**
- * F168: the orientation caution — a strict majority of panels on southerly
- * faces (bearing strictly between 90° and 270°). Names the direction and the
- * share; never judges the yield (row 4.13). D25: it CAN not fire on a job
- * like this one, so it is a notice, not a caption.
+ * THE THREE ORIENTATION BUCKETS, counted in PANELS (D40).
+ *
+ * southern — bearing strictly between 90° and 270°, the low-sun half here.
+ * northern — bearing strictly outside that, the high-sun half.
+ * NEITHER  — a face whose azimuth is exactly 90° or exactly 270° (due east or
+ *            due west, the boundary itself) or is not known at all. Its panels
+ *            COUNT TOWARD THE TOTAL and toward neither half, deliberately:
+ *            calling due east "northern" would overstate the good half, and
+ *            calling an unknown azimuth anything at all would be an invention.
+ *            So `northern + southern` can be LESS than `total`, and every
+ *            sentence built from these is phrased to stay true when it is.
+ */
+function orientationSplit(planes: RoofPlaneView[]): {
+  total: number;
+  southern: number;
+  northern: number;
+  southernFaces: RoofPlaneView[];
+} {
+  let total = 0;
+  let southern = 0;
+  let northern = 0;
+  const southernFaces: RoofPlaneView[] = [];
+  for (const plane of planes) {
+    const count = plane.panelCount ?? 0;
+    total += count;
+    if (plane.azimuth === null) continue;
+    if (plane.azimuth > 90 && plane.azimuth < 270) {
+      southern += count;
+      southernFaces.push(plane);
+    } else if (plane.azimuth < 90 || plane.azimuth > 270) {
+      northern += count;
+    }
+  }
+  return { total, southern, northern, southernFaces };
+}
+
+/**
+ * F168 / D40: the orientation caution — fires when A THIRD OR MORE of the
+ * panels sit on southerly faces. Names the direction and the share; never
+ * judges the yield (row 4.13, and D40 records the yield-shortfall version as
+ * the better long-run answer, NOT chosen, waiting on 4.2).
+ *
+ * WHY A THIRD, not a majority (D40, F241): the strict majority meant
+ * a57e13f1 at 12 of 26 panels (46%) said NOTHING while 670c80db at 16 of 27
+ * (59%) warned — and 46 against 59 is not a line anyone would recognise as
+ * meaningful. A roof that is nearly half badly oriented is exactly the roof
+ * about to be quoted at northern-roof numbers.
+ *
+ * D25: it CAN not fire on a job like this one, so it is a notice.
  */
 function roofOrientationNotice(planes: RoofPlaneView[]): RoofNoticeView | null {
-  const total = planes.reduce((s, p) => s + (p.panelCount ?? 0), 0);
+  const { total, southern: poorPanels, southernFaces: poor } =
+    orientationSplit(planes);
   if (total <= 0) return null;
-  const poor = planes.filter(
-    (p) => p.azimuth !== null && p.azimuth > 90 && p.azimuth < 270,
-  );
-  const poorPanels = poor.reduce((s, p) => s + (p.panelCount ?? 0), 0);
-  if (poorPanels * 2 <= total) return null; // strict majority, never half
+  // A THIRD OR MORE, in integer arithmetic — no float ratio is formed, so no
+  // rounding decides whether a warning appears.
+  if (poorPanels * 3 < total) return null;
   let leadWords = "south";
   let leadCount = -1;
   for (const p of poor) {
@@ -1256,8 +1313,46 @@ function roofOrientationNotice(planes: RoofPlaneView[]): RoofNoticeView | null {
   return {
     tone: "caution",
     level: "notice",
-    title: `Most of these panels face ${leadWords}`,
+    // THE TITLE MUST BE TRUE AT EVERY SHARE THIS CAN FIRE ON (D40). The old
+    // "Most of these panels face south" was false the moment the line moved
+    // to a third — at 46% on a57e13f1 it would have asserted a majority that
+    // does not exist. A count states the fact and cannot go false.
+    title: `${poorPanels} of the ${total} panels ${
+      poorPanels === 1 ? "faces" : "face"
+    } the southern half`,
     body: `${poorPanels} of the ${total} panels (${share}%) sit on faces pointing into the southern half of the compass, mostly ${leadWords}. In the southern hemisphere that is the low-sun side. Each face's direction and pitch are spelled out in the table.`,
+  };
+}
+
+/**
+ * D40: every roof with panels on BOTH halves states the split as a plain
+ * fact — regardless of whether the caution fires.
+ *
+ * MUTUALLY EXCLUSIVE WITH THE CAUTION, deliberately: when the caution fires
+ * its body already carries both numbers, and two composers saying the same
+ * thing in different words is exactly the fault F248 records about this
+ * screen. So this returns null whenever the caution is present.
+ *
+ * D25: a split is a FACT about the roof, true of every mixed roof and
+ * carrying no judgement — a caption, not a finding.
+ *
+ * The sentence says "of the N panels", never "N north plus M south", because
+ * a boundary or unknown azimuth belongs to neither half (see orientationSplit)
+ * and the two numbers are not required to sum.
+ */
+function roofOrientationSplitCaption(
+  planes: RoofPlaneView[],
+  caution: RoofNoticeView | null,
+): RoofNoticeView | null {
+  if (caution !== null) return null;
+  const { total, southern, northern } = orientationSplit(planes);
+  if (total <= 0 || southern === 0 || northern === 0) return null;
+  return {
+    tone: "info",
+    level: "caption",
+    icon: "info",
+    title: "These panels face both ways",
+    body: `Of the ${total} panels, ${northern} face the northern half of the compass and ${southern} the southern.`,
   };
 }
 
@@ -1614,6 +1709,7 @@ export function addressRoofView(job: unknown): AddressRoofView {
     showsExistingArray: rule ? rule.showsExistingArray : false,
     countReconciliation: null,
     orientationNotice: null,
+    orientationSplitCaption: null,
     totalKwpLabel: null,
     panelMismatchNotice: null,
     scaledToLine: null,
@@ -1694,6 +1790,10 @@ export function addressRoofView(job: unknown): AddressRoofView {
   view.totalKwpLabel = roofKwLabel(view.totals.kwp);
   view.countReconciliation = roofCountReconciliation(view.planes, row);
   view.orientationNotice = roofOrientationNotice(view.planes);
+  view.orientationSplitCaption = roofOrientationSplitCaption(
+    view.planes,
+    view.orientationNotice,
+  );
 
   const imageryDate = typeof row.imagery_date === "string" ? row.imagery_date : null;
   view.imageryDate = imageryDate;
@@ -2579,12 +2679,26 @@ export function roofDiagramCaptionLines(
         ? view.imageryQualityLabel.charAt(0).toLowerCase() +
           view.imageryQualityLabel.slice(1)
         : null;
-    lines.push(
+    // D46 / F247: THESE TWO VALUES DESCRIBE THE SOLAR MODEL, NOT THE PHOTO.
+    // roof_geometry.imagery_date / imagery_quality are read from the
+    // buildingInsights response (data.get("imageryDate") /
+    // data.get("imageryQuality") in backend/roof_geometry.py) and stored on
+    // the roof row. The picture underneath the drawing is a Static Maps
+    // satellite tile, and NOTHING WE STORE RECORDS ITS DATE. The line above
+    // already says the two are different captures, so dating the photograph
+    // with the model's date made the caption contradict itself — and it is
+    // the one sentence a reader would use to judge whether the photo is
+    // current. The model's date is real and useful, so it stays, attributed
+    // to the model by name; the photograph's date is stated as unknown rather
+    // than invented.
+    const modelFacts =
       view.imageryDate !== null && quality !== null
-        ? `The photo is dated ${view.imageryDate}, ${quality}.`
+        ? `is dated ${view.imageryDate}, ${quality}`
         : view.imageryDate !== null
-          ? `The photo is dated ${view.imageryDate}.`
-          : `${view.imageryQualityLabel}.`,
+          ? `is dated ${view.imageryDate}`
+          : `is ${quality}`;
+    lines.push(
+      `Google's solar model ${modelFacts}. The photograph's own date is not known to us.`,
     );
   }
   return lines;
