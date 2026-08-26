@@ -1129,7 +1129,15 @@ test("F168: orientationLabel — direction and pitch in plain words, degrading t
       ],
     }),
   );
-  assert.equal(view.planes[0].orientationLabel, "faces south-south-east, 23 degree pitch");
+  // D47 (was "faces south-south-east, 23 degree pitch"): the pitch left this
+  // label because the table's own Pitch column sits immediately alongside it.
+  assert.equal(view.planes[0].orientationLabel, "faces south-south-east");
+  assert.ok(
+    !/pitch/i.test(view.planes[0].orientationLabel),
+    "a known azimuth must not restate the pitch",
+  );
+  // THE FALLBACK STAYS: with no azimuth this label is the only place the pitch
+  // appears in words, so change 1 cannot be implemented by deleting it here.
   assert.equal(view.planes[1].orientationLabel, "20 degree pitch");
   assert.equal(view.planes[2].orientationLabel, "faces north");
   assert.equal(view.planes[3].orientationLabel, null);
@@ -10026,7 +10034,8 @@ test("3.4c-3 (1): provenance, orientation words and rounded labels are ON SCREEN
   // D48: assessed faces carry NO label; only the exception is marked.
   assert.ok(!text.includes("from Google's panel layout"), text.slice(0, 200));
   assert.ok(text.includes("estimated from area alone"));
-  assert.ok(text.includes("faces west-north-west, 23 degree pitch"));
+  assert.ok(text.includes("faces west-north-west"));
+  assert.ok(!text.includes("faces west-north-west, 23 degree pitch"), "the pitch is not restated");
   assert.ok(text.includes("about 8 m²")); // area-counted face: approximate, whole metres
   assert.ok(text.includes("19 m²")); // Google-laid-out face: whole metres, no "about"
   assert.ok(text.includes("3.5 kW")); // one decimal
@@ -10581,7 +10590,7 @@ test("D48 (3): NOTHING anywhere composes an orientation judgement", () => {
     assert.ok(!text.includes(gone), `orientation judgement still on screen: ${gone}`);
   }
   // The FACTS the table states are untouched — direction and pitch per face.
-  assert.ok(text.includes("faces east-south-east, 6 degree pitch"), text);
+  assert.ok(text.includes("faces east-south-east"), text);
 });
 // ── 3.4c fix 3: the roof table follows the pinned panel (F217, D39) ─────────
 // Fixtures shaped on the two LIVE runs, both verified against the database on
@@ -10689,13 +10698,16 @@ test("3.4c fix 3 (4): UNPINNED — the roof row's own numbers, exactly as today"
   assert.deepEqual(view.totals, { panels: 26, kwp: 11.44 });
   assert.equal(view.totalKwpLabel, "11.4 kW");
   assert.equal(view.panelLabel, "Jinko Tiger Neo 440 W");
-  assert.equal(
-    view.scaledToLine,
-    "Scaled to Jinko Tiger Neo 440 W — the panel the lookup was scaled to",
-  );
+  // D47 (was "… — the panel the lookup was scaled to"): with no pin there is
+  // nothing to distinguish it from, so the trailing clause described our
+  // plumbing rather than the roof. Mark the exception, not the rule.
+  assert.equal(view.scaledToLine, "Scaled to Jinko Tiger Neo 440 W");
+  assert.ok(!view.scaledToLine.includes("—"), "no trailing clause without a pin");
   const text = roofTextOf(renderRoofSection({ view, jobId: "j", isOpen: false }));
   console.log(`        [auto table]   ${text.slice(text.indexOf("Direction"), text.indexOf("Direction") + 620)}`);
-  assert.ok(text.includes("the panel the lookup was scaled to"), text);
+  // D47: the unpinned line carries no explanation — just the panel.
+  assert.ok(text.includes("Scaled to Jinko Tiger Neo 440 W"), text);
+  assert.ok(!text.includes("the panel the lookup was scaled to"), text);
 });
 
 test("3.4c fix 3 (5): the CONFUSION GUARD — capacity is the largest point, never chosen_solar", () => {
@@ -10734,7 +10746,7 @@ test("3.4c fix 3 (6): totality — no run, no layout, junk points: falls back, n
     const view = addressRoofView(job);
     assert.deepEqual(view.planes.map((p) => p.panelCount), lookupCounts, name);
     assert.deepEqual(view.totals, { panels: 26, kwp: 11.44 }, name);
-    assert.ok(view.scaledToLine?.includes("the panel the lookup was scaled to"), name);
+    assert.equal(view.scaledToLine, "Scaled to Jinko Tiger Neo 440 W", name);
     assert.doesNotThrow(() => renderRoofSection({ view, jobId: "j", isOpen: false }), name);
   }
 });
@@ -10885,7 +10897,7 @@ test("D48 (7): every item on the WHAT STAYS list is still on screen", () => {
   // The address, the table (direction AND pitch), "Scaled to", the attribution.
   const main = render(base);
   assert.ok(main.includes("Direction") && main.includes("Pitch"), "the table columns");
-  assert.ok(main.includes("faces east-south-east, 6 degree pitch"), "direction in words");
+  assert.ok(main.includes("faces east-south-east"), "direction in words");
   assert.ok(main.includes("Scaled to Jinko Tiger Neo 440 W"), "the Scaled to line");
   assert.ok(main.includes("Includes solar data from Google"), "the attribution");
   assert.ok(main.includes("The dashed box is the area Google measured."), "the box");
@@ -10935,4 +10947,29 @@ test("D48 (7): every item on the WHAT STAYS list is still on screen", () => {
         run_assumptions: { panel: { id: "panel-b", watts: 475 } } }] },
   );
   assert.ok(mismatch.includes("scaled to a different panel than the quote"), "D39 mismatch notice");
+});
+test("D47 (4): RENDER on a57e13f1 — direction without pitch, Scaled to without a clause", () => {
+  const view = viewFor({
+    ...withImagery(A57_ROW),
+    lat: -34.92,
+    lng: 138.62,
+    selected_panel: { id: "p1", brand: "Jinko", model: "Tiger Neo", watts: 440 },
+  });
+  const text = roofTextOf(
+    renderRoofSection({ view, jobId: "j", isOpen: true, diagram: CAPTION_DIAGRAM }),
+  );
+  // CHANGE 1: the direction is in words, the pitch is NOT restated beside it.
+  assert.ok(text.includes("faces east-south-east"), text.slice(0, 300));
+  assert.ok(!text.includes("6 degree pitch"), "the pitch is not printed twice");
+  assert.ok(!/degree pitch/.test(text), "no face restates its pitch in words");
+  // ...and the Pitch column still carries it, so nothing was lost.
+  assert.ok(text.includes("6°"), "the Pitch column still reads 6°");
+  // CHANGE 2: the unpinned line is the panel and nothing else.
+  assert.ok(text.includes("Scaled to Jinko Tiger Neo 440 W"), text);
+  assert.ok(!text.includes("the panel the lookup was scaled to"), text);
+  // The full line, as it reads on screen — no trailing dash clause.
+  assert.ok(
+    text.includes("Scaled to Jinko Tiger Neo 440 W · 70% of each face treated as usable"),
+    text,
+  );
 });

@@ -1100,13 +1100,24 @@ function roofNum(v: unknown): number | null {
   return typeof v === "number" && Number.isFinite(v) ? v : null;
 }
 
-/** F168: compass words + pitch; pitch alone when only pitch is known. */
+/**
+ * F168: which way a face points, in words.
+ *
+ * D47 (seen on screen 2026-08-26): this used to append the pitch —
+ * "faces east-south-east, 6 degree pitch" — while the table's own Pitch
+ * column, immediately alongside, read 6°. The same number twice in adjacent
+ * columns. The Direction cell says which way the face points; the Pitch
+ * column says how steep it is.
+ *
+ * THE PITCH-ONLY FALLBACK STAYS. On a face whose azimuth is unknown this
+ * label is the ONLY place the pitch appears in words, so dropping it there
+ * would lose a fact rather than de-duplicate one.
+ */
 function orientationLabelFor(azimuth: number | null, pitch: number | null): string | null {
   const code = azimuthLabel(azimuth);
   const words = code !== null ? COMPASS_WORDS[code] ?? null : null;
-  const degrees = pitch !== null ? Math.round(pitch) : null;
-  if (words !== null && degrees !== null) return `faces ${words}, ${degrees} degree pitch`;
   if (words !== null) return `faces ${words}`;
+  const degrees = pitch !== null ? Math.round(pitch) : null;
   if (degrees !== null) return `${degrees} degree pitch`;
   return null;
 }
@@ -1574,11 +1585,16 @@ export function addressRoofView(job: unknown): AddressRoofView {
   // stored layout drives the numbers above, else the lookup's own panel.
   const lookupLabel = panelDisplayLabel(row.selected_panel);
   view.panelLabel = pinned !== null ? pinned.label ?? lookupLabel : lookupLabel;
+  // MARK THE EXCEPTION, NOT THE RULE (D47, the same principle as the per-face
+  // marker). A PINNED panel is a deliberate instruction (D39), and saying so
+  // tells the installer why the table follows it. With no pin there is nothing
+  // to distinguish it from, so "the panel the lookup was scaled to" described
+  // our plumbing rather than his roof.
   view.scaledToLine =
     pinned !== null
       ? `Scaled to ${pinned.label ?? "the pinned panel"} — the panel pinned for the current run`
       : lookupLabel !== null
-        ? `Scaled to ${lookupLabel} — the panel the lookup was scaled to`
+        ? `Scaled to ${lookupLabel}`
         : null;
 
   view.panelMismatchNotice = roofPanelMismatchNotice(job, row, view.panelLabel, pinned !== null);
