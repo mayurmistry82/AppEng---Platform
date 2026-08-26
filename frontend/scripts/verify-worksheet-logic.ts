@@ -162,6 +162,12 @@ import {
   tariffBillMismatchNotice,
   tariffNetworkView,
   tariffSaveNotices,
+  PREFILLED_TARIFF_FIELDS,
+  SAVABLE_TARIFF_FIELDS,
+  tariffFieldSources,
+  tariffFormFromView,
+  type TariffFormState,
+  type TariffNetworkView,
   fitZoomForBuilding,
   metresPerPixel,
   panelRectangles,
@@ -3994,6 +4000,216 @@ test("3.8: the HH:MM guard matches the backend's regex, including 24:00", () => 
   }
   for (const bad of ["25:00", "18:60", "6pm", "", "18", "18:0", null, 18]) {
     assert.ok(!isTariffTime(bad), `${JSON.stringify(bad)} should be rejected`);
+  }
+});
+
+// ── 3.18: provenance of prefilled values — the client derivation ─────────────
+// tariffFieldSources is pure and browser-free by design (D25/F128): every case
+// below drives it over in-memory fixtures exactly as the component drives it
+// at save time. The backend's carry-forward half lives in
+// verify_tariff_provenance.py; the two field lists are set-compared across the
+// language gap there too.
+
+test("3.18: fieldOrigin — one entry per savable field, always, with its cause", () => {
+  // Empty job with both defaults: the two lookup prefills and the form's own
+  // flat literal read "lookup_default"; the never-prefilled fields read "none".
+  const empty = tariffNetworkView(jobWithTariff(null), BOTH_DEFAULTS);
+  assert.deepEqual(
+    Object.keys(empty.fieldOrigin).sort(),
+    [...SAVABLE_TARIFF_FIELDS].sort(),
+    "one entry for EVERY savable field, no more, no fewer",
+  );
+  assert.equal(empty.fieldOrigin.fit_aud_per_kwh, "lookup_default");
+  assert.equal(empty.fieldOrigin.export_limit_kw, "lookup_default");
+  assert.equal(empty.fieldOrigin.tariff_type, "lookup_default");
+  assert.equal(empty.fieldOrigin.import_rate, "none");
+  assert.equal(empty.fieldOrigin.supply_charge, "none");
+  assert.equal(empty.fieldOrigin.tou_windows, "none");
+
+  // A stored row wins per field; the fields it does not carry keep their own
+  // answer (the 3.8 (c) per-field rule, now visible as provenance).
+  const partial = tariffNetworkView(
+    jobWithTariff({ tariff_type: "flat", import_rate: 0.42, export_limit_kw: 7.5 }),
+    BOTH_DEFAULTS,
+  );
+  assert.equal(partial.fieldOrigin.tariff_type, "stored");
+  assert.equal(partial.fieldOrigin.import_rate, "stored");
+  assert.equal(partial.fieldOrigin.export_limit_kw, "stored");
+  assert.equal(partial.fieldOrigin.fit_aud_per_kwh, "lookup_default");
+  assert.equal(partial.fieldOrigin.supply_charge, "none");
+
+  // No defaults at all: absence carries its cause — "none", never a label.
+  const bare = tariffNetworkView(jobWithTariff(null), { exportLimit: null, fit: null });
+  assert.equal(bare.fieldOrigin.fit_aud_per_kwh, "none");
+  assert.equal(bare.fieldOrigin.export_limit_kw, "none");
+
+  // Stored TOU windows are "stored"; a row whose windows were all unreadable
+  // has nothing to display, so the origin honestly reads "none".
+  const tou = tariffNetworkView(
+    jobWithTariff({
+      tariff_type: "tou",
+      tou_windows: [
+        { label: "peak", rate: 0.55, start: "18:00", end: "22:00", days: "all" },
+        { label: "offpeak", rate: 0.22, start: "22:00", end: "06:00", days: "all" },
+      ],
+    }),
+    BOTH_DEFAULTS,
+  );
+  assert.equal(tou.fieldOrigin.tou_windows, "stored");
+  const unreadable = tariffNetworkView(
+    jobWithTariff({ tariff_type: "tou", tou_windows: [{ rate: 0.4 }] }),
+    BOTH_DEFAULTS,
+  );
+  assert.equal(unreadable.fieldOrigin.tou_windows, "none");
+});
+
+test("3.18: the caption and the origin map cannot disagree — same fact, both places", () => {
+  // Both are computed from the ONE fromStored fact inside tariffNetworkView;
+  // this asserts the composed result, not the intention (2N.1).
+  const fixtures = [
+    jobWithTariff(null),
+    jobWithTariff({ tariff_type: "flat", import_rate: 0.42 }),
+    jobWithTariff({ tariff_type: "flat", fit_aud_per_kwh: 0.06 }),
+    jobWithTariff({ tariff_type: "flat", export_limit_kw: 7.5 }),
+    jobWithTariff({ tariff_type: "flat", fit_aud_per_kwh: 0.06, export_limit_kw: 7.5 }),
+  ];
+  for (const job of fixtures) {
+    const view = tariffNetworkView(job, BOTH_DEFAULTS);
+    assert.equal(
+      view.fitSourceLabel === "From the saved tariff.",
+      view.fieldOrigin.fit_aud_per_kwh === "stored",
+      "fit caption vs fit origin",
+    );
+    assert.equal(
+      view.exportSourceLabel === "From the saved tariff.",
+      view.fieldOrigin.export_limit_kw === "stored",
+      "export caption vs export origin",
+    );
+  }
+});
+
+test("3.18 (a): THE F196 CASE — only the import rate typed, the rest accepted defaults", () => {
+  const view = tariffNetworkView(jobWithTariff(null), BOTH_DEFAULTS);
+  const form: TariffFormState = { ...tariffFormFromView(view), importRate: "0.42" };
+  // deepEqual, not per-key reads: the ABSENT keys (supply_charge empty,
+  // tou_windows null on a flat save) are as much the assertion as the present
+  // ones. tariff_type is accepted_default because the form's own `?? "flat"`
+  // literal prefilled the radio and the person never touched it.
+  assert.deepEqual(tariffFieldSources(view, form), {
+    tariff_type: "accepted_default",
+    import_rate: "typed",
+    fit_aud_per_kwh: "accepted_default",
+    export_limit_kw: "accepted_default",
+  });
+});
+
+test("3.18 (b): changing the feed-in tariff makes it typed — 0.08 over the 0.05 default", () => {
+  const view = tariffNetworkView(jobWithTariff(null), BOTH_DEFAULTS);
+  const form: TariffFormState = { ...tariffFormFromView(view), fitRate: "0.08" };
+  const sources = tariffFieldSources(view, form);
+  assert.equal(sources.fit_aud_per_kwh, "typed");
+  // The untouched default beside it still reads accepted_default — per field,
+  // never per form.
+  assert.equal(sources.export_limit_kw, "accepted_default");
+});
+
+test("3.18 (c): stored row, only the supply charge touched — stored fields carry NO key", () => {
+  const view = tariffNetworkView(
+    jobWithTariff({
+      tariff_type: "flat", import_rate: 0.42,
+      fit_aud_per_kwh: 0.05, export_limit_kw: 5.0,
+    }),
+    BOTH_DEFAULTS,
+  );
+  const form: TariffFormState = { ...tariffFormFromView(view), supplyCharge: "1.10" };
+  // The stored fields are omitted ON PURPOSE: the endpoint carries their
+  // stored labels forward, and the client cannot know the history. Sending
+  // "typed" for them here is the exact defect this row exists to end.
+  assert.deepEqual(tariffFieldSources(view, form), { supply_charge: "typed" });
+});
+
+test("3.18 (d): no defaults anywhere — a lookup field is never an accepted default", () => {
+  const view = tariffNetworkView(jobWithTariff(null), { exportLimit: null, fit: null });
+  const typedInto: TariffFormState = {
+    ...tariffFormFromView(view), importRate: "0.42", fitRate: "0.08",
+  };
+  const sources = tariffFieldSources(view, typedInto);
+  assert.equal(sources.import_rate, "typed");
+  assert.equal(sources.fit_aud_per_kwh, "typed");
+  for (const field of ["import_rate", "supply_charge", "tou_windows",
+                       "fit_aud_per_kwh", "export_limit_kw"]) {
+    assert.notEqual(sources[field], "accepted_default",
+      `${field}: there was no default to accept`);
+  }
+  // tariff_type is the ONE deliberate exception: its prefill is the form's
+  // own `?? "flat"` literal, not a TariffDefault, so an untouched radio is a
+  // genuinely accepted default even when TariffDefaults are both null.
+  const untouched = tariffFieldSources(view, tariffFormFromView(view));
+  assert.deepEqual(untouched, { tariff_type: "accepted_default" });
+});
+
+test("3.18: a TOU save nulls the import rate, so its box text carries no provenance", () => {
+  // The payload sends import_rate: null when the tariff is TOU — a leftover
+  // number in the hidden flat box must not be labelled anything (rule C4).
+  const view = tariffNetworkView(
+    jobWithTariff({ tariff_type: "flat", import_rate: 0.42 }),
+    BOTH_DEFAULTS,
+  );
+  const form: TariffFormState = {
+    ...tariffFormFromView(view),
+    tariffType: "tou",
+    windows: [
+      { label: "peak", rate: "0.5", start: "07:00", end: "21:00", days: "all" },
+      { label: "offpeak", rate: "0.2", start: "21:00", end: "07:00", days: "all" },
+    ],
+  };
+  const sources = tariffFieldSources(view, form);
+  assert.ok(!("import_rate" in sources), "nulled by the payload -> no key");
+  assert.equal(sources.tariff_type, "typed");
+  assert.equal(sources.tou_windows, "typed");
+});
+
+test("3.18 (e): junk in — nulls, numbers, missing view fields — an object, never a throw", () => {
+  const junkViews: unknown[] = [
+    null, undefined, 42, "a view", [], {},
+    { fieldOrigin: "not a map" },
+    { importRate: 7, windows: "x" },
+    { tariffType: "tou" },
+  ];
+  const junkForms: unknown[] = [
+    null, undefined, 42, "a form", [], {},
+    { windows: 9 },
+    { importRate: { nested: true } },
+    { tariffType: "tou", windows: [null, 42] },
+  ];
+  for (const v of junkViews) {
+    for (const f of junkForms) {
+      const out = tariffFieldSources(
+        v as unknown as TariffNetworkView,
+        f as unknown as TariffFormState,
+      );
+      assert.ok(out !== null && typeof out === "object" && !Array.isArray(out));
+      for (const label of Object.values(out)) {
+        assert.ok(label === "typed" || label === "accepted_default",
+          `only vocabulary labels ever appear, got ${JSON.stringify(label)}`);
+      }
+    }
+  }
+  // tariffFormFromView is total too — the component seeds state through it.
+  for (const v of junkViews) {
+    const formed = tariffFormFromView(v as unknown as TariffNetworkView);
+    assert.ok(formed.tariffType === "flat" || formed.tariffType === "tou");
+    assert.ok(Array.isArray(formed.windows));
+  }
+});
+
+test("3.18: the prefilled list is a subset of the savable list, both non-empty", () => {
+  // The cross-language equality with routes/demand.py lives in
+  // verify_tariff_provenance.py; this is the client-side sanity half.
+  const savable = new Set<string>(SAVABLE_TARIFF_FIELDS);
+  assert.ok(savable.size > 0 && PREFILLED_TARIFF_FIELDS.length > 0);
+  for (const field of PREFILLED_TARIFF_FIELDS) {
+    assert.ok(savable.has(field), `${field} must be savable to be prefilled`);
   }
 });
 

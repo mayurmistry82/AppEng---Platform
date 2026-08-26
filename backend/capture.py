@@ -117,6 +117,12 @@ _ALLOWED: dict[str, set[str]] = {
         # 3.8 — the tariff envelope: the scalar rate, the single FiT, the export
         # cap, the provenance, and the writer-set updated_at (no triggers exist).
         "import_rate", "fit_aud_per_kwh", "export_limit_kw", "source", "updated_at",
+        # 3.18 — field-level provenance: {column name -> typed|accepted_default}
+        # recorded at save time, because after the fact a default and a
+        # deliberate choice are the same number. Absent from this allowlist the
+        # column would be SILENTLY DROPPED by _filtered, which is exactly what
+        # this allowlist does. Vocabulary: routes/demand.py TARIFF_FIELD_SOURCES.
+        "field_sources",
     },
     "surveys": {
         "survey_id", "job_id", "household_size", "occupancy_pattern", "hot_water_type",

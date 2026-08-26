@@ -22,8 +22,11 @@ import {
   TARIFF_DAYS_VALUES,
   TARIFF_WINDOW_LABELS,
   isTariffTime,
+  tariffFieldSources,
+  tariffFormFromView,
   tariffSaveNotices,
   type RoofNoticeView,
+  type TariffFormState,
   type TariffNetworkView,
   type TariffWindowFormRow,
   type SizingInputSave,
@@ -34,9 +37,11 @@ import {
  * what export earns, and how much the network lets this house send back.
  *
  * The database is the single source of truth. The server page hands in the
- * view (stored row over lookup default, per field), saving POSTs the seven
- * fields TariffSaveRequest accepts, then router.refresh() re-reads. There is no
- * store and nothing persisted client-side — section state is local React state.
+ * view (stored row over lookup default, per field), saving POSTs the eight
+ * fields TariffSaveRequest accepts — the values plus field_sources, the
+ * typed-versus-accepted-default record (3.18, derived in lib/worksheet.ts,
+ * never here) — then router.refresh() re-reads. There is no store and nothing
+ * persisted client-side — section state is local React state.
  *
  * THE EXPORT LIMIT IS A NUMBER ONLY (Mayur, 2026-08-18). No fixed-or-flexible
  * dropdown, not even disabled: flexible and dynamic export is checklist 4.4 and
@@ -62,28 +67,6 @@ const DAYS_OPTIONS: { value: string; label: string }[] = [
   { value: "weekend", label: "Weekends" },
 ];
 
-interface FormState {
-  tariffType: "flat" | "tou";
-  importRate: string;
-  supplyCharge: string;
-  fitRate: string;
-  exportLimitKw: string;
-  windows: TariffWindowFormRow[];
-}
-
-function fromView(view: TariffNetworkView): FormState {
-  return {
-    // Flat is the default on a job with no stored row — the common case, and
-    // the one that needs the fewest keystrokes.
-    tariffType: view.tariffType ?? "flat",
-    importRate: view.importRate.text,
-    supplyCharge: view.supplyCharge.text,
-    fitRate: view.fitRate.text,
-    exportLimitKw: view.exportLimitKw.text,
-    windows: view.windows.map((w) => ({ ...w })),
-  };
-}
-
 /** 409/422/503 carry a plain-English `detail` written for exactly this — show
     the backend's own words rather than a generic sentence over the top. */
 function saveErrorCopy(kind: ApiErrorKind, status: number, message: string) {
@@ -106,7 +89,7 @@ export function TariffNetworkSection({
   onSaved?: (change: SizingInputSave) => void;
 }) {
   const router = useRouter();
-  const [form, setForm] = React.useState<FormState>(() => fromView(view));
+  const [form, setForm] = React.useState<TariffFormState>(() => tariffFormFromView(view));
   const [saving, setSaving] = React.useState(false);
   const [errors, setErrors] = React.useState<Record<string, string>>({});
   const [actionError, setActionError] = React.useState<
@@ -115,7 +98,7 @@ export function TariffNetworkSection({
   const [saveNotices, setSaveNotices] = React.useState<readonly RoofNoticeView[]>([]);
   const [savedTick, setSavedTick] = React.useState(false);
 
-  const baseline = React.useMemo(() => fromView(view), [view]);
+  const baseline = React.useMemo(() => tariffFormFromView(view), [view]);
   const dirty = JSON.stringify(form) !== JSON.stringify(baseline);
 
   function touch() {
@@ -123,7 +106,7 @@ export function TariffNetworkSection({
     setSaveNotices([]);
   }
 
-  function set<K extends keyof FormState>(key: K, value: FormState[K]) {
+  function set<K extends keyof TariffFormState>(key: K, value: TariffFormState[K]) {
     setForm((f) => ({ ...f, [key]: value }));
     setErrors((e) => ({ ...e, [key]: "" }));
     touch();
@@ -237,8 +220,8 @@ export function TariffNetworkSection({
         supply_charge: numberOrNull(form.supplyCharge),
         fit_aud_per_kwh: numberOrNull(form.fitRate),
         export_limit_kw: numberOrNull(form.exportLimitKw),
-        // Anything a person typed or accepted on this screen is "installer".
         source: "installer",
+        field_sources: tariffFieldSources(view, form),
       };
       const result = await requestJson<Record<string, unknown>>(
         "POST",

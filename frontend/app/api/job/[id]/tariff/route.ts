@@ -6,8 +6,10 @@ import { createClient } from "@/lib/supabase/server";
  * app/api/job/[id]/demand/route.ts: session read server-side, Bearer attached,
  * explicit field whitelist, upstream status passed through, token never logged
  * or returned. The whitelist matches routes/demand.py's TariffSaveRequest
- * exactly — seven fields, nothing else forwarded — and the job id comes from
- * the ROUTE PATH, never the body.
+ * exactly — eight fields, nothing else forwarded — and the job id comes from
+ * the ROUTE PATH, never the body. A field added to the interface but not the
+ * body literal (or the reverse) is dropped between the browser and the
+ * backend, silently — the two lists move together or not at all.
  */
 
 const API_BASE = process.env.NEXT_PUBLIC_API_URL ?? "http://localhost:8000";
@@ -20,6 +22,7 @@ interface TariffBody {
   fit_aud_per_kwh?: unknown;
   export_limit_kw?: unknown;
   source?: unknown;
+  field_sources?: unknown;
 }
 
 export async function POST(
@@ -60,6 +63,7 @@ export async function POST(
     fit_aud_per_kwh: raw.fit_aud_per_kwh ?? null,
     export_limit_kw: raw.export_limit_kw ?? null,
     source: raw.source ?? null,
+    field_sources: raw.field_sources ?? null,
   };
 
   try {

@@ -49,7 +49,7 @@ from typing import Any, Literal, Optional
 import sentry_sdk
 from datetime import datetime, timezone
 from fastapi import APIRouter, Depends, File, HTTPException, UploadFile
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
 import bill_parser
 import capture
@@ -307,6 +307,32 @@ class TariffWindowIn(BaseModel):
     days: Literal["weekday", "weekend", "all"] = "all"
 
 
+# ── 3.18 prompt 1: field-level provenance of the saved envelope ──────────────
+# The ONLY definition of the vocabulary anywhere — tariffs.field_sources
+# deliberately carries no CHECK constraint (D33: a label must be able to gain a
+# value without a migration each time); the endpoint refuses an unknown label
+# at write time so the refusal can name the accepted values. The RESOLVER's own
+# row-level vocabulary (request / installer / bill / default) answers a
+# DIFFERENT question — where a value came from at SIZING time — and is
+# untouched. These are two levels, not one. There is deliberately no "bill":
+# tariffNetworkView has no bill branch (it reads detail.bills only for the
+# mismatch notice), so a bill-derived prefill is not something the form can
+# produce, and a value no path can emit is a feature that only claims to exist.
+TARIFF_FIELD_SOURCES: frozenset[str] = frozenset({"typed", "accepted_default"})
+
+# The savable columns whose DISPLAYED value can come from somewhere other than
+# a person typing: fit_aud_per_kwh and export_limit_kw are prefilled by
+# lib/worksheet.ts::tariffNetworkView from TariffDefaults, and tariff_type by
+# the form's own `view.tariffType ?? "flat"` literal. The other three cannot be
+# accepted defaults: import_rate and supply_charge have deliberately no prefill
+# (F78 — a guess presented as an entered value), and tou_windows only ever
+# shows stored rows or empty seeds that validation refuses to save untouched.
+# verify_tariff_provenance.py asserts set equality with the frontend's list.
+PREFILLED_TARIFF_FIELDS: frozenset[str] = frozenset({
+    "tariff_type", "fit_aud_per_kwh", "export_limit_kw",
+})
+
+
 class TariffSaveRequest(BaseModel):
     tariff_type: Literal["flat", "tou"]
     import_rate: Optional[float] = Field(default=None, ge=0, le=5)
@@ -315,6 +341,57 @@ class TariffSaveRequest(BaseModel):
     fit_aud_per_kwh: Optional[float] = Field(default=None, ge=0, le=5)
     export_limit_kw: Optional[float] = Field(default=None, ge=0, le=100)
     source: Literal["installer", "bill", "default"] = "installer"
+    # 3.18: {column name -> TARIFF_FIELD_SOURCES label} for the values in THIS
+    # save. Optional — an older client that never sends it must not be broken.
+    # str values, NOT a Literal: the vocabulary lives in TARIFF_FIELD_SOURCES
+    # and the endpoint refuses unknown labels itself (the CONFIRMED_SOURCES
+    # pattern in routes/roof.py).
+    field_sources: Optional[dict[str, str]] = None
+
+    @field_validator("field_sources", mode="before")
+    @classmethod
+    def _field_sources_readable(cls, value: object) -> object:
+        # An unreadable shape is a 422 BEFORE any write, in plain English —
+        # never a partial store.
+        if value is None:
+            return value
+        if not isinstance(value, dict):
+            raise ValueError(
+                "field_sources must be an object mapping tariff field names "
+                "to source labels."
+            )
+        for key, item in value.items():
+            if not isinstance(item, str):
+                raise ValueError(
+                    f"field_sources[{key!r}] must be a plain string label, "
+                    f"not {type(item).__name__}."
+                )
+        return value
+
+
+# Derived FROM the model, not transcribed beside it, so it cannot drift: the
+# value-bearing fields the form saves. `source` is the row-level label the
+# resolver reads today (prompt 2 decides its future) and `field_sources` is the
+# provenance record itself — neither carries a tariff value.
+SAVABLE_TARIFF_FIELDS: frozenset[str] = frozenset(
+    name for name in TariffSaveRequest.model_fields
+    if name not in ("source", "field_sources")
+)
+
+
+def _tariff_value_matches(incoming: Any, stored: Any) -> bool:
+    """True when the incoming value and the stored one are the same value.
+    Numerics compare AS NUMBERS — PostgREST hands them back as float or string
+    depending on the column — and bools never coerce (bool is an int subclass,
+    so float(True) == 1.0 would call True a $1 rate). None never matches."""
+    if incoming is None or stored is None:
+        return False
+    if isinstance(incoming, bool) or isinstance(stored, bool):
+        return incoming is stored
+    try:
+        return float(incoming) == float(stored)
+    except (TypeError, ValueError):
+        return incoming == stored
 
 
 # The SAME four-table rule routes/job.py's address lock uses (its
@@ -362,23 +439,111 @@ async def save_job_tariff(
             detail="A flat tariff needs its import rate — that number is what this section exists to collect.",
         )
 
-    warnings: list[str] = []
-    now = datetime.now(timezone.utc).isoformat()
-    tariff_id = capture.save_tariff(
-        {
-            "job_id": job_id,
-            "tariff_type": body.tariff_type,
-            "import_rate": body.import_rate,
-            "tou_windows": (
-                [w.model_dump() for w in body.tou_windows] if body.tou_windows else None
+    # ── 3.18: validate the provenance claims — all refusals before any write ──
+    supplied_sources = dict(body.field_sources or {})
+    unknown_fields = set(supplied_sources) - SAVABLE_TARIFF_FIELDS
+    if unknown_fields:
+        raise HTTPException(
+            status_code=422,
+            detail=(
+                f"field_sources names unknown field(s) {sorted(unknown_fields)} — "
+                f"the savable tariff fields are: {', '.join(sorted(SAVABLE_TARIFF_FIELDS))}."
             ),
-            "supply_charge": body.supply_charge,
-            "fit_aud_per_kwh": body.fit_aud_per_kwh,
-            "export_limit_kw": body.export_limit_kw,
-            "source": body.source,
-            "updated_at": now,
-        }
+        )
+    unknown_labels = set(supplied_sources.values()) - TARIFF_FIELD_SOURCES
+    if unknown_labels:
+        raise HTTPException(
+            status_code=422,
+            detail=(
+                f"unknown field_sources label(s) {sorted(unknown_labels)} — "
+                f"accepted values: {', '.join(sorted(TARIFF_FIELD_SOURCES))}."
+            ),
+        )
+    false_defaults = sorted(
+        f for f, label in supplied_sources.items()
+        if label == "accepted_default" and f not in PREFILLED_TARIFF_FIELDS
     )
+    if false_defaults:
+        # No default exists on these fields to accept, so the claim is false by
+        # construction — without this guard a client bug could launder a typed
+        # number into a default.
+        raise HTTPException(
+            status_code=422,
+            detail=(
+                f"'accepted_default' claimed on {false_defaults}, but only "
+                f"{', '.join(sorted(PREFILLED_TARIFF_FIELDS))} are ever prefilled — "
+                "there is no default on that field to accept."
+            ),
+        )
+
+    warnings: list[str] = []
+
+    incoming_values: dict[str, Any] = {
+        name: getattr(body, name) for name in sorted(SAVABLE_TARIFF_FIELDS)
+    }
+    if body.tou_windows:
+        incoming_values["tou_windows"] = [w.model_dump() for w in body.tou_windows]
+
+    # The stored row FIRST, because rule 5 needs it: a re-save of an untouched
+    # field must not relabel it, and the client cannot know the history.
+    stored_row: Optional[dict] = None
+    stored_read_failed = False
+    try:
+        res = (
+            client.table("tariffs").select("*").eq("job_id", job_id)
+            .limit(1).execute()
+        )
+        rows = getattr(res, "data", None) or []
+        stored_row = rows[0] if rows else None
+    except Exception as exc:  # noqa: BLE001 — unreadable history is a warning, never a guess
+        sentry_sdk.capture_exception(exc)
+        stored_read_failed = True
+
+    field_sources_out: dict[str, str] = {}
+    include_field_sources = True
+    if stored_read_failed:
+        # Do NOT guess: keep only what the client asserted about non-null
+        # values. With nothing asserted there is nothing to store — leave the
+        # stored column untouched rather than overwrite history we cannot see.
+        field_sources_out = {
+            f: label for f, label in supplied_sources.items()
+            if incoming_values.get(f) is not None
+        }
+        include_field_sources = bool(field_sources_out)
+        warnings.append(
+            "The stored tariff could not be read back, so the provenance of "
+            "unchanged fields was not carried forward — only this save's own "
+            "labels were recorded."
+        )
+    else:
+        stored_sources_raw = stored_row.get("field_sources") if stored_row else None
+        stored_sources = stored_sources_raw if isinstance(stored_sources_raw, dict) else {}
+        for f in sorted(SAVABLE_TARIFF_FIELDS):
+            value = incoming_values.get(f)
+            if value is None:
+                continue  # no value, no provenance — never a placeholder
+            if f in supplied_sources:
+                field_sources_out[f] = supplied_sources[f]
+                continue
+            # No label supplied: carry the stored label forward ONLY for an
+            # unchanged value. A changed value with no label stores NO key —
+            # never "typed": a label that cannot tell a default from a decision
+            # is worse than no label.
+            prior = stored_sources.get(f)
+            stored_value = stored_row.get(f) if stored_row else None
+            if isinstance(prior, str) and _tariff_value_matches(value, stored_value):
+                field_sources_out[f] = prior
+
+    now = datetime.now(timezone.utc).isoformat()
+    payload: dict[str, Any] = {
+        "job_id": job_id,
+        **incoming_values,
+        "source": body.source,
+        "updated_at": now,
+    }
+    if include_field_sources:
+        payload["field_sources"] = field_sources_out
+    tariff_id = capture.save_tariff(payload)
     saved = tariff_id is not None
 
     tariff_row = None

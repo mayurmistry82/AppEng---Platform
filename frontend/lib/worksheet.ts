@@ -3887,6 +3887,13 @@ export interface TariffNetworkView {
   postcode: string | null;
   fitSourceLabel: string | null;
   exportSourceLabel: string | null;
+  /** 3.18: where each savable field's DISPLAYED value came from — one entry
+      for EVERY member of SAVABLE_TARIFF_FIELDS, always present, so an absence
+      carries its cause. "stored" = the tariffs row; "lookup_default" =
+      TariffDefaults or the form's own literal; "none" = nothing to display.
+      Built from the SAME storedFit/storedExport facts as the source labels,
+      so the caption and the origin map cannot disagree. */
+  fieldOrigin: Record<string, "stored" | "lookup_default" | "none">;
   notices: RoofNoticeView[];
   /** Null unless the C&I flag is on — absent from the DOM, not hidden by CSS. */
   ci: TariffCiView | null;
@@ -3895,6 +3902,28 @@ export interface TariffNetworkView {
 /** The four window labels and three day values the backend accepts. */
 export const TARIFF_WINDOW_LABELS = ["peak", "shoulder", "offpeak", "flat"] as const;
 export const TARIFF_DAYS_VALUES = ["all", "weekday", "weekend"] as const;
+
+/**
+ * 3.18: the two field lists this side of the language gap, keyed by COLUMN
+ * NAME so the keys and the columns are one vocabulary (2Q.1).
+ * verify_tariff_provenance.py asserts SET EQUALITY IN BOTH DIRECTIONS against
+ * routes/demand.py's SAVABLE_TARIFF_FIELDS / PREFILLED_TARIFF_FIELDS, so a
+ * name added on one side without the other fails a gate rather than dropping
+ * provenance in silence.
+ */
+export const SAVABLE_TARIFF_FIELDS = [
+  "tariff_type", "import_rate", "tou_windows",
+  "supply_charge", "fit_aud_per_kwh", "export_limit_kw",
+] as const;
+
+/** The savable fields whose displayed value can come from somewhere other
+    than a person typing: the two TariffDefaults prefills and the form's own
+    `?? "flat"` literal. import_rate and supply_charge deliberately have no
+    prefill (F78), and tou_windows only ever shows stored rows or empty seeds
+    that validation refuses to save untouched. */
+export const PREFILLED_TARIFF_FIELDS = [
+  "tariff_type", "fit_aud_per_kwh", "export_limit_kw",
+] as const;
 
 /**
  * The client-side bounds. These MIRROR TariffSaveRequest's Field(ge=…, le=…)
@@ -4117,6 +4146,28 @@ export function tariffNetworkView(
 
   const { rows: windows, dropped } = tariffWindowRows(row?.tou_windows);
 
+  // Derived ONCE and passed to both the source labels and the origin map, so
+  // the caption a person reads and the provenance the save records cannot
+  // disagree about where a number came from.
+  const fitFromStored = storedFit !== null;
+  const exportFromStored = storedExport !== null;
+
+  // One entry for EVERY savable field, always — an absence carries its cause.
+  // tariff_type is never "none": with nothing stored the form's own
+  // `?? "flat"` literal fills the control, which is a prefill like any other.
+  const fieldOrigin: Record<string, "stored" | "lookup_default" | "none"> = {
+    tariff_type: tariffType !== null ? "stored" : "lookup_default",
+    import_rate: storedImport !== null ? "stored" : "none",
+    tou_windows: windows.length > 0 ? "stored" : "none",
+    supply_charge: storedSupply !== null ? "stored" : "none",
+    fit_aud_per_kwh: fitFromStored
+      ? "stored"
+      : fitValue !== null ? "lookup_default" : "none",
+    export_limit_kw: exportFromStored
+      ? "stored"
+      : exportValue !== null ? "lookup_default" : "none",
+  };
+
   const notices: RoofNoticeView[] = [];
   if (dropped > 0) notices.push(TARIFF_WINDOWS_UNREADABLE_NOTICE);
   // Unreachable today — `bills` is 0 rows — but the classification is declared
@@ -4142,11 +4193,124 @@ export function tariffNetworkView(
     dnsp: roofStr(detail.site_dnsp),
     state_: roofStr(detail.site_state),
     postcode: roofStr(detail.site_postcode),
-    fitSourceLabel: tariffFitLabel(fitDefault, roofStr(detail.site_state), storedFit !== null),
-    exportSourceLabel: tariffExportLabel(exportDefault, storedExport !== null),
+    fitSourceLabel: tariffFitLabel(fitDefault, roofStr(detail.site_state), fitFromStored),
+    exportSourceLabel: tariffExportLabel(exportDefault, exportFromStored),
+    fieldOrigin,
     notices,
     ci: showCiRows ? tariffCiView(row) : null,
   };
+}
+
+/**
+ * 3.18: the tariff form's state — the six fields the form edits, ALL STRINGS
+ * except the radio, exactly like PlaneFormRow and for the same reason (these
+ * populate controlled inputs). Exported so the component imports it rather
+ * than declaring its own, and so tariffFieldSources can be driven from tests
+ * without a browser.
+ */
+export interface TariffFormState {
+  tariffType: "flat" | "tou";
+  importRate: string;
+  supplyCharge: string;
+  fitRate: string;
+  exportLimitKw: string;
+  windows: TariffWindowFormRow[];
+}
+
+/**
+ * The view as form state — the ONE baseline builder. The component seeds its
+ * state from this AND compares against it for `dirty`; tariffFieldSources
+ * compares against it for provenance. One implementation, so the dirty check
+ * and the provenance derivation cannot disagree about what "unchanged" means.
+ * Total: junk in yields a usable empty form, never a throw.
+ */
+export function tariffFormFromView(view: TariffNetworkView): TariffFormState {
+  const v = asRecord(view);
+  const text = (field: unknown): string => {
+    const rec = asRecord(field);
+    return typeof rec.text === "string" ? rec.text : "";
+  };
+  return {
+    // Flat is the default on a job with no stored row — the common case, and
+    // the one that needs the fewest keystrokes.
+    tariffType: v.tariffType === "tou" ? "tou" : "flat",
+    importRate: text(v.importRate),
+    supplyCharge: text(v.supplyCharge),
+    fitRate: text(v.fitRate),
+    exportLimitKw: text(v.exportLimitKw),
+    windows: Array.isArray(v.windows)
+      ? (v.windows as TariffWindowFormRow[]).map((w) => ({ ...w }))
+      : [],
+  };
+}
+
+/**
+ * 3.18: which of THIS save's values were typed and which are prefills
+ * accepted untouched — derived at save time, because provenance after the
+ * fact cannot tell a default from a deliberate choice (both read 0.05).
+ *
+ * Per savable field, in this order:
+ *   - value empty/null now                            -> omit the key
+ *   - current text differs from tariffFormFromView's  -> "typed"
+ *   - unchanged AND fieldOrigin "stored"              -> omit the key
+ *                       (the endpoint carries the stored label forward)
+ *   - unchanged AND fieldOrigin "lookup_default"      -> "accepted_default"
+ *
+ * Pure and total: junk input yields an object, never a throw. The component
+ * composes NO label text — this is the D25 line.
+ */
+export function tariffFieldSources(
+  view: TariffNetworkView,
+  form: TariffFormState,
+): Record<string, string> {
+  const baseline = tariffFormFromView(view);
+  // The form re-read through the same total builder, so junk arriving as
+  // `form` degrades exactly the way junk arriving as `view` does.
+  const f = asRecord(form);
+  const formText = (value: unknown): string =>
+    typeof value === "string" ? value : "";
+  const current: TariffFormState = {
+    tariffType: f.tariffType === "tou" ? "tou" : "flat",
+    importRate: formText(f.importRate),
+    supplyCharge: formText(f.supplyCharge),
+    fitRate: formText(f.fitRate),
+    exportLimitKw: formText(f.exportLimitKw),
+    windows: Array.isArray(f.windows)
+      ? (f.windows as TariffWindowFormRow[]).map((w) => ({ ...w }))
+      : [],
+  };
+  const origin = asRecord(asRecord(view).fieldOrigin);
+
+  const out: Record<string, string> = {};
+  const put = (field: string, currentText: string, baselineText: string) => {
+    if (currentText.trim() === "") return; // no value, no provenance (C4)
+    if (currentText !== baselineText) {
+      out[field] = "typed";
+      return;
+    }
+    if (origin[field] === "lookup_default") out[field] = "accepted_default";
+    // "stored": omitted — the endpoint carries the stored label forward, and
+    // the client cannot know the history. "none" with an unchanged non-empty
+    // value cannot occur (an empty baseline differs from any non-empty text);
+    // omitting is the safe total answer.
+  };
+
+  // Mirror what the save actually SENDS: on a TOU tariff import_rate goes up
+  // as null, and tou_windows goes up as null unless the tariff is TOU — a
+  // value the payload nulls carries no provenance, whatever the box held.
+  const importText = current.tariffType === "tou" ? "" : current.importRate;
+  const windowsText = (state: TariffFormState): string =>
+    state.tariffType === "tou" && state.windows.length > 0
+      ? JSON.stringify(state.windows)
+      : "";
+
+  put("tariff_type", current.tariffType, baseline.tariffType);
+  put("import_rate", importText, baseline.importRate);
+  put("tou_windows", windowsText(current), windowsText(baseline));
+  put("supply_charge", current.supplyCharge, baseline.supplyCharge);
+  put("fit_aud_per_kwh", current.fitRate, baseline.fitRate);
+  put("export_limit_kw", current.exportLimitKw, baseline.exportLimitKw);
+  return out;
 }
 
 /**
