@@ -181,6 +181,7 @@ import {
   showsGoogleSolarAttribution,
   siteDetailsView,
   worksheetErrorCopy,
+  type AddressRoofView,
   type JobDetailLike,
   type ResultsBarView,
   type WorksheetSectionSpec,
@@ -1053,7 +1054,12 @@ const BISHOPS_ROW = {
   ],
 };
 
-test("F231 (a) a57e13f1: assessed faces agree; the five extra panels come from the two unassessed faces", () => {
+test("D48 (5): a57e13f1 — the marker appears on the two unassessed faces and NO others", () => {
+  // WAS "F231 (a): assessed faces agree…". The reconciliation it asserted is
+  // deleted by D48; what survives is the per-face provenance, which D48 turns
+  // from a label on every face into a marker on the exception (F257: on an
+  // assessed face our count is min(area, google), a CEILING — so
+  // "from Google's panel layout" was misleading as well as noisy).
   const view = viewFor(A57_ROW);
   assert.deepEqual(
     view.planes.map((p) => p.countSource),
@@ -1063,64 +1069,29 @@ test("F231 (a) a57e13f1: assessed faces agree; the five extra panels come from t
     view.planes.map((p) => p.googlePanelCount),
     [null, 8, null, 8, 2, 3],
   );
-  const rec = view.countReconciliation;
-  assert.ok(rec);
-  assert.equal(rec.tableTotal, 26);
-  assert.equal(rec.googleTotal, 21);
-  assert.equal(rec.googleTotalStored, 21); // stored and summed agree on this roof
-  assert.equal(rec.facesGoogleAssessed, 4);
-  assert.equal(rec.facesFromAreaAlone, 2);
-  assert.equal(rec.panelsFromAreaAlone, 5);
-  assert.equal(rec.agreeOnAssessedFaces, true);
-  assert.ok(rec.explanation);
-  // Names the two unassessed faces, by number and direction.
-  assert.ok(rec.explanation.includes("face 1 (west-north-west)"), rec.explanation);
-  assert.ok(rec.explanation.includes("face 3 (south-east)"), rec.explanation);
-  assert.ok(rec.explanation.includes("5 of the 26 panels"), rec.explanation);
-  // NEVER the false cause. Panel size explains none of the count gap here.
-  assert.ok(!/different panel|panel size/i.test(rec.explanation), rec.explanation);
-  // D40 (was: "12 of 26 is no majority, so the caution stays quiet"). At a
-  // THIRD the same roof warns — 12 of 26 is 46%, and the old strict majority
-  // is exactly the line F241 says nobody would recognise as meaningful.
-  assert.ok(view.orientationNotice, "46% must now fire");
-  assert.equal(view.orientationNotice.title, "12 of the 26 panels face the southern half");
-  // ...and the split caption stays silent, because the caution carries the numbers.
-  assert.equal(view.orientationSplitCaption, null);
+  assert.deepEqual(
+    view.planes.map((p) => p.countSourceLabel),
+    [
+      "estimated from area alone", null,
+      "estimated from area alone", null, null, null,
+    ],
+  );
+  // Exactly two markers, exactly on the faces with no google_panel_count.
+  const marked = view.planes.filter((p) => p.countSourceLabel !== null);
+  assert.equal(marked.length, 2);
+  assert.ok(marked.every((p) => p.googlePanelCount === null));
 });
 
-test("F231 (b) / D43 670c80db: the two disagree where both looked — panel size named as a CANDIDATE", () => {
-  const view = viewFor(BISHOPS_ROW);
-  const rec = view.countReconciliation;
-  assert.ok(rec);
-  assert.equal(rec.tableTotal, 27);
-  assert.equal(rec.googleTotal, 28);
-  assert.equal(rec.googleTotalStored, 28);
-  assert.equal(rec.facesFromAreaAlone, 0);
-  assert.equal(rec.agreeOnAssessedFaces, false);
-  assert.ok(rec.explanation);
-  assert.ok(/disagree/.test(rec.explanation), rec.explanation);
-  assert.ok(rec.explanation.includes("27"), rec.explanation);
-  assert.ok(rec.explanation.includes("28"), rec.explanation);
-  // D43 (was: panel size must NEVER appear). On a face BOTH sides assessed it
-  // is a plausible cause, and refusing to say so is truth-on-all-instances —
-  // F244. Named as a candidate, never as the cause.
-  assert.ok(/panel size is one possible explanation/i.test(rec.explanation), rec.explanation);
-  assert.ok(rec.explanation.includes("nothing here establishes the cause"), rec.explanation);
-});
 
 test("F231 (c) 456e0242 (the Frome row): no layout at all — every face reads roof_area", () => {
   const view = viewFor(FROME_ROW);
   assert.deepEqual(view.planes.map((p) => p.countSource), ["roof_area", "roof_area"]);
+  // D48: the marker is short, and every face carries it because Google
+  // assessed none of them. (The reconciliation this test also asserted is
+  // deleted with the feature.)
   for (const p of view.planes) {
-    assert.equal(p.countSourceLabel, "estimated from roof area — Google placed none here");
+    assert.equal(p.countSourceLabel, "estimated from area alone");
   }
-  const rec = view.countReconciliation;
-  assert.ok(rec);
-  assert.equal(rec.facesGoogleAssessed, 0);
-  assert.equal(rec.googleTotalStored, null);
-  assert.ok(rec.explanation);
-  assert.ok(rec.explanation.includes("no panel layout"), rec.explanation);
-  assert.ok(!/different panel|panel size/i.test(rec.explanation), rec.explanation);
 });
 
 test("F231: the MEASURED zero — google_panel_count 0 is google_layout, never roof_area", () => {
@@ -1135,7 +1106,8 @@ test("F231: the MEASURED zero — google_panel_count 0 is google_layout, never r
     }),
   );
   assert.equal(view.planes[0].countSource, "google_layout");
-  assert.equal(view.planes[0].countSourceLabel, "from Google's panel layout");
+  // D48: an assessed face carries NO marker — mark the exception, not the rule.
+  assert.equal(view.planes[0].countSourceLabel, null);
   assert.equal(view.planes[1].countSource, "roof_area");
   // An unusable google_panel_count is not a number Google gave us — roof_area.
   const junk = viewFor(
@@ -1144,36 +1116,7 @@ test("F231: the MEASURED zero — google_panel_count 0 is google_layout, never r
   assert.equal(junk.planes[0].countSource, "roof_area");
 });
 
-test("F231: agreement across the board says so", () => {
-  const view = viewFor(
-    roofRow({
-      google_max_array_panels_count: 17,
-      planes: [{ azimuth: 0, pitch: 22, area_m2: 50, usable_area_m2: 35, panel_count: 17, kwp: 7.48, google_panel_count: 17 }],
-    }),
-  );
-  const rec = view.countReconciliation;
-  assert.ok(rec);
-  assert.equal(rec.agreeOnAssessedFaces, true);
-  assert.equal(rec.panelsFromAreaAlone, 0);
-  assert.ok(rec.explanation);
-  assert.ok(rec.explanation.includes("agree on every face"), rec.explanation);
-});
 
-test("F231: stored Google total disagreeing with the per-face sum is reported, not chosen from", () => {
-  const view = viewFor(
-    roofRow({
-      google_max_array_panels_count: 19,
-      planes: [{ azimuth: 0, pitch: 22, panel_count: 17, kwp: 7.48, google_panel_count: 17 }],
-    }),
-  );
-  const rec = view.countReconciliation;
-  assert.ok(rec);
-  assert.equal(rec.googleTotal, 17);
-  assert.equal(rec.googleTotalStored, 19);
-  assert.ok(rec.explanation);
-  assert.ok(rec.explanation.includes("19"), rec.explanation);
-  assert.ok(rec.explanation.includes("17"), rec.explanation);
-});
 
 test("F168: orientationLabel — direction and pitch in plain words, degrading to each alone", () => {
   const view = viewFor(
@@ -1192,50 +1135,7 @@ test("F168: orientationLabel — direction and pitch in plain words, degrading t
   assert.equal(view.planes[3].orientationLabel, null);
 });
 
-test("F168: the orientation caution fires on the 173-degree roof and names direction and share", () => {
-  const view = viewFor(FROME_ROW); // all 23 panels at azimuth 173.1
-  assert.ok(view.orientationNotice);
-  assert.equal(view.orientationNotice.tone, "caution");
-  assert.equal(view.orientationNotice.level, "notice"); // D25: job-specific, a finding
-  assert.ok(view.orientationNotice.title.includes("south"), view.orientationNotice.title);
-  assert.ok(view.orientationNotice.body.includes("23 of the 23"), view.orientationNotice.body);
-  assert.ok(view.orientationNotice.body.includes("100%"), view.orientationNotice.body);
-  // And on the real Bishops Pl roof: 16 of 27 southerly, mostly the 13-panel SSW face.
-  const bishops = viewFor(BISHOPS_ROW);
-  assert.ok(bishops.orientationNotice);
-  // D40: the title is a COUNT now — "Most …" was false the moment the line
-  // moved to a third, and a count cannot go false at any firing share.
-  assert.equal(bishops.orientationNotice.title, "16 of the 27 panels face the southern half");
-  assert.ok(bishops.orientationNotice.body.includes("16 of the 27"), bishops.orientationNotice.body);
-  assert.ok(bishops.orientationNotice.body.includes("59%"), bishops.orientationNotice.body);
-});
 
-test("F168/D40: the caution does NOT fire north-facing, on the boundary, or with no panels", () => {
-  assert.equal(viewFor(roofRow()).orientationNotice, null); // 17 panels at azimuth 0
-  const half = viewFor(
-    roofRow({
-      planes: [
-        { azimuth: 180, pitch: 20, panel_count: 5, kwp: 2.2 },
-        { azimuth: 0, pitch: 20, panel_count: 5, kwp: 2.2 },
-      ],
-    }),
-  );
-  // D40 (was: "strict majority, never half" -> null). Half is above a third,
-  // so this roof now warns; the split caption is silent in its place.
-  assert.ok(half.orientationNotice, "50% is above a third");
-  assert.equal(half.orientationSplitCaption, null);
-  // Due east and west sit on the boundary — no southerly component, no caution.
-  const eastWest = viewFor(
-    roofRow({
-      planes: [
-        { azimuth: 90, pitch: 20, panel_count: 5, kwp: 2.2 },
-        { azimuth: 270, pitch: 20, panel_count: 5, kwp: 2.2 },
-      ],
-    }),
-  );
-  assert.equal(eastWest.orientationNotice, null);
-  assert.equal(viewFor(roofRow({ planes: [] })).orientationNotice, null);
-});
 
 test("F94: rounded strings emitted beside the raw numbers, which stay unrounded", () => {
   const frome = viewFor(FROME_ROW);
@@ -1256,17 +1156,10 @@ test("F94: rounded strings emitted beside the raw numbers, which stay unrounded"
 });
 
 test("3.4c prompt 2: totality — junk in, fields out, nothing invented, nothing thrown", () => {
-  assert.equal(addressRoofView(null).countReconciliation, null);
-  assert.equal(addressRoofView(null).orientationNotice, null);
   assert.equal(addressRoofView(null).totalKwpLabel, null);
-  assert.equal(addressRoofView(unsafe<object>("garbage")).countReconciliation, null);
-  // A row with planes as a string: a reconciliation object exists (there IS a
-  // roof row) but explains nothing and invents nothing.
   const junkPlanes = viewFor(roofRow({ planes: "not-a-list" }));
-  assert.ok(junkPlanes.countReconciliation);
-  assert.equal(junkPlanes.countReconciliation.tableTotal, 0);
-  assert.equal(junkPlanes.countReconciliation.explanation, null);
-  assert.equal(junkPlanes.orientationNotice, null);
+  assert.deepEqual(junkPlanes.planes, []);
+  assert.deepEqual(junkPlanes.totals, { panels: 0, kwp: 0 });
   const bare = viewFor(roofRow({ planes: [{}] }));
   assert.equal(bare.planes[0].countSource, "roof_area");
   assert.equal(bare.planes[0].orientationLabel, null);
@@ -1304,7 +1197,9 @@ test("confidenceNotices: a single cause renders exactly one notice", () => {
     flags: ["low_confidence_too_few_segments", "low_confidence_result"],
   });
   assert.equal(view.confidenceNotices.length, 1);
-  assert.equal(view.confidenceNotices[0].title, "This may be a newer build than the photo");
+  // D48: the subject is Google's model, never the photograph. The advice is
+  // unchanged, and is asserted for substance in the D48 (4) test below.
+  assert.equal(view.confidenceNotices[0].title, "This may be a newer build than Google's model");
 });
 
 test("confidenceNotices: too_few_segments and too_few_panels dedup to one notice", () => {
@@ -1339,7 +1234,7 @@ test("confidenceNotices: all four causes stack in order", () => {
     [
       "One of these faces is too steep to be a roof",
       "Google could not fit any panels on this building",
-      "This may be a newer build than the photo",
+      "This may be a newer build than Google's model",
       "Something about this result looks wrong",
     ],
   );
@@ -2273,7 +2168,8 @@ test("D25 check 1: every producer sets level, proven structurally", () => {
   ];
   for (const job of roofJobs) {
     const view = addressRoofView(job);
-    collected.push(view.notice, view.staleNotice, view.solarExpiredNotice);
+    // D48: view.staleNotice is deleted — nothing dates the photograph.
+    collected.push(view.notice, view.solarExpiredNotice);
     collected.push(...view.confidenceNotices);
   }
   collected.push(MULTI_DWELLING_CAPTION, PREFILL_FROM_LOOKUP_CAPTION);
@@ -2297,11 +2193,9 @@ test("D25 check 1: every producer sets level, proven structurally", () => {
 });
 
 test("D25 check 2: the roof reclassification, item by item", () => {
-  const stale = addressRoofView(
-    emptyJob({ roof_geometry: [googleRoof()] }),
-  ).staleNotice;
-  assert.equal(stale?.level, "caption", "stale imagery fires on 100% of jobs");
-  assert.equal(stale?.icon, "clock", "an age fact carries the clock glyph");
+  // D48 (was: the stale-imagery caption's level and clock glyph). That notice
+  // is DELETED — its subject was never the photograph, and nothing dates the
+  // photograph (F247, F256). The rest of the reclassification is unchanged.
 
   const conf = addressRoofView(
     emptyJob({
@@ -10072,29 +9966,6 @@ test("3.4c-3 (3): the FALSE sentence is gone from the component source", () => {
   assert.equal(hits.length, 0, `${hits.length} hits of the deleted sentence`);
 });
 
-test("3.4c-3 (4): the three real roofs each render their OWN true explanation", () => {
-  for (const [name, row] of [
-    ["a57e13f1 (26 vs 21)", A57_ROW],
-    ["670c80db (27 vs 28)", BISHOPS_ROW],
-    ["456e0242 (no layout)", FROME_ROW],
-  ] as const) {
-    const view = viewFor(row);
-    const explanation = view.countReconciliation?.explanation;
-    assert.ok(explanation, `${name} has an explanation`);
-    const text = roofTextOf(roofSectionMarkup(row));
-    console.log(`        [${name}] rendered: ${explanation}`);
-    assert.ok(text.includes(explanation), `${name} renders its explanation`);
-    assert.ok(!text.includes("uses a different panel"), name);
-    // D43: panel size is allowed — and required — ONLY where both sides
-    // assessed the disagreeing face (670c80db). On the other two it must
-    // still be absent, which is F231's finding.
-    if (name.startsWith("670c80db")) {
-      assert.ok(/panel size is one possible explanation/i.test(explanation), name);
-    } else {
-      assert.ok(!/panel size/i.test(explanation), name);
-    }
-  }
-});
 
 test("3.4c-3 (5): the SHIPPED panel rectangles carry no stroke-dasharray; adjacent faces still differ", () => {
   const diagram = {
@@ -10140,15 +10011,21 @@ test("3.4c-3 (5): the SHIPPED panel rectangles carry no stroke-dasharray; adjace
   // The building box KEEPS its dashes — it means extent, and the caption says so.
   assert.ok(/stroke-dasharray="6 4"/.test(markup), "building box dashes stay");
   // The honest two-imagery caveat survives the deletion.
-  assert.ok(roofTextOf(markup).includes("a different capture"), "the true caveat stays");
+  // D48 rewrote this line: it no longer claims "a different capture" (never
+  // established) and names no mechanism (untested — F235, homed at 4.2).
+  assert.ok(
+    roofTextOf(markup).includes("nothing aligns them, so the shapes are indicative"),
+    "the indicative caveat stays",
+  );
 });
 
 test("3.4c-3 (1): provenance, orientation words and rounded labels are ON SCREEN", () => {
   const text = roofTextOf(
     renderRoofSection({ view: viewFor(A57_ROW), jobId: "job-render", isOpen: false }),
   );
-  assert.ok(text.includes("from Google's panel layout"), text.slice(0, 200));
-  assert.ok(text.includes("estimated from roof area — Google placed none here"));
+  // D48: assessed faces carry NO label; only the exception is marked.
+  assert.ok(!text.includes("from Google's panel layout"), text.slice(0, 200));
+  assert.ok(text.includes("estimated from area alone"));
   assert.ok(text.includes("faces west-north-west, 23 degree pitch"));
   assert.ok(text.includes("about 8 m²")); // area-counted face: approximate, whole metres
   assert.ok(text.includes("19 m²")); // Google-laid-out face: whole metres, no "about"
@@ -10309,40 +10186,38 @@ test("3.4c-4 (item e): the EXPIRED state no longer asserts found and deleted at 
   assert.ok(!text.includes("Roof prefilled"), "the prefill caption yields while expired");
 });
 
-test("3.4c-5 (F234): the caption STATES the drawing and its assumptions — the instruction-shaped opening is gone", () => {
-  // REPLACES prompt 4's "the caption leads with the question" test: that one
-  // asserted the opening instruction ("Check this picture for two things…"),
-  // which is exactly what this prompt removes. Same fixture, new shape.
+test("D48 (1)(2): the caption is three lines and carries no deleted claim", () => {
+  // WAS "3.4c-5 (F234): the caption STATES the drawing and its assumptions",
+  // which asserted the fitted-panel total and the two-wattage line. D48
+  // deletes both; what survives is that the caption states the drawing is
+  // indicative, dates the MODEL, and names the box.
   const view = viewFor({
-    ...roofRow({
+    ...withImagery(roofRow({
       selected_panel: { id: "p1", brand: "Jinko", model: "Tiger Neo", watts: 440 },
-    }),
-    imagery_date: "2018-11-17",
-    imagery_quality: "MEDIUM",
+    })),
   });
   const text = roofTextOf(
     renderRoofSection({ view, jobId: "j", isOpen: true, diagram: CAPTION_DIAGRAM }),
   );
-  // The deleted shapes, gone from what SHIPS.
   for (const dead of [
     "Check this picture",
     "is this the right building",
     "judge the building, not the layout",
     "they will sit roughly",
     "uses a different panel",
+    "a different capture",
+    "Google's model fitted",
+    "W assumption",
+    "% of each face is treated as usable",
+    "take their panel counts",
+    "The photo is dated",
+    "medium-quality",
   ]) {
     assert.ok(!text.includes(dead), `still on screen: ${dead}`);
   }
-  // The facts, present and in order.
-  const iFitted = text.indexOf("Google's model fitted 21 panels");
-  const iAssumption = text.indexOf("400 W assumption");
-  // Anchored on the satellite-layer clause: same sentence, and unique in the
-  // caption now that the old vendor wording is gone (3.4c fix 2).
-  const iSources = text.indexOf("Google's satellite layer");
-  assert.ok(iFitted !== -1 && iAssumption !== -1 && iSources !== -1, text);
-  assert.ok(iFitted < iAssumption, "what was drawn precedes whose panel it assumes");
-  assert.ok(text.includes("scaled to Jinko Tiger Neo 440 W"), "the two wattages connect");
-  assert.ok(text.includes("rather than a placement plan"), "the unfinished sentence is replaced");
+  assert.ok(text.includes("so the shapes are indicative"), text);
+  assert.ok(text.includes("Google's solar model is dated 2018-11-17."), text);
+  assert.ok(text.includes("The dashed box is the area Google measured."), text);
 });
 
 test("3.4c-4 (item d): the multi-dwelling caution has ONE home", async () => {
@@ -10518,116 +10393,96 @@ test("3.4c-5 (3): the caption instructs the reader NOWHERE, on any roof", () => 
   assert.ok(readerInstructionsIn(["Your roof is fine."]).length > 0);
 });
 
-test("3.4c-5 (4): the three real roofs — every caption figure traces to the view", () => {
-  const cases: [string, Record<string, unknown>, unknown][] = [
-    ["a57e13f1 (26 vs 21)", withImagery(A57_ROW), CAPTION_DIAGRAM],
-    ["670c80db (27 vs 28)", withImagery(BISHOPS_ROW), { ...CAPTION_DIAGRAM, panelCount: 28 }],
-    ["456e0242 (no layout)", withImagery(FROME_ROW), { ...CAPTION_DIAGRAM, reason: "no_panel_positions", panelCount: 0 }],
+test("D48 (2): the caption on a lookup roof is EXACTLY the three lines, in order", () => {
+  // WAS "the three real roofs — every caption figure traces to the view",
+  // which asserted eight lines including the reconciliation summary, the
+  // fitted-panel total and the usable-area factor. D48 deletes all of those:
+  // the caption is three lines. THE COUNT IS ASSERTED, not just the contents —
+  // a fourth line creeping back is the failure this row exists to prevent.
+  const cases: [string, Record<string, unknown>, unknown, string[]][] = [
+    ["a57e13f1", withImagery(A57_ROW), CAPTION_DIAGRAM, [
+      "The panel shapes are Google's estimate for this building, drawn over Google's satellite view. The two are separate products and nothing aligns them, so the shapes are indicative.",
+      "Google's solar model is dated 2018-11-17.",
+      "The dashed box is the area Google measured.",
+    ]],
+    ["670c80db", withImagery(BISHOPS_ROW), CAPTION_DIAGRAM, [
+      "The panel shapes are Google's estimate for this building, drawn over Google's satellite view. The two are separate products and nothing aligns them, so the shapes are indicative.",
+      "Google's solar model is dated 2018-11-17.",
+      "The dashed box is the area Google measured.",
+    ]],
+    // The roof whose drawing cannot be drawn keeps its reason copy elsewhere
+    // and still states the model's date (D48's fallback).
+    ["456e0242 (no layout)", withImagery(FROME_ROW),
+      { ...CAPTION_DIAGRAM, reason: "no_panel_positions", panelCount: 0 }, [
+      "Google's solar model is dated 2018-11-17.",
+      "The dashed box is the area Google measured.",
+    ]],
   ];
-  for (const [name, row, diagram] of cases) {
-    const view = viewFor(row);
-    const lines = roofDiagramCaptionLines(view, diagram as never);
-    console.log(`        [${name}]`);
+  for (const [name, row, diagram, expected] of cases) {
+    const lines = roofDiagramCaptionLines(viewFor(row), diagram as never);
+    console.log(`        [${name}] ${lines.length} line(s)`);
     for (const line of lines) console.log(`          ${line}`);
-    const text = lines.join(" ");
-    const rec = view.countReconciliation;
-    assert.ok(rec);
-    // Face provenance: BOTH counts are the view's own, never restated numbers.
-    if (rec.facesGoogleAssessed > 0 && rec.facesFromAreaAlone > 0) {
-      assert.ok(text.includes(`Of the ${view.planes.length} faces`), text);
-      assert.ok(text.includes(`${rec.facesGoogleAssessed} take their panel counts`), text);
-      assert.ok(text.includes(`${rec.facesFromAreaAlone} are estimated from roof area`), text);
-    } else if (rec.facesFromAreaAlone === 0) {
-      assert.ok(
-        text.includes(`supplied the panel counts on all ${view.planes.length} faces`),
-        text,
-      );
-    } else {
-      // The no-layout roof: it still says where its counts came from, which is
-      // the roof where that matters most and the one whose drawing cannot be drawn.
-      assert.ok(
-        text.includes(`Google placed no panels, so the panel counts on all ${view.planes.length} faces are estimated from roof area alone.`),
-        text,
-      );
-    }
-    // The usable-area factor, the imagery, and the dashed box — all view facts.
-    assert.ok(text.includes("70% of each face"), text);
-    // D46: the date belongs to the SOLAR MODEL; the photograph's is unknown.
-    assert.ok(
-      text.includes(
-        "Google's solar model is dated 2018-11-17, medium-quality imagery. The photograph's own date is not known to us.",
-      ),
-      text,
-    );
-    assert.ok(text.includes("The dashed box is the extent"), text);
-    // And it is rendered, not merely computed.
-    const rendered = roofTextOf(
-      renderRoofSection({ view, jobId: "j", isOpen: true, diagram: diagram as never }),
-    );
-    for (const line of lines) assert.ok(rendered.includes(line), `${name} renders: ${line}`);
+    assert.deepEqual(lines, expected, name);
   }
-});
-
-test("3.4c-5 (4): the drawable roof states what was drawn, whose panel, and why it sits roughly", () => {
-  const lines = roofDiagramCaptionLines(viewFor(withImagery(A57_ROW)), CAPTION_DIAGRAM as never);
-  const text = lines.join(" ");
-  assert.ok(text.includes("Google's model fitted 21 panels of 1.05 m × 1.88 m at 400 W each"), text);
-  assert.ok(text.includes("Google's own 400 W assumption"), text);
-  assert.ok(text.includes("scaled to Jinko Tiger Neo 440 W"), text);
-  assert.ok(
-    text.includes(
-      "come from Google's solar model while the photo is Google's satellite layer",
-    ),
-    text,
+  // No stored date: line 2 is OMITTED, never guessed — and the count drops.
+  const noDate = roofDiagramCaptionLines(viewFor(A57_ROW), CAPTION_DIAGRAM as never);
+  assert.equal(noDate.length, 2, noDate.join(" | "));
+  assert.ok(!noDate.join(" ").includes("dated"), noDate.join(" | "));
+  // No dashed box: line 3 is omitted too.
+  const noBox = roofDiagramCaptionLines(
+    viewFor(withImagery(A57_ROW)),
+    { ...CAPTION_DIAGRAM, buildingBox: null } as never,
   );
-  assert.ok(text.includes("rather than a placement plan"), text);
-  // A roof with NO drawing still states the TABLE's facts and the imagery, and
-  // says nothing about a drawing that does not exist.
-  const noDiagram = roofDiagramCaptionLines(viewFor(withImagery(roofRow())), undefined);
-  assert.deepEqual(noDiagram, [
-    // roofRow()'s one plane carries no google_panel_count, so it is an
-    // area-estimated face — the caption says exactly that.
-    "Google placed no panels, so the panel counts on the single face are estimated from roof area alone.",
-    "70% of each face is treated as usable after setbacks, vents and walkways.",
-    "Google's solar model is dated 2018-11-17, medium-quality imagery. The photograph's own date is not known to us.",
-  ]);
+  assert.equal(noBox.length, 2, noBox.join(" | "));
+  // A MANUAL roof says nothing about Google at all (D48's fallback).
+  const manual = roofDiagramCaptionLines(
+    viewFor({ ...withImagery(roofRow()), source: "manual_plans" }),
+    undefined,
+  );
+  assert.deepEqual(manual, []);
 });
 
-test("3.4c-5 (6): totality — junk view and missing figures invent nothing", () => {
+test("D48 (1): line 1 says the shapes are INDICATIVE, names no cause and no vendor", () => {
+  // WAS "the drawable roof states what was drawn, whose panel, and why it sits
+  // roughly" — the fitted-panel and two-wattage lines it asserted are deleted.
+  // Line 1 is rewritten: it must not claim the two are "a different capture"
+  // (never established) and must not name a mechanism for the misalignment
+  // (untested — F235, homed at 4.2).
+  const lines = roofDiagramCaptionLines(viewFor(withImagery(A57_ROW)), CAPTION_DIAGRAM as never);
+  const line1 = lines[0];
+  assert.ok(line1.startsWith("The panel shapes are Google's estimate"), line1);
+  assert.ok(line1.includes("drawn over Google's satellite view"), line1);
+  assert.ok(line1.includes("separate products and nothing aligns them"), line1);
+  assert.ok(line1.endsWith("so the shapes are indicative."), line1);
+  for (const forbidden of [
+    "a different capture", "supplier", "vendor", "third party",
+    "Airbus", "Maxar", "Vexcel",
+    "lean", "relief displacement", "parallax", "perspective", "ortho",
+    "placement plan",
+  ]) {
+    assert.ok(!new RegExp(forbidden, "i").test(line1), `line 1 must not say "${forbidden}": ${line1}`);
+  }
+  assert.deepEqual(readerInstructionsIn(lines), []);
+});
+
+test("D48: totality — junk view and missing figures invent nothing", () => {
   assert.deepEqual(roofDiagramCaptionLines(addressRoofView(null), undefined), []);
-  // A junk view with a drawable diagram cannot occur on screen (roofDiagramView
-  // hides the diagram when there is no roof row), but the function is total:
-  // it describes the DRAWING it was handed and states nothing about the roof.
   const junk = roofDiagramCaptionLines(addressRoofView("garbage"), CAPTION_DIAGRAM as never);
   assert.deepEqual(readerInstructionsIn(junk), []);
-  for (const forbidden of ["faces", "% of each face", "is dated", "scaled to"]) {
+  for (const forbidden of ["dated", "faces", "% of each face", "scaled to"]) {
     assert.ok(!junk.join(" ").includes(forbidden), `${forbidden} invented from a junk view`);
   }
-  // No dimensions, no wattage, no panel, no usability, no imagery: the lines
-  // that HAVE figures appear, the rest are omitted rather than guessed.
-  const bare = viewFor(roofRow({ planes: [{ panel_count: 3 }], usability_factor: null }));
+  // A drawable diagram over a junk view still describes only the DRAWING.
+  assert.ok(junk.includes("The dashed box is the area Google measured."), junk.join(" | "));
+  const bare = viewFor(roofRow({ planes: [{}], usability_factor: null }));
   const lines = roofDiagramCaptionLines(bare, {
-    ...CAPTION_DIAGRAM,
-    panelWidthM: null,
-    panelHeightM: null,
-    panelCapacityW: null,
-    buildingBox: null,
+    ...CAPTION_DIAGRAM, panelWidthM: null, panelHeightM: null,
+    panelCapacityW: null, buildingBox: null,
   } as never);
   const text = lines.join(" ");
-  assert.ok(text.includes("Google's model fitted 21 panels onto this building."), text);
-  assert.ok(!text.includes("null"), text);
-  assert.ok(!text.includes("undefined"), text);
-  assert.ok(!text.includes("NaN"), text);
-  assert.ok(!text.includes("m ×"), "no dimensions were invented");
-  assert.ok(!text.includes("% of each face"), "no usability factor was invented");
-  // One face, none assessed: the singular reads properly, never "all 1 face".
-  assert.ok(
-    text.includes("the panel counts on the single face are estimated from roof area alone"),
-    text,
-  );
-  assert.ok(!text.includes("dashed box"), "no box was invented");
-  assert.ok(!text.includes("is dated"), "no imagery date was invented");
-  assert.deepEqual(readerInstructionsIn(lines), []);
+  for (const junkWord of ["null", "undefined", "NaN"]) {
+    assert.ok(!text.includes(junkWord), text);
+  }
   assert.doesNotThrow(() =>
     renderRoofSection({ view: bare, jobId: "j", isOpen: true, diagram: CAPTION_DIAGRAM }),
   );
@@ -10708,51 +10563,25 @@ test("3.4c-5 (F128): the moved notices still RENDER, wording unchanged", () => {
   assert.ok(text.includes("The job was set up as SA, but the address geocodes to VIC"), text);
   assert.ok(text.includes("worth checking before quoting"), "wording moved verbatim");
 });
-test("3.4c fix 2: the caption names BOTH sources as Google's, and names no mechanism", () => {
-  const lines = roofDiagramCaptionLines(viewFor(withImagery(A57_ROW)), CAPTION_DIAGRAM as never);
-  const sentence = lines.find((l) => l.includes("placement plan"));
-  assert.ok(sentence, lines.join(" | "));
-  // BOTH are Google APIs — the Solar API's model and the Static Maps
-  // satellite layer. The old wording implied two separate vendors, which
-  // would send anyone fixing the alignment to the wrong place.
-  assert.ok(sentence.includes("Google's solar model"), sentence);
-  assert.ok(sentence.includes("Google's satellite layer"), sentence);
-  assert.ok(sentence.includes("a different capture"), sentence);
-  assert.ok(sentence.includes("nothing guarantees the two line up"), sentence);
-  // The ending is prompt 5's, unchanged — only the cause was replaced.
-  assert.ok(
-    sentence.endsWith(
-      "so the shapes indicate roughly where Google measured panels rather than a placement plan.",
-    ),
-    sentence,
-  );
-  // What it must never say: a second vendor, the attribution the figcaption
-  // already carries once, or a mechanism nobody has measured (the test that
-  // would settle it is row 4.2, F235).
-  for (const forbidden of [
-    "supplier", "vendor", "third party", "third-party",
-    "Airbus", "Maxar", "Vexcel",
-    "lean", "relief displacement", "parallax", "perspective", "ortho",
+test("D48 (3): NOTHING anywhere composes an orientation judgement", () => {
+  // D48 supersedes D40 and removes the caution and its split caption. F258:
+  // the caution counted panels and never read PITCH — on a57e13f1 eight of
+  // the twelve it counted sat on a 5.6 degree face, very nearly flat, where
+  // azimuth barely changes what the panel collects.
+  const view = viewFor(A57_ROW); // 12 of 26 on southerly faces — used to fire
+  // The view fields are GONE, not merely null: an orphan field is F255's defect.
+  assert.ok(!("orientationNotice" in view), "orientationNotice must not exist");
+  assert.ok(!("orientationSplitCaption" in view), "orientationSplitCaption must not exist");
+  // And no rendered output mentions it, on the roof that used to warn.
+  const text = roofTextOf(renderRoofSection({ view, jobId: "j", isOpen: true, diagram: CAPTION_DIAGRAM }));
+  for (const gone of [
+    "southern half", "northern half", "low-sun", "face the southern",
+    "panels face", "compass",
   ]) {
-    assert.ok(
-      !new RegExp(forbidden, "i").test(sentence),
-      `the caption must not say "${forbidden}": ${sentence}`,
-    );
+    assert.ok(!text.includes(gone), `orientation judgement still on screen: ${gone}`);
   }
-  // And the whole caption still instructs nobody.
-  assert.deepEqual(readerInstructionsIn(lines), []);
-
-  // RENDERED, server-side, and printed whole so the new sentence can be read
-  // in context rather than as a string in a test.
-  const view = viewFor(withImagery(A57_ROW));
-  const rendered = roofTextOf(
-    renderRoofSection({ view, jobId: "j", isOpen: true, diagram: CAPTION_DIAGRAM }),
-  );
-  console.log("        [a57e13f1 caption, rendered server-side]");
-  for (const line of roofDiagramCaptionLines(view, CAPTION_DIAGRAM as never)) {
-    assert.ok(rendered.includes(line), `not rendered: ${line}`);
-    console.log(`          ${line}`);
-  }
+  // The FACTS the table states are untouched — direction and pitch per face.
+  assert.ok(text.includes("faces east-south-east, 6 degree pitch"), text);
 });
 // ── 3.4c fix 3: the roof table follows the pinned panel (F217, D39) ─────────
 // Fixtures shaped on the two LIVE runs, both verified against the database on
@@ -10926,277 +10755,184 @@ test("3.4c fix 3 (c): the narrowed mismatch notice — silent when the table fol
 });
 // ── D40 / D43 / D46 — the three copy changes of 2026-08-26 ─────────────────
 
-/** A roof of `south` southerly panels and `north` northerly ones, one face each. */
-const splitRoof = (south: number, north: number) =>
-  viewFor(
-    roofRow({
-      planes: [
-        { azimuth: 180, pitch: 20, panel_count: south, kwp: 0.44 * south },
-        { azimuth: 0, pitch: 20, panel_count: north, kwp: 0.44 * north },
-      ],
-    }),
-  );
 
-test("D40 (1): the threshold is a THIRD — exactly a third fires, one panel below is silent", () => {
-  // Exactly one third: 5 of 15. Fires.
-  const atThird = splitRoof(5, 10);
-  assert.ok(atThird.orientationNotice, "exactly a third must fire");
-  assert.equal(atThird.orientationNotice.title, "5 of the 15 panels face the southern half");
-  // One panel below the third: 4 of 15 (26.7%). Silent — and the SPLIT speaks instead.
-  const belowThird = splitRoof(4, 11);
-  assert.equal(belowThird.orientationNotice, null, "below a third must stay silent");
-  assert.ok(belowThird.orientationSplitCaption, "a mixed roof still states its split");
-  // The old line, for contrast: a strict majority would have silenced BOTH of these.
-  assert.ok(splitRoof(5, 10).orientationNotice, "a majority rule would have been silent here");
-});
 
-test("D40 (2): the title is true at the LOWEST share that can fire — a count, not 'most'", () => {
-  // At exactly a third, "Most of these panels face south" would be FALSE. This
-  // assertion is the one that fails against the old title, which is the point.
-  const atThird = splitRoof(1, 2);
-  assert.ok(atThird.orientationNotice);
-  assert.equal(atThird.orientationNotice.title, "1 of the 3 panels faces the southern half");
-  assert.ok(!/^most/i.test(atThird.orientationNotice.title), atThird.orientationNotice.title);
-  // The claim in the title is arithmetically true at every share it can fire on.
-  for (const [south, north] of [[1, 2], [5, 10], [12, 14], [16, 11], [23, 0]]) {
-    const view = splitRoof(south, north);
-    assert.ok(view.orientationNotice, `${south}/${south + north}`);
-    assert.equal(
-      view.orientationNotice.title,
-      `${south} of the ${south + north} panels ${south === 1 ? "faces" : "face"} the southern half`,
-    );
-  }
-});
 
-test("D40 (3): the caution and the split caption are MUTUALLY EXCLUSIVE, always", () => {
-  for (let south = 0; south <= 12; south++) {
-    const view = splitRoof(south, 12 - south);
-    const both = view.orientationNotice !== null && view.orientationSplitCaption !== null;
-    assert.ok(!both, `${south} of 12 emitted both`);
-  }
-  // And the caption, when it speaks, states the split as a fact.
-  const quiet = splitRoof(2, 10); // 16.7% — below a third
-  assert.equal(quiet.orientationNotice, null);
-  assert.ok(quiet.orientationSplitCaption);
-  assert.equal(quiet.orientationSplitCaption.level, "caption"); // D25: a fact, not a finding
-  assert.equal(
-    quiet.orientationSplitCaption.body,
-    "Of the 12 panels, 10 face the northern half of the compass and 2 the southern.",
-  );
-});
 
-test("D40: fallbacks — one-sided roofs, the boundary, and an unknown azimuth", () => {
-  // Nothing southern: neither the caution nor the split.
-  const allNorth = splitRoof(0, 9);
-  assert.equal(allNorth.orientationNotice, null);
-  assert.equal(allNorth.orientationSplitCaption, null);
-  // Everything southern: the caution, and no caption.
-  const allSouth = splitRoof(9, 0);
-  assert.ok(allSouth.orientationNotice);
-  assert.equal(allSouth.orientationSplitCaption, null);
-  // A face with NO azimuth counts toward the TOTAL and toward NEITHER half, so
-  // the two halves need not sum to the total — the sentence is phrased for that.
-  const unknown = viewFor(
-    roofRow({
-      planes: [
-        { azimuth: 180, pitch: 20, panel_count: 2, kwp: 0.88 },
-        { azimuth: 0, pitch: 20, panel_count: 4, kwp: 1.76 },
-        { pitch: 20, panel_count: 6, kwp: 2.64 }, // azimuth unknown
-      ],
-    }),
-  );
-  assert.equal(unknown.orientationNotice, null); // 2 of 12 is below a third
-  assert.equal(
-    unknown.orientationSplitCaption?.body,
-    "Of the 12 panels, 4 face the northern half of the compass and 2 the southern.",
-  );
-  // Due east and due west are the boundary itself — neither half, same rule.
-  const boundary = viewFor(
-    roofRow({
-      planes: [
-        { azimuth: 90, pitch: 20, panel_count: 5, kwp: 2.2 },
-        { azimuth: 270, pitch: 20, panel_count: 5, kwp: 2.2 },
-      ],
-    }),
-  );
-  assert.equal(boundary.orientationNotice, null);
-  assert.equal(boundary.orientationSplitCaption, null, "no panel is on either half");
-});
 
-test("D43 (4): panel size is named ONLY where both sides assessed the face", () => {
-  // 670c80db: 27 against 28, the one disagreeing face assessed by both.
-  const bishops = viewFor(BISHOPS_ROW).countReconciliation;
-  assert.ok(bishops?.explanation);
-  assert.equal(bishops.agreeOnAssessedFaces, false);
-  assert.ok(/panel size is one possible explanation/i.test(bishops.explanation), bishops.explanation);
-  // A CANDIDATE, never the cause — the distinction F231 was about.
-  assert.ok(bishops.explanation.includes("nothing here establishes the cause"), bishops.explanation);
-  // a57e13f1 AGREES on every assessed face: panel size explains none of its
-  // gap, and the screen must still say nothing about it (F231's deleted line).
-  const a57 = viewFor(A57_ROW).countReconciliation;
-  assert.ok(a57?.explanation);
-  assert.equal(a57.agreeOnAssessedFaces, true);
-  assert.ok(!/panel size|different panel/i.test(a57.explanation), a57.explanation);
-  // The no-layout roof: every count from area alone, still no panel-size talk.
-  const frome = viewFor(FROME_ROW).countReconciliation;
-  assert.ok(!/panel size|different panel/i.test(String(frome?.explanation)), String(frome?.explanation));
-});
 
-test("D46 (5): NO caption line ever asserts a date for the PHOTOGRAPH itself", () => {
-  const fixtures = [
+/** Every string this module composes for a given job — the caption lines plus
+ *  every notice anywhere in the view, found by walking it. A DEEP walk on
+ *  purpose: F256's lesson is that a claim is not a location, so the detector
+ *  must not depend on knowing which field a sentence lives in. */
+function everyComposedString(view: AddressRoofView, diagram: unknown): string[] {
+  const out: string[] = [...roofDiagramCaptionLines(view, diagram as never)];
+  const walk = (value: unknown, depth = 0): void => {
+    if (depth > 8 || value === null || value === undefined) return;
+    if (typeof value === "string") { out.push(value); return; }
+    if (Array.isArray(value)) { for (const v of value) walk(v, depth + 1); return; }
+    if (typeof value === "object") {
+      for (const v of Object.values(value as Record<string, unknown>)) walk(v, depth + 1);
+    }
+  };
+  walk(view);
+  return out;
+}
+
+test("D48 (1): NOTHING this module composes dates, ages or vintages the PHOTOGRAPH", () => {
+  // F247 fixed one composer; F256 found the same false claim in a second one
+  // minutes later, because the fix repaired a LOCATION rather than a CLAIM.
+  // This detector reads every string the module produces, wherever it lives.
+  const SUBJECT = /\b(photo|photograph|picture)\b/i;
+  const VINTAGE = /\b(dated|date|aged?|years? old|old|vintage|predates?|since then|current)\b/i;
+  const fixtures: [string, unknown, unknown][] = [
     ["a57e13f1", withImagery(A57_ROW), CAPTION_DIAGRAM],
-    ["670c80db", withImagery(BISHOPS_ROW), CAPTION_DIAGRAM],
     ["456e0242", withImagery(FROME_ROW), { ...CAPTION_DIAGRAM, reason: "no_panel_positions" }],
+    ["stale flag set", { ...withImagery(A57_ROW), imagery_stale: true }, CAPTION_DIAGRAM],
+    ["every low-confidence cause", {
+      ...withImagery(A57_ROW),
+      low_confidence: true,
+      flags: [
+        "low_confidence_too_few_segments", "low_confidence_too_few_panels",
+        "low_confidence_implausible_pitch", "low_confidence_no_google_panel_layout",
+      ],
+    }, CAPTION_DIAGRAM],
     ["no diagram", withImagery(roofRow()), undefined],
-  ] as const;
+  ];
   for (const [name, row, diagram] of fixtures) {
-    const lines = roofDiagramCaptionLines(viewFor(row), diagram as never);
-    for (const line of lines) {
-      for (const raw of line.split(/(?<=\.)\s+/)) {
-        const sentence = raw.trim();
-        // THE DETECTOR: a sentence carrying a date must not be about the photo.
-        // Reinstating "The photo is dated 2018-11-17, medium-quality." trips this.
-        if (/\d{4}-\d{2}-\d{2}/.test(sentence)) {
+    for (const raw of everyComposedString(viewFor(row), diagram)) {
+      for (const sentence of raw.split(/(?<=\.)\s+/)) {
+        if (SUBJECT.test(sentence)) {
           assert.ok(
-            !/\bphoto(graph)?\b/i.test(sentence),
-            `${name}: a date is asserted for the photograph: ${sentence}`,
+            !VINTAGE.test(sentence),
+            `${name}: a vintage is attributed to the photograph: ${sentence}`,
           );
         }
       }
     }
-    const text = lines.join(" ");
-    if (text.includes("2018-11-17")) {
-      // The date is attributed to the MODEL, and the photo's is stated unknown.
-      assert.ok(text.includes("Google's solar model is dated 2018-11-17"), text);
-      assert.ok(text.includes("The photograph's own date is not known to us."), text);
-    }
   }
-  // Quality alone, with no date: still the model's, never the photo's.
-  const qualityOnly = roofDiagramCaptionLines(
-    viewFor({ ...roofRow(), imagery_quality: "HIGH" }),
-    undefined,
+  // The model's date IS stated, attributed to the model, on a lookup roof.
+  const lines = roofDiagramCaptionLines(viewFor(withImagery(A57_ROW)), CAPTION_DIAGRAM as never);
+  assert.ok(lines.includes("Google's solar model is dated 2018-11-17."), lines.join(" | "));
+});
+
+test("D48 (4): the newer-build notice keeps its ADVICE, with the model as its subject", () => {
+  const view = viewFor({
+    ...FROME_ROW,
+    flags: ["low_confidence_too_few_segments", "low_confidence_result"],
+  });
+  const notice = view.confidenceNotices.find((n) => n.title.includes("newer build"));
+  assert.ok(notice, view.confidenceNotices.map((n) => n.title).join(" | "));
+  // THE ADVICE, asserted for substance rather than phrasing.
+  assert.ok(/may not be the real one/i.test(notice.body), notice.body);
+  assert.ok(/confirm.*against the plans/i.test(notice.body), notice.body);
+  // THE SUBJECT is Google's model, never the photograph.
+  assert.ok(/Google's model/i.test(notice.title + notice.body), notice.title);
+  assert.ok(!/\bphoto(graph)?\b/i.test(notice.title + notice.body), notice.body);
+});
+test("D48 (6): the RENDERED a57e13f1 section carries none of the deleted strings", () => {
+  const view = viewFor({ ...withImagery(A57_ROW), lat: -34.92, lng: 138.62 });
+  const text = roofTextOf(
+    renderRoofSection({ view, jobId: "j", isOpen: true, diagram: CAPTION_DIAGRAM }),
   );
-  // roofRow() carries no usability_factor, so no usability line — the caption
-  // omits what it does not have rather than inventing it.
-  assert.deepEqual(qualityOnly, [
-    "Google placed no panels, so the panel counts on the single face are estimated from roof area alone.",
-    "Google's solar model is high-quality imagery. The photograph's own date is not known to us.",
-  ]);
-  // A roof with NO imagery values emits no line at all rather than a guess.
-  const none = roofDiagramCaptionLines(viewFor(roofRow()), undefined);
-  assert.ok(!none.join(" ").includes("is dated"), none.join(" "));
-  assert.ok(!none.join(" ").includes("not known to us"), none.join(" "));
-});
-// ── F255: the orientation caution and split caption REACH THE SCREEN ────────
-//
-// These assert the RENDER, never the view. F255's whole point is that a view
-// field with no consumer is invisible to tsc, to a view-level suite and to
-// review — it looks like working code from every angle except the screen. So
-// every assertion here reads the markup the component actually produced.
-
-/** Bordered notices in a render: <Notice> carries role="note"; NoticeCaption
-    is a plain <p> with no role at all. */
-function borderedNotices(markup: string): number {
-  return (markup.match(/role="note"/g) ?? []).length;
-}
-
-/** A roof of `south` southerly panels and `north` northerly, rendered. */
-const renderSplit = (south: number, north: number) => {
-  const view = splitRoof(south, north);
-  const markup = renderRoofSection({ view, jobId: "j", isOpen: false });
-  return { view, markup, text: roofTextOf(markup) };
-};
-
-test("F255 (1): the orientation CAUTION reaches the screen, as a bordered notice", () => {
-  // 12 of 26 — a57e13f1's real share, the roof D40 made warn.
-  const firing = renderSplit(12, 14);
-  assert.ok(firing.view.orientationNotice, "the fixture must fire the caution");
-  const title = firing.view.orientationNotice.title;
-  assert.equal(title, "12 of the 26 panels face the southern half");
-  // THE ASSERTION F255 EXISTS FOR: the title is in the rendered output.
-  assert.ok(firing.text.includes(title), firing.text.slice(0, 400));
-  assert.ok(firing.text.includes(firing.view.orientationNotice.body), firing.text);
-  // ...and it is BORDERED: one more role="note" than the same roof with no
-  // orientation content at all. A differential, so it cannot pass by accident.
-  const quiet = renderSplit(0, 26);
-  assert.equal(quiet.view.orientationNotice, null);
-  assert.equal(quiet.view.orientationSplitCaption, null);
-  assert.equal(
-    borderedNotices(firing.markup),
-    borderedNotices(quiet.markup) + 1,
-    "the caution must add exactly one bordered notice",
-  );
-  // 670c80db's share renders its own numbers, not a template.
-  const bishops = renderSplit(16, 11);
-  assert.ok(bishops.text.includes("16 of the 27 panels face the southern half"), bishops.text);
-});
-
-test("F255 (2): below the threshold, the SPLIT CAPTION reaches the screen and nothing is bordered", () => {
-  const below = renderSplit(2, 10); // 16.7% — below a third
-  assert.equal(below.view.orientationNotice, null);
-  assert.ok(below.view.orientationSplitCaption);
-  assert.ok(below.text.includes(below.view.orientationSplitCaption.body), below.text);
-  assert.ok(
-    below.text.includes(
-      "Of the 12 panels, 10 face the northern half of the compass and 2 the southern.",
-    ),
-    below.text,
-  );
-  // Quiet, not bordered: the same count as a roof with no orientation content.
-  assert.equal(borderedNotices(below.markup), borderedNotices(renderSplit(0, 12).markup));
-});
-
-test("F255 (3): the caution renders ABOVE every caption (D25 ordering, on screen)", () => {
-  const firing = renderSplit(12, 14);
-  const cautionAt = firing.text.indexOf("12 of the 26 panels face the southern half");
-  // view.notice on a found roof is the PREFILL caption — level "caption".
-  assert.equal(firing.view.notice?.level, "caption");
-  const captionAt = firing.text.indexOf(firing.view.notice.title);
-  assert.ok(cautionAt !== -1 && captionAt !== -1, firing.text.slice(0, 300));
-  assert.ok(cautionAt < captionAt, `caution at ${cautionAt}, caption at ${captionAt}`);
-});
-
-test("F255 (4): NEITHER field can be dropped from EITHER array — proven by the render", () => {
-  // Both fields sit in BOTH partitions, so a change of `level` cannot make
-  // either disappear. These four cases are the four ways that could regress:
-  // each hand-builds the level the composer does not currently produce, which
-  // is precisely what a source-level check could never catch.
-  const base = splitRoof(12, 14);
-  const cases: [string, Partial<typeof base>, string][] = [
-    ["orientationNotice at level notice (findings array)",
-     { orientationNotice: { tone: "caution", level: "notice", title: "T1", body: "BODY-ONE" },
-       orientationSplitCaption: null }, "BODY-ONE"],
-    ["orientationNotice at level caption (captions array)",
-     { orientationNotice: { tone: "info", level: "caption", title: "T2", body: "BODY-TWO" },
-       orientationSplitCaption: null }, "BODY-TWO"],
-    ["orientationSplitCaption at level caption (captions array)",
-     { orientationNotice: null,
-       orientationSplitCaption: { tone: "info", level: "caption", title: "T3", body: "BODY-THREE" } },
-     "BODY-THREE"],
-    ["orientationSplitCaption at level notice (findings array)",
-     { orientationNotice: null,
-       orientationSplitCaption: { tone: "caution", level: "notice", title: "T4", body: "BODY-FOUR" } },
-     "BODY-FOUR"],
+  const DELETED = [
+    // 1 — every reference to the photograph's date or age
+    "The photo is", "years old", "Anything built or planted since then",
+    "newer build than the photo", "predates this house", "medium-quality",
+    // 2 — Google's own total and the whole reconciliation
+    "Google's model fitted", "W assumption", "take their panel counts",
+    "The faces Google assessed match the table exactly",
+    "disagree on faces both assessed", "possible explanation",
+    "estimated from roof area alone", "supplied the panel counts",
+    // 3 — the orientation judgement
+    "southern half", "northern half", "low-sun",
+    // 4 — the duplicated usable-factor line in the caption
+    "of each face is treated as usable",
+    // 5 — the label on faces Google DID assess
+    "from Google's panel layout",
   ];
-  for (const [name, patch, marker] of cases) {
-    const text = roofTextOf(
-      renderRoofSection({ view: { ...base, ...patch }, jobId: "j", isOpen: false }),
-    );
-    assert.ok(text.includes(marker), `${name} did not reach the screen: ${text.slice(0, 300)}`);
+  for (const dead of DELETED) {
+    assert.ok(!text.includes(dead), `still rendered: ${dead}`);
   }
+  // The three caption lines, and only those, in order.
+  const line1 = "The panel shapes are Google's estimate for this building, drawn over Google's satellite view. The two are separate products and nothing aligns them, so the shapes are indicative.";
+  const line2 = "Google's solar model is dated 2018-11-17.";
+  const line3 = "The dashed box is the area Google measured.";
+  assert.ok(text.includes(line1), text.slice(0, 400));
+  assert.ok(text.includes(line2), text);
+  assert.ok(text.includes(line3), text);
+  assert.ok(text.indexOf(line1) < text.indexOf(line2), "line 1 precedes line 2");
+  assert.ok(text.indexOf(line2) < text.indexOf(line3), "line 2 precedes line 3");
+  // Exactly two per-face markers, on the two faces Google never assessed.
+  assert.equal((text.match(/estimated from area alone/g) ?? []).length, 2);
+  // The usable-area factor survives ONCE, under the table (D48 item 5).
+  assert.equal((text.match(/of each face treated as usable/g) ?? []).length, 1);
 });
 
-test("F255: a view with neither field renders exactly what it rendered before", () => {
-  // The fallback: nothing populated, nothing added.
-  const none = renderSplit(0, 17);
-  assert.equal(none.view.orientationNotice, null);
-  assert.equal(none.view.orientationSplitCaption, null);
-  const baseline = roofTextOf(
-    renderRoofSection({
-      view: { ...none.view, orientationNotice: null, orientationSplitCaption: null },
-      jobId: "j",
-      isOpen: false,
-    }),
+test("D48 (7): every item on the WHAT STAYS list is still on screen", () => {
+  const base = { ...withImagery(A57_ROW), lat: -34.92, lng: 138.62 };
+  const render = (row: unknown, extra: Record<string, unknown> = {}, props = {}) =>
+    roofTextOf(
+      renderRoofSection({
+        view: addressRoofView(emptyJob({ roof_geometry: [row], ...extra })),
+        jobId: "j",
+        isOpen: true,
+        diagram: CAPTION_DIAGRAM,
+        ...props,
+      }),
+    );
+
+  // The address, the table (direction AND pitch), "Scaled to", the attribution.
+  const main = render(base);
+  assert.ok(main.includes("Direction") && main.includes("Pitch"), "the table columns");
+  assert.ok(main.includes("faces east-south-east, 6 degree pitch"), "direction in words");
+  assert.ok(main.includes("Scaled to Jinko Tiger Neo 440 W"), "the Scaled to line");
+  assert.ok(main.includes("Includes solar data from Google"), "the attribution");
+  assert.ok(main.includes("The dashed box is the area Google measured."), "the box");
+  // The prefill-and-confirm line (D24) and the three controls.
+  assert.ok(main.includes("Roof prefilled from Google's aerial imagery"), "D24 prefill line");
+  for (const control of ["Confirm this roof", "Correct these values", "Look up again"]) {
+    assert.ok(main.includes(control), `control: ${control}`);
+  }
+  // The multi-dwelling caution (passed in, F99).
+  assert.ok(
+    render(base, {}, { showsMultiDwellingCaution: true }).includes(
+      "The roof lookup may not be this dwelling",
+    ),
+    "multi-dwelling caution",
   );
-  assert.equal(none.text, baseline);
+  // Expired Solar Data.
+  assert.ok(
+    render({ ...base, solar_data_expired: true }).includes(
+      "Google's roof data for this job has been deleted",
+    ),
+    "expired Solar Data caution",
+  );
+  // The three surviving low-confidence causes, plus the unrecognised fallback.
+  const flagged = render({
+    ...base,
+    low_confidence: true,
+    planes: [{ azimuth: 173, pitch: 77, panel_count: 23, kwp: 10.12 }],
+    flags: [
+      "low_confidence_implausible_pitch",
+      "low_confidence_no_google_panel_layout",
+      "low_confidence_madeup",
+    ],
+  });
+  assert.ok(flagged.includes("One of these faces is too steep to be a roof"), "too steep");
+  assert.ok(flagged.includes("Google could not fit any panels on this building"), "no panels fitted");
+  assert.ok(flagged.includes("Something about this result looks wrong"), "unrecognised flag");
+  // The confirmed-roof notice.
+  assert.ok(
+    render({ ...base, roof_confirmed_at: "2026-08-25T07:41:51Z", roof_confirmed_source: "installer" })
+      .includes("Roof confirmed"),
+    "confirmed notice",
+  );
+  // The panel-versus-quote mismatch notice (D39).
+  const mismatch = render(
+    { ...base, selected_panel: { id: "panel-a", brand: "Jinko", model: "Tiger Neo", watts: 440 } },
+    { sizing_results: [{ sizing_result_id: "s1", created_at: "2026-08-25T00:00:00Z",
+        run_assumptions: { panel: { id: "panel-b", watts: 475 } } }] },
+  );
+  assert.ok(mismatch.includes("scaled to a different panel than the quote"), "D39 mismatch notice");
 });

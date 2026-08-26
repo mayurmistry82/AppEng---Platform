@@ -960,8 +960,15 @@ export interface RoofPlaneView {
   googlePanelCount: number | null;
   /** Where panelCount came from — decided by googlePanelCount null-vs-number, nothing else. */
   countSource: "google_layout" | "roof_area";
-  /** The same fact in plain words, for rendering as-is. */
-  countSourceLabel: string;
+  /**
+   * D48 / F257: a MARKER ON THE EXCEPTION, never a label on every face. Null
+   * where Google assessed the face — our count there is
+   * min(area_count, google_panel_count), a CEILING rather than an adopted
+   * layout, so "from Google's panel layout" was misleading as well as noisy
+   * (it read identically on the three of four a57e13f1 faces where the cap
+   * merely bound). Marked only where Google returned nothing.
+   */
+  countSourceLabel: string | null;
   /**
    * F168: the direction and pitch in plain words, e.g.
    * "faces south-south-east, 23 degree pitch". Pitch alone when only pitch is
@@ -979,35 +986,6 @@ export interface RoofPlaneView {
   kwpLabel: string | null;
 }
 
-/**
- * 3.4c prompt 2 (F231): the roof-level reconciliation of OUR per-face counts
- * against Google's, built by COMPARING the two — never a fixed sentence. The
- * caption that blamed "a different panel" was FALSE on a57e13f1 (the two agree
- * exactly on all four faces Google assessed; every extra panel sits on the two
- * faces it returned nothing for), so `explanation` is assembled from the
- * numbers and can only say what they establish.
- */
-export interface RoofCountReconciliation {
-  /** Sum of the table's per-face panel counts. */
-  tableTotal: number;
-  /** Sum of the non-null per-face google_panel_count values. */
-  googleTotal: number;
-  /**
-   * The row's stored google_max_array_panels_count — may differ from the sum;
-   * both are reported rather than one chosen, and the explanation says when
-   * they disagree.
-   */
-  googleTotalStored: number | null;
-  facesGoogleAssessed: number;
-  facesFromAreaAlone: number;
-  /** How many of tableTotal sit on faces Google returned no layout for. */
-  panelsFromAreaAlone: number;
-  /** Face-by-face agreement where BOTH sides have a number. */
-  agreeOnAssessedFaces: boolean;
-  /** The TRUE reason for any gap, assembled from the fields above. Null only
-   *  when there are no faces to reconcile. */
-  explanation: string | null;
-}
 
 export interface RoofNoticeView {
   tone: "info" | "success" | "caution" | "problem";
@@ -1037,7 +1015,6 @@ export interface AddressRoofView {
   imageryDate: string | null;
   imageryQualityLabel: string | null;
   imageryStale: boolean;
-  imageryAgeYears: number | null;
   sourceLabel: string | null;
   lat: number | null;
   lng: number | null;
@@ -1052,7 +1029,6 @@ export interface AddressRoofView {
     mismatch: boolean;
   } | null;
   notice: RoofNoticeView | null;
-  staleNotice: RoofNoticeView | null;
   /**
    * §20.2 (3.5b): the newest row's Google Solar Data is past its 30-day
    * retention. Deliberately an OR of three signals — the backend's redaction
@@ -1070,7 +1046,6 @@ export interface AddressRoofView {
   solarMode: PathRule["solarMode"] | null;
   showsExistingArray: boolean;
   /** 3.4c prompt 2 (F231). Null when there is no roof row. */
-  countReconciliation: RoofCountReconciliation | null;
   /**
    * F168: fires when a strict MAJORITY of panels sit on faces pointing into
    * the southern half of the compass (a bearing strictly between 90° and 270°
@@ -1078,13 +1053,6 @@ export interface AddressRoofView {
    * count). It states a FACT about orientation and names the direction and
    * the share. It does NOT judge the yield — that is row 4.13, deliberately.
    */
-  orientationNotice: RoofNoticeView | null;
-  /**
-   * D40: the north/south split as a plain fact, on every roof with panels on
-   * both halves. Null when the caution above fires (its body already carries
-   * the numbers — F248), and null when every panel is on one half.
-   */
-  orientationSplitCaption: RoofNoticeView | null;
   /** F94: totals.kwp to one decimal, the same one-rule rounding as the planes. */
   totalKwpLabel: string | null;
   /**
@@ -1164,197 +1132,7 @@ function joinAnd(items: string[]): string {
   return `${items.slice(0, -1).join(", ")} and ${items[items.length - 1]}`;
 }
 
-/**
- * 3.4c prompt 2 (F231): the reconciliation, computed by comparing the two
- * counts per face. The explanation is chosen by the DATA and never says
- * "uses a different panel" — panel size may explain a kW difference, but on
- * the live evidence it explains none of the count difference, and a plausible
- * wrong cause is worse than none.
- */
-function roofCountReconciliation(
-  planes: RoofPlaneView[],
-  row: Record<string, unknown>,
-): RoofCountReconciliation {
-  const tableTotal = planes.reduce((s, p) => s + (p.panelCount ?? 0), 0);
-  const assessed = planes.filter((p) => p.googlePanelCount !== null);
-  const areaFaces = planes.filter((p) => p.googlePanelCount === null);
-  const googleTotal = assessed.reduce((s, p) => s + (p.googlePanelCount ?? 0), 0);
-  const googleTotalStored = roofNum(row.google_max_array_panels_count);
-  const tableOnAssessed = assessed.reduce((s, p) => s + (p.panelCount ?? 0), 0);
-  const panelsFromAreaAlone = tableTotal - tableOnAssessed;
-  const agreeOnAssessedFaces = assessed.every(
-    (p) => (p.panelCount ?? 0) === p.googlePanelCount,
-  );
 
-  const sentences: string[] = [];
-  if (planes.length > 0) {
-    if (assessed.length === 0) {
-      sentences.push(
-        "Google returned no panel layout for this roof, so every panel count is estimated from roof area alone.",
-      );
-    } else {
-      if (!agreeOnAssessedFaces) {
-        // D43 / F244: on a face BOTH sides assessed, panel size is genuinely
-        // plausible — 670c80db's one disagreeing face is 13 against 14 — and
-        // refusing to say so is truth-on-all-instances, which can be a way of
-        // saying nothing. Named as a CANDIDATE, never as the cause: the
-        // sentence deleted at 3.4c stated it as THE cause, and F231 proved
-        // that false on a57e13f1. Nothing is added to the area-alone branch
-        // below, where panel size explains none of the gap.
-        sentences.push(
-          `Google's layout and the table disagree on faces both assessed — the table has ${tableOnAssessed} panels on those faces, Google's layout ${googleTotal}. A different panel size is one possible explanation for a difference of that kind, though nothing here establishes the cause.`,
-        );
-      } else if (areaFaces.length > 0) {
-        sentences.push("The faces Google assessed match the table exactly.");
-      }
-      if (areaFaces.length > 0) {
-        const names = areaFaces.map((p) => {
-          const code = azimuthLabel(p.azimuth);
-          const words = code !== null ? COMPASS_WORDS[code] ?? null : null;
-          return words !== null ? `face ${p.index + 1} (${words})` : `face ${p.index + 1}`;
-        });
-        const faces =
-          areaFaces.length === 1 ? "a face" : `${areaFaces.length} faces`;
-        sentences.push(
-          `${panelsFromAreaAlone} of the ${tableTotal} panels sit on ${faces} Google returned no layout for — ${joinAnd(names)} — where the count is estimated from roof area alone.`,
-        );
-      } else if (agreeOnAssessedFaces) {
-        sentences.push("Google's panel layout and the table agree on every face.");
-      }
-    }
-    if (googleTotalStored !== null && googleTotalStored !== googleTotal) {
-      sentences.push(
-        `Google's stored building total is ${googleTotalStored} panels while its per-face layout sums to ${googleTotal} — both are reported rather than one chosen.`,
-      );
-    }
-  }
-  return {
-    tableTotal,
-    googleTotal,
-    googleTotalStored,
-    facesGoogleAssessed: assessed.length,
-    facesFromAreaAlone: areaFaces.length,
-    panelsFromAreaAlone,
-    agreeOnAssessedFaces,
-    explanation: sentences.length > 0 ? sentences.join(" ") : null,
-  };
-}
-
-/**
- * THE THREE ORIENTATION BUCKETS, counted in PANELS (D40).
- *
- * southern — bearing strictly between 90° and 270°, the low-sun half here.
- * northern — bearing strictly outside that, the high-sun half.
- * NEITHER  — a face whose azimuth is exactly 90° or exactly 270° (due east or
- *            due west, the boundary itself) or is not known at all. Its panels
- *            COUNT TOWARD THE TOTAL and toward neither half, deliberately:
- *            calling due east "northern" would overstate the good half, and
- *            calling an unknown azimuth anything at all would be an invention.
- *            So `northern + southern` can be LESS than `total`, and every
- *            sentence built from these is phrased to stay true when it is.
- */
-function orientationSplit(planes: RoofPlaneView[]): {
-  total: number;
-  southern: number;
-  northern: number;
-  southernFaces: RoofPlaneView[];
-} {
-  let total = 0;
-  let southern = 0;
-  let northern = 0;
-  const southernFaces: RoofPlaneView[] = [];
-  for (const plane of planes) {
-    const count = plane.panelCount ?? 0;
-    total += count;
-    if (plane.azimuth === null) continue;
-    if (plane.azimuth > 90 && plane.azimuth < 270) {
-      southern += count;
-      southernFaces.push(plane);
-    } else if (plane.azimuth < 90 || plane.azimuth > 270) {
-      northern += count;
-    }
-  }
-  return { total, southern, northern, southernFaces };
-}
-
-/**
- * F168 / D40: the orientation caution — fires when A THIRD OR MORE of the
- * panels sit on southerly faces. Names the direction and the share; never
- * judges the yield (row 4.13, and D40 records the yield-shortfall version as
- * the better long-run answer, NOT chosen, waiting on 4.2).
- *
- * WHY A THIRD, not a majority (D40, F241): the strict majority meant
- * a57e13f1 at 12 of 26 panels (46%) said NOTHING while 670c80db at 16 of 27
- * (59%) warned — and 46 against 59 is not a line anyone would recognise as
- * meaningful. A roof that is nearly half badly oriented is exactly the roof
- * about to be quoted at northern-roof numbers.
- *
- * D25: it CAN not fire on a job like this one, so it is a notice.
- */
-function roofOrientationNotice(planes: RoofPlaneView[]): RoofNoticeView | null {
-  const { total, southern: poorPanels, southernFaces: poor } =
-    orientationSplit(planes);
-  if (total <= 0) return null;
-  // A THIRD OR MORE, in integer arithmetic — no float ratio is formed, so no
-  // rounding decides whether a warning appears.
-  if (poorPanels * 3 < total) return null;
-  let leadWords = "south";
-  let leadCount = -1;
-  for (const p of poor) {
-    const count = p.panelCount ?? 0;
-    const code = azimuthLabel(p.azimuth);
-    const words = code !== null ? COMPASS_WORDS[code] ?? null : null;
-    if (count > leadCount && words !== null) {
-      leadCount = count;
-      leadWords = words;
-    }
-  }
-  const share = Math.round((poorPanels / total) * 100);
-  return {
-    tone: "caution",
-    level: "notice",
-    // THE TITLE MUST BE TRUE AT EVERY SHARE THIS CAN FIRE ON (D40). The old
-    // "Most of these panels face south" was false the moment the line moved
-    // to a third — at 46% on a57e13f1 it would have asserted a majority that
-    // does not exist. A count states the fact and cannot go false.
-    title: `${poorPanels} of the ${total} panels ${
-      poorPanels === 1 ? "faces" : "face"
-    } the southern half`,
-    body: `${poorPanels} of the ${total} panels (${share}%) sit on faces pointing into the southern half of the compass, mostly ${leadWords}. In the southern hemisphere that is the low-sun side. Each face's direction and pitch are spelled out in the table.`,
-  };
-}
-
-/**
- * D40: every roof with panels on BOTH halves states the split as a plain
- * fact — regardless of whether the caution fires.
- *
- * MUTUALLY EXCLUSIVE WITH THE CAUTION, deliberately: when the caution fires
- * its body already carries both numbers, and two composers saying the same
- * thing in different words is exactly the fault F248 records about this
- * screen. So this returns null whenever the caution is present.
- *
- * D25: a split is a FACT about the roof, true of every mixed roof and
- * carrying no judgement — a caption, not a finding.
- *
- * The sentence says "of the N panels", never "N north plus M south", because
- * a boundary or unknown azimuth belongs to neither half (see orientationSplit)
- * and the two numbers are not required to sum.
- */
-function roofOrientationSplitCaption(
-  planes: RoofPlaneView[],
-  caution: RoofNoticeView | null,
-): RoofNoticeView | null {
-  if (caution !== null) return null;
-  const { total, southern, northern } = orientationSplit(planes);
-  if (total <= 0 || southern === 0 || northern === 0) return null;
-  return {
-    tone: "info",
-    level: "caption",
-    icon: "info",
-    title: "These panels face both ways",
-    body: `Of the ${total} panels, ${northern} face the northern half of the compass and ${southern} the southern.`,
-  };
-}
 
 /**
  * 3.4c prompt 3 (step 5): the roof table is scaled to the roof row's
@@ -1657,8 +1435,12 @@ function confidenceNotices(row: Record<string, unknown>): RoofNoticeView[] {
     notices.push({
       tone: "caution",
       level: "notice",
-      title: "This may be a newer build than the photo",
-      body: "The aerial photo looks like it predates this house, so the roof found may not be the real one. Confirm against the plans.",
+      // D48: the subject is GOOGLE'S MODEL, never the photograph — nothing
+      // dates the photograph and nothing can (F247, F256). The ADVICE is
+      // unchanged in substance: the roof found may not be the real one, so
+      // confirm it against the plans.
+      title: "This may be a newer build than Google's model",
+      body: "Google's model is built from imagery that looks older than this house, so the roof it found may not be the real one. Confirm against the plans.",
     });
   }
   // Anything left is a cause this build does not know about — say so, never hide it.
@@ -1691,7 +1473,6 @@ export function addressRoofView(job: unknown): AddressRoofView {
     imageryDate: null,
     imageryQualityLabel: null,
     imageryStale: false,
-    imageryAgeYears: null,
     sourceLabel: null,
     lat: null,
     lng: null,
@@ -1700,16 +1481,12 @@ export function addressRoofView(job: unknown): AddressRoofView {
     note: null,
     crossCheck: null,
     notice: null,
-    staleNotice: null,
     solarDataExpired: false,
     solarDataCapturedAt: null,
     solarExpiredNotice: null,
     confidenceNotices: [],
     solarMode: rule ? rule.solarMode : null,
     showsExistingArray: rule ? rule.showsExistingArray : false,
-    countReconciliation: null,
-    orientationNotice: null,
-    orientationSplitCaption: null,
     totalKwpLabel: null,
     panelMismatchNotice: null,
     scaledToLine: null,
@@ -1757,9 +1534,7 @@ export function addressRoofView(job: unknown): AddressRoofView {
       googlePanelCount,
       countSource,
       countSourceLabel:
-        countSource === "google_layout"
-          ? "from Google's panel layout"
-          : "estimated from roof area — Google placed none here",
+        countSource === "google_layout" ? null : "estimated from area alone",
       orientationLabel: orientationLabelFor(azimuth, pitch),
       areaM2Label: roofAreaLabel(areaM2, countSource),
       usableAreaM2Label: roofAreaLabel(usableAreaM2, countSource),
@@ -1788,25 +1563,10 @@ export function addressRoofView(job: unknown): AddressRoofView {
   }
   view.totals = { panels, kwp: Math.round(kwp * 1000) / 1000 };
   view.totalKwpLabel = roofKwLabel(view.totals.kwp);
-  view.countReconciliation = roofCountReconciliation(view.planes, row);
-  view.orientationNotice = roofOrientationNotice(view.planes);
-  view.orientationSplitCaption = roofOrientationSplitCaption(
-    view.planes,
-    view.orientationNotice,
-  );
 
   const imageryDate = typeof row.imagery_date === "string" ? row.imagery_date : null;
   view.imageryDate = imageryDate;
   view.imageryStale = row.imagery_stale === true;
-  if (imageryDate) {
-    const time = new Date(imageryDate).getTime();
-    if (Number.isFinite(time)) {
-      view.imageryAgeYears = Math.max(
-        0,
-        Math.floor((Date.now() - time) / (365.25 * 24 * 3600 * 1000)),
-      );
-    }
-  }
   const quality = typeof row.imagery_quality === "string" ? row.imagery_quality : null;
   view.imageryQualityLabel = quality ? QUALITY_LABELS[quality] ?? quality : null;
 
@@ -1915,19 +1675,6 @@ export function addressRoofView(job: unknown): AddressRoofView {
   view.showsConfirmControl =
     (view.state === "found" || view.state === "low_confidence") &&
     view.roofConfirmedAt === null;
-  if (view.imageryStale && view.state !== "manual") {
-    const years = view.imageryAgeYears;
-    view.staleNotice = {
-      tone: "caution",
-      // D25's founding case (F96): every located Australian building returns
-      // imagery dated 2018-11-17, so this fires on 100% of jobs — a method
-      // fact, quiet. Clock, because it is an age fact.
-      level: "caption",
-      icon: "clock",
-      title: years !== null ? `The photo is ${years} years old` : "The photo is old",
-      body: "Anything built or planted since then will not appear. Worth a check against the plans.",
-    };
-  }
   return view;
 }
 
@@ -2544,10 +2291,6 @@ export function roofDiagramView(job: unknown): RoofDiagramView {
 
 // ── The picture's caption, and the notices F128 left inline (3.4c prompt 5) ──
 
-/** Metres to at most 2 dp, for the caption. Mirrors the component's old fmtMetres. */
-function roofMetres(value: number): string {
-  return String(Math.round(value * 100) / 100);
-}
 
 /**
  * THE CAPTION UNDER THE ROOF PICTURE, as plain statements (3.4c prompt 5,
@@ -2579,128 +2322,34 @@ export function roofDiagramCaptionLines(
   const lines: string[] = [];
   const shown = diagram !== null && diagram !== undefined && diagram.show;
   const drawn = shown && diagram.reason === null;
-
-  if (drawn && diagram.panelCount > 0) {
-    const size =
-      diagram.panelWidthM !== null && diagram.panelHeightM !== null
-        ? ` of ${roofMetres(diagram.panelWidthM)} m × ${roofMetres(diagram.panelHeightM)} m`
-        : "";
-    const watts =
-      diagram.panelCapacityW !== null
-        ? ` at ${Math.round(diagram.panelCapacityW)} W each`
-        : "";
-    lines.push(
-      `Google's model fitted ${diagram.panelCount} panel${
-        diagram.panelCount === 1 ? "" : "s"
-      }${size}${watts} onto this building.`,
-    );
-    // The panel DRAWN is Google's assumption; the panel the TABLE is scaled to
-    // is ours. Both are named in one sentence because the two wattages appear
-    // metres apart on screen and nothing else joined them (seen 2026-08-25).
-    const drawnPanel =
-      diagram.panelCapacityW !== null
-        ? `Google's own ${Math.round(diagram.panelCapacityW)} W assumption`
-        : "Google's own panel assumption";
-    lines.push(
-      view.panelLabel !== null
-        ? `The drawn panels are ${drawnPanel}; the counts and kW in the table above are scaled to ${view.panelLabel}.`
-        : `The drawn panels are ${drawnPanel}.`,
-    );
-  }
-
-  // WHERE THE TABLE'S COUNTS CAME FROM is a fact about the FACES, not about
-  // the drawing, so it is stated whenever there are faces to describe — a roof
-  // Google returned no layout for is exactly the roof where that matters most,
-  // and it is also the roof whose drawing cannot be drawn. LOOKUP roofs only:
-  // on a manual roof Google never looked, so "Google placed no panels" would
-  // be an insinuation rather than a fact (prompt 3 draws the same line).
-  const rec = view.countReconciliation;
-  const total = view.planes.length;
+  // Google's own claims belong only on a roof Google actually produced. A
+  // manual roof gets no line about Google at all (D48's fallback).
   const fromLookup = view.state === "found" || view.state === "low_confidence";
-  if (fromLookup && rec !== null && total > 0) {
-    const faces = (n: number) => `${n} ${n === 1 ? "face" : "faces"}`;
-    const allFaces = total === 1 ? "the single face" : `all ${total} faces`;
-    if (rec.facesFromAreaAlone === 0) {
-      lines.push(`Google's own layout supplied the panel counts on ${allFaces}.`);
-    } else if (rec.facesGoogleAssessed === 0) {
-      lines.push(
-        `Google placed no panels, so the panel counts on ${allFaces} are estimated from roof area alone.`,
-      );
-    } else {
-      // Mixed implies at least two faces, so the plural is always right here.
-      lines.push(
-        `Of the ${faces(total)}, ${rec.facesGoogleAssessed} take their panel counts from Google's own layout and ${rec.facesFromAreaAlone} are estimated from roof area alone, where Google placed no panels.`,
-      );
-    }
-  }
-  if (view.usabilityFactor !== null) {
-    lines.push(
-      `${Math.round(
-        view.usabilityFactor * 100,
-      )}% of each face is treated as usable after setbacks, vents and walkways.`,
-    );
-  }
 
+  // LINE 1 — what the shapes ARE, and the one level of confidence D47 assigns
+  // them: the picture and the panel count are INDICATIVE. It names no cause
+  // for the misalignment — building lean is the leading hypothesis and it is
+  // UNTESTED, homed at 4.2 (F235) — and it no longer claims the two are "a
+  // different capture", which was never established either.
   if (drawn) {
-    // The replacement for prompt 4's unfinished "they will sit roughly —
-    // judge the building, not the layout": it now says roughly WHERE, and
-    // asks nothing of the reader. F107 forbids tidying the overlay away.
-    //
-    // THE OLD VENDOR WORDING WAS WRONG AND IS FIXED HERE (3.4c fix 2). BOTH
-    // sources are Google: the panel positions come from the Google Solar API
-    // (solar.googleapis.com buildingInsights:findClosest, roof_geometry.py)
-    // and the photo from the Google Static Maps API at maptype=satellite
-    // (routes/roof.py). Its Australian base layer is licensed from other
-    // operators — which is what the figcaption attribution names, once — but
-    // it is still a Google API. The old wording put the photo with a second
-    // VENDOR, which implied we mix two companies' APIs and would send anyone
-    // trying to fix the alignment to the wrong place. What is actually true
-    // is that these are two different
-    // Google products serving two different CAPTURES, with nothing in either
-    // contract co-registering them.
-    //
-    // THE CAUSE IS DELIBERATELY NOT NAMED. Building lean / relief displacement
-    // is the leading hypothesis and it is UNTESTED — the measurement that
-    // would settle it is homed at row 4.2 (F235). This states the fact that
-    // the captures differ; it must not state a mechanism we have not
-    // established.
     lines.push(
-      "The panel positions come from Google's solar model while the photo is Google's satellite layer — a different capture, and nothing guarantees the two line up — so the shapes indicate roughly where Google measured panels rather than a placement plan.",
+      "The panel shapes are Google's estimate for this building, drawn over Google's satellite view. The two are separate products and nothing aligns them, so the shapes are indicative.",
     );
   }
 
+  // LINE 2 — the model's date, alone. A 2018 model will not know about an
+  // extension, and that bears on whether the roof SHAPE is current (D48).
+  // The quality tier is dropped: Google's internal grade means nothing to an
+  // installer. NOTHING HERE DATES THE PHOTOGRAPH — nothing can (F247, F256).
+  if (fromLookup && view.imageryDate !== null) {
+    lines.push(`Google's solar model is dated ${view.imageryDate}.`);
+  }
+
+  // LINE 3 — what the dashed box is.
   if (shown && diagram.buildingBox !== null) {
-    lines.push("The dashed box is the extent of the area Google measured.");
+    lines.push("The dashed box is the area Google measured.");
   }
 
-  if (view.imageryDate !== null || view.imageryQualityLabel !== null) {
-    const quality =
-      view.imageryQualityLabel !== null
-        ? view.imageryQualityLabel.charAt(0).toLowerCase() +
-          view.imageryQualityLabel.slice(1)
-        : null;
-    // D46 / F247: THESE TWO VALUES DESCRIBE THE SOLAR MODEL, NOT THE PHOTO.
-    // roof_geometry.imagery_date / imagery_quality are read from the
-    // buildingInsights response (data.get("imageryDate") /
-    // data.get("imageryQuality") in backend/roof_geometry.py) and stored on
-    // the roof row. The picture underneath the drawing is a Static Maps
-    // satellite tile, and NOTHING WE STORE RECORDS ITS DATE. The line above
-    // already says the two are different captures, so dating the photograph
-    // with the model's date made the caption contradict itself — and it is
-    // the one sentence a reader would use to judge whether the photo is
-    // current. The model's date is real and useful, so it stays, attributed
-    // to the model by name; the photograph's date is stated as unknown rather
-    // than invented.
-    const modelFacts =
-      view.imageryDate !== null && quality !== null
-        ? `is dated ${view.imageryDate}, ${quality}`
-        : view.imageryDate !== null
-          ? `is dated ${view.imageryDate}`
-          : `is ${quality}`;
-    lines.push(
-      `Google's solar model ${modelFacts}. The photograph's own date is not known to us.`,
-    );
-  }
   return lines;
 }
 

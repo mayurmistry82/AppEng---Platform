@@ -448,12 +448,15 @@ export function AddressRoofSection({
                   }
                 >
                   {fmt(plane.panelCount, 0)}
-                  {/* F231: where this face's number came from, in the view's
-                      own words — an area-counted face is a different KIND of
-                      number and must look like one. */}
-                  <span className="block text-caption text-muted-foreground">
-                    {plane.countSourceLabel}
-                  </span>
+                  {/* D48 / F257: MARK THE EXCEPTION, not the rule. Only a face
+                      Google never assessed carries a marker; the rest are
+                      unlabelled, because on an assessed face our count is a
+                      ceiling set by Google rather than an adopted layout. */}
+                  {plane.countSourceLabel !== null ? (
+                    <span className="block text-caption text-muted-foreground">
+                      {plane.countSourceLabel}
+                    </span>
+                  ) : null}
                 </TableCell>
                 <TableCell className="metric-sm">{plane.kwpLabel ?? "—"}</TableCell>
               </TableRow>
@@ -608,19 +611,6 @@ export function AddressRoofSection({
             {line}
           </p>
         ))}
-        {/* F231: the TRUE account of any gap between Google's count and the
-            table's, assembled face-by-face in lib/worksheet.ts. It replaces
-            the deleted different-panel sentence, which was FALSE on
-            a57e13f1 — the two agree on every face Google assessed there, and
-            a plausible wrong cause stops the reader looking. Rendered for
-            LOOKUP roofs only: on a manual roof there is no Google side to
-            reconcile against. */}
-        {(view.state === "found" || view.state === "low_confidence") &&
-        view.countReconciliation?.explanation ? (
-          <p className="mt-1 text-caption text-muted-foreground">
-            {view.countReconciliation.explanation}
-          </p>
-        ) : null}
         {/* The imagery date and quality moved INTO the caption above (3.4c
             prompt 5) so one composer owns them. This keeps the attribution,
             which is a licence requirement, not a caption line. */}
@@ -869,13 +859,6 @@ export function AddressRoofSection({
           view.confirmedNotice,
           view.notice,
           ...view.confidenceNotices,
-          // F255: BOTH orientation fields appear in BOTH partitions, and the
-          // `level` filter routes each to the right one. Listing them in both
-          // is deliberate — it is what stops a future change of level making
-          // either vanish from the screen again, which is the defect F255
-          // records: composed, tested, decided on, and never rendered.
-          view.orientationNotice,
-          view.orientationSplitCaption,
           view.solarExpiredNotice,
         ].filter(
           (n): n is RoofNoticeView => n !== null && n.level === "notice",
@@ -915,10 +898,6 @@ export function AddressRoofSection({
         [
           view.notice,
           showsMultiDwellingCaution ? MULTI_DWELLING_CAPTION : null,
-          // F255 — the same pair, same reason (see the findings block above).
-          view.orientationNotice,
-          view.orientationSplitCaption,
-          view.staleNotice,
         ].filter(
           (n): n is RoofNoticeView => n !== null && n.level === "caption",
         )
