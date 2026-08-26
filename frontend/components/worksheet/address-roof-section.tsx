@@ -869,6 +869,13 @@ export function AddressRoofSection({
           view.confirmedNotice,
           view.notice,
           ...view.confidenceNotices,
+          // F255: BOTH orientation fields appear in BOTH partitions, and the
+          // `level` filter routes each to the right one. Listing them in both
+          // is deliberate — it is what stops a future change of level making
+          // either vanish from the screen again, which is the defect F255
+          // records: composed, tested, decided on, and never rendered.
+          view.orientationNotice,
+          view.orientationSplitCaption,
           view.solarExpiredNotice,
         ].filter(
           (n): n is RoofNoticeView => n !== null && n.level === "notice",
@@ -908,6 +915,9 @@ export function AddressRoofSection({
         [
           view.notice,
           showsMultiDwellingCaution ? MULTI_DWELLING_CAPTION : null,
+          // F255 — the same pair, same reason (see the findings block above).
+          view.orientationNotice,
+          view.orientationSplitCaption,
           view.staleNotice,
         ].filter(
           (n): n is RoofNoticeView => n !== null && n.level === "caption",

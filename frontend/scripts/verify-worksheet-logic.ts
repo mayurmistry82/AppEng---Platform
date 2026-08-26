@@ -11087,3 +11087,116 @@ test("D46 (5): NO caption line ever asserts a date for the PHOTOGRAPH itself", (
   assert.ok(!none.join(" ").includes("is dated"), none.join(" "));
   assert.ok(!none.join(" ").includes("not known to us"), none.join(" "));
 });
+// ── F255: the orientation caution and split caption REACH THE SCREEN ────────
+//
+// These assert the RENDER, never the view. F255's whole point is that a view
+// field with no consumer is invisible to tsc, to a view-level suite and to
+// review — it looks like working code from every angle except the screen. So
+// every assertion here reads the markup the component actually produced.
+
+/** Bordered notices in a render: <Notice> carries role="note"; NoticeCaption
+    is a plain <p> with no role at all. */
+function borderedNotices(markup: string): number {
+  return (markup.match(/role="note"/g) ?? []).length;
+}
+
+/** A roof of `south` southerly panels and `north` northerly, rendered. */
+const renderSplit = (south: number, north: number) => {
+  const view = splitRoof(south, north);
+  const markup = renderRoofSection({ view, jobId: "j", isOpen: false });
+  return { view, markup, text: roofTextOf(markup) };
+};
+
+test("F255 (1): the orientation CAUTION reaches the screen, as a bordered notice", () => {
+  // 12 of 26 — a57e13f1's real share, the roof D40 made warn.
+  const firing = renderSplit(12, 14);
+  assert.ok(firing.view.orientationNotice, "the fixture must fire the caution");
+  const title = firing.view.orientationNotice.title;
+  assert.equal(title, "12 of the 26 panels face the southern half");
+  // THE ASSERTION F255 EXISTS FOR: the title is in the rendered output.
+  assert.ok(firing.text.includes(title), firing.text.slice(0, 400));
+  assert.ok(firing.text.includes(firing.view.orientationNotice.body), firing.text);
+  // ...and it is BORDERED: one more role="note" than the same roof with no
+  // orientation content at all. A differential, so it cannot pass by accident.
+  const quiet = renderSplit(0, 26);
+  assert.equal(quiet.view.orientationNotice, null);
+  assert.equal(quiet.view.orientationSplitCaption, null);
+  assert.equal(
+    borderedNotices(firing.markup),
+    borderedNotices(quiet.markup) + 1,
+    "the caution must add exactly one bordered notice",
+  );
+  // 670c80db's share renders its own numbers, not a template.
+  const bishops = renderSplit(16, 11);
+  assert.ok(bishops.text.includes("16 of the 27 panels face the southern half"), bishops.text);
+});
+
+test("F255 (2): below the threshold, the SPLIT CAPTION reaches the screen and nothing is bordered", () => {
+  const below = renderSplit(2, 10); // 16.7% — below a third
+  assert.equal(below.view.orientationNotice, null);
+  assert.ok(below.view.orientationSplitCaption);
+  assert.ok(below.text.includes(below.view.orientationSplitCaption.body), below.text);
+  assert.ok(
+    below.text.includes(
+      "Of the 12 panels, 10 face the northern half of the compass and 2 the southern.",
+    ),
+    below.text,
+  );
+  // Quiet, not bordered: the same count as a roof with no orientation content.
+  assert.equal(borderedNotices(below.markup), borderedNotices(renderSplit(0, 12).markup));
+});
+
+test("F255 (3): the caution renders ABOVE every caption (D25 ordering, on screen)", () => {
+  const firing = renderSplit(12, 14);
+  const cautionAt = firing.text.indexOf("12 of the 26 panels face the southern half");
+  // view.notice on a found roof is the PREFILL caption — level "caption".
+  assert.equal(firing.view.notice?.level, "caption");
+  const captionAt = firing.text.indexOf(firing.view.notice.title);
+  assert.ok(cautionAt !== -1 && captionAt !== -1, firing.text.slice(0, 300));
+  assert.ok(cautionAt < captionAt, `caution at ${cautionAt}, caption at ${captionAt}`);
+});
+
+test("F255 (4): NEITHER field can be dropped from EITHER array — proven by the render", () => {
+  // Both fields sit in BOTH partitions, so a change of `level` cannot make
+  // either disappear. These four cases are the four ways that could regress:
+  // each hand-builds the level the composer does not currently produce, which
+  // is precisely what a source-level check could never catch.
+  const base = splitRoof(12, 14);
+  const cases: [string, Partial<typeof base>, string][] = [
+    ["orientationNotice at level notice (findings array)",
+     { orientationNotice: { tone: "caution", level: "notice", title: "T1", body: "BODY-ONE" },
+       orientationSplitCaption: null }, "BODY-ONE"],
+    ["orientationNotice at level caption (captions array)",
+     { orientationNotice: { tone: "info", level: "caption", title: "T2", body: "BODY-TWO" },
+       orientationSplitCaption: null }, "BODY-TWO"],
+    ["orientationSplitCaption at level caption (captions array)",
+     { orientationNotice: null,
+       orientationSplitCaption: { tone: "info", level: "caption", title: "T3", body: "BODY-THREE" } },
+     "BODY-THREE"],
+    ["orientationSplitCaption at level notice (findings array)",
+     { orientationNotice: null,
+       orientationSplitCaption: { tone: "caution", level: "notice", title: "T4", body: "BODY-FOUR" } },
+     "BODY-FOUR"],
+  ];
+  for (const [name, patch, marker] of cases) {
+    const text = roofTextOf(
+      renderRoofSection({ view: { ...base, ...patch }, jobId: "j", isOpen: false }),
+    );
+    assert.ok(text.includes(marker), `${name} did not reach the screen: ${text.slice(0, 300)}`);
+  }
+});
+
+test("F255: a view with neither field renders exactly what it rendered before", () => {
+  // The fallback: nothing populated, nothing added.
+  const none = renderSplit(0, 17);
+  assert.equal(none.view.orientationNotice, null);
+  assert.equal(none.view.orientationSplitCaption, null);
+  const baseline = roofTextOf(
+    renderRoofSection({
+      view: { ...none.view, orientationNotice: null, orientationSplitCaption: null },
+      jobId: "j",
+      isOpen: false,
+    }),
+  );
+  assert.equal(none.text, baseline);
+});
