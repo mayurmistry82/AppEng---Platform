@@ -676,8 +676,104 @@ def t7_export_and_gaps() -> None:
           gaps3 == 10 and sizing_route._FLAG_GAPS in fl3, f"{gaps3} / {fl3}")
 
 
+_THREE_WINDOWS = [
+    {"label": "peak", "rate": 0.55, "start": "17:00", "end": "21:00", "days": "all"},
+    {"label": "offpeak", "rate": 0.20, "start": "21:00", "end": "07:00", "days": "all"},
+    {"label": "shoulder", "rate": 0.35, "start": "07:00", "end": "17:00", "days": "all"},
+]
+_BILL_TOU = {
+    "job_id": "j1",
+    "parsed_json": {
+        "tariff_rate": 0.38,
+        "tariff_structured": {
+            "tariff_type": "tou", "supply_charge": 1.1,
+            "tou_windows": [
+                {"label": "peak", "rate": 0.60, "start": "07:00", "end": "21:00", "days": "all"},
+                {"label": "offpeak", "rate": 0.20, "start": "21:00", "end": "07:00", "days": "all"},
+            ],
+            "demand_charges": [], "controlled_load": [], "block_tiers": [], "fit_tiers": [],
+        },
+    },
+    "feed_in_tariff": 0.07,
+}
+
+
+def t8_flat_type_gates_windows() -> None:
+    """3.18 prompt 4 (Part A). Until now tariff_type was read for reporting and
+    never consulted before pricing — the form nulling the windows on a flat
+    save was the ONLY reason a flat-typed row could not be priced hour by hour
+    on windows nobody meant. The gate is exactly 'flat', nothing wider."""
+    print("\nT8. the engine asks what the stored type says before pricing on windows")
+
+    # (8a) THE IMPOSSIBLE CASE, CONSTRUCTED: type flat AND three windows.
+    # Before this prompt the BEFORE harness proved is_tou True with the hours
+    # priced 0.55/0.20/0.35 and zero flags. WHY EACH HALF MOVES: remove the
+    # gate and is_tou reads True again; remove the flag and the ignoring is
+    # silent — the same class of fault as the deletion this ships beside.
+    t, fl = _resolve({"tariffs": [_flat_row(tou_windows=_THREE_WINDOWS)], "bills": []})
+    check("(8a) flat type + 3 stored windows: the vector is FLAT at the "
+          "stored scalar", t["rate_24"] == [0.42] * 24 and t["is_tou"] is False,
+          f"is_tou={t['is_tou']} rate24[:4]={t['rate_24'][:4]}")
+    check("(8a) ...the ignored-windows flag fires WITH the count",
+          any(f.startswith("stored_windows_ignored") and "3 stored TOU window" in f
+              for f in fl), str(fl))
+    check("(8a) ...and rate_24_source tells the truth (the scalar's own "
+          "source, never the windows' origin)",
+          t["rate_24_source"] == "installer_unrecorded",
+          repr(t["rate_24_source"]))
+
+    # (8b) the bill's windows are gated by the same stored type — the second
+    # window path, reachable TODAY (a complete flat row still loads the bill
+    # on the stored_windows-is-None clause).
+    t2, fl2 = _resolve({"tariffs": [_flat_row()], "bills": [_BILL_TOU]})
+    check("(8b) flat type + bill windows: flat vector, bill windows ignored "
+          "and flagged with the count",
+          t2["is_tou"] is False and t2["rate_24"] == [0.42] * 24
+          and any(f.startswith("bill_windows_ignored") and "2 TOU window" in f
+                  for f in fl2),
+          f"is_tou={t2['is_tou']} flags={fl2}")
+
+    # (8c) THE THREE NO-REGRESSION BRANCHES, each its own check.
+    t3, _ = _resolve({"tariffs": [], "bills": [_BILL_TOU]})
+    check("(8c) no stored row + bill windows: TOU stays — a job with no "
+          "tariff row must still get its TOU vector",
+          t3["is_tou"] is True and t3["rate_24"][8] == 0.60,
+          f"is_tou={t3['is_tou']}")
+    t4, fl4 = _resolve({"tariffs": [_flat_row(tariff_type="tou", import_rate=None,
+                                              tou_windows=_THREE_WINDOWS)], "bills": []})
+    check("(8c) stored type 'tou': unchanged — windows price the hours",
+          t4["is_tou"] is True and t4["rate_24"][18] == 0.55
+          and not any("ignored" in f for f in fl4),
+          f"is_tou={t4['is_tou']} flags={fl4}")
+    t5, fl5 = _resolve({"tariffs": [_flat_row(tariff_type=None, import_rate=None,
+                                              tou_windows=_THREE_WINDOWS)], "bills": []})
+    check("(8c) stored type NULL: unchanged — the gate is EXACTLY 'flat'",
+          t5["is_tou"] is True and not any("ignored" in f for f in fl5),
+          f"is_tou={t5['is_tou']} flags={fl5}")
+
+    # (8d) REQUEST WINDOWS WIN: an explicit instruction from the caller is
+    # honoured regardless of the stored type, and nothing was ignored.
+    req = [{"label": "peak", "rate": 0.90, "start": "00:00", "end": "24:00", "days": "all"}]
+    t6, fl6 = _resolve({"tariffs": [_flat_row(tou_windows=_THREE_WINDOWS)], "bills": []},
+                       tou_windows=req)
+    check("(8d) request windows on a flat stored row: TOU built from the "
+          "request, rate_24_source 'request', NO ignored flag",
+          t6["is_tou"] is True and t6["rate_24"] == [0.90] * 24
+          and t6["rate_24_source"] == "request"
+          and not any("ignored" in f for f in fl6),
+          f"is_tou={t6['is_tou']} src={t6['rate_24_source']} flags={fl6}")
+
+    # (8e) the quiet shapes: an empty or unreadable stored list on a flat row
+    # is not a held window list — no flag fires about ignoring nothing.
+    for label, windows in (("empty list", []), ("a bare string", "junk")):
+        t7, fl7 = _resolve({"tariffs": [_flat_row(tou_windows=windows)], "bills": []})
+        check(f"(8e) flat row, tou_windows {label}: flat as today, no ignored flag",
+              t7["is_tou"] is False and not any("ignored" in f for f in fl7),
+              f"is_tou={t7['is_tou']} flags={fl7}")
+
+
 def main() -> int:
-    print("verify_tariff_provenance.py — 3.18 prompts 1+2 (writes nothing)\n")
+    print("verify_tariff_provenance.py — 3.18 prompts 1+2+4 (writes nothing)\n")
     t1_allowlists()
     t2_vocabulary()
     t3_refusals()
@@ -685,6 +781,7 @@ def main() -> int:
     t5_cross_language()
     t6_founding_case()
     t7_export_and_gaps()
+    t8_flat_type_gates_windows()
     print(f"\n{'-' * 60}")
     if SKIPS:
         print(f"SKIPPED (uncounted, never a pass): {len(SKIPS)}")

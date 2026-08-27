@@ -3997,6 +3997,13 @@ export interface TariffNetworkView {
   fitRate: SiteFieldView<number>;
   exportLimitKw: SiteFieldView<number>;
   windows: TariffWindowFormRow[];
+  /** 3.18 prompt 4: how many windows the STORED row holds, counted from the
+      raw stored list — including entries the form could not read, because a
+      flat save deletes the whole column, readable or not. 0 when there is no
+      row, no list, an empty list, or junk. Derived from the same read as
+      `windows`, so the count on screen and the count in the database cannot
+      disagree. */
+  storedWindowCount: number;
   /** jobs.site_dnsp — READ ONLY on this screen. */
   dnsp: string | null;
   /** jobs.site_state. Named with the underscore because `state` above is the
@@ -4308,6 +4315,7 @@ export function tariffNetworkView(
     fitRate: tariffField(fitValue),
     exportLimitKw: tariffField(exportValue),
     windows,
+    storedWindowCount: Array.isArray(row?.tou_windows) ? row.tou_windows.length : 0,
     dnsp: roofStr(detail.site_dnsp),
     state_: roofStr(detail.site_state),
     postcode: roofStr(detail.site_postcode),
@@ -4429,6 +4437,55 @@ export function tariffFieldSources(
   put("fit_aud_per_kwh", current.fitRate, baseline.fitRate);
   put("export_limit_kw", current.exportLimitKw, baseline.exportLimitKw);
   return out;
+}
+
+/** What the flat-save confirmation dialog renders. All wording lives HERE —
+    the component composes nothing (D25, F128). */
+export interface TariffFlatSaveConfirmation {
+  title: string;
+  body: string;
+  /** The second deliberate action — proceeding IS the save. */
+  confirmLabel: string;
+  cancelLabel: string;
+}
+
+/**
+ * 3.18 prompt 4 (Part B): the content of the confirmation shown before a flat
+ * save deletes stored time-of-use windows, or null when no confirmation is
+ * due. Non-null WHEN AND ONLY WHEN the save is flat and the stored row holds
+ * windows — it happened live on 2026-08-27: three windows deleted silently,
+ * recoverable only because a stored sizing run kept the 24-hour vector.
+ *
+ * D47 disciplines the wording: it states the fact and the count and instructs
+ * the reader in nothing. No "are you sure" — the question is not whether the
+ * person is sure, it is whether they know what the save removes.
+ *
+ * Total: junk view or form yields null (a malformed row must never block a
+ * save), an empty stored list is not a deletion, and a TOU save deletes
+ * nothing (the windows travel with it).
+ */
+export function tariffFlatSaveConfirmation(
+  view: TariffNetworkView,
+  form: TariffFormState,
+): TariffFlatSaveConfirmation | null {
+  const v = asRecord(view);
+  const count =
+    typeof v.storedWindowCount === "number" && Number.isFinite(v.storedWindowCount)
+      ? v.storedWindowCount
+      : 0;
+  if (count <= 0) return null;
+  if (asRecord(form).tariffType !== "flat") return null;
+  const them = count === 1 ? "it" : "them";
+  return {
+    title: "Saving as flat removes the stored windows",
+    body:
+      `The stored tariff holds ${count} time-of-use ${
+        count === 1 ? "window" : "windows"
+      }. Saving as flat removes ${them} from this job, and the flat import ` +
+      "rate prices every hour.",
+    confirmLabel: `Save as flat and remove ${them}`,
+    cancelLabel: "Keep the windows",
+  };
 }
 
 /**

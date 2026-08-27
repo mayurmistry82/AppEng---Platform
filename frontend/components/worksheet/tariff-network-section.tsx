@@ -14,6 +14,14 @@ import {
   SelectTrigger,
   SelectValue,
 } from "@/components/ui/select";
+import {
+  Dialog,
+  DialogContent,
+  DialogDescription,
+  DialogFooter,
+  DialogHeader,
+  DialogTitle,
+} from "@/components/ui/dialog";
 import { requestJson } from "@/lib/client-api";
 import { clientActionErrorCopy, type ApiErrorKind } from "@/lib/jobs";
 import {
@@ -23,9 +31,11 @@ import {
   TARIFF_WINDOW_LABELS,
   isTariffTime,
   tariffFieldSources,
+  tariffFlatSaveConfirmation,
   tariffFormFromView,
   tariffSaveNotices,
   type RoofNoticeView,
+  type TariffFlatSaveConfirmation,
   type TariffFormState,
   type TariffNetworkView,
   type TariffWindowFormRow,
@@ -97,6 +107,11 @@ export function TariffNetworkSection({
   >(null);
   const [saveNotices, setSaveNotices] = React.useState<readonly RoofNoticeView[]>([]);
   const [savedTick, setSavedTick] = React.useState(false);
+  // 3.18 prompt 4 (Part B): non-null while the flat-save confirmation is on
+  // screen. Its content is COMPOSED in lib/worksheet.ts; this component only
+  // holds it open.
+  const [confirmRemoval, setConfirmRemoval] =
+    React.useState<TariffFlatSaveConfirmation | null>(null);
 
   const baseline = React.useMemo(() => tariffFormFromView(view), [view]);
   const dirty = JSON.stringify(form) !== JSON.stringify(baseline);
@@ -196,9 +211,21 @@ export function TariffNetworkSection({
   const numberOrNull = (text: string): number | null =>
     text.trim() === "" ? null : Number(text);
 
-  async function save() {
+  async function save(removalConfirmed = false) {
     if (saving || !dirty) return;
     if (!validate()) return; // never submit a knowingly invalid body
+    // 3.18 prompt 4 (Part B): a flat save that would delete stored windows
+    // STOPS HERE until a person has taken the second deliberate action — the
+    // dialog's own confirm button, which re-enters with removalConfirmed
+    // true. FAIL CLOSED: this return is before every write, so if the dialog
+    // cannot render nothing is written; the save is only ever reached through
+    // an explicit confirmation. The endpoint is deliberately not asked to
+    // enforce this — a confirmed flat save must keep working.
+    const confirmation = tariffFlatSaveConfirmation(view, form);
+    if (confirmation !== null && !removalConfirmed) {
+      setConfirmRemoval(confirmation);
+      return;
+    }
     setSaving(true);
     setActionError(null);
     setSaveNotices([]);
@@ -598,7 +625,10 @@ export function TariffNetworkSection({
       ) : null}
 
       <div className="flex items-center gap-3">
-        <Button onClick={save} disabled={saving || !dirty}>
+        {/* () => save(): the bare handler would receive the MouseEvent as
+            removalConfirmed — a truthy value that would walk straight past
+            the confirmation. */}
+        <Button onClick={() => void save()} disabled={saving || !dirty}>
           {saving ? "Saving…" : "Save tariff & network"}
         </Button>
         {dirty ? (
@@ -607,6 +637,38 @@ export function TariffNetworkSection({
           <span className="text-caption text-muted-foreground">Saved</span>
         ) : null}
       </div>
+
+      {/* 3.18 prompt 4 (Part B): the flat-save confirmation — the product's
+          first destructive-action dialog, on the SAME ui/dialog the New Job
+          flow uses (one pattern for one idea). Every word comes from
+          tariffFlatSaveConfirmation in the logic layer. Dismissing it saves
+          nothing; the confirm button IS the save. */}
+      <Dialog
+        open={confirmRemoval !== null}
+        onOpenChange={(open) => {
+          if (!open) setConfirmRemoval(null);
+        }}
+      >
+        <DialogContent>
+          <DialogHeader>
+            <DialogTitle>{confirmRemoval?.title}</DialogTitle>
+            <DialogDescription>{confirmRemoval?.body}</DialogDescription>
+          </DialogHeader>
+          <DialogFooter>
+            <Button variant="secondary" onClick={() => setConfirmRemoval(null)}>
+              {confirmRemoval?.cancelLabel}
+            </Button>
+            <Button
+              onClick={() => {
+                setConfirmRemoval(null);
+                void save(true);
+              }}
+            >
+              {confirmRemoval?.confirmLabel}
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
     </div>
   );
 }

@@ -1007,22 +1007,53 @@ def _resolve_tariff(
         if export_meta.get("is_default"):
             flags.append("export_limit defaulted (state/postcode not recognised)")
 
-    windows_for_rate = getattr(body, "tou_windows", None) or stored_windows
+    request_windows = getattr(body, "tou_windows", None)
+    # ── 3.18 prompt 4 (Part A): the engine asks what the STORED type says ──
+    # before pricing a year on windows. Until now the form nulling the windows
+    # on a flat save was the ONLY reason a flat-typed row could not be priced
+    # hour by hour on windows nobody meant — tariff_type was read for reporting
+    # and never consulted here. The gate is NARROW, exactly "flat":
+    #   - a request window list (or explicit 24-h rates) is an instruction from
+    #     the caller and is honoured regardless of the stored type;
+    #   - no row, type "tou", type NULL, any other type: exactly as today;
+    #   - type "flat": neither the stored windows nor the bill's structured
+    #     windows build the vector, and each ignored list is FLAGGED with its
+    #     count — an ignored input that says nothing is the same class of
+    #     fault as the silent deletion this ships beside.
+    stored_type_is_flat = stored is not None and stored.get("tariff_type") == "flat"
+    windows_gated = stored_type_is_flat and not request_windows
+    if windows_gated and stored_windows is not None:
+        flags.append(
+            f"stored_windows_ignored — the stored tariff_type is flat, so the "
+            f"{len(stored_windows)} stored TOU window(s) were held and not "
+            "used; the hours are priced at the flat rate"
+        )
+    if windows_gated and structured and structured.get("tou_windows"):
+        bill_windows = structured.get("tou_windows")
+        n_bill = len(bill_windows) if isinstance(bill_windows, list) else 1
+        flags.append(
+            f"bill_windows_ignored — the stored tariff_type is flat, so the "
+            f"bill's {n_bill} TOU window(s) were not used; the hours are "
+            "priced at the flat rate"
+        )
+    windows_for_rate = request_windows or (None if windows_gated else stored_windows)
+    structured_for_rate = None if windows_gated else structured
     # 3.13 prompt 4b: the hourly vector's OWN provenance — where the thing
     # that will price the hours was read, tracked before the build so the
-    # build stays a pure converter.
+    # build stays a pure converter. Gated lists cannot be the origin of a
+    # vector they did not build.
     if explicit_windows:
         vector_origin: Optional[str] = "request"
-    elif stored_windows is not None:
+    elif stored_windows is not None and not windows_gated:
         vector_origin = _stored_label("tou_windows")
-    elif structured and structured.get("tou_windows"):
+    elif structured and structured.get("tou_windows") and not windows_gated:
         vector_origin = "bill"
     else:
         vector_origin = None
     n_flags_before = len(flags)
     rate_24, is_tou, rate_24_gap_filled_hours = _build_rate_24(
-        getattr(body, "import_rates_24", None), windows_for_rate, structured,
-        float(import_rate), flags,
+        getattr(body, "import_rates_24", None), windows_for_rate,
+        structured_for_rate, float(import_rate), flags,
     )
     # The defaulted scalar REACHED rate_24 iff the tariff came out flat, or
     # the window build filled at least one uncovered hour with it (the exact

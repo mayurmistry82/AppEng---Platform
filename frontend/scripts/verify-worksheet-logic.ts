@@ -160,6 +160,7 @@ import {
   TARIFF_WINDOWS_UNREADABLE_NOTICE,
   isTariffTime,
   tariffBillMismatchNotice,
+  tariffFlatSaveConfirmation,
   tariffNetworkView,
   tariffSaveNotices,
   ASSUMPTION_SOURCE_WORDS,
@@ -4444,6 +4445,135 @@ test("3.18 (e): junk in — nulls, numbers, missing view fields — an object, n
     assert.ok(formed.tariffType === "flat" || formed.tariffType === "tou");
     assert.ok(Array.isArray(formed.windows));
   }
+});
+
+// ── 3.18 prompt 4 (Part B): a person agrees to the deletion ─────────────────
+
+const STORED_TOU_JOB = jobWithTariff({
+  tariff_type: "tou",
+  tou_windows: [
+    { label: "peak", rate: 0.55, start: "17:00", end: "21:00", days: "all" },
+    { label: "offpeak", rate: 0.2, start: "21:00", end: "07:00", days: "all" },
+    { label: "shoulder", rate: 0.35, start: "07:00", end: "17:00", days: "all" },
+  ],
+});
+
+test("3.18-4: storedWindowCount counts the RAW stored list, not the readable rows", () => {
+  assert.equal(tariffNetworkView(STORED_TOU_JOB, BOTH_DEFAULTS).storedWindowCount, 3);
+  // An unreadable entry still counts — a flat save deletes the whole column,
+  // readable or not, so the count on screen must match the database.
+  const partial = tariffNetworkView(
+    jobWithTariff({ tariff_type: "tou", tou_windows: [
+      { label: "peak", rate: 0.55, start: "17:00", end: "21:00", days: "all" },
+      { label: "offpeak", rate: 0.2 }, // unreadable: no times — dropped from the FORM
+    ] }),
+    BOTH_DEFAULTS,
+  );
+  assert.equal(partial.windows.length, 1, "the form shows only the readable row");
+  assert.equal(partial.storedWindowCount, 2, "the count says what the save deletes");
+  assert.equal(tariffNetworkView(jobWithTariff({ tariff_type: "flat", import_rate: 0.4 }),
+    BOTH_DEFAULTS).storedWindowCount, 0);
+  assert.equal(tariffNetworkView(jobWithTariff({ tariff_type: "flat", tou_windows: [] }),
+    BOTH_DEFAULTS).storedWindowCount, 0, "an empty list is not a deletion");
+  assert.equal(tariffNetworkView(jobWithTariff({ tariff_type: "flat", tou_windows: "junk" }),
+    BOTH_DEFAULTS).storedWindowCount, 0, "unreadable/not-a-list: no dialog, save as today");
+  assert.equal(tariffNetworkView(jobWithTariff(null), BOTH_DEFAULTS).storedWindowCount, 0);
+});
+
+test("3.18-4: the confirmation is offered WHEN AND ONLY WHEN the save is flat and windows exist", () => {
+  const view = tariffNetworkView(STORED_TOU_JOB, BOTH_DEFAULTS);
+  // The live shape: a TOU job switched to Flat. WHY THIS MOVES: before this
+  // prompt the save proceeded straight to the network and nulled the column.
+  const flatForm = { ...tariffFormFromView(view), tariffType: "flat" as const };
+  const confirmation = tariffFlatSaveConfirmation(view, flatForm);
+  assert.ok(confirmation, "a flat save over 3 stored windows must be confirmed");
+  assert.match(confirmation!.body, /\b3\b/, "the count is stated");
+  assert.match(confirmation!.body, /time-of-use windows/);
+
+  // Saving it as TOU deletes nothing — the windows travel with the save.
+  assert.equal(tariffFlatSaveConfirmation(view, tariffFormFromView(view)), null);
+  // A flat job with no stored windows: nothing to confirm.
+  const flatView = tariffNetworkView(
+    jobWithTariff({ tariff_type: "flat", import_rate: 0.4 }), BOTH_DEFAULTS);
+  assert.equal(tariffFlatSaveConfirmation(flatView, tariffFormFromView(flatView)), null);
+  // Empty list and junk list: not a deletion / malformed must never block.
+  for (const tou_windows of [[], "junk", 42, {}]) {
+    const v = tariffNetworkView(
+      jobWithTariff({ tariff_type: "flat", import_rate: 0.4, tou_windows }),
+      BOTH_DEFAULTS);
+    assert.equal(tariffFlatSaveConfirmation(v, { ...tariffFormFromView(v), tariffType: "flat" }),
+      null, `${JSON.stringify(tou_windows)} must not raise the dialog`);
+  }
+  // One window: the count and the grammar follow.
+  const one = tariffNetworkView(
+    jobWithTariff({ tariff_type: "tou", tou_windows: [
+      { label: "peak", rate: 0.55, start: "17:00", end: "21:00", days: "all" }] }),
+    BOTH_DEFAULTS);
+  const oneConfirm = tariffFlatSaveConfirmation(
+    one, { ...tariffFormFromView(one), tariffType: "flat" });
+  assert.match(oneConfirm!.body, /\b1 time-of-use window\b/);
+});
+
+test("3.18-4: the wording states fact and count, and instructs the reader in nothing", () => {
+  const view = tariffNetworkView(STORED_TOU_JOB, BOTH_DEFAULTS);
+  const c = tariffFlatSaveConfirmation(
+    view, { ...tariffFormFromView(view), tariffType: "flat" })!;
+  for (const text of [c.title, c.body]) {
+    assert.ok(!/are you sure/i.test(text), `"are you sure" is banned: ${text}`);
+    assert.ok(!text.includes("?"), `no questions — state the fact: ${text}`);
+    assert.ok(!/\byou\b|\byour\b/i.test(text),
+      `no second-person instruction (D47): ${text}`);
+  }
+  assert.ok(c.confirmLabel.length > 0 && c.cancelLabel.length > 0);
+  assert.notEqual(c.confirmLabel, c.cancelLabel);
+});
+
+test("3.18-4: junk input never throws and never volunteers a dialog", () => {
+  const junkViews: unknown[] = [null, undefined, 42, "view", [], {},
+    { storedWindowCount: "three" }, { storedWindowCount: -1 },
+    { storedWindowCount: Number.NaN }];
+  const junkForms: unknown[] = [null, undefined, 42, "form", [], {},
+    { tariffType: "tou" }, { tariffType: 9 }];
+  for (const v of junkViews) {
+    for (const f of junkForms) {
+      const out = tariffFlatSaveConfirmation(
+        v as Parameters<typeof tariffFlatSaveConfirmation>[0],
+        f as Parameters<typeof tariffFlatSaveConfirmation>[1]);
+      assert.equal(out, null, `${JSON.stringify(v)} + ${JSON.stringify(f)}`);
+    }
+  }
+});
+
+test("3.18-4: FAIL CLOSED — the save cannot reach the network unconfirmed", async () => {
+  // Proven on the component SOURCE, the same instrument as the one-place
+  // caution check: within save(), the confirmation guard sits BEFORE the one
+  // and only requestJson call, returns without writing, and the save button
+  // cannot smuggle a truthy MouseEvent in as the confirmation flag.
+  const { readFileSync } = await import("node:fs");
+  const { fileURLToPath } = await import("node:url");
+  const path = await import("node:path");
+  const root = path.dirname(path.dirname(fileURLToPath(import.meta.url)));
+  const src = readFileSync(
+    path.join(root, "components/worksheet/tariff-network-section.tsx"), "utf8");
+
+  const guardAt = src.indexOf("tariffFlatSaveConfirmation(view, form)");
+  const networkAt = src.indexOf("requestJson<");
+  assert.ok(guardAt > 0 && networkAt > 0);
+  assert.ok(guardAt < networkAt, "the guard sits before the network call");
+  assert.equal((src.match(/requestJson</g) ?? []).length, 1,
+    "exactly ONE network call site, so the guard cannot be routed around");
+  assert.match(src.slice(guardAt, networkAt),
+    /if \(confirmation !== null && !removalConfirmed\) \{\s*setConfirmRemoval\(confirmation\);\s*return;/,
+    "the unconfirmed path sets the dialog and RETURNS — nothing written");
+  assert.ok(!src.includes("onClick={save}"),
+    "the bare handler would pass the MouseEvent as removalConfirmed");
+  assert.ok(src.includes("() => void save()"),
+    "the save button calls save() with no arguments");
+  // The dialog's confirm is the ONLY caller that passes true.
+  assert.equal((src.match(/save\(true\)/g) ?? []).length, 1);
+  // ...and it renders the logic layer's words, composing none of its own.
+  assert.ok(src.includes("{confirmRemoval?.title}"));
+  assert.ok(src.includes("{confirmRemoval?.body}"));
 });
 
 test("3.18: the prefilled list is a subset of the savable list, both non-empty", () => {

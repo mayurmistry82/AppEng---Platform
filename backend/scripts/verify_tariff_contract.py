@@ -301,6 +301,20 @@ def t5_resolution_order() -> None:
             check("(5d) the existing import_rate fallback flag is present",
                   any("import_rate fallback $0.40/kWh" in f for f in flags), str(flags))
 
+    # (5e) 3.18 prompt 4 (Part A): case b's own shape, one level deeper. The
+    # stored row's TYPE is flat, so the bill's TOU windows must not price the
+    # hours — before this prompt the scalar resolution said "stored beats
+    # bill" while the VECTOR quietly came from the bill's windows anyway.
+    stub = StubClient({"jobs": [], "tariffs": [dict(stored_row)], "bills": [BILL_ROW]})
+    flags5e: list[str] = []
+    t5e = sizing_route._resolve_tariff(stub, body_ns(job_id="j1"), "SA", "5000", flags5e)
+    check("(5e) stored type flat + bill windows: the VECTOR is flat at the "
+          "stored 0.42 — the bill's windows no longer price the hours",
+          t5e["is_tou"] is False and t5e["rate_24"] == [0.42] * 24,
+          f"is_tou={t5e['is_tou']} rate24[:4]={t5e['rate_24'][:4]}")
+    check("(5e) ...and the ignored bill windows are FLAGGED, never silent",
+          any(f.startswith("bill_windows_ignored") for f in flags5e), str(flags5e))
+
 
 def t6_days_flag() -> None:
     print("\nT6. the days flag")
