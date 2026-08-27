@@ -1015,7 +1015,6 @@ export interface AddressRoofView {
   imageryDate: string | null;
   imageryQualityLabel: string | null;
   imageryStale: boolean;
-  sourceLabel: string | null;
   lat: number | null;
   lng: number | null;
   panelLabel: string | null;
@@ -1280,12 +1279,26 @@ function roofPanelMismatchNotice(
   };
 }
 
-const SOURCE_LABELS: Record<string, string> = {
-  google_solar: "Google Solar",
-  manual_plans: "Entered from plans",
-  manual_site_measure: "Entered from a site measure",
-  manual_estimate: "Estimated",
-};
+/**
+ * A stored timestamp as "3 September 2026", or null when there is no usable
+ * date. ONE definition (3.18 prompt 3): the confirmed notice and the manual
+ * roof's entry date both read it, so a date cannot be worded two ways — the
+ * two-copies-of-one-rule fault 2b had just fixed elsewhere.
+ *
+ * A missing or unparseable date yields NULL, never "undefined" and never
+ * "Invalid Date": the caller renders the sentence without the date rather than
+ * with a wrong one. A missing date is not an error.
+ */
+function roofDateLabel(value: unknown): string | null {
+  if (typeof value !== "string" || value.trim() === "") return null;
+  const when = new Date(value);
+  if (!Number.isFinite(when.getTime())) return null;
+  return when.toLocaleDateString("en-AU", {
+    day: "numeric",
+    month: "long",
+    year: "numeric",
+  });
+}
 
 const QUALITY_LABELS: Record<string, string> = {
   HIGH: "High-quality imagery",
@@ -1296,6 +1309,11 @@ const QUALITY_LABELS: Record<string, string> = {
 function roofStateNotice(
   state: RoofEntryState,
   source: string | null,
+  /** 3.18 prompt 3 (D44's second half — "and when"): the roof row's created_at,
+      already worded, or null. Rows are APPEND-ONLY and a manual entry writes a
+      new row, so created_at IS the moment the installer entered it. Null when
+      the row carries no usable date — the caption then renders without it. */
+  enteredOn: string | null,
 ): RoofNoticeView | null {
   switch (state) {
     // D25: the success ticks fire on EVERY job of their kind — method facts,
@@ -1327,13 +1345,21 @@ function roofStateNotice(
         title: "Check this roof before you use it",
         body: "The lookup returned a result, but something about it does not look right. The details are below.",
       };
-    case "manual":
+    case "manual": {
+      // D44's second half: a hand-entered roof says WHEN it was entered, so a
+      // reader can tell how old the installer's own figures are. The date is
+      // the ENTRY event — a real timestamp on a real row — which is why it can
+      // be stated at all, unlike the photograph's date D48 removed (nothing
+      // dated the photograph). "Entered on" is deliberate for all three: a site
+      // measure taken last month and typed in today was ENTERED today, and
+      // saying "measured on" would date an event this row does not record.
+      const when = enteredOn !== null ? ` Entered on ${enteredOn}.` : "";
       if (source === "manual_plans") {
         return {
           tone: "success",
           level: "caption",
           title: "Entered from plans",
-          body: "Plans are the most accurate roof source we can get.",
+          body: `Plans are the most accurate roof source we can get.${when}`,
         };
       }
       if (source === "manual_site_measure") {
@@ -1341,15 +1367,23 @@ function roofStateNotice(
           tone: "success",
           level: "caption",
           title: "Entered from a site measure",
-          body: "Measured on site by the installer.",
+          body: `Measured on site by the installer.${when}`,
         };
       }
       return {
-        tone: "success",
+        // 3.18 prompt 3: tone was "success" while the body says "refine it from
+        // plans when you can" — a best estimate reading as good news is the
+        // unearned confidence D47 exists to stop. INFO, not caution: the
+        // estimate is a deliberate choice by the installer, and a caution-toned
+        // caption on every estimated roof would be noise that trains people to
+        // ignore cautions (F96). The plans and site-measure captions keep
+        // "success" — those genuinely ARE good news and say so.
+        tone: "info",
         level: "caption",
         title: "Estimated",
-        body: "A best estimate — refine it from plans when you can.",
+        body: `A best estimate — refine it from plans when you can.${when}`,
       };
+    }
     default:
       return null;
   }
@@ -1484,7 +1518,6 @@ export function addressRoofView(job: unknown): AddressRoofView {
     imageryDate: null,
     imageryQualityLabel: null,
     imageryStale: false,
-    sourceLabel: null,
     lat: null,
     lng: null,
     panelLabel: null,
@@ -1513,7 +1546,6 @@ export function addressRoofView(job: unknown): AddressRoofView {
   if (view.state === "none") return view;
 
   const source = typeof row.source === "string" ? row.source : null;
-  view.sourceLabel = source ? SOURCE_LABELS[source] ?? source : null;
   view.lat = roofNum(row.lat);
   view.lng = roofNum(row.lng);
   view.usabilityFactor = roofNum(row.usability_factor);
@@ -1648,7 +1680,7 @@ export function addressRoofView(job: unknown): AddressRoofView {
   }
 
   view.confidenceNotices = confidenceNotices(row);
-  view.notice = roofStateNotice(view.state, source);
+  view.notice = roofStateNotice(view.state, source, roofDateLabel(row.created_at));
   // 3.4c prompt 4 (item e): with the Solar Data DELETED, the prefill caption
   // must not still speak as if the lookup result were on screen — the section
   // was asserting found and deleted in one breath. The expired notice carries
@@ -1669,14 +1701,8 @@ export function addressRoofView(job: unknown): AddressRoofView {
         : view.roofConfirmedSource === "customer"
           ? "the customer"
           : view.roofConfirmedSource ?? "someone";
-    const when = new Date(view.roofConfirmedAt);
-    const whenLabel = Number.isFinite(when.getTime())
-      ? when.toLocaleDateString("en-AU", {
-          day: "numeric",
-          month: "long",
-          year: "numeric",
-        })
-      : null;
+    // 3.18 prompt 3: through the SHARED formatter — one wording for a date.
+    const whenLabel = roofDateLabel(view.roofConfirmedAt);
     view.confirmedNotice = {
       tone: "success",
       // A finding about THIS job — it fires only once a human has confirmed
@@ -1717,15 +1743,70 @@ export interface SiteDetailsView {
   /** The discriminant — null unless the stored value is one of the four. */
   dwellingType: DwellingType | null;
   /**
-   * F99 — true ONLY for `unit` and `townhouse`. Never for `detached`; never for
-   * `other` (other means unknown, and warning on unknown is how a warning becomes
-   * noise, F96); never for null (absence is not a signal). The DB stores
-   * lowercase, and this deliberately does NOT case-fold: an uppercase value is
-   * not a value the schema can produce, and guessing at it would be inventing a
-   * signal. ONE derivation — both the Site details and Address & roof sections
-   * read this same field.
+   * F99 — true for a TYPED `unit` or `townhouse`. Never for a typed `detached`;
+   * never for a typed `other` (other means unknown, and warning on unknown is
+   * how a warning becomes noise, F96). The DB stores lowercase, and this
+   * deliberately does NOT case-fold: an uppercase value is not a value the
+   * schema can produce, and guessing at it would be inventing a signal. ONE
+   * derivation — both the Site details and Address & roof sections read this
+   * same field.
+   *
+   * 3.18 prompt 3 (F260): when NOTHING usable is typed, the ADDRESS decides.
+   * Until now absence was silence, and `dwelling_type` is NULL on the live job
+   * whose address reads "unit 5/53 Bishops Pl" — the string said it and nothing
+   * read it — while the field itself sits BELOW the roof step, so on a fresh
+   * job the roof is judged before anything could have set it. A typed value
+   * still always wins, in both directions.
    */
   showsMultiDwellingCaution: boolean;
+  /**
+   * 3.18 prompt 3 (F260): one short line on the Site details dwelling-type
+   * field, non-null ONLY when the caution is firing from the ADDRESS rather
+   * than from a stored value. It explains a FORM FIELD — where the value is
+   * coming from and how to take it over — and deliberately does NOT restate
+   * the caution, which doubts the ROOF and lives on the roof section. Two
+   * sentences saying one thing in two places is the fault 3.4c item (d) fixed.
+   */
+  dwellingTypeDerivedNote: string | null;
+}
+
+/**
+ * 3.18 prompt 3 (F260): does the ADDRESS say this is a multi-dwelling site?
+ *
+ * WHY THIS EXISTS: the caution that would catch Google measuring a neighbour's
+ * building read `jobs.dwelling_type` and nothing else, and that column is NULL
+ * on the live job whose address literally reads "unit 5/53 Bishops Pl". The
+ * string said it and nothing read it — and the field sits in Site details,
+ * BELOW the roof step, so on a fresh job the roof is judged before anything
+ * could have set it. F107's founding catch happened at this address class.
+ *
+ * WHAT IT CATCHES: an Australian unit-style prefix followed by a number, and
+ * the number/number separator. Every token REQUIRES a following digit, which
+ * is what keeps "Flat Rock Rd" and "Unity St" out — a token alone is a street
+ * name far more often than a dwelling.
+ *
+ * WHAT IT DELIBERATELY DOES NOT CATCH, because a guard that over-fires becomes
+ * noise and a noisy warning dies:
+ *   - "Lot 3 Smith Rd" — a lot is an unregistered parcel in a new subdivision,
+ *     usually a detached block. ("Lot 3/5 V St" still fires, on the slash.)
+ *   - "Level 3, 100 King St", "Suite 5", "Shop 4" — commercial tenancies, not
+ *     dwellings; the caution talks about a home's roof and body corporate.
+ *   - "12A Smith St", "Rear 12 Smith St" — a subdivided or battle-axe block is
+ *     usually its own title with its own roof.
+ *
+ * Total: null, undefined, a non-string, whitespace or junk all answer false.
+ * Never throws — a caution that crashed the worksheet would be worse than one
+ * that slept.
+ */
+export function isMultiDwellingAddress(address: unknown): boolean {
+  if (typeof address !== "string") return false;
+  const text = address.trim().toLowerCase();
+  if (text === "") return false;
+  // The Australian unit/street separator: 5/53, 301/2, 7 / 9.
+  if (/\d\s*\/\s*\d/.test(text)) return true;
+  // A dwelling prefix that is followed by its number. The trailing digit is
+  // load-bearing: without it every "Flat Rock Rd" fires.
+  return /\b(unit|u|flat|apartment|apt|villa)\s*\.?,?\s*\d/.test(text);
 }
 
 const DWELLING_TYPES: readonly DwellingType[] = [
@@ -1754,7 +1835,44 @@ export function siteDetailsView(job: unknown): SiteDetailsView {
   const detail = asObject(job);
   const dwellingField = siteStrField(detail.dwelling_type);
   const dwellingType = DWELLING_TYPES.find((t) => t === dwellingField.raw) ?? null;
+
+  // 3.18 prompt 3 (F260). The row's shape: the derivation is the PREFILL, the
+  // typed answer is the CONFIRMATION. A typed value ALWAYS wins — including a
+  // typed "detached", which silences the caution — and only when nothing
+  // usable is typed does the address get a say.
+  //
+  // NOTHING IS WRITTEN. dwelling_type is never prefilled, patched or stored
+  // from this derivation: a derived value written as though it were typed is
+  // the precise defect this row exists to stop, and committing it here would
+  // be that defect committed by the fix.
+  //
+  // A stored value OUTSIDE the four (a raw DB edit, a legacy path) is not
+  // something this view can interpret, so it neither fires the caution itself
+  // nor counts as the typed confirmation — the address decides, exactly as if
+  // the field were empty. The prompt admits both readings; this one is chosen
+  // because the alternative hands back a way for the guard to fall asleep
+  // (store any junk, caution off), which is the fault being fixed. Pinned by
+  // its own test and reported.
+  const addressSaysMulti = isMultiDwellingAddress(
+    arr(detail.customer)[0]?.property_address_full,
+  );
+  const showsMultiDwellingCaution =
+    dwellingType !== null
+      ? dwellingType === "unit" || dwellingType === "townhouse"
+      : addressSaysMulti;
+
   return {
+    // The note's condition is deliberately NOT the caution's. The caution asks
+    // "is anything usable typed?" (dwellingType); the note sits ON THE FIELD
+    // and describes what the FIELD holds, so it asks "is the field empty?"
+    // (dwellingField.raw). They differ on exactly one shape — an unrecognised
+    // stored value like "duplex", where the caution fires from the address but
+    // the field is NOT empty, and a line claiming the field is read from the
+    // address would be false about the field it sits on. Do not merge them.
+    dwellingTypeDerivedNote:
+      dwellingField.raw === null && addressSaysMulti
+        ? "Read from this job's address for now — choosing a type here sets it instead."
+        : null,
     storeys: siteNumField(detail.storeys),
     roofMaterial: siteStrField(detail.roof_material),
     dwellingTypeField: dwellingField,
@@ -1763,7 +1881,7 @@ export function siteDetailsView(job: unknown): SiteDetailsView {
     floorAreaM2: siteNumField(detail.floor_area_m2),
     electricalPhase: siteStrField(detail.electrical_phase),
     dwellingType,
-    showsMultiDwellingCaution: dwellingType === "unit" || dwellingType === "townhouse",
+    showsMultiDwellingCaution,
   };
 }
 

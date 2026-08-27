@@ -183,6 +183,7 @@ import {
   resultsView,
   storedIncentives,
   incentivesView,
+  isMultiDwellingAddress,
   roofEntryState,
   sectionStates,
   sectionsForPath,
@@ -1417,6 +1418,246 @@ test("siteDetailsView: the multi-dwelling caution fires ONLY for unit/townhouse"
   assert.equal(caution(null), false, "absence is not a signal");
   assert.equal(caution("UNIT"), false, "the DB stores lowercase; do not invent a signal");
   assert.equal(caution(7), false);
+});
+
+// ── 3.18 prompt 3 (D44): a hand-entered roof says WHEN it was entered ───────
+
+test("3.18-3 (A): the three manual captions carry the entry date", () => {
+  const captionFor = (over: Record<string, unknown>) =>
+    addressRoofView(emptyJob({ roof_geometry: [roofRow(over)] })).notice;
+
+  // roofRow's created_at is 2026-08-14T01:00:00Z. Rows are APPEND-ONLY and a
+  // manual entry writes a new row, so created_at IS the entry moment.
+  const plans = captionFor({ source: "manual_plans" });
+  assert.equal(plans?.title, "Entered from plans");
+  assert.match(plans?.body ?? "", /Entered on 14 August 2026\.$/);
+  assert.match(plans?.body ?? "", /^Plans are the most accurate roof source we can get\./);
+
+  const measure = captionFor({ source: "manual_site_measure" });
+  assert.equal(measure?.title, "Entered from a site measure");
+  assert.match(measure?.body ?? "", /Entered on 14 August 2026\.$/);
+
+  const estimate = captionFor({ source: "manual_estimate" });
+  assert.equal(estimate?.title, "Estimated");
+  assert.match(estimate?.body ?? "", /Entered on 14 August 2026\.$/);
+});
+
+test("3.18-3 (A): a missing or unparseable date renders NO date, never 'undefined'", () => {
+  // THE SPECIFIC WAY THIS FAILS: a date pipeline that stringifies whatever it
+  // was given puts "undefined" or "Invalid Date" in front of an installer.
+  const bases = ["manual_plans", "manual_site_measure", "manual_estimate"];
+  const badDates: unknown[] = [
+    undefined, null, "", "   ", "not a date", 42, {}, [], "2026-13-45T99:99:99Z",
+  ];
+  for (const source of bases) {
+    for (const created_at of badDates) {
+      const notice = addressRoofView(
+        emptyJob({ roof_geometry: [roofRow({ source, created_at })] }),
+      ).notice;
+      const body = notice?.body ?? "";
+      assert.ok(body.length > 0, `${source}/${JSON.stringify(created_at)}: body renders`);
+      assert.ok(!body.includes("undefined"),
+        `${source}/${JSON.stringify(created_at)}: "undefined" reached the caption: ${body}`);
+      assert.ok(!body.includes("Invalid Date"),
+        `${source}/${JSON.stringify(created_at)}: "Invalid Date" reached the caption: ${body}`);
+      assert.ok(!body.includes("Entered on"),
+        `${source}/${JSON.stringify(created_at)}: no date means no date clause: ${body}`);
+      assert.ok(!body.includes("NaN"), `${source}: NaN reached the caption: ${body}`);
+    }
+  }
+});
+
+test("3.18-3 (A): 'Estimated' no longer reads as success; plans and site measure still do", () => {
+  const toneFor = (source: string) =>
+    addressRoofView(emptyJob({ roof_geometry: [roofRow({ source })] })).notice?.tone;
+  // A best estimate whose own body says "refine it from plans when you can"
+  // reading as SUCCESS is the unearned confidence D47 exists to stop.
+  assert.equal(toneFor("manual_estimate"), "info");
+  // ...and it is not a caution either: the estimate is a deliberate choice, and
+  // a caution on every estimated roof is noise that kills cautions (F96).
+  assert.notEqual(toneFor("manual_estimate"), "caution");
+  assert.equal(toneFor("manual_plans"), "success", "plans ARE good news");
+  assert.equal(toneFor("manual_site_measure"), "success", "a site measure IS good news");
+});
+
+test("3.18-3 (A): sourceLabel is GONE — the field, the map, and every reference", async () => {
+  // It was computed and never shown: 3 hits repo-wide, all inside worksheet.ts,
+  // zero in components — the same shape as the caution that was built and never
+  // rendered. Where two places must agree, removing one beats gating both.
+  const { readFileSync } = await import("node:fs");
+  const { fileURLToPath } = await import("node:url");
+  const path = await import("node:path");
+  const root = path.dirname(path.dirname(fileURLToPath(import.meta.url)));
+  const lib = readFileSync(path.join(root, "lib/worksheet.ts"), "utf8");
+  const roof = readFileSync(
+    path.join(root, "components/worksheet/address-roof-section.tsx"), "utf8");
+  assert.equal((lib.match(/sourceLabel/g) ?? []).length, 0,
+    "sourceLabel must not survive anywhere in the logic layer");
+  assert.equal((lib.match(/SOURCE_LABELS/g) ?? []).length, 0,
+    "its map had no other user, so it goes with it");
+  assert.equal((roof.match(/sourceLabel/g) ?? []).length, 0);
+  // The view still serialises and still carries the caption that says the same
+  // words with MORE context — nothing was lost by the deletion.
+  const view = addressRoofView(
+    emptyJob({ roof_geometry: [roofRow({ source: "manual_plans" })] }));
+  assert.doesNotThrow(() => JSON.stringify(view));
+  assert.equal(view.notice?.title, "Entered from plans");
+});
+
+// ── 3.18 prompt 3 (F260): the address wakes the sleeping caution ────────────
+
+/** The fixture table, printed with its verdicts so the decisions are visible
+    rather than buried in assertions. */
+const ADDRESS_FIXTURES: { address: unknown; multi: boolean; why: string }[] = [
+  // The live job that proved the guard was asleep.
+  { address: "unit 5/53 Bishops Pl, Kensington SA 5068, Australia", multi: true,
+    why: "unit token + slash — the live a57e13f1 address" },
+  { address: "Unit 5/53 Bishops Pl", multi: true, why: "capitalised token" },
+  { address: "5/53 Bishops Pl", multi: true, why: "the AU unit/street separator alone" },
+  { address: "Flat 2, 14 Frome St", multi: true, why: "flat token, no slash" },
+  { address: "Apartment 301/2 X St", multi: true, why: "apartment token + slash" },
+  { address: "Apt 3 12 Y Rd", multi: true, why: "apt token, no slash" },
+  { address: "U 7/9 Z Ave", multi: true, why: "bare U + number, and a slash" },
+  { address: "Villa 4/22 W Cr", multi: true, why: "villa token + slash" },
+  { address: "Lot 3/5 V St", multi: true,
+    why: "fires on the SLASH, not on 'lot' — see the not-caught list" },
+  { address: "1/2 Mile Rd", multi: true,
+    why: "DECIDED: fires. '1/2' is the unit separator; AU roads are not named "
+       + "with fractions, and a missed unit is the fault being fixed" },
+  { address: "  UNIT 12/8 Smith St  ", multi: true, why: "case and padding" },
+  { address: "u5/53 Bishops Pl", multi: true, why: "no space after the token" },
+  // Not multi-dwelling.
+  { address: "53 Bishops Pl, Kensington SA 5068, Australia", multi: false,
+    why: "plain street address — the neighbouring live job" },
+  { address: "14 Frome St, Adelaide SA 5000", multi: false, why: "plain" },
+  { address: "8 King William Rd, Wayville SA 5034", multi: false, why: "plain" },
+  { address: "12 Flat Rock Rd, Stirling SA 5152", multi: false,
+    why: "a token NOT followed by a number is a street name — the reason every "
+       + "token requires a trailing digit" },
+  { address: "3 Unity St, Adelaide SA 5000", multi: false, why: "'Unity' is not 'unit'" },
+  { address: "9 Villa Ave, Brighton SA 5048", multi: false, why: "villa as a street name" },
+  { address: "Lot 3 Smith Rd, Mount Barker SA 5251", multi: false,
+    why: "DECIDED: not caught — a lot is an unregistered parcel, usually detached" },
+  { address: "12A Smith St, Norwood SA 5067", multi: false,
+    why: "DECIDED: not caught — a subdivided block is usually its own title/roof" },
+  { address: "Level 3, 100 King William St, Adelaide SA 5000", multi: false,
+    why: "DECIDED: not caught — commercial tenancy, not a dwelling" },
+  { address: "Shop 4, 22 Rundle Mall, Adelaide SA 5000", multi: false,
+    why: "DECIDED: not caught — commercial" },
+  // Neither way: never throw, never fire.
+  { address: "", multi: false, why: "empty" },
+  { address: "   ", multi: false, why: "whitespace" },
+  { address: null, multi: false, why: "null" },
+  { address: undefined, multi: false, why: "undefined" },
+  { address: 12345, multi: false, why: "non-string" },
+  { address: {}, multi: false, why: "non-string object" },
+  { address: ["5/53 Bishops Pl"], multi: false, why: "non-string array" },
+];
+
+test("3.18-3 (B): the address parser, fixture by fixture", () => {
+  console.log(`        ${"verdict".padEnd(9)} address`);
+  for (const f of ADDRESS_FIXTURES) {
+    const got = isMultiDwellingAddress(f.address);
+    console.log(`        ${(got ? "MULTI" : "single").padEnd(9)} ${JSON.stringify(f.address)}  — ${f.why}`);
+    assert.equal(got, f.multi, `${JSON.stringify(f.address)}: ${f.why}`);
+  }
+});
+
+test("3.18-3 (B): a TYPED value always wins, in both directions", () => {
+  const withAddress = (address: unknown, dwelling?: unknown) =>
+    siteDetailsView(emptyJob({
+      customer: unsafe<JobDetailLike["customer"]>([{ property_address_full: address }]),
+      ...(dwelling === undefined ? {} : { dwelling_type: unsafe<string>(dwelling) }),
+    }));
+  const UNIT = "unit 5/53 Bishops Pl, Kensington SA 5068, Australia";
+  const PLAIN = "53 Bishops Pl, Kensington SA 5068, Australia";
+
+  // Nothing typed: the address decides — the whole point of F260.
+  assert.equal(withAddress(UNIT).showsMultiDwellingCaution, true,
+    "the sleeping caution now wakes on the address alone");
+  assert.equal(withAddress(PLAIN).showsMultiDwellingCaution, false);
+
+  // A typed value ALWAYS wins, including a typed detached that SILENCES it.
+  assert.equal(withAddress(UNIT, "detached").showsMultiDwellingCaution, false,
+    "a typed detached at a unit address silences the caution");
+  assert.equal(withAddress(UNIT, "other").showsMultiDwellingCaution, false,
+    "other means unknown (F96), and it is still a typed answer");
+  assert.equal(withAddress(PLAIN, "unit").showsMultiDwellingCaution, true,
+    "a typed unit at a plain street address fires it");
+  assert.equal(withAddress(PLAIN, "townhouse").showsMultiDwellingCaution, true);
+  assert.equal(withAddress(UNIT, "unit").showsMultiDwellingCaution, true);
+
+  // THE CASE MOST LIKELY TO BE GOT WRONG: a stored value outside the four is
+  // not something this view can interpret, so it is NOT the typed confirmation
+  // and does not itself fire — the address decides, exactly as if empty. The
+  // prompt admits both readings; this one is chosen because the alternative
+  // hands back a way for the guard to sleep (store any junk, caution off),
+  // which is the fault being fixed. Reported to the inbox.
+  assert.equal(withAddress(PLAIN, "duplex").showsMultiDwellingCaution, false,
+    "an unrecognised value never fires the caution by itself");
+  assert.equal(withAddress(UNIT, "duplex").showsMultiDwellingCaution, true,
+    "...and it does not count as the typed confirmation either");
+  assert.equal(withAddress(UNIT, "UNIT").showsMultiDwellingCaution, true,
+    "the DB stores lowercase; an uppercase value is not a value it can produce");
+  assert.equal(withAddress(PLAIN, "UNIT").showsMultiDwellingCaution, false);
+});
+
+test("3.18-3 (B): the form line appears ONLY when the address is what is firing", () => {
+  const noteFor = (address: unknown, dwelling?: unknown) =>
+    siteDetailsView(emptyJob({
+      customer: unsafe<JobDetailLike["customer"]>([{ property_address_full: address }]),
+      ...(dwelling === undefined ? {} : { dwelling_type: unsafe<string>(dwelling) }),
+    })).dwellingTypeDerivedNote;
+  const UNIT = "unit 5/53 Bishops Pl";
+  const PLAIN = "53 Bishops Pl";
+
+  const note = noteFor(UNIT);
+  assert.ok(note, "derived-and-firing shows the line");
+  // It explains a FORM FIELD; it must NOT restate the caution, which doubts
+  // the ROOF and lives on the roof section (the 3.4c item (d) fault).
+  assert.ok(!note!.includes("may not be this dwelling"));
+  assert.ok(!/body corporate|Google/i.test(note!),
+    "no word of the caution's own argument appears here");
+  assert.ok(note!.length < 120, "one SHORT line");
+
+  assert.equal(noteFor(PLAIN), null, "nothing derived, nothing to explain");
+  assert.equal(noteFor(UNIT, "unit"), null,
+    "typed: the value is the installer's, not the address's");
+  assert.equal(noteFor(UNIT, "detached"), null);
+  assert.equal(noteFor(UNIT, "duplex"), null,
+    "an unrecognised stored value is still a value someone put there");
+  assert.equal(noteFor(null), null);
+});
+
+test("3.18-3 (B): siteDetailsView stays total, and NOTHING is written", () => {
+  const junk: unknown[] = [
+    null, undefined, 42, "job", [], {},
+    { customer: "not an array" },
+    { customer: [null] },
+    { customer: [{ property_address_full: 7 }] },
+    { customer: [{}], dwelling_type: 9 },
+    { customer: [{ property_address_full: "5/53 X St" }], dwelling_type: [] },
+  ];
+  for (const j of junk) {
+    const view = siteDetailsView(j);
+    assert.equal(typeof view.showsMultiDwellingCaution, "boolean");
+    assert.ok(view.dwellingTypeDerivedNote === null
+      || typeof view.dwellingTypeDerivedNote === "string");
+    // The derivation NEVER becomes a stored-looking value: the form field is
+    // still empty, because a derived value written as though it were typed is
+    // the precise defect this row exists to stop.
+    assert.equal(view.dwellingTypeField.text, "",
+      "the derivation must never prefill the field itself");
+    assert.equal(view.dwellingType, null);
+  }
+  // ...and on the real firing shape too: caution on, field still empty.
+  const derived = siteDetailsView(emptyJob({
+    customer: unsafe<JobDetailLike["customer"]>([
+      { property_address_full: "unit 5/53 Bishops Pl" }]),
+  }));
+  assert.equal(derived.showsMultiDwellingCaution, true);
+  assert.equal(derived.dwellingTypeField.text, "", "no prefill, ever");
+  assert.equal(derived.dwellingType, null, "the discriminant stays honest");
 });
 
 test("siteDetailsView: an out-of-list roof_material survives into the view", () => {

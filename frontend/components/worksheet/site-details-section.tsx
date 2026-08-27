@@ -37,6 +37,12 @@ import type { SiteDetailsView, SizingInputSave } from "@/lib/worksheet";
  * caution through siteDetailsView.showsMultiDwellingCaution. One derivation,
  * one renderer. (The old immediate pre-save render here said the same words
  * with the same weight twice on one screen — the trade is deliberate.)
+ *
+ * 3.18 prompt 3 (F260): when nothing is stored and the ADDRESS is what the
+ * caution is firing from, the dwelling-type field carries one line saying so.
+ * It is NOT the caution restated — that doubts the roof and stays on Address &
+ * roof; this explains where THIS FIELD's value is coming from and how to take
+ * it over. The wording is composed in siteDetailsView, never here (D25, F128).
  */
 
 const DWELLING_OPTIONS = [
@@ -274,6 +280,11 @@ export function SiteDetailsSection({
           "Dwelling type",
           "dwellingType",
           DWELLING_OPTIONS,
+          view.dwellingTypeDerivedNote ? (
+            <p className="mt-1 max-w-[200px] text-caption text-muted-foreground">
+              {view.dwellingTypeDerivedNote}
+            </p>
+          ) : null,
         )}
         {numberField("site-storeys", "Storeys", "storeys", "1", "e.g. 1")}
         {selectField("site-roof-material", "Roof material", "roofMaterial", roofOptions)}
