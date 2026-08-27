@@ -1070,9 +1070,12 @@ def t_r8(client, sol_tou: dict) -> dict:
     # installer typed and a NULL import rate — the exact fixture case prompt 1
     # labelled "default". WHY IT MOVES: pre-prompt-2 the label borrowed
     # `source`, which only the import-rate resolution ever assigns.
-    check("(R8/known · P8) assumptions.supply_charge_source is 'installer' — "
-          "never 'default', the import rate's provenance",
-          asm.get("supply_charge_source") == "installer",
+    check("(R8/known · P8) assumptions.supply_charge_source is "
+          "'installer_unrecorded' — never 'default', the import rate's "
+          "provenance (3.18: the live row's field_sources carries no "
+          "supply_charge key, and the bare 'installer' — the claim a person "
+          "chose it — is deleted from the emitter)",
+          asm.get("supply_charge_source") == "installer_unrecorded",
           repr(asm.get("supply_charge_source")))
     check("(R8/known) the supply_charge_unknown flag does NOT appear",
           not any(str(f).startswith("supply_charge_unknown")
@@ -1675,42 +1678,49 @@ def t_s2_s3(client) -> None:
 
 
 def t_u_provenance(bat: dict, sol_null: dict) -> None:
-    """3.13 prompt 4b TEST 2 — the defect, proven on the real jobs. NOTE, and
-    it contradicts the prompt: the prompt asserts fit_source == 'default' on
-    the fixture, claiming its tariffs row stores no feed-in figure. The LIVE
-    row stores fit_aud_per_kwh = 0.05 (and every stored run records
-    fit_is_fallback false), so the honest per-field label is 'installer'.
-    Asserting 'default' would re-create the exact misattribution this prompt
-    exists to end, in the other direction. Reported to the inbox."""
+    """3.13 prompt 4b TEST 2 — the defect, proven on the real jobs; 3.18
+    prompt 2 moved every expectation to what the live rows actually
+    ESTABLISH. a57e13f1's tariffs row now records field_sources
+    {tariff_type: typed, tou_windows: typed} (re-saved through the prompt-1
+    form), so the windows and the type read installer_typed, while the fit
+    and the supply charge — stored, nothing recorded about them — read
+    installer_unrecorded. The old 'installer' claimed a choice for all four;
+    only two of the four ever had one recorded. (This also settles the old
+    inbox note about fit_source: the honest label was neither 'default' nor
+    'installer' — it was 'unrecorded', a word that did not exist yet.)"""
     print("\nU. per-field provenance on the REAL jobs — the defect closed")
     asm = bat.get("assumptions") or {}
     four = {k: asm.get(k) for k in ("rate_24_source", "tariff_type_source",
                                     "supply_charge_source", "fit_source")}
     print(f"        a57e13f1 (stored TOU windows): {four}")
-    check("(U/tou) rate_24_source 'installer' — the installer typed those "
-          "windows; pre-4b this read 'default' off the scalar's flag",
-          asm.get("rate_24_source") == "installer",
+    check("(U/tou) rate_24_source 'installer_typed' — field_sources records "
+          "the windows as typed; pre-4b this read 'default' off the scalar's "
+          "flag, pre-3.18 it read 'installer' whether recorded or not",
+          asm.get("rate_24_source") == "installer_typed",
           repr(asm.get("rate_24_source")))
-    check("(U/tou) tariff_type_source 'installer'",
-          asm.get("tariff_type_source") == "installer",
+    check("(U/tou) tariff_type_source 'installer_typed' (recorded typed)",
+          asm.get("tariff_type_source") == "installer_typed",
           repr(asm.get("tariff_type_source")))
-    check("(U/tou) supply_charge_source 'installer' (unchanged from prompt 2)",
-          asm.get("supply_charge_source") == "installer",
+    check("(U/tou) supply_charge_source 'installer_unrecorded' — stored, no "
+          "field_sources key for it",
+          asm.get("supply_charge_source") == "installer_unrecorded",
           repr(asm.get("supply_charge_source")))
-    check("(U/tou) fit_source 'installer' — the LIVE row stores "
-          "fit_aud_per_kwh 0.05 (fit_is_fallback false on every stored run), "
-          "so 'default' would be the misattribution; contradicts the prompt "
-          "and is reported",
-          asm.get("fit_source") == "installer" and asm.get("fit_is_fallback") is False,
+    check("(U/tou) fit_source 'installer_unrecorded' — the LIVE row stores "
+          "fit_aud_per_kwh 0.05 with nothing recorded about it "
+          "(fit_is_fallback stays False): neither 'default' nor a claimed "
+          "choice",
+          asm.get("fit_source") == "installer_unrecorded"
+          and asm.get("fit_is_fallback") is False,
           f"{asm.get('fit_source')!r}/{asm.get('fit_is_fallback')!r}")
 
     asm_n = sol_null.get("assumptions") or {}
     four_n = {k: asm_n.get(k) for k in ("rate_24_source", "tariff_type_source",
                                         "supply_charge_source", "fit_source")}
     print(f"        456e0242 (flat installer scalar): {four_n}")
-    check("(U/flat) rate_24_source 'installer' — the flat vector is the "
-          "installer's stored scalar tiled",
-          asm_n.get("rate_24_source") == "installer",
+    check("(U/flat) rate_24_source 'installer_unrecorded' — the flat vector "
+          "is the stored scalar tiled, and 456e0242's row predates "
+          "field_sources (NULL), so nothing was ever recorded about it",
+          asm_n.get("rate_24_source") == "installer_unrecorded",
           repr(asm_n.get("rate_24_source")))
     check("(U/flat) the two jobs DIFFER (supply charge: installer vs not "
           "stated) — the check tests the fix, not one lucky shape",
@@ -1793,7 +1803,8 @@ def t_u_red() -> None:
     green = _probe_u_via_subprocess()
     print(f"        restored probe : {green}")
     check("(U-RED) GREEN AGAIN after the restore",
-          isinstance(green, dict) and green.get("rate_24_source") == "installer",
+          isinstance(green, dict)
+          and green.get("rate_24_source") == "installer_typed",
           repr(green))
     shutil.rmtree(tmpdir, ignore_errors=True)
 
@@ -2033,18 +2044,21 @@ def t_p8_resolver() -> None:
         _LJClient({"tariffs": [stored], "bills": []}), body, "SA", "5000",
         flags)
     check("(P8) a stored charge beside a NULL import rate: "
-          "supply_charge_source is 'installer', not 'default' — prompt 1's "
-          "label borrowed the import rate's provenance and said 'default' "
-          "about a number the installer typed",
-          t.get("supply_charge_source") == "installer"
+          "supply_charge_source is 'installer_unrecorded', not 'default' — "
+          "prompt 1's label borrowed the import rate's provenance and said "
+          "'default' about a number the installer typed (3.18: this stub row "
+          "has no field_sources, so the stored charge reads unrecorded, "
+          "never the bare 'installer' choice-claim)",
+          t.get("supply_charge_source") == "installer_unrecorded"
           and t.get("import_rate_source") == "default",
           f"supply_charge_source={t.get('supply_charge_source')!r} "
           f"import_rate_source={t.get('import_rate_source')!r}")
     fl: list[str] = []
     annual, src = sizing_route._annual_supply_charge(t, fl)
     check("(P8) ...and the annualiser carries it: 383.25 labelled "
-          "'installer'",
-          annual == 383.25 and src == "installer", f"{annual!r} / {src!r}")
+          "'installer_unrecorded'",
+          annual == 383.25 and src == "installer_unrecorded",
+          f"{annual!r} / {src!r}")
 
 
 
@@ -2956,6 +2970,185 @@ def t_y_two_languages_agree(client) -> None:
           "self_consumption_ratio" not in blob
           and all("self_consumption_ratio" not in r for r in runs), "")
 
+# 3.18 prompt 2b: the job whose newest run is genuinely UNCONSTRAINED — the one
+# whose panel printed two raw JSON blobs of nulls and called them applied.
+CLEAN_JOB = "670c80db-90f5-4fc8-89e3-6a934b81ce38"
+
+# The fixture set BOTH languages are driven over. Mirrors CONSTRAINT_FIXTURES in
+# frontend/scripts/verify-worksheet-logic.ts; the point is not that each side
+# passes its own tests but that the two ANSWER THE SAME, because two copies of
+# one rule drifting is what produced the defect.
+_LIVE_UNPINNED = {
+    "equipment_pin_source": {"panel": None, "battery": None, "inverter": None},
+    "equipment_pin_unavailable": {"panel": None, "battery": None, "inverter": None},
+}
+_CONSTRAINT_FIXTURES: list[tuple[str, object]] = [
+    ("the live all-null shape", _LIVE_UNPINNED),
+    ("solar writer, nothing set", {
+        "panel_id": None, "inverter_id": None, "fix_solar_kwp": None,
+        "fix_panel_count": None, **_LIVE_UNPINNED}),
+    ("a pinned panel from the job", {
+        **_LIVE_UNPINNED,
+        "equipment_pin_source": {"panel": "job", "battery": None, "inverter": None}}),
+    ("a pinned battery from the request", {
+        **_LIVE_UNPINNED,
+        "equipment_pin_source": {"panel": None, "battery": "request", "inverter": None}}),
+    ("an unavailable pinned panel", {
+        **_LIVE_UNPINNED,
+        "equipment_pin_unavailable": {"panel": "pan-123", "battery": None,
+                                      "inverter": None}}),
+    ("a size key set", {"panel_id": None, "fix_solar_kwp": 6.6, **_LIVE_UNPINNED}),
+    ("a product key set", {"panel_id": "pan-abc", "inverter_id": None, **_LIVE_UNPINNED}),
+    ("force_no_battery true", {"force_no_battery": True, **_LIVE_UNPINNED}),
+    ("force_no_battery false is NOT a constraint",
+     {"force_no_battery": False, **_LIVE_UNPINNED}),
+    ("a size key of 0 (0 == False in Python)",
+     {"fix_panel_count": 0, **_LIVE_UNPINNED}),
+    ("an empty dict (pre-3.14b)", {}),
+    ("null", None),
+    ("a non-dict string", "everything"),
+    ("a non-dict number", 42),
+    ("an empty string (falsy)", ""),
+    ("an empty array (falsy)", []),
+    ("a non-empty array", ["fix_solar_kwp"]),
+    ("a pin key that is not a dict (skipped)", {"equipment_pin_source": "job"}),
+    ("a pin key that is an array (not a dict)", {"equipment_pin_source": ["job"]}),
+    ("an unknown key set", {"fix_wombat_count": 3, **_LIVE_UNPINNED}),
+]
+
+# The node half: isUnconstrained over the same fixtures, plus the RENDERED
+# Constraints applied row for each, so the blob check runs on the real string
+# the panel shows rather than on a reconstruction of it.
+_CONSTRAINTS_NODE_SCRIPT = (
+    'import { isUnconstrained, resultsTabView } from "./lib/worksheet.ts"; '
+    'import { readFileSync } from "node:fs"; '
+    "const fixtures = JSON.parse(readFileSync(process.argv[1], 'utf8')); "
+    "const out = []; "
+    "for (const f of fixtures) { "
+    "  const view = resultsTabView({ sizing_results: [{ sizing_result_id: 's1', "
+    "    solar_kw: 1, run_assumptions: { constraints_applied: f.value } }], "
+    "    financial_results: [{ sizing_result_id: 's1' }] }); "
+    "  const row = (view.assumptions ?? []).find((r) => r.label === 'Constraints applied'); "
+    "  out.push({ name: f.name, unconstrained: isUnconstrained(f.value), "
+    "             rendered: row ? row.value : null }); "
+    "} "
+    "console.log(JSON.stringify(out));"
+)
+
+
+def _run_constraints_node(fixtures: list[dict]) -> Optional[list]:
+    """Both sides RUN, neither parsed (F148). Any node failure other than the
+    recognisable missing-export signature FAILS rather than skips, so the
+    bridge cannot rot silently."""
+    frontend = os.path.abspath(os.path.join(BACKEND_DIR, "..", "frontend"))
+    with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False) as fh:
+        json.dump(fixtures, fh)
+        path = fh.name
+    try:
+        proc = subprocess.run(
+            ["node", "--experimental-strip-types", "--input-type=module",
+             "-e", _CONSTRAINTS_NODE_SCRIPT, path],
+            cwd=frontend, capture_output=True, text=True, timeout=120,
+        )
+    except FileNotFoundError:
+        check("(Y2) node available for the cross-language check", False,
+              "node not found")
+        return None
+    finally:
+        os.unlink(path)
+    if proc.returncode != 0:
+        stderr = (proc.stderr or "").strip()
+        if "does not provide an export named 'isUnconstrained'" in stderr:
+            check("(Y2) lib/worksheet.ts exports isUnconstrained", False,
+                  "the predicate is missing — the two rules cannot be compared")
+            return None
+        check("(Y2) node ran the TypeScript predicate", False, stderr[:300])
+        return None
+    return json.loads(proc.stdout.strip())
+
+
+def t_y2_constraints_two_languages(client) -> None:
+    """3.18 prompt 2b. THE REASON THIS RECURS is two copies of one rule, so the
+    check is the thing that catches the next divergence: _is_unconstrained (the
+    reference) and lib/worksheet.ts's isUnconstrained, RUN over the same
+    fixtures, compared answer for answer."""
+    print("\nY2. the constraints rule in both languages — same fixtures, "
+          "same answers, and no JSON on the panel")
+
+    fixtures = [{"name": n, "value": v} for n, v in _CONSTRAINT_FIXTURES]
+
+    # The LIVE run, READ not constructed: the newest stored run on the job whose
+    # panel showed the defect. Appended as one more fixture so the live shape is
+    # compared in both languages exactly like the rest.
+    live_ra = None
+    try:
+        rows = (client.table("sizing_results")
+                .select("sizing_result_id,run_assumptions,created_at")
+                .eq("job_id", CLEAN_JOB)
+                .order("created_at", desc=True).limit(1).execute().data) or []
+        live_ra = (rows[0].get("run_assumptions") or {}) if rows else None
+    except Exception as exc:  # noqa: BLE001
+        check("(Y2) the live run on 670c80db was readable", False,
+              f"{type(exc).__name__}: {exc}")
+    if live_ra is None:
+        skip("(Y2/live) no stored run on 670c80db to read.")
+    else:
+        live_constraints = live_ra.get("constraints_applied")
+        print(f"        LIVE constraints_applied: {json.dumps(live_constraints)}")
+        check("(Y2/live) the stored run carries BOTH pin keys (3.14b, F191) — "
+              "so this is the shape that read as two applied constraints",
+              isinstance(live_constraints, dict)
+              and "equipment_pin_source" in live_constraints
+              and "equipment_pin_unavailable" in live_constraints,
+              repr(live_constraints))
+        fixtures.append({"name": "THE LIVE 670c80db RUN (read, not constructed)",
+                         "value": live_constraints})
+
+    ts = _run_constraints_node(fixtures)
+    if ts is None:
+        return
+    by_name = {row["name"]: row for row in ts}
+
+    print(f"        {'fixture':52s} {'python':>8s} {'node':>8s}  rendered")
+    disagreements = []
+    for f in fixtures:
+        name = f["name"]
+        py = _is_unconstrained(f["value"])
+        node_row = by_name.get(name) or {}
+        node_answer = node_row.get("unconstrained")
+        rendered = node_row.get("rendered")
+        print(f"        {name[:52]:52s} {str(py):>8s} {str(node_answer):>8s}  {rendered!r}")
+        if py != node_answer:
+            disagreements.append(f"{name}: python={py} node={node_answer}")
+    check("(Y2) every fixture answers IDENTICALLY in both languages — the "
+          "check that catches the next divergence",
+          not disagreements, "; ".join(disagreements))
+
+    # No JSON reaches the panel, on the constrained half as much as the
+    # unconstrained one — a blob was the defect.
+    blobs = [r["name"] for r in ts
+             if isinstance(r.get("rendered"), str)
+             and ("{" in r["rendered"] or '"' in r["rendered"])]
+    check("(Y2) no rendered value contains a brace or a quote",
+          not blobs, str(blobs))
+    check('(Y2) "none" is rendered EXACTLY when the rule says unconstrained',
+          all((r.get("rendered") == "none") == r.get("unconstrained") for r in ts),
+          str([(r["name"], r.get("rendered"), r.get("unconstrained")) for r in ts
+               if (r.get("rendered") == "none") != r.get("unconstrained")]))
+
+    if live_ra is not None:
+        live_row = by_name.get("THE LIVE 670c80db RUN (read, not constructed)") or {}
+        check("(Y2/live) the LIVE run's Constraints applied row reads 'none' — "
+              "since 3.14b it printed two dicts of nulls and called them "
+              "applied",
+              live_row.get("rendered") == "none", repr(live_row.get("rendered")))
+    pinned = by_name.get("a pinned panel from the job") or {}
+    check("(Y2) ...while a genuine pin does NOT read 'none' and carries no brace",
+          pinned.get("rendered") not in (None, "none")
+          and "{" not in str(pinned.get("rendered")),
+          repr(pinned.get("rendered")))
+
+
 def main() -> int:
     print("verify_results_contract.py — 3.13 prompts 1+2 (writes nothing)\n")
     start = _counts()
@@ -2999,6 +3192,7 @@ def main() -> int:
         t_x3_flag_absent_unconstrained(client)
         t_x4_missing_battery_named(client, (x1 or {}).get("pin"))
         t_y_two_languages_agree(client)
+        t_y2_constraints_two_languages(client)
         t_z_pins_live(client)
         t_z3_own_panel_reproduces(client)
         t_q1_red()

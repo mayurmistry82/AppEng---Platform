@@ -630,7 +630,9 @@ def t_agree_live(client) -> None:
 def _build(windows, flat=0.40):
     flags: list[str] = []
     try:
-        rate, is_tou = sizing_route._build_rate_24(None, windows, None, flat, flags)
+        # 3.18 prompt 2: 3-tuple — the gap count is provenance detail these
+        # checks do not consume.
+        rate, is_tou, _gaps = sizing_route._build_rate_24(None, windows, None, flat, flags)
         return rate, is_tou, flags, None
     except Exception as ex:  # noqa: BLE001
         return None, None, flags, f"{type(ex).__name__}: {ex}"

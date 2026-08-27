@@ -162,6 +162,8 @@ import {
   tariffBillMismatchNotice,
   tariffNetworkView,
   tariffSaveNotices,
+  ASSUMPTION_SOURCE_WORDS,
+  isUnconstrained,
   PREFILLED_TARIFF_FIELDS,
   SAVABLE_TARIFF_FIELDS,
   tariffFieldSources,
@@ -6711,20 +6713,27 @@ test("U1: each assumption row carries its OWN source — installer rates beside 
   };
   const rows = resultsTabView(job).assumptions ?? [];
   const byLabel = new Map(rows.map((r) => [r.label, r]));
-  assert.equal(byLabel.get("Hourly import rates")?.source, "installer",
-    "the installer's typed windows must never read 'default'");
-  assert.equal(byLabel.get("Import rate")?.source, "default",
+  // 3.18 prompt 2: sources render as WORDS now, through
+  // ASSUMPTION_SOURCE_WORDS — the historical "installer" token gets the
+  // unrecorded wording, because that is all it ever actually established.
+  assert.equal(
+    byLabel.get("Hourly import rates")?.source,
+    ASSUMPTION_SOURCE_WORDS.installer,
+    "the stored windows must never read as a default",
+  );
+  assert.equal(byLabel.get("Import rate")?.source, ASSUMPTION_SOURCE_WORDS.default,
     "the scalar genuinely defaulted — the two answer different questions");
-  assert.equal(byLabel.get("Tariff type")?.source, "installer");
-  assert.equal(byLabel.get("Feed-in tariff")?.source, "default",
-    "a default fit stays a default BESIDE installer rates — per-field, not shared");
+  assert.equal(byLabel.get("Tariff type")?.source, ASSUMPTION_SOURCE_WORDS.installer);
+  assert.equal(byLabel.get("Feed-in tariff")?.source, "the state feed-in scheme's default",
+    "a default fit stays a default BESIDE installer rates — and is NAMED, not generic");
   // A pre-4b stored row renders what it recorded via the legacy fallback.
   const legacy = resultsTabView({
     sizing_results: [{ sizing_result_id: "s1", solar_kw: 1,
       run_assumptions: { import_rate: 0.38, tariff_source: "bill" } }],
     financial_results: [{ sizing_result_id: "s1" }],
   }).assumptions ?? [];
-  assert.equal(legacy.find((r) => r.label === "Import rate")?.source, "bill",
+  assert.equal(legacy.find((r) => r.label === "Import rate")?.source,
+    ASSUMPTION_SOURCE_WORDS.bill,
     "history is rendered as recorded, not rewritten and not hidden");
 });
 
@@ -6759,6 +6768,277 @@ test("U3: the bill-eliminated derivation is THE SAME function on both surfaces",
       `projected spend ${spend}: the section and the tab must render the same framing`);
     assert.deepEqual(section, projectedSpendView(spend),
       "and both ARE projectedSpendView's own answer — one derivation");
+  }
+});
+
+// ── 3.18 prompt 2: the panel says where each value came from, in words ───────
+
+function assumptionJob(ra: Record<string, unknown>) {
+  return {
+    sizing_results: [{ sizing_result_id: "s1", solar_kw: 9.24,
+      run_assumptions: ra }],
+    financial_results: [{ sizing_result_id: "s1", system_capex: 1 }],
+  };
+}
+
+function rowsFor(ra: Record<string, unknown>) {
+  return resultsTabView(assumptionJob(ra)).assumptions ?? [];
+}
+
+test("3.18 (view): every token, old and new, maps to words — and a default never reads as a decision", () => {
+  // The full vocabulary renders words, not tokens.
+  for (const [token, words] of Object.entries(ASSUMPTION_SOURCE_WORDS)) {
+    const rows = rowsFor({ import_rate: 0.4, import_rate_source: token });
+    assert.equal(rows.find((r) => r.label === "Import rate")?.source, words,
+      `token ${token} must render its words`);
+  }
+  // The three installer_* forms make three DIFFERENT claims — and only
+  // "typed" claims entry. The accepted-default wording says the opposite.
+  assert.notEqual(ASSUMPTION_SOURCE_WORDS.installer_typed,
+    ASSUMPTION_SOURCE_WORDS.installer_accepted_default);
+  assert.match(ASSUMPTION_SOURCE_WORDS.installer_accepted_default, /not chosen/,
+    "an accepted default must SAY it was not chosen");
+  assert.match(ASSUMPTION_SOURCE_WORDS.installer_unrecorded, /not recorded/,
+    "unrecorded must say so, shortly, and stop (D47)");
+  // The historical token establishes only what unrecorded establishes.
+  assert.equal(ASSUMPTION_SOURCE_WORDS.installer,
+    ASSUMPTION_SOURCE_WORDS.installer_unrecorded);
+  // An unknown token renders VERBATIM rather than dropping the row — every
+  // stored assumption traces; none is hidden.
+  const odd = rowsFor({ import_rate: 0.4, import_rate_source: "from_a_comet" });
+  assert.equal(odd.find((r) => r.label === "Import rate")?.source, "from_a_comet");
+});
+
+test("3.18 (view): the export row reads export_meta.source and NOTHING else", () => {
+  // dnsp_standard names the network — detail, used only AFTER the token
+  // decided the source.
+  const dnsp = rowsFor({ export_limit_kw: 5,
+    export_limit_source: { source: "dnsp_standard", dnsp: "SA Power Networks",
+      state: "SA", export_limit_kw: 5, is_default: false } });
+  assert.equal(dnsp.find((r) => r.label === "Export limit")?.source,
+    "SA Power Networks's standard published limit");
+  // The conservative fallback says what it is and why.
+  const def = rowsFor({ export_limit_kw: 5,
+    export_limit_source: { source: "default", export_limit_kw: 5, is_default: true } });
+  assert.match(def.find((r) => r.label === "Export limit")?.source ?? "",
+    /conservative default/);
+  // THE DELETED GUESS: a meta with dnsp and is_default but NO source token
+  // must NOT invent one from the shape — the legacy lookup meta renders no
+  // source rather than a guess.
+  const shapeOnly = rowsFor({ export_limit_kw: 5,
+    export_limit_source: { dnsp: "SA Power Networks", is_default: true,
+      export_limit_kw: 5 } });
+  assert.equal(shapeOnly.find((r) => r.label === "Export limit")?.source, null,
+    "presence of dnsp/is_default is a SHAPE, not a source");
+  // A given-branch token still words correctly.
+  const typed = rowsFor({ export_limit_kw: 5,
+    export_limit_source: { source: "installer_typed", export_limit_kw: 5 } });
+  assert.equal(typed.find((r) => r.label === "Export limit")?.source,
+    ASSUMPTION_SOURCE_WORDS.installer_typed);
+});
+
+test("3.18 (view): the hourly-rates row says both things on ONE line", () => {
+  const gapped = rowsFor({
+    import_rates_24: [0.2, 0.55], rate_24_source: "installer_typed",
+    rate_24_gap_filled_hours: 4,
+  });
+  const line = gapped.find((r) => r.label === "Hourly import rates");
+  assert.equal(line?.source,
+    `${ASSUMPTION_SOURCE_WORDS.installer_typed}; 4 of the 24 hours had no window and took the flat-rate default`,
+    "one line credits the windows AND counts the defaulted hours");
+  // Zero gaps adds nothing — full coverage says nothing extra (D47).
+  const full = rowsFor({
+    import_rates_24: [0.2, 0.55], rate_24_source: "installer_typed",
+    rate_24_gap_filled_hours: 0,
+  });
+  assert.equal(full.find((r) => r.label === "Hourly import rates")?.source,
+    ASSUMPTION_SOURCE_WORDS.installer_typed);
+  // A run stored before the count existed renders exactly as before.
+  const old = rowsFor({
+    import_rates_24: [0.2, 0.55], rate_24_source: "installer",
+  });
+  assert.equal(old.find((r) => r.label === "Hourly import rates")?.source,
+    ASSUMPTION_SOURCE_WORDS.installer);
+  // The two new machine keys never render as raw token rows.
+  const machine = rowsFor({
+    import_rate: 0.4, rate_24_gap_filled_hours: 0,
+    tariff_provenance_state: "recorded",
+  });
+  assert.ok(!machine.some((r) => r.label === "rate_24_gap_filled_hours"
+    || r.label === "tariff_provenance_state"),
+    "consumed as facts, not rendered as rows");
+});
+
+// ── 3.18 prompt 2b: the Constraints applied row ─────────────────────────────
+// The defect: since 3.14b constraints_applied ALWAYS carries the two pin-record
+// dicts (all-null when nothing is pinned, F191), the old filter tested only
+// whether the top-level value was non-null, so "none" was unreachable on every
+// run and a genuine pin reached the installer as raw JSON.
+
+/** The EXACT shape stored on the live 670c80db run, as read from the database
+    on 2026-08-27 — the case the panel got wrong on screen. */
+const LIVE_UNPINNED_CONSTRAINTS = {
+  equipment_pin_source: { panel: null, battery: null, inverter: null },
+  equipment_pin_unavailable: { panel: null, battery: null, inverter: null },
+};
+
+/** Every fixture both languages are compared over, so the frontend half and
+    verify_results_contract.py's cross-language check drive the same set. */
+const CONSTRAINT_FIXTURES: { name: string; value: unknown; unconstrained: boolean }[] = [
+  { name: "the live all-null shape", value: LIVE_UNPINNED_CONSTRAINTS, unconstrained: true },
+  { name: "solar writer, nothing set", value: {
+      panel_id: null, inverter_id: null, fix_solar_kwp: null, fix_panel_count: null,
+      ...LIVE_UNPINNED_CONSTRAINTS }, unconstrained: true },
+  { name: "a pinned panel from the job", value: {
+      ...LIVE_UNPINNED_CONSTRAINTS,
+      equipment_pin_source: { panel: "job", battery: null, inverter: null },
+    }, unconstrained: false },
+  { name: "a pinned battery from the request", value: {
+      ...LIVE_UNPINNED_CONSTRAINTS,
+      equipment_pin_source: { panel: null, battery: "request", inverter: null },
+    }, unconstrained: false },
+  { name: "an unavailable pinned panel", value: {
+      ...LIVE_UNPINNED_CONSTRAINTS,
+      equipment_pin_unavailable: { panel: "pan-123", battery: null, inverter: null },
+    }, unconstrained: false },
+  { name: "a size key set", value: {
+      panel_id: null, fix_solar_kwp: 6.6, ...LIVE_UNPINNED_CONSTRAINTS },
+    unconstrained: false },
+  { name: "a product key set", value: {
+      panel_id: "pan-abc", inverter_id: null, ...LIVE_UNPINNED_CONSTRAINTS },
+    unconstrained: false },
+  { name: "force_no_battery true", value: {
+      force_no_battery: true, ...LIVE_UNPINNED_CONSTRAINTS }, unconstrained: false },
+  { name: "force_no_battery false is NOT a constraint", value: {
+      force_no_battery: false, ...LIVE_UNPINNED_CONSTRAINTS }, unconstrained: true },
+  { name: "a size key of 0 (Python: 0 == False, so unconstrained)", value: {
+      fix_panel_count: 0, ...LIVE_UNPINNED_CONSTRAINTS }, unconstrained: true },
+  { name: "an empty dict (pre-3.14b)", value: {}, unconstrained: true },
+  { name: "null", value: null, unconstrained: true },
+  { name: "a non-dict string", value: "everything", unconstrained: false },
+  { name: "a non-dict number", value: 42, unconstrained: false },
+  { name: "an empty string (falsy in Python)", value: "", unconstrained: true },
+  { name: "an empty array (falsy in Python)", value: [], unconstrained: true },
+  { name: "a non-empty array", value: ["fix_solar_kwp"], unconstrained: false },
+  { name: "a pin key that is not a dict (Python skips it)", value: {
+      equipment_pin_source: "job" }, unconstrained: true },
+  { name: "a pin key that is an array (not a dict in Python)", value: {
+      equipment_pin_source: ["job"] }, unconstrained: true },
+  { name: "an unknown key set", value: {
+      fix_wombat_count: 3, ...LIVE_UNPINNED_CONSTRAINTS }, unconstrained: false },
+];
+
+function constraintRow(constraints: unknown): string {
+  const rows = rowsFor({ constraints_applied: constraints });
+  const row = rows.find((r) => r.label === "Constraints applied");
+  assert.ok(row, "the Constraints applied row must always render");
+  return row!.value;
+}
+
+test("3.18-2b: the LIVE stored shape reads 'none' — the case seen on screen", () => {
+  // Since 3.14b this printed two raw JSON blobs of nulls and claimed they were
+  // applied. WHY IT MOVES: the old filter kept any non-null top-level value,
+  // and a dict of nulls is not null.
+  assert.equal(isUnconstrained(LIVE_UNPINNED_CONSTRAINTS), true);
+  assert.equal(constraintRow(LIVE_UNPINNED_CONSTRAINTS), "none");
+  // ...and a genuine pin does NOT read none, and carries no brace.
+  const pinned = constraintRow({
+    ...LIVE_UNPINNED_CONSTRAINTS,
+    equipment_pin_source: { panel: "job", battery: null, inverter: null },
+  });
+  assert.notEqual(pinned, "none");
+  assert.equal(pinned, "panel pinned on the job");
+});
+
+test("3.18-2b: the predicate agrees with the reference rule on every fixture", () => {
+  // The Python half of this comparison lives in verify_results_contract.py and
+  // runs BOTH implementations over these same shapes.
+  for (const f of CONSTRAINT_FIXTURES) {
+    assert.equal(isUnconstrained(f.value), f.unconstrained,
+      `${f.name}: isUnconstrained(${JSON.stringify(f.value)})`);
+  }
+});
+
+test("3.18-2b: NO JSON reaches the string — no brace, no quote, on any fixture", () => {
+  // A test that only checked the unconstrained case would not have caught the
+  // constrained half, which is where the blob actually appeared.
+  for (const f of CONSTRAINT_FIXTURES) {
+    const value = constraintRow(f.value);
+    assert.ok(!value.includes("{"), `${f.name}: a brace reached the panel: ${value}`);
+    assert.ok(!value.includes("\""), `${f.name}: a quote reached the panel: ${value}`);
+    assert.ok(value.length > 0, `${f.name}: the row is never blank`);
+    assert.equal(value === "none", f.unconstrained,
+      `${f.name}: "none" iff unconstrained`);
+  }
+});
+
+test("3.18-2b: what IS set reads as plain words, never a raw key name", () => {
+  assert.equal(constraintRow({ ...LIVE_UNPINNED_CONSTRAINTS,
+    equipment_pin_source: { panel: null, battery: "request", inverter: null } }),
+    "battery pinned in this request");
+  assert.equal(constraintRow({ ...LIVE_UNPINNED_CONSTRAINTS,
+    equipment_pin_unavailable: { panel: "pan-123", battery: null, inverter: null } }),
+    "the pinned panel pan-123 could not be used");
+  assert.equal(constraintRow({ fix_solar_kwp: 6.6, ...LIVE_UNPINNED_CONSTRAINTS }),
+    "solar size fixed at 6.6 kW");
+  assert.equal(constraintRow({ panel_id: "pan-abc", ...LIVE_UNPINNED_CONSTRAINTS }),
+    "panel fixed to pan-abc");
+  assert.equal(constraintRow({ force_no_battery: true, ...LIVE_UNPINNED_CONSTRAINTS }),
+    "battery excluded");
+  assert.equal(constraintRow({ battery_ids: ["bat-1", "bat-2"], ...LIVE_UNPINNED_CONSTRAINTS }),
+    "battery choice limited to bat-1, bat-2");
+  // Several at once read as one sentence, in stored order.
+  assert.equal(constraintRow({
+    panel_id: "pan-abc", fix_panel_count: 24,
+    equipment_pin_source: { panel: "job", battery: null, inverter: null },
+    equipment_pin_unavailable: { panel: null, battery: "bat-9", inverter: null },
+  }), "panel fixed to pan-abc, panel count fixed at 24 panels, panel pinned on the job, "
+    + "the pinned battery bat-9 could not be used");
+  // An unrecognised key still renders — nothing stored is hidden — with its
+  // underscores opened out rather than as a raw token.
+  assert.equal(constraintRow({ fix_wombat_count: 3, ...LIVE_UNPINNED_CONSTRAINTS }),
+    "fix wombat count: 3");
+  // An unexpected pin value renders verbatim rather than being dropped.
+  assert.equal(constraintRow({
+    equipment_pin_source: { panel: "elsewhere", battery: null, inverter: null } }),
+    "panel pinned (elsewhere)");
+});
+
+test("3.18-2b: the row renders on any stored run — junk never throws", () => {
+  const junk: unknown[] = [
+    null, undefined, 0, false, true, 42, -1, "", "everything", [], ["a", "b"],
+    {}, { equipment_pin_source: null }, { equipment_pin_source: 7 },
+    { equipment_pin_source: { panel: { nested: true } } },
+    { equipment_pin_unavailable: { panel: ["a"] } },
+    { fix_solar_kwp: { deep: { deeper: 1 } } },
+    { weird: [1, 2, 3] },
+  ];
+  for (const j of junk) {
+    const value = constraintRow(j);
+    assert.equal(typeof value, "string", `${JSON.stringify(j)} must render a string`);
+    assert.ok(value.length > 0);
+    assert.ok(!value.includes("{"), `brace from ${JSON.stringify(j)}: ${value}`);
+    assert.ok(!value.includes("\""), `quote from ${JSON.stringify(j)}: ${value}`);
+    assert.equal(typeof isUnconstrained(j), "boolean");
+  }
+});
+
+test("3.18 (view): junk input never throws and never invents a claim", () => {
+  const junkMetas: unknown[] = [null, 42, "a string", [], { source: 7 },
+    { source: { nested: true } }, { dnsp: 9, is_default: "yes" }];
+  for (const meta of junkMetas) {
+    const rows = rowsFor({ export_limit_kw: 5, export_limit_source: meta });
+    const row = rows.find((r) => r.label === "Export limit");
+    assert.ok(row, "the export row always renders");
+    assert.ok(row!.source === null || typeof row!.source === "string");
+  }
+  for (const gaps of [null, "four", -1, {}, true]) {
+    const rows = rowsFor({ import_rates_24: [0.2], rate_24_source: "bill",
+      rate_24_gap_filled_hours: gaps });
+    const line = rows.find((r) => r.label === "Hourly import rates");
+    // Unreadable or non-positive counts add nothing; the source words stay.
+    assert.equal(line?.source, ASSUMPTION_SOURCE_WORDS.bill,
+      `gap junk ${JSON.stringify(gaps)} must not corrupt the line`);
   }
 });
 // ── 3.13 prompt 4d: BARS, not a line (4d-V1 … 4d-V6) ────────────────────────

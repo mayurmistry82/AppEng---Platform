@@ -6334,6 +6334,178 @@ export interface ResultsTabView {
   assumptionsNote: string | null;
 }
 
+/**
+ * 3.18 prompt 2 (E): every provenance token, OLD AND NEW, as words an
+ * installer can read. The old tokens must keep working — 12 stored runs carry
+ * them and 1 carries the even older tariff_source — and the historical
+ * "installer" gets the UNRECORDED wording, because that is all the old token
+ * ever actually established. A default never reads as a decision. An unknown
+ * token renders verbatim (the existing rule: every stored assumption traces,
+ * none is hidden).
+ */
+export const ASSUMPTION_SOURCE_WORDS: Record<string, string> = {
+  request: "supplied in this sizing request",
+  installer_typed: "entered by the installer",
+  installer_accepted_default: "a default the installer accepted, not chosen",
+  installer_unrecorded:
+    "saved by the installer; whether it was typed or accepted was not recorded",
+  installer:
+    "saved by the installer; whether it was typed or accepted was not recorded",
+  bill: "parsed from the customer's bill",
+  default: "an engine default",
+  "not stated": "not stated",
+  dnsp_standard: "the network's standard published limit",
+};
+
+function sourceWords(token: string | null): string | null {
+  if (token === null) return null;
+  return ASSUMPTION_SOURCE_WORDS[token] ?? token;
+}
+
+/**
+ * 3.18 prompt 2b: is NOTHING constrained on this run?
+ *
+ * THE MIRROR of backend/scripts/verify_results_contract.py::_is_unconstrained,
+ * which is the reference implementation — this function must answer
+ * identically for every input, and that gate now runs BOTH sides over the same
+ * fixtures and compares (the two copies of one rule are what drifted).
+ *
+ * Since 3.14b, constraints_applied ALWAYS carries equipment_pin_source and
+ * equipment_pin_unavailable, each a dict whose values are null when nothing is
+ * pinned (F191: present-and-null means "no pin", absent means "not recorded").
+ * The old filter tested only whether the TOP-LEVEL value was non-null, so two
+ * dicts of nulls counted as two active constraints: "none" was unreachable on
+ * every run since, and the panel printed raw JSON at the installer.
+ *
+ * PYTHON TRUTHINESS, NOT JAVASCRIPT'S. The reference opens with
+ * `if not constraints_applied: return True`, and in Python {} and [] are FALSY
+ * while in JavaScript they are truthy. Mirroring the reference means mirroring
+ * that, or the two sides disagree on the commonest shape of all — the empty
+ * dict a pre-3.14b run stored. The same care applies to `value not in (None,
+ * False)`: Python compares by ==, so 0 == False and a size key of 0 reads as
+ * unconstrained. Both quirks are mirrored deliberately; consistency between
+ * the two implementations is the property being defended.
+ */
+export function isUnconstrained(constraintsApplied: unknown): boolean {
+  // `if not constraints_applied` — every falsy-in-Python value.
+  if (constraintsApplied === null || constraintsApplied === undefined) return true;
+  if (typeof constraintsApplied === "string") return constraintsApplied === "";
+  if (typeof constraintsApplied === "number") return constraintsApplied === 0;
+  if (typeof constraintsApplied === "boolean") return !constraintsApplied;
+  if (Array.isArray(constraintsApplied)) return constraintsApplied.length === 0;
+  // `if not isinstance(constraints_applied, dict): return False`
+  if (typeof constraintsApplied !== "object") return false;
+  const rec = constraintsApplied as Record<string, unknown>;
+  if (Object.keys(rec).length === 0) return true; // {} is falsy in Python
+
+  for (const [key, value] of Object.entries(rec)) {
+    if (key === "equipment_pin_source" || key === "equipment_pin_unavailable") {
+      // `isinstance(value, dict)` — an ARRAY is not a dict in Python, so a
+      // list here is skipped rather than inspected. asRecord would treat one
+      // as a record and diverge, which is why the check is written out.
+      const isDict =
+        typeof value === "object" && value !== null && !Array.isArray(value);
+      if (
+        isDict &&
+        Object.values(value as Record<string, unknown>).some(
+          (v) => v !== null && v !== undefined,
+        )
+      ) {
+        return false;
+      }
+      continue;
+    }
+    // `if value not in (None, False)` — 0 included, because Python's `in`
+    // compares by == and 0 == False.
+    if (value !== null && value !== undefined && value !== false && value !== 0) {
+      return false;
+    }
+  }
+  return true;
+}
+
+/** A value as plain words: never a brace, never a quote. Arrays read as their
+    members; an object nobody has words for names its keys rather than
+    printing a blob — the point of this row is that an installer can read it. */
+function plainConstraintValue(value: unknown): string {
+  if (value === null || value === undefined) return "not set";
+  if (typeof value === "string") return value;
+  if (typeof value === "number" || typeof value === "boolean") return String(value);
+  if (Array.isArray(value)) {
+    return value.length > 0
+      ? value.map((v) => plainConstraintValue(v)).join(", ")
+      : "not set";
+  }
+  const keys = Object.keys(asRecord(value));
+  return keys.length > 0 ? keys.map((k) => k.replace(/_/g, " ")).join(", ") : "not set";
+}
+
+/** The size/product keys, worded. `_SIZE_CONSTRAINT_KEYS` in routes/sizing.py
+    plus the two resolved ids and the battery pool. */
+const CONSTRAINT_PHRASES: Record<string, (value: unknown) => string> = {
+  panel_id: (v) => `panel fixed to ${plainConstraintValue(v)}`,
+  inverter_id: (v) => `inverter fixed to ${plainConstraintValue(v)}`,
+  battery_ids: (v) => `battery choice limited to ${plainConstraintValue(v)}`,
+  fix_solar_kwp: (v) => `solar size fixed at ${plainConstraintValue(v)} kW`,
+  fix_panel_count: (v) => `panel count fixed at ${plainConstraintValue(v)} panels`,
+  fix_battery_kwh: (v) => `battery size fixed at ${plainConstraintValue(v)} kWh`,
+  force_no_battery: () => "battery excluded",
+};
+
+/** _pin_record's own vocabulary (routes/sizing.py): pin_source is
+    "job" | "request" | null per kind; pin_unavailable is an equipment id or
+    null. An unexpected value renders verbatim rather than being hidden. */
+const PIN_SOURCE_PHRASES: Record<string, string> = {
+  job: "pinned on the job",
+  request: "pinned in this request",
+};
+
+/**
+ * The Constraints applied row's value. "none" when isUnconstrained agrees with
+ * the backend that nothing is set; otherwise ONLY what is actually set, in
+ * words. Never a JSON blob — a blob was the defect.
+ */
+function constraintsApplied(constraints: unknown): string {
+  if (isUnconstrained(constraints)) return "none";
+  // Constrained but not a readable dict (a string, a number, a non-empty
+  // array): render it verbatim rather than dropping the row.
+  if (typeof constraints !== "object" || constraints === null || Array.isArray(constraints)) {
+    return plainConstraintValue(constraints);
+  }
+
+  const clauses: string[] = [];
+  for (const [key, value] of Object.entries(constraints as Record<string, unknown>)) {
+    if (key === "equipment_pin_source" || key === "equipment_pin_unavailable") {
+      const kinds = asRecord(value);
+      for (const [kind, pin] of Object.entries(kinds)) {
+        if (pin === null || pin === undefined) continue; // no pin on this kind
+        clauses.push(
+          key === "equipment_pin_source"
+            ? `${kind} ${
+                typeof pin === "string" && pin in PIN_SOURCE_PHRASES
+                  ? PIN_SOURCE_PHRASES[pin]
+                  : `pinned (${plainConstraintValue(pin)})`
+              }`
+            : `the pinned ${kind} ${plainConstraintValue(pin)} could not be used`,
+        );
+      }
+      continue;
+    }
+    // The same "set" test the predicate uses, so the two never disagree about
+    // which keys are active.
+    if (value === null || value === undefined || value === false || value === 0) continue;
+    const phrase = CONSTRAINT_PHRASES[key];
+    // A key this rule does not know still renders — nothing stored is hidden —
+    // with its underscores opened out rather than as a raw database token.
+    clauses.push(
+      phrase ? phrase(value) : `${key.replace(/_/g, " ")}: ${plainConstraintValue(value)}`,
+    );
+  }
+  // A dict the predicate called constrained always yields at least one clause;
+  // the fallback keeps the row honest if it ever did not.
+  return clauses.length > 0 ? clauses.join(", ") : "constrained (details not readable)";
+}
+
 /** Plain-English labels for the known assumption keys, with the block's own
     provenance keys paired as sources. Unknown keys still render — every
     figure traces to an assumption, so nothing stored is hidden. */
@@ -6369,21 +6541,41 @@ function assumptionRows(
     }
     return legacySource;
   };
-  const importRateSource = own("import_rate_source");
-  const rate24Source = own("rate_24_source");
-  const tariffTypeSource = own("tariff_type_source");
-  const fitOwnSource = own("fit_source");
-  const supplySource = str(take("supply_charge_source"));
+  const importRateSource = sourceWords(own("import_rate_source"));
+  const rate24Source = sourceWords(own("rate_24_source"));
+  const tariffTypeSource = sourceWords(own("tariff_type_source"));
+  const fitToken = own("fit_source");
+  const supplySource = sourceWords(str(take("supply_charge_source")));
   const fitFallback = take("fit_is_fallback") === true;
   const exportMeta = asRecord(take("export_limit_source"));
+  // 3.18 prompt 2: the export source is export_meta.source and NOTHING else —
+  // the three-way shape guess (source, else dnsp, else is_default) is
+  // deleted; the resolver knows the answer and states it on both branches.
+  // dnsp is DETAIL for the wording once the token has said dnsp_standard,
+  // never a source signal. A legacy lookup meta with no token renders no
+  // source rather than a guess.
+  const exportToken =
+    typeof exportMeta.source === "string" ? exportMeta.source : null;
+  const exportDnsp = typeof exportMeta.dnsp === "string" ? exportMeta.dnsp : null;
   const exportSource =
-    typeof exportMeta.source === "string"
-      ? exportMeta.source
-      : typeof exportMeta.dnsp === "string"
-        ? exportMeta.dnsp
-        : exportMeta.is_default === true
-          ? "default"
-          : null;
+    exportToken === "dnsp_standard" && exportDnsp
+      ? `${exportDnsp}'s standard published limit`
+      : exportToken === "default"
+        ? "a conservative default — the network's own published limit was not found"
+        : sourceWords(exportToken);
+  // 3.18 prompt 2 (D): how many of the 24 hours took the flat rate because no
+  // window covered them. Rendered ON the hourly-rates row, one line with the
+  // windows' own source — never a row plus a flag elsewhere.
+  const gapRaw = tariffNum(take("rate_24_gap_filled_hours"));
+  const gapHours = gapRaw !== null && gapRaw > 0 ? gapRaw : null;
+  const gapWords =
+    gapHours !== null
+      ? `${gapHours} of the 24 hours had no window and took the flat-rate default`
+      : null;
+  // Row-level provenance state — machine state for later prompts, consumed so
+  // it does not render as a raw token row (the is_tou precedent); the
+  // per-field wording above already says everything an installer can act on.
+  used.add("tariff_provenance_state");
 
   const importRate = take("import_rate");
   if (importRate !== undefined) {
@@ -6404,7 +6596,10 @@ function assumptionRows(
         nums.length > 0
           ? `${rates24.length} hourly rates, ${formatMoneyCents(Math.min(...nums))}–${formatMoneyCents(Math.max(...nums))}/kWh`
           : "unreadable",
-      source: rate24Source,
+      source:
+        rate24Source !== null && gapWords !== null
+          ? `${rate24Source}; ${gapWords}`
+          : gapWords ?? rate24Source,
     });
   } else {
     used.add("import_rates_24");
@@ -6432,11 +6627,16 @@ function assumptionRows(
   // disagreeing with itself. Consumed, not rendered.
   used.add("is_tou");
   if ("fit" in ra) {
+    // Name WHICH default when the resolver knows: "a default" and "the state
+    // feed-in scheme's default" are different amounts of information and the
+    // second costs nothing.
     rows.push({
       label: "Feed-in tariff",
       value: `${formatMoneyCents(take("fit"))}/kWh`,
       source:
-        fitOwnSource ?? (fitFallback ? "default (state scheme)" : legacySource),
+        (fitToken === "default" || fitToken === null) && fitFallback
+          ? "the state feed-in scheme's default"
+          : sourceWords(fitToken),
     });
   }
   if ("supply_charge_annual" in ra) {
@@ -6503,15 +6703,9 @@ function assumptionRows(
     const w = take("custom_weight");
     if (w !== null) rows.push({ label: "Custom objective blend", value: str(w), source: null });
   }
-  const constraints = take("constraints_applied");
-  const conRec = asRecord(constraints);
-  const activeCons = Object.entries(conRec).filter(([, v]) => v != null);
   rows.push({
     label: "Constraints applied",
-    value:
-      activeCons.length === 0
-        ? "none"
-        : activeCons.map(([k, v]) => `${k}: ${str(v)}`).join(", "),
+    value: constraintsApplied(take("constraints_applied")),
     source: null,
   });
   if ("engine_version" in ra) {

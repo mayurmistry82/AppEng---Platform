@@ -258,7 +258,9 @@ def load_job_inputs(client) -> dict:
         raise SystemExit("MISSING INPUT: tariff row lacks fit / export limit. Stopping.")
     scalar = tar.get("import_rate")
     scalar = float(scalar) if scalar is not None else solar_optimiser.DEFAULT_IMPORT_RATE
-    rate_24, is_tou = sizing_route._build_rate_24(
+    # 3.18 prompt 2: 3-tuple — the gap count is provenance detail this
+    # measurement does not consume.
+    rate_24, is_tou, _gaps = sizing_route._build_rate_24(
         None, tar.get("tou_windows"), None, scalar, flags)
     supply_charge = tar.get("supply_charge")
     supply_charge_annual = (float(supply_charge) * 365

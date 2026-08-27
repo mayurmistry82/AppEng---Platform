@@ -206,7 +206,7 @@ def t2_round_trip() -> None:
           not detected and structured["tou_windows"], str(structured["tou_windows"]))
     flags: list[str] = []
     try:
-        rate, is_tou = sizing_route._build_rate_24(None, None, structured, 0.40, flags)
+        rate, is_tou, _gaps = sizing_route._build_rate_24(None, None, structured, 0.40, flags)
         check("(2) the parser's own shape does not raise", True)
     except Exception as exc:  # noqa: BLE001
         check("(2) the parser's own shape does not raise", False,
@@ -220,7 +220,7 @@ def t2_round_trip() -> None:
                                   and abs(v) != float("inf") for v in rate))
 
     flags2: list[str] = []
-    rate2, tou2 = sizing_route._build_rate_24(
+    rate2, tou2, _gaps2 = sizing_route._build_rate_24(
         None, None, BILL_ROW["parsed_json"]["tariff_structured"], 0.40, flags2)
     check("(2) a real 2-window TOU maps: 07..20 peak, 21..23+00..06 offpeak",
           tou2 is True and rate2[7] == 0.60 and rate2[20] == 0.60
@@ -263,9 +263,13 @@ def t5_resolution_order() -> None:
                                           export_limit_kw=3.0),
          {"tariffs": [stored_row], "bills": [BILL_ROW]},
          0.55, "request", 0.09, 3.0),
+        # 3.18 prompt 2: the stored row's label is one of the installer_*
+        # forms now — this fixture row carries no field_sources, so the honest
+        # value is installer_unrecorded, never the bare "installer" (which
+        # claimed a choice the data never established).
         ("b. stored beats bill", body_ns(job_id="j1"),
          {"tariffs": [stored_row], "bills": [BILL_ROW]},
-         0.42, "installer", 0.06, 7.5),
+         0.42, "installer_unrecorded", 0.06, 7.5),
         ("c. bill beats default", body_ns(job_id="j1"),
          {"tariffs": [], "bills": [BILL_ROW]},
          0.38, "bill", 0.07, None),
@@ -305,7 +309,7 @@ def t6_days_flag() -> None:
         {"label": "offpeak", "rate": 0.2, "start": "10:00", "end": "06:00", "days": "weekday"},
     ]
     flags: list[str] = []
-    rate, tou = sizing_route._build_rate_24(None, windows, None, 0.40, flags)
+    rate, tou, _gaps = sizing_route._build_rate_24(None, windows, None, 0.40, flags)
     expected = ("This tariff has weekday/weekend-specific rates; the model applies one "
                 "24-hour rate profile to every day of the year.")
     check("(6) the exact weekday/weekend flag STRING is present",
@@ -412,10 +416,13 @@ FLAG_PARTIAL_HOURS = "Some hours in a TOU window were unreadable and were skippe
 
 
 def _build(windows, flat=0.40):
-    """Call it and never let an exception escape — a raise IS the failure."""
+    """Call it and never let an exception escape — a raise IS the failure.
+    3.18 prompt 2: _build_rate_24 returns a 3-tuple; the gap count is dropped
+    here because these checks are about the vector and the flags — the count
+    has its own checks in verify_tariff_provenance.py T7."""
     flags: list[str] = []
     try:
-        rate, is_tou = sizing_route._build_rate_24(None, windows, None, flat, flags)
+        rate, is_tou, _gaps = sizing_route._build_rate_24(None, windows, None, flat, flags)
         return rate, is_tou, flags, None
     except Exception as ex:  # noqa: BLE001
         return None, None, flags, f"{type(ex).__name__}: {ex}"
@@ -636,8 +643,9 @@ def t10_supply_charge_source() -> None:
         StubClient({"tariffs": [stored], "bills": []}),
         body_ns(job_id="j1"), "SA", "5000", flags)
     check("(10a) stored charge + NULL import rate: supply_charge_source is "
-          "'installer'...",
-          t.get("supply_charge_source") == "installer",
+          "'installer_unrecorded' (3.18: no field_sources on this fixture "
+          "row, and the bare 'installer' is deleted from the emitter)...",
+          t.get("supply_charge_source") == "installer_unrecorded",
           repr(t.get("supply_charge_source")))
     check("(10a) ...while `source` (the import rate's) is 'default' — the two "
           "keys provably answer DIFFERENT questions on this one row",
@@ -671,8 +679,10 @@ def t10_supply_charge_source() -> None:
     flags4: list[str] = []
     annual, src = sizing_route._annual_supply_charge(t, flags4)
     check("(10d) _annual_supply_charge reads supply_charge_source: "
-          "1.05 $/day -> 383.25/yr labelled 'installer', never 'default'",
-          annual == 383.25 and src == "installer",
+          "1.05 $/day -> 383.25/yr labelled 'installer_unrecorded', never "
+          "'default' (3.18: the label passes through, and the bare "
+          "'installer' is gone)",
+          annual == 383.25 and src == "installer_unrecorded",
           f"{annual!r} / {src!r}")
     # Every OTHER key keeps its name, type and value — the annualiser's
     # unknown branch is unchanged.
@@ -706,17 +716,20 @@ def t11_per_field_provenance() -> None:
     t = sizing_route._resolve_tariff(
         StubClient({"tariffs": [stored_tou], "bills": []}),
         body_ns(job_id="j1"), "SA", "5000", flags)
-    check("(11a) stored windows + NULL scalar: rate_24_source 'installer' — "
-          "the installer's typed rates are never labelled 'default'",
-          t["rate_24_source"] == "installer", repr(t["rate_24_source"]))
+    check("(11a) stored windows + NULL scalar: rate_24_source "
+          "'installer_unrecorded' (3.18: no field_sources on this fixture "
+          "row) — the stored rates are never labelled 'default'",
+          t["rate_24_source"] == "installer_unrecorded", repr(t["rate_24_source"]))
     check("(11a) ...while import_rate_source is 'default' (the scalar "
           "genuinely defaulted) — the two answer different questions",
           t["import_rate_source"] == "default", repr(t["import_rate_source"]))
-    check("(11a) tariff_type_source 'installer'",
-          t["tariff_type_source"] == "installer", repr(t["tariff_type_source"]))
-    check("(11a) fit_source 'installer' (fit_aud_per_kwh stored on the row) "
-          "and fit_is_fallback False, unchanged",
-          t["fit_source"] == "installer" and t["fit_is_fallback"] is False,
+    check("(11a) tariff_type_source 'installer_unrecorded'",
+          t["tariff_type_source"] == "installer_unrecorded",
+          repr(t["tariff_type_source"]))
+    check("(11a) fit_source 'installer_unrecorded' (fit_aud_per_kwh stored on "
+          "the row, nothing recorded about it) and fit_is_fallback False, "
+          "unchanged",
+          t["fit_source"] == "installer_unrecorded" and t["fit_is_fallback"] is False,
           f"{t['fit_source']!r}/{t['fit_is_fallback']!r}")
 
     # (b) the flat installer scalar (the 456e0242 shape): the vector IS the
@@ -728,9 +741,11 @@ def t11_per_field_provenance() -> None:
     t2 = sizing_route._resolve_tariff(
         StubClient({"tariffs": [stored_flat], "bills": []}),
         body_ns(job_id="j1"), "SA", "5000", [])
-    check("(11b) flat stored scalar: rate_24_source 'installer' (the flat "
-          "vector is the installer's scalar tiled)",
-          t2["rate_24_source"] == "installer" and t2["import_rate_source"] == "installer",
+    check("(11b) flat stored scalar: rate_24_source 'installer_unrecorded' "
+          "(the flat vector is the stored scalar tiled; the row records "
+          "nothing about who supplied it)",
+          t2["rate_24_source"] == "installer_unrecorded"
+          and t2["import_rate_source"] == "installer_unrecorded",
           f"{t2['rate_24_source']!r}/{t2['import_rate_source']!r}")
 
     # (c) nothing anywhere: default scalar priced every hour -> 'default';

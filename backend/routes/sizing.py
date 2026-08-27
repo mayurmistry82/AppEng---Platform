@@ -774,8 +774,12 @@ def _read_tariff_row(client: Any, job_id: Optional[str], flags: list[str]) -> Op
     try:
         res = (
             client.table("tariffs")
+            # 3.18 prompt 2: field_sources is IN the select — a column-scoped
+            # read that omits it makes every live row read "absent" while the
+            # stubs (which ignore select lists) pass; caught on the live U
+            # checks the first time this gate ran.
             .select("tariff_type,supply_charge,tou_windows,import_rate,"
-                    "fit_aud_per_kwh,export_limit_kw,source")
+                    "fit_aud_per_kwh,export_limit_kw,source,field_sources")
             .eq("job_id", job_id)
             .order("created_at", desc=True)
             .limit(1)
@@ -785,6 +789,46 @@ def _read_tariff_row(client: Any, job_id: Optional[str], flags: list[str]) -> Op
     except Exception:  # noqa: BLE001
         flags.append("stored tariff could not be read — fell back to bill/defaults — is_fallback")
         return None
+
+
+# ── 3.18 prompt 2: the resolver reads what the tariff form now records ───────
+# Prompt 1's tariffs.field_sources answers "did a person choose this value when
+# it was saved" (typed / accepted_default); the resolver's per-field vocabulary
+# answers "where did the value the engine used come from". Two levels — neither
+# constant imports the other. The stored-branch labels this map feeds REPLACE
+# the bare "installer", which claimed a choice the data never established: live
+# on 2026-08-27, 11 of 12 stored runs read fit_source "installer" against a
+# feed-in of exactly 0.05 — the SA default.
+_TARIFF_FIELD_SOURCE_LABELS: dict[str, str] = {
+    "typed": "installer_typed",
+    "accepted_default": "installer_accepted_default",
+}
+
+
+def _tariff_field_provenance(stored: Optional[dict]) -> tuple[dict, str]:
+    """({field -> resolver label}, row-level state) from a stored tariffs row.
+
+    State: "recorded" (field_sources was a dict, even {}), "absent" (row exists,
+    field_sources NULL — predates the column), "no_row". NULL and {} give the
+    same FIELD answer (installer_unrecorded) but different row states — the
+    prompt-1 build's inbox item; do not collapse them.
+
+    Total and permissive by design: an unreadable field_sources (a string, a
+    list, junk) reads as absent, a label outside prompt 1's vocabulary leaves
+    that field unrecorded, and nothing here can raise — a malformed provenance
+    record must never block a sizing run."""
+    if not stored:
+        return {}, "no_row"
+    raw = stored.get("field_sources")
+    if not isinstance(raw, dict):
+        # NULL and unreadable junk both read "absent" — nothing assertable.
+        return {}, "absent"
+    labels = {
+        field: _TARIFF_FIELD_SOURCE_LABELS[value]
+        for field, value in raw.items()
+        if isinstance(field, str) and value in _TARIFF_FIELD_SOURCE_LABELS
+    }
+    return labels, "recorded"
 
 
 def _resolve_tariff(
@@ -804,9 +848,11 @@ def _resolve_tariff(
          every one flagged is_fallback
 
     THE NO-REGRESSION RULE: on a job with NO tariffs row, import_rate, fit,
-    fit_is_fallback, export_limit_kw and export_meta are IDENTICAL to what the
-    endpoints computed before 3.8. import_rate is the bill's SCALAR
-    tariff_rate, never sum(rate_24)/24 — the solar numbers must not move.
+    fit_is_fallback, export_limit_kw and export_meta's NUMBERS are IDENTICAL
+    to what the endpoints computed before 3.8 (3.18 prompt 2 added an explicit
+    `source` string to export_meta on both branches — a label, not a number).
+    import_rate is the bill's SCALAR tariff_rate, never sum(rate_24)/24 — the
+    solar numbers must not move.
 
     TOU windows are LOCAL CLOCK HOURS and are never rotated, offset or
     converted — generation is the only rotated series (3.7), and that happens
@@ -831,15 +877,30 @@ def _resolve_tariff(
     fit_source: Optional[str] = "request" if fit is not None else None
 
     stored = _read_tariff_row(client, body.job_id, flags)
+    # 3.18 prompt 2: what the tariff form recorded at save time about each
+    # stored value, plus the row-level state. A stored value's label is one of
+    # the three installer_* forms — the bare "installer" is DELETED as an
+    # emitted value, because it is precisely the word that claims "the
+    # installer chose this", which is the claim that was false. Runs already
+    # stored keep their old tokens; the view renders both vocabularies.
+    field_provenance, tariff_provenance_state = _tariff_field_provenance(stored)
+
+    def _stored_label(field: str) -> str:
+        return field_provenance.get(field, "installer_unrecorded")
+
     tariff_type = stored.get("tariff_type") if stored else None
-    tariff_type_source = "installer" if tariff_type is not None else "not stated"
+    tariff_type_source = (
+        _stored_label("tariff_type") if tariff_type is not None else "not stated"
+    )
     supply_charge = stored.get("supply_charge") if stored else None
     # 3.13 prompt 2 (G): the supply charge's OWN provenance, tracked where the
     # charge itself is read — the fit_is_fallback pattern, never inferred from
     # `source`, which is only ever assigned when the IMPORT RATE resolves.
     # Prompt 1 borrowed `source` and the fixture job answered "default" about
     # a number the installer typed.
-    supply_charge_source = "installer" if supply_charge is not None else "not stated"
+    supply_charge_source = (
+        _stored_label("supply_charge") if supply_charge is not None else "not stated"
+    )
     stored_windows = None
     if stored and isinstance(stored.get("tou_windows"), list) and stored["tou_windows"]:
         stored_windows = stored["tou_windows"]
@@ -847,13 +908,20 @@ def _resolve_tariff(
     if import_rate is None and stored and stored.get("import_rate") is not None:
         try:
             import_rate = float(stored["import_rate"])
-            source = source or (stored.get("source") or "installer")
+            # The row-level `source` still names a bill- or default-sourced
+            # ENVELOPE (the legacy routes/job.py path can store those); only
+            # the "installer" claim is replaced by the per-field record.
+            row_source = stored.get("source")
+            if row_source in ("bill", "default"):
+                source = source or row_source
+            else:
+                source = source or _stored_label("import_rate")
         except (TypeError, ValueError):
             pass
     if fit is None and stored and stored.get("fit_aud_per_kwh") is not None:
         try:
             fit = float(stored["fit_aud_per_kwh"])
-            fit_source = "installer"
+            fit_source = _stored_label("fit_aud_per_kwh")
         except (TypeError, ValueError):
             pass
     export_limit_kw = body.export_limit_kw
@@ -861,7 +929,7 @@ def _resolve_tariff(
     if export_limit_kw is None and stored and stored.get("export_limit_kw") is not None:
         try:
             export_limit_kw = float(stored["export_limit_kw"])
-            export_given = "installer"
+            export_given = _stored_label("export_limit_kw")
         except (TypeError, ValueError):
             pass
 
@@ -924,7 +992,17 @@ def _resolve_tariff(
                              "source": export_given}
         export_limit_kw = float(export_limit_kw)
     else:
-        export_meta = nem_data.get_export_limit(state=state, postcode=postcode)
+        # 3.18 prompt 2 (C): the resolver's OWN meta, built fresh rather than
+        # mutating what nem_data returned, so the default tables stay one
+        # thing with one shape. `source` is explicit on BOTH branches now —
+        # the assumptions view was inferring provenance from which KEYS the
+        # dict happened to carry. state / dnsp / is_default stay as detail
+        # the wording uses; they are no longer anyone's source signal.
+        lookup = nem_data.get_export_limit(state=state, postcode=postcode)
+        export_meta = {
+            **lookup,
+            "source": "default" if lookup.get("is_default") else "dnsp_standard",
+        }
         export_limit_kw = export_meta["export_limit_kw"]
         if export_meta.get("is_default"):
             flags.append("export_limit defaulted (state/postcode not recognised)")
@@ -936,13 +1014,13 @@ def _resolve_tariff(
     if explicit_windows:
         vector_origin: Optional[str] = "request"
     elif stored_windows is not None:
-        vector_origin = "installer"
+        vector_origin = _stored_label("tou_windows")
     elif structured and structured.get("tou_windows"):
         vector_origin = "bill"
     else:
         vector_origin = None
     n_flags_before = len(flags)
-    rate_24, is_tou = _build_rate_24(
+    rate_24, is_tou, rate_24_gap_filled_hours = _build_rate_24(
         getattr(body, "import_rates_24", None), windows_for_rate, structured,
         float(import_rate), flags,
     )
@@ -977,6 +1055,15 @@ def _resolve_tariff(
         "tariff_type_source": tariff_type_source,
         "supply_charge": supply_charge,
         "supply_charge_source": supply_charge_source,
+        # 3.18 prompt 2 (B): the ROW-level provenance state — "recorded" (a
+        # dict was present, even {}), "absent" (row exists, field_sources
+        # NULL), "no_row". NULL and {} give the same FIELD answer but must
+        # never collapse at row level.
+        "tariff_provenance_state": tariff_provenance_state,
+        # 3.18 prompt 2 (D): how many of the 24 hours took the flat rate
+        # because no window covered them — 0 when none. The gap-fill flag
+        # still fires; the silence about HOW MANY is what this ends.
+        "rate_24_gap_filled_hours": rate_24_gap_filled_hours,
         # 3.13 prompt 4b: `source` RENAMED — this is what it always genuinely
         # meant, the SCALAR import rate's provenance. The vector and the fit
         # carry their own.
@@ -1481,6 +1568,10 @@ async def optimise_sizing(
             "import_rate": import_rate,
             "import_rate_source": tariff["import_rate_source"],
             "rate_24_source": tariff["rate_24_source"],
+            # 3.18 prompt 2: the two new provenance facts, stored beside the
+            # sources they qualify (both writers, same keys).
+            "rate_24_gap_filled_hours": tariff["rate_24_gap_filled_hours"],
+            "tariff_provenance_state": tariff["tariff_provenance_state"],
             "tariff_type": tariff["tariff_type"],
             "tariff_type_source": tariff["tariff_type_source"],
             "supply_charge_annual": supply_charge_annual,
@@ -1739,14 +1830,20 @@ def _build_rate_24(
     structured: Optional[dict],
     flat_rate: float,
     flags: list[str],
-) -> tuple[list[float], bool]:
+) -> tuple[list[float], bool, int]:
     """
     Build a 24-hour import-rate vector. Priority: explicit 24-h rates > TOU windows
-    (request or structured tariff) > flat. Returns (rate_24, is_tou).
+    (request or structured tariff) > flat. Returns (rate_24, is_tou,
+    gap_filled_hours) — the third is how many of the 24 hours took the flat
+    rate because no window covered them (3.18 prompt 2: the count existed here
+    and was thrown away one line before anything could use it). 0 when none,
+    and 0 on the flat branch: a flat tariff's vector IS the flat rate by
+    design, not a gap. _FLAG_GAPS keeps firing unchanged — the flag is not the
+    mechanism being replaced, the silence about HOW MANY is.
     """
     if import_rates_24 and len(import_rates_24) == 24:
         try:
-            return [float(x) for x in import_rates_24], True
+            return [float(x) for x in import_rates_24], True, 0
         except (TypeError, ValueError):
             pass
 
@@ -1855,13 +1952,14 @@ def _build_rate_24(
                 "Some hours in a TOU window were unreadable and were skipped."
             )
         if any(r is not None for r in rate):
+            gap_filled_hours = sum(1 for r in rate if r is None)
             filled = [r if r is not None else flat_rate for r in rate]
-            if any(r is None for r in rate):
+            if gap_filled_hours:
                 flags.append(_FLAG_GAPS)
-            return filled, True
+            return filled, True, gap_filled_hours
 
     flags.append("No TOU tariff — flat import rate used (battery value = self-consumption + peak avoidance only) — is_fallback.")
-    return [flat_rate] * 24, False
+    return [flat_rate] * 24, False, 0
 
 
 @router.post("/api/sizing/battery")
@@ -2200,6 +2298,10 @@ async def battery_sizing(
             "import_rates_24": rate_24,
             "rate_24_source": tariff["rate_24_source"],
             "import_rate_source": tariff["import_rate_source"],
+            # 3.18 prompt 2: same two keys as the solar writer, same order of
+            # facts — the gap count beside the vector it qualifies.
+            "rate_24_gap_filled_hours": tariff["rate_24_gap_filled_hours"],
+            "tariff_provenance_state": tariff["tariff_provenance_state"],
             "fit": fit,
             "fit_source": tariff["fit_source"],
             "fit_is_fallback": fit_is_fallback,
