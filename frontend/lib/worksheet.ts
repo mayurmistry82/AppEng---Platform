@@ -6530,6 +6530,10 @@ export const ASSUMPTION_SOURCE_WORDS: Record<string, string> = {
   default: "an engine default",
   "not stated": "not stated",
   dnsp_standard: "the network's standard published limit",
+  // 3.15 prompt 1 (F268): the two literals _resolve_load can return for the
+  // annual load. Plain words; neither claims more than it knows.
+  tier3_actual: "the customer's own interval meter data",
+  representative: "a yearly total spread over a representative daily shape",
 };
 
 function sourceWords(token: string | null): string | null {
@@ -6721,6 +6725,18 @@ function assumptionRows(
   const tariffTypeSource = sourceWords(own("tariff_type_source"));
   const fitToken = own("fit_source");
   const supplySource = sourceWords(str(take("supply_charge_source")));
+  // 3.15 prompt 1 (F268): the annual load's provenance is read with take()
+  // and NOTHING else — never own(), whose fallback is the row-level
+  // tariff_source, a TARIFF fact. Through own(), the one stored run that
+  // carries tariff_source "bill" would print "parsed from the customer's
+  // bill" against a load that came from a representative expansion, and it
+  // would read entirely reasonably. Absent, null, or not a non-empty string
+  // yields null, which the tab renders as an em-dash. An unrecognised token
+  // renders verbatim, as every stored assumption does.
+  const loadRaw = take("total_load_kwh_source");
+  const loadSource = sourceWords(
+    typeof loadRaw === "string" && loadRaw ? loadRaw : null,
+  );
   const fitFallback = take("fit_is_fallback") === true;
   const exportMeta = asRecord(take("export_limit_source"));
   // 3.18 prompt 2: the export source is export_meta.source and NOTHING else —
@@ -6816,10 +6832,14 @@ function assumptionRows(
   }
   if ("supply_charge_annual" in ra) {
     const sc = take("supply_charge_annual");
+    // 3.15 prompt 1 (F269): a null charge says "not stated" ONCE, in the
+    // value cell; the source cell is a dash. supply_charge_source is still
+    // read through take() above, on both branches, so it is consumed and
+    // never falls through to the trailing loop as a raw token row.
     rows.push({
       label: "Daily supply charge (annualised)",
       value: sc === null ? "not stated" : `${formatMoney(sc)}/yr`,
-      source: supplySource,
+      source: sc === null ? null : supplySource,
     });
   }
   if ("export_limit_kw" in ra) {
@@ -6872,7 +6892,7 @@ function assumptionRows(
     });
   }
   if ("total_load_kwh" in ra) {
-    rows.push({ label: "Annual load", value: `${str(take("total_load_kwh"))} kWh`, source: null });
+    rows.push({ label: "Annual load", value: `${str(take("total_load_kwh"))} kWh`, source: loadSource });
   }
   if ("custom_weight" in ra) {
     const w = take("custom_weight");

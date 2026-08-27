@@ -1620,6 +1620,11 @@ async def optimise_sizing(
             "tariff_escalation_pct": fin["tariff_escalation_pct"],
             "panel": con_panel if solar_constraints_active else panel,
             "total_load_kwh": round(sum(load_hourly), 1),
+            # 3.15 prompt 1 (F268): where the load came from, stored beside
+            # the figure it qualifies — the SAME value _resolve_load returned
+            # and the response's top-level load_source carries. Not the
+            # request-body name (that is a caller's assertion, one level up).
+            "total_load_kwh_source": load_source,
             "n_configs_evaluated": result["n_configs_evaluated"],
             "cache_hits": result["cache_hits"],
             "cache_misses": result["cache_misses"],
@@ -2345,6 +2350,8 @@ async def battery_sizing(
             "tariff_escalation_pct": fin["tariff_escalation_pct"],
             "resolution": result["resolution"],
             "total_load_kwh": round(sum(load_hourly), 1),
+            # 3.15 prompt 1 (F268): same key as the solar writer, same value.
+            "total_load_kwh_source": load_source,
             "panel": used_panel,
             "custom_weight": custom_weight if objective == "custom" else None,
             "constraints_applied": constraints_applied,

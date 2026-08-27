@@ -828,6 +828,44 @@ def t_r7(client) -> dict:
                       for d in (s_ra, b_ra))
               and "resolution" in b_ra,
               "")
+        # 3.15 prompt 1 (F268): the annual load's provenance travels WITH the
+        # figure it qualifies, on BOTH payloads, and it is the SAME value the
+        # response already carries at the top level as load_source — one fact
+        # in two places, COMPARED rather than asserted twice (2Q.1), so the
+        # two can never drift. The vocabulary below was derived by reading
+        # _resolve_load top to bottom: every non-error return is one of
+        # exactly these two literals (the error branch returns None and exits
+        # before the assumptions block is built). Both values are printed
+        # always, pass or fail.
+        s_ls = (s_ra.get("total_load_kwh_source", "<ABSENT>")
+                if isinstance(s_ra, dict) else "<no dict>")
+        b_ls = (b_ra.get("total_load_kwh_source", "<ABSENT>")
+                if isinstance(b_ra, dict) else "<no dict>")
+        load_detail = (
+            f"solar: assumptions.total_load_kwh_source={s_ls!r} vs "
+            f"response.load_source={sol.get('load_source')!r}; "
+            f"battery: assumptions.total_load_kwh_source={b_ls!r} vs "
+            f"response.load_source={bat.get('load_source')!r}")
+        print(f"        (S1) load provenance — {load_detail}")
+        for _label, _ra, _resp in (("solar", s_ra, sol), ("battery", b_ra, bat)):
+            check(f"(S1) {_label} payload: run_assumptions carries total_load_kwh "
+                  "AND total_load_kwh_source — the load's provenance travels "
+                  "with the figure",
+                  isinstance(_ra, dict) and "total_load_kwh" in _ra
+                  and "total_load_kwh_source" in _ra,
+                  load_detail)
+            check(f"(S1) {_label} payload: assumptions.total_load_kwh_source "
+                  "EQUALS the response's top-level load_source — one fact, "
+                  "two places, compared (2Q.1)",
+                  isinstance(_ra, dict) and "total_load_kwh_source" in _ra
+                  and _ra.get("total_load_kwh_source") == _resp.get("load_source"),
+                  load_detail)
+            check(f"(S1) {_label} payload: total_load_kwh_source is one of "
+                  "_resolve_load's two literals, tier3_actual / representative",
+                  isinstance(_ra, dict)
+                  and _ra.get("total_load_kwh_source")
+                  in ("tier3_actual", "representative"),
+                  load_detail)
 
         s_sum = round((so.get("annual_savings") or 0)
                       + (bi.get("annual_savings_vs_solar_only") or 0), 2)

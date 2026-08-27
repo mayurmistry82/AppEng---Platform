@@ -7240,6 +7240,77 @@ test("3.18 (view): the hourly-rates row says both things on ONE line", () => {
     "consumed as facts, not rendered as rows");
 });
 
+// ── 3.15 prompt 1 (F268, F269): the annual load says where it came from, and
+// the supply-charge row stops answering one question in both cells ──────────
+
+test("3.15 (F268-a): a yearly total spread over a representative shape says so", () => {
+  const rows = rowsFor({ total_load_kwh: 8240, total_load_kwh_source: "representative" });
+  const load = rows.find((r) => r.label === "Annual load");
+  assert.equal(load?.value, "8240 kWh");
+  assert.equal(load?.source, ASSUMPTION_SOURCE_WORDS.representative);
+  assert.ok(!rows.some((r) => r.label === "total_load_kwh_source"),
+    "consumed as a source, never rendered as a raw token row");
+});
+
+test("3.15 (F268-b): the customer's own meter data says so — and the two claims differ", () => {
+  const rows = rowsFor({ total_load_kwh: 6011.4, total_load_kwh_source: "tier3_actual" });
+  const load = rows.find((r) => r.label === "Annual load");
+  assert.equal(load?.value, "6011.4 kWh");
+  assert.equal(load?.source, ASSUMPTION_SOURCE_WORDS.tier3_actual);
+  assert.notEqual(ASSUMPTION_SOURCE_WORDS.tier3_actual,
+    ASSUMPTION_SOURCE_WORDS.representative,
+    "two different provenances must read as two different sentences");
+  assert.ok(!rows.some((r) => r.label === "total_load_kwh_source"));
+});
+
+test("3.15 (F268-c): a run without the key — the 13 stored ones — renders a dash, and junk never invents one", () => {
+  const absent = rowsFor({ total_load_kwh: 8240 });
+  assert.equal(absent.find((r) => r.label === "Annual load")?.source, null,
+    "no source is invented for a historical run, ever");
+  // A junk value is never JSON.stringify'd into the Source cell and never
+  // crashes the view.
+  for (const junk of [null, 42, {}, [], "", true] as const) {
+    const rows = rowsFor({ total_load_kwh: 8240, total_load_kwh_source: junk });
+    assert.equal(rows.find((r) => r.label === "Annual load")?.source, null,
+      `junk ${JSON.stringify(junk)} must yield a null source`);
+    assert.ok(!rows.some((r) => r.label === "total_load_kwh_source"),
+      "junk is consumed, not rendered as a raw row");
+  }
+});
+
+test("3.15 (F268-d): an unrecognised token renders VERBATIM — nothing stored is hidden", () => {
+  const rows = rowsFor({ total_load_kwh: 8240, total_load_kwh_source: "from_a_comet" });
+  assert.equal(rows.find((r) => r.label === "Annual load")?.source, "from_a_comet");
+});
+
+test("3.15 (F268-e) THE TRAP: a legacy tariff_source must NEVER become the load's source", () => {
+  // One stored run carries the row-level tariff_source. It is a TARIFF fact.
+  // Routed through own() the load row would print "parsed from the
+  // customer's bill" against a representative expansion — and read fine.
+  const rows = rowsFor({ total_load_kwh: 8240, tariff_source: "bill" });
+  const load = rows.find((r) => r.label === "Annual load");
+  assert.equal(load?.source, null,
+    "the load's source is take(\"total_load_kwh_source\") and NOTHING else");
+  assert.notEqual(load?.source, ASSUMPTION_SOURCE_WORDS.bill,
+    "the bill parsed a tariff, not a load");
+});
+
+test("3.15 (F269): the supply-charge row says 'not stated' ONCE — and a stored charge is unchanged", () => {
+  const none = rowsFor({ supply_charge_annual: null, supply_charge_source: "not stated" });
+  const row = none.find((r) => r.label === "Daily supply charge (annualised)");
+  assert.equal(row?.value, "not stated");
+  assert.equal(row?.source, null, "two cells stating one fact is one cell too many");
+  assert.ok(!none.some((r) => r.label === "supply_charge_source"),
+    "the token is consumed on the null branch too — never a raw row");
+  const stored = rowsFor({ supply_charge_annual: 383.25, supply_charge_source: "installer" });
+  const srow = stored.find((r) => r.label === "Daily supply charge (annualised)");
+  // The value cell is whatever formatMoney already renders — unchanged by
+  // this task, so the assertion is derived from the formatter, not typed.
+  assert.equal(srow?.value, `${formatMoney(383.25)}/yr`);
+  assert.equal(srow?.source, ASSUMPTION_SOURCE_WORDS.installer);
+  assert.ok(!stored.some((r) => r.label === "supply_charge_source"));
+});
+
 // ── 3.18 prompt 2b: the Constraints applied row ─────────────────────────────
 // The defect: since 3.14b constraints_applied ALWAYS carries the two pin-record
 // dicts (all-null when nothing is pinned, F191), the old filter tested only
