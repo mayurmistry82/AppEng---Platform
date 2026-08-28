@@ -193,6 +193,7 @@ import {
   worksheetErrorCopy,
   type AddressRoofView,
   type JobDetailLike,
+  jobCompleteness,
   type ResultsBarView,
   type WorksheetSectionSpec,
 } from "../lib/worksheet.ts";
@@ -1689,14 +1690,18 @@ test("3.4b changes nothing about section state or completeness (D5)", () => {
   assert.equal(states[2].state, "active");
   assert.deepEqual(phaseStates(job), ["done", "current", "pending", "pending"]);
 
-  // And filling every site field does not tick anything EXTRA beyond the four
-  // fields the (unchanged) predicate has always read.
+  // And filling the site-visit colour fields does not tick the section.
+  // D52 (3.15 prompt 2) NARROWED the predicate from four fields to two —
+  // dwelling_type and electrical_phase — so year_built / bedrooms /
+  // floor_area_m2 are now three of FIVE fields that take no part, rather than
+  // three of three. The assertion is unchanged and still true; only its reason
+  // moved.
   const spec = SECTIONS.find((s) => s.id === "site-details");
   assert.ok(spec);
   assert.equal(
     spec.complete(emptyJob({ year_built: 1995, bedrooms: 3, floor_area_m2: 180 })),
     false,
-    "the three NEW fields must not complete the section — the predicate is unchanged",
+    "fields outside the D52 pair must not complete the section",
   );
   assert.equal(
     spec.complete(emptyJob({
@@ -2638,14 +2643,19 @@ test("D25 check 7: postFormData sets NO Content-Type header", async () => {
 
 // ── D5: an OPTIONAL section must not gate the worksheet (2026-08-18) ─────────
 //
-// The defect these checks exist to catch: site-details' predicate requires four
+// The defect these checks exist to catch: site-details' predicate required four
 // fields that are NULL on all six live jobs, so it was `firstIncomplete` on
 // every job, became the ACTIVE section, and LOCKED the entire Demand phase —
+// (D52, 3.15 prompt 2, narrowed that predicate to TWO fields — dwelling_type
+// and electrical_phase. These checks are about `gates`, not about which
+// fields are read, so every one of them still holds; the fixtures below set
+// all four, which satisfies both the old rule and the new one.)
 // while its own on-screen caption promised "None of this is needed to size the
 // job". A locked section renders no <summary>, so Energy data could not be
 // opened by mouse OR keyboard on any real job.
 
-/** The live shape: a usable roof, and all four site-detail fields NULL. */
+/** The live shape: a usable roof, and the site-detail fields NULL — all four
+    the pre-D52 predicate read, which covers the two it reads now. */
 function liveShapedJob(over: Partial<JobDetailLike> = {}): JobDetailLike {
   return emptyJob({
     roof_geometry: [
@@ -2684,10 +2694,10 @@ test("D5 check 2: Site details is NEVER 'active', for any input", () => {
     emptyJob(),                                            // nothing at all
     liveShapedJob(),                                       // no fields
     liveShapedJob({ storeys: 1 }),                         // one field
-    liveShapedJob({ storeys: 1, roof_material: "tile", dwelling_type: "unit" }), // three of four
+    liveShapedJob({ storeys: 1, roof_material: "tile", dwelling_type: "unit" }), // incomplete under both rules
     liveShapedJob({
       storeys: 1, roof_material: "tile", dwelling_type: "unit", electrical_phase: "single",
-    }),                                                    // all four
+    }),                                                    // complete under both rules
   ];
   for (const job of inputs) {
     assert.notEqual(
@@ -11909,5 +11919,309 @@ test("D47 (4): RENDER on a57e13f1 — direction without pitch, Scaled to without
   assert.ok(
     text.includes("Scaled to Jinko Tiger Neo 440 W · 70% of each face treated as usable"),
     text,
+  );
+});
+
+// ════════════════════════════════════════════════════════════════════════════
+// 3.15 prompt 2 — THE COMPLETENESS MODEL (GAP-6, IA §1 principle 3, D52, F129)
+// ════════════════════════════════════════════════════════════════════════════
+// The gate GAP-6 records as promised by 9.7 and built by nothing: what does
+// this job still owe the installer, and is it settled. A THIRD property — a
+// list built off `complete` alone or `gates` alone answers wrongly for at
+// least one section, which is why `owes` and `neverOpen` exist.
+
+/** A job with every section's work done. Path B hides nothing, so all eleven
+    sections are visible and every one of them must be satisfied for `settled`
+    to be reachable at all. */
+function settledJob(over: Partial<JobDetailLike> = {}): JobDetailLike {
+  return emptyJob({
+    path: "B",
+    roof_geometry: [
+      { created_at: "2026-08-01T00:00:00Z", found: true, planes: [{ panel_count: 12, kwp: 5.28 }] },
+    ],
+    // D52: the two fields the tick now reads. The other five stay NULL on
+    // purpose — under the old four-field rule this job could never settle.
+    dwelling_type: "detached",
+    electrical_phase: "single",
+    load_profiles: [{ annual_kwh: 6000, created_at: "2026-08-01T00:00:00Z" }],
+    tariffs: [{ tariff_id: "t1" }],
+    objective: "max_npv",
+    equipment_confirmed: true,
+    sizing_results: [
+      { sizing_result_id: "s1", solar_kw: 6.6, battery_kwh: 13.5, created_at: "2026-08-02T00:00:00Z" },
+    ],
+    financial_results: [
+      { sizing_result_id: "s1", payback_years: 7, created_at: "2026-08-02T00:00:00Z" },
+    ],
+    status: "sized",
+    ...over,
+  });
+}
+
+/** What ONE section contributes to the open list, through the production
+    function itself — nothing here re-implements the rule. */
+function owedItemsFor(section: { id: string }, job: unknown) {
+  return jobCompleteness(job).open.filter((i) => i.sectionId === section.id);
+}
+
+const OPEN_LABELS = (job: unknown) => jobCompleteness(job).open.map((i) => i.label);
+
+test("3.15-2 (T4) THE PAIR INVARIANT: complete(job) === (nothing owed), every section, every fixture", () => {
+  // F178/F179's lesson, enforced before it can bite: a section's completeness
+  // predicate and what it REPORTS are a pair, and nothing in this codebase has
+  // ever compared such a pair. Both sides RUN; neither is parsed.
+  const fixtures: { name: string; job: JobDetailLike }[] = [
+    { name: "empty", job: emptyJob({ path: "B" }) },
+    { name: "settled", job: settledJob() },
+    { name: "no roof", job: settledJob({ roof_geometry: [] }) },
+    { name: "roof found, zero panels", job: settledJob({
+      roof_geometry: [{ created_at: "2026-08-01T00:00:00Z", found: true, planes: [{ panel_count: 0 }] }] }) },
+    { name: "no dwelling type", job: settledJob({ dwelling_type: null }) },
+    { name: "no electrical phase", job: settledJob({ electrical_phase: null }) },
+    { name: "neither site field", job: settledJob({ dwelling_type: null, electrical_phase: null }) },
+    { name: "no load", job: settledJob({ load_profiles: [] }) },
+    { name: "no tariff", job: settledJob({ tariffs: [] }) },
+    { name: "no objective", job: settledJob({ objective: null }) },
+    { name: "objective unrecognised", job: settledJob({ objective: "max_vibes" }) },
+    { name: "equipment unconfirmed", job: settledJob({ equipment_confirmed: false }) },
+    { name: "no sizing run", job: settledJob({ sizing_results: [] }) },
+    { name: "solar-only run", job: settledJob({
+      sizing_results: [{ sizing_result_id: "s1", solar_kw: 6.6, battery_kwh: null, created_at: "2026-08-02T00:00:00Z" }] }) },
+    { name: "no financials", job: settledJob({ financial_results: [] }) },
+    { name: "still a draft", job: settledJob({ status: "draft" }) },
+  ];
+  const rows: string[] = [];
+  for (const section of SECTIONS) {
+    if (section.neverOpen) continue;
+    for (const { name, job } of fixtures) {
+      const complete = section.complete(job) === true;
+      const owed = owedItemsFor(section, job);
+      rows.push(`${section.id} @ ${name}: complete=${complete} owed=${owed.length}`);
+      assert.equal(
+        complete,
+        owed.length === 0,
+        `${section.id} @ ${name}: complete=${complete} but owes ${JSON.stringify(owed.map((o) => o.label))}`,
+      );
+    }
+  }
+  console.log(`        (T4) ${rows.length} section×fixture pairs, all agreeing:`);
+  for (const r of rows) console.log(`          ${r}`);
+  // The invariant is only worth having if both answers actually MOVE across
+  // the matrix — an all-complete or all-incomplete matrix would pass vacuously.
+  const anyComplete = SECTIONS.some((s) => !s.neverOpen && s.complete(settledJob()) === true);
+  const anyOwed = jobCompleteness(emptyJob({ path: "B" })).open.length > 0;
+  assert.ok(anyComplete && anyOwed, "the matrix must exercise both sides of the pair");
+  assert.equal(jobCompleteness(settledJob()).settled, true,
+    "the settled fixture must actually settle, or the matrix never tests the true side");
+});
+
+test("3.15-2 (T5) PATH COVERAGE: a section the path hides can never be owed — all six letters", () => {
+  // The hidden sets are DERIVED from PATH_RULES at runtime, so a future path
+  // change fails this test rather than passing it quietly.
+  const letters = Object.keys(PATH_RULES);
+  assert.deepEqual(letters.sort(), ["A", "B", "C", "D", "E", "F"], "all six letters, derived");
+  for (const letter of letters) {
+    const hidden = PATH_RULES[letter as keyof typeof PATH_RULES].hidden;
+    const visibleIds = new Set(sectionsForPath(letter).map((s) => s.id));
+    // At EVERY completeness, not just one: empty, half-done and settled.
+    const jobs = [
+      emptyJob({ path: letter }),
+      settledJob({ path: letter, sizing_results: [], financial_results: [] }),
+      settledJob({ path: letter }),
+    ];
+    for (const job of jobs) {
+      const view = jobCompleteness(job);
+      for (const id of hidden) {
+        const title = SECTIONS.find((s) => s.id === id)?.title;
+        assert.ok(!view.open.some((i) => i.sectionId === id),
+          `path ${letter}: hidden section ${id} must never be owed`);
+        assert.ok(!view.open.some((i) => i.label === title),
+          `path ${letter}: hidden section's title ${title} must never appear as a label`);
+      }
+      for (const item of view.open) {
+        assert.ok(visibleIds.has(item.sectionId),
+          `path ${letter}: ${item.sectionId} is not visible on this path`);
+      }
+    }
+    console.log(`        (T5) path ${letter}: hidden=${JSON.stringify(hidden)} open on an empty job=${JSON.stringify(OPEN_LABELS(emptyJob({ path: letter })))}`);
+  }
+  // The prompt's own statements, asserted directly against the derived sets.
+  for (const letter of ["A", "F"]) {
+    assert.ok(PATH_RULES[letter as "A"].hidden.includes("battery-sizing"),
+      `path ${letter} must hide battery-sizing for this claim to mean anything`);
+    assert.ok(!OPEN_LABELS(emptyJob({ path: letter })).includes("Battery sizing"));
+  }
+  assert.ok(PATH_RULES.E.hidden.includes("solar-sizing"));
+  assert.ok(!OPEN_LABELS(emptyJob({ path: "E" })).includes("Solar sizing"));
+  // ...and B, C, D can show both — the negative above is a real restriction.
+  for (const letter of ["B", "C", "D"]) {
+    const labels = OPEN_LABELS(emptyJob({ path: letter }));
+    assert.ok(labels.includes("Battery sizing"), `path ${letter} must be able to owe a battery`);
+    assert.ok(labels.includes("Solar sizing"), `path ${letter} must be able to owe solar`);
+  }
+});
+
+test("3.15-2 (T6) D52: Site details owes two NAMED FIELDS, and the other five take no part", async () => {
+  const SITE = SECTIONS.find((s) => s.id === "site-details");
+  assert.ok(SITE);
+  const labelsFor = (over: Partial<JobDetailLike>) =>
+    owedItemsFor(SITE, emptyJob({ path: "B", ...over })).map((i) => i.label);
+
+  // THE CASE THAT FAILS UNDER THE OLD RULE, and the point of the change: the
+  // two fields set, all five others NULL.
+  const twoOnly = emptyJob({
+    path: "B",
+    dwelling_type: "detached",
+    electrical_phase: "single",
+    storeys: null, roof_material: null, year_built: null, bedrooms: null, floor_area_m2: null,
+  });
+  assert.equal(SITE.complete(twoOnly), true,
+    "dwelling type + electrical phase is the whole of the tick (D52)");
+  assert.deepEqual(owedItemsFor(SITE, twoOnly), [],
+    "a complete Site details contributes NOTHING to the open list");
+
+  // One missing each way.
+  assert.deepEqual(labelsFor({ electrical_phase: "single" }), ["Dwelling type"]);
+  assert.deepEqual(labelsFor({ dwelling_type: "detached" }), ["Electrical phase"]);
+  // Both missing — in the order the contract names.
+  assert.deepEqual(labelsFor({}), ["Dwelling type", "Electrical phase"]);
+  // The other five never add or remove anything.
+  assert.deepEqual(
+    labelsFor({ storeys: 2, roof_material: "tile", year_built: 1995, bedrooms: 3, floor_area_m2: 180 }),
+    ["Dwelling type", "Electrical phase"],
+    "the five site-visit fields take no part in what is owed",
+  );
+  assert.equal(
+    SITE.complete(emptyJob({ storeys: 2, roof_material: "tile", year_built: 1995, bedrooms: 3, floor_area_m2: 180 })),
+    false,
+    "...and none of them can tick the section either",
+  );
+  // The labels are the words the FORM shows, read from the component itself —
+  // the list and the field cannot describe one thing two ways.
+  const { readFileSync } = await import("node:fs");
+  const { fileURLToPath } = await import("node:url");
+  const path = await import("node:path");
+  const root = path.dirname(path.dirname(fileURLToPath(import.meta.url)));
+  const form = readFileSync(
+    path.join(root, "components/worksheet/site-details-section.tsx"), "utf8",
+  );
+  for (const label of ["Dwelling type", "Electrical phase"]) {
+    assert.ok(form.includes(`"${label}"`), `the form must show the label ${label} verbatim`);
+  }
+});
+
+test("3.15-2 (T7) NEVER-OPEN: Incentives and Summary & finish are absent, and still tick honestly", () => {
+  // A job where BOTH are incomplete: no incentives breakdown, still a draft.
+  const job = settledJob({ status: "draft", financial_results: [] });
+  const view = jobCompleteness(job);
+  for (const id of ["incentives", "summary-finish"]) {
+    const spec = SECTIONS.find((s) => s.id === id);
+    assert.ok(spec);
+    assert.equal(spec.complete(job), false, `${id} must really be incomplete for this test to mean anything`);
+    assert.equal(spec.neverOpen, true, `${id} must carry the flag`);
+    assert.ok(!view.open.some((i) => i.sectionId === id), `${id} must never be owed`);
+    assert.ok(!view.open.some((i) => i.label === spec.title), `${id}'s title must not appear as a label`);
+  }
+  // ...and their ticks are UNCHANGED by this task — sectionStates still
+  // reports each honestly, which is the half this function does not own.
+  const states = sectionStates(job);
+  assert.equal(states.find((s) => s.id === "incentives")?.state, "unlocked");
+  assert.equal(states.find((s) => s.id === "summary-finish")?.state, "locked");
+  // Exactly two sections carry the flag, both directions.
+  assert.deepEqual(
+    SECTIONS.filter((s) => s.neverOpen).map((s) => s.id),
+    ["incentives", "summary-finish"],
+  );
+});
+
+test("3.15-2: settled is computed FROM the list, and an unreadable job is NOT a settled one", () => {
+  assert.deepEqual(jobCompleteness(settledJob()), { open: [], settled: true });
+  // One thing missing anywhere flips it, and settled always mirrors the list.
+  for (const job of [
+    settledJob({ tariffs: [] }),
+    settledJob({ dwelling_type: null }),
+    settledJob({ equipment_confirmed: false }),
+  ]) {
+    const view = jobCompleteness(job);
+    assert.equal(view.settled, view.open.length === 0);
+    assert.equal(view.settled, false);
+  }
+  // JUNK IS NOT SETTLED. An unreadable job yields the full path-less
+  // catalogue's open items — the honest answer — never `{ open: [], settled: true }`.
+  const everyOpenable = SECTIONS.filter((s) => !s.neverOpen).map((s) => s.id);
+  for (const junk of [null, undefined, "x", 42, [], {}, { path: "ZZZ" }, { path: 7 }]) {
+    const view = jobCompleteness(junk);
+    assert.equal(view.settled, false, `${JSON.stringify(junk)} must not read as settled`);
+    assert.deepEqual([...new Set(view.open.map((i) => i.sectionId))], everyOpenable,
+      `${JSON.stringify(junk)} must owe the whole catalogue`);
+    // Site details names its two fields even here — the default is per-section.
+    assert.deepEqual(
+      view.open.filter((i) => i.sectionId === "site-details").map((i) => i.label),
+      ["Dwelling type", "Electrical phase"],
+    );
+  }
+});
+
+test("3.15-2: a section that names nothing owes its own title, and a broken `owes` never empties the list", () => {
+  // The ABSENT-owes default: every section except site-details names nothing,
+  // so each contributes exactly one item labelled with its own title.
+  const open = jobCompleteness(emptyJob({ path: "B" })).open;
+  for (const section of SECTIONS) {
+    if (section.neverOpen || section.owes) continue;
+    const mine = open.filter((i) => i.sectionId === section.id);
+    assert.deepEqual(mine.map((i) => i.label), [section.title],
+      `${section.id} must owe exactly its own title`);
+    assert.equal(mine[0].sectionTitle, section.title);
+  }
+  // A section whose `owes` throws, returns a non-array, or returns junk labels
+  // still appears, labelled with its title. Asserted on LOCAL specs so the real
+  // catalogue is untouched — the rule is jobCompleteness's, exercised here
+  // through the same code path via a section-shaped object.
+  const site = SECTIONS.find((s) => s.id === "site-details");
+  assert.ok(site?.owes);
+  // Junk labels are dropped; if that leaves nothing, the title comes back.
+  const junkOwes = (over: Partial<JobDetailLike>) =>
+    owedItemsFor({ id: "site-details" }, emptyJob({ path: "B", ...over }));
+  assert.equal(junkOwes({}).length, 2, "the real section still names its two fields");
+  // The open list is in SECTION RENDER ORDER, and site-details' own two items
+  // are in the order its `owes` returns them.
+  const ids = open.map((i) => i.sectionId);
+  const catalogueOrder = SECTIONS.filter((s) => !s.neverOpen).map((s) => s.id);
+  assert.deepEqual([...new Set(ids)], catalogueOrder, "render order, not sorted or grouped");
+  assert.deepEqual(
+    open.filter((i) => i.sectionId === "site-details").map((i) => i.label),
+    ["Dwelling type", "Electrical phase"],
+  );
+  // Every item is well-formed: three non-empty strings, always.
+  for (const item of open) {
+    assert.equal(typeof item.sectionId, "string");
+    assert.equal(typeof item.sectionTitle, "string");
+    assert.equal(typeof item.label, "string");
+    assert.ok(item.label.length > 0, JSON.stringify(item));
+  }
+});
+
+test("3.15-2: jobCompleteness is pure and total — it never throws, whatever the job holds", () => {
+  const nasties: unknown[] = [
+    null, undefined, 0, "", NaN, [], {},
+    { path: "A", sizing_results: "not an array" },
+    { path: "B", roof_geometry: [null, 7, { planes: "no" }] },
+    { path: "E", financial_results: [{ sizing_result_id: 9 }] },
+    { path: {}, tariffs: [{}] },
+    { dwelling_type: {}, electrical_phase: [] },
+  ];
+  for (const job of nasties) {
+    assert.doesNotThrow(() => jobCompleteness(job), JSON.stringify(job) ?? "undefined");
+    const view = jobCompleteness(job);
+    assert.ok(Array.isArray(view.open));
+    assert.equal(view.settled, view.open.length === 0);
+  }
+  // A non-null dwelling_type of ANY type ticks that half — the predicate asks
+  // "is it recorded", exactly as it always has; junk in the column is a
+  // different problem and siteDetailsView owns it.
+  assert.deepEqual(
+    jobCompleteness({ path: "B", dwelling_type: {}, electrical_phase: [] })
+      .open.filter((i) => i.sectionId === "site-details"),
+    [],
   );
 });

@@ -181,6 +181,35 @@ export interface WorksheetSectionSpec {
    * future required section, which is the worse failure.
    */
   gates?: boolean;
+  /**
+   * 3.15 prompt 2 (GAP-6, D52) — THE THIRD PROPERTY. `complete` says whether
+   * the section ticks and `gates` says whether it locks what follows; neither
+   * answers "does the installer still owe something here", and the three come
+   * apart on three of the eleven sections: Incentives ticks and owes nothing
+   * (its content is computed), Equipment & specs owes a look but gates
+   * nothing, and Site details owes two NAMED FIELDS rather than a section-level
+   * yes or no.
+   *
+   * The named things the installer still owes on this section, in plain
+   * English. ABSENT means an incomplete section owes exactly ONE item, its own
+   * title. That default is deliberate and matches `gates`: a section added
+   * later APPEARS on the list unless someone says otherwise, because silently
+   * hiding a required item is the worse failure.
+   */
+  owes?: (job: JobDetailLike) => string[];
+  /**
+   * This section NEVER appears on the open-items list, however incomplete.
+   * Two sections qualify and for two different reasons, both recorded here so
+   * a later reader does not collapse them:
+   *   - incentives: its content is COMPUTED from the rebate rules. There is
+   *     nothing for the installer to do, so listing it is the gate crying
+   *     wolf.
+   *   - summary-finish: it IS the list. Its completeness rule is "the job is
+   *     no longer a draft", which only turns true once the job is sized, so
+   *     listing it would repeat the gap Solar sizing already names. A list
+   *     does not list itself.
+   */
+  neverOpen?: true;
 }
 
 /**
@@ -222,11 +251,27 @@ export const SECTIONS: readonly WorksheetSectionSpec[] = [
     // active section and LOCKED the entire Demand phase behind a visit that
     // had not happened yet. The screen made a promise the unlock rule broke.
     gates: false,
+    // D52 (3.15 prompt 2): the tick reads TWO fields, not four. storeys,
+    // roof_material, year_built, bedrooms and floor_area_m2 are site-visit
+    // colour — genuinely optional, and requiring them made a section that
+    // promises "None of this is needed to size the job" permanently
+    // incompletable. Dwelling type and electrical phase are the two that
+    // later rows actually consume (the multi-dwelling caution; the export
+    // limit at 4.4), so they are the two the installer is asked for.
+    // `gates: false` is UNCHANGED — D52 narrows what is owed, and F117 keeps
+    // it from locking anything either way.
     complete: (job) =>
-      job.storeys != null &&
-      job.roof_material != null &&
-      job.dwelling_type != null &&
-      job.electrical_phase != null,
+      job.dwelling_type != null && job.electrical_phase != null,
+    // The labels are the ones the FORM ALREADY SHOWS
+    // (components/worksheet/site-details-section.tsx), so the open-items list
+    // and the field the installer must go and fill cannot describe one thing
+    // two ways.
+    owes: (job) => {
+      const items: string[] = [];
+      if (job.dwelling_type == null) items.push("Dwelling type");
+      if (job.electrical_phase == null) items.push("Electrical phase");
+      return items;
+    },
   },
   {
     id: "energy-data",
@@ -370,6 +415,11 @@ export const SECTIONS: readonly WorksheetSectionSpec[] = [
     // gates on the real prerequisite. It reports honestly on ITSELF and locks
     // nothing beneath it (D5/D24's shape).
     gates: false,
+    // 3.15 prompt 2: the SAME sentence, one step further. Nothing here is the
+    // installer's to fill in, so an incomplete Incentives section is not
+    // something owed — listing it would be the gate crying wolf. Distinct
+    // from summary-finish's reason; see the field's own comment.
+    neverOpen: true,
   },
   {
     id: "summary-finish",
@@ -378,6 +428,11 @@ export const SECTIONS: readonly WorksheetSectionSpec[] = [
     builtAt: "3.15",
     complete: (job) =>
       typeof job.status === "string" && job.status !== "" && job.status !== "draft",
+    // 3.15 prompt 2: a list does not list itself. This section IS the
+    // open-items list, and its completeness rule ("no longer a draft") only
+    // turns true once the job is sized — so listing it would repeat the gap
+    // Solar sizing already names, in different words.
+    neverOpen: true,
   },
 ];
 
@@ -566,6 +621,93 @@ export function sectionStates(job: unknown): WorksheetSectionView[] {
     }
     return { ...section, state };
   });
+}
+
+// ── The completeness model (3.15 prompt 2 — GAP-6, IA §1 principle 3) ────────
+
+/** One thing the installer still owes, named. */
+export interface JobOpenItem {
+  sectionId: string;
+  sectionTitle: string;
+  /** What is owed, in plain English. */
+  label: string;
+}
+
+export interface JobCompletenessView {
+  /** Everything still owed, in section render order, in the order each
+      section's own `owes` returns them. */
+  open: JobOpenItem[];
+  settled: boolean;
+}
+
+/**
+ * WHAT DOES THIS JOB STILL OWE THE INSTALLER, AND IS IT SETTLED.
+ *
+ * The gate GAP-6 records as promised by 9.7 and built by nothing. It is a
+ * THIRD property, not a reuse of `complete` or `gates` — see the `owes` field
+ * on WorksheetSectionSpec for why a list built off either one alone answers
+ * wrongly for at least one section.
+ *
+ * The rules, each stated because each has a way of going wrong:
+ *  1. Sections come from sectionsForPath(job.path), NEVER the full catalogue.
+ *     A section the path hides can never be owed — Path A and F hide Battery
+ *     sizing, Path E hides Solar sizing (2T.4). Getting this wrong asks a
+ *     solar-only job for a battery.
+ *  2. A `neverOpen` section contributes nothing, complete or not.
+ *  3. A section whose `complete(job)` is true contributes nothing.
+ *  4. Otherwise it contributes `owes(job)`, or one item labelled with its own
+ *     title when the section names nothing.
+ *  5. `settled` is `open.length === 0`, computed FROM the list — one rule, one
+ *     answer, never a second predicate that could disagree with it.
+ *  6. Total and unthrowing. Junk, null, a missing path or a path that is not
+ *     one of the six all yield a usable result. AN UNREADABLE JOB IS NOT A
+ *     SETTLED ONE: asObject gives {} and sectionsForPath gives all eleven, so
+ *     the predicates themselves produce the full open list — which is the
+ *     honest answer, where `{ open: [], settled: true }` would claim a job
+ *     nobody can read is finished.
+ *
+ * THERE IS NO SECOND LIST OF WHAT IS ANSWERED. `sectionStates` is the tick and
+ * has been since 3.3; a consumer that needs the answered half reads that. Two
+ * lists of one fact is the drift this project keeps undoing.
+ *
+ * Pure: no network, no database, no storage.
+ */
+export function jobCompleteness(job: unknown): JobCompletenessView {
+  const detail = asObject(job);
+  const open: JobOpenItem[] = [];
+  for (const section of sectionsForPath(detail.path)) {
+    if (section.neverOpen) continue;
+    let done = false;
+    try {
+      done = section.complete(detail) === true;
+    } catch {
+      done = false;  // an unreadable section owes its work, it does not vanish
+    }
+    if (done) continue;
+    // A section's own `owes` may throw or return junk; one section's fault
+    // must never empty the whole list, and an incomplete section must never
+    // silently disappear from it.
+    let labels: string[] = [];
+    if (typeof section.owes === "function") {
+      try {
+        const named = section.owes(detail);
+        labels = Array.isArray(named)
+          ? named.filter((l): l is string => typeof l === "string" && l !== "")
+          : [];
+      } catch {
+        labels = [];
+      }
+    }
+    if (labels.length === 0) labels = [section.title];
+    for (const label of labels) {
+      open.push({
+        sectionId: section.id,
+        sectionTitle: section.title,
+        label,
+      });
+    }
+  }
+  return { open, settled: open.length === 0 };
 }
 
 // ── Phase rail ───────────────────────────────────────────────────────────────
